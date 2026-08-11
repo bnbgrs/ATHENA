@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from enum import Enum
 
+from athena.chat.generation import ChatGenerationService
 from athena.chat.repository import ChatRepository
 from athena.chat.service import ChatService
 from athena.config.settings import AthenaSettings
@@ -47,7 +48,9 @@ class AthenaApplication:
         self.model_provider = LMStudioProvider(
             base_url=self.settings.lm_studio_base_url,
             timeout_seconds=self.settings.model_request_timeout_seconds,
+            generation_timeout_seconds=self.settings.model_generation_timeout_seconds,
         )
+        self.chat_generation = ChatGenerationService(self.chat, self.model_provider)
 
         bootstrap_services: tuple[LifecycleService, ...] = (
             RuntimeLayoutService(self.paths),

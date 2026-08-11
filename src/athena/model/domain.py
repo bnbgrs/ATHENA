@@ -36,3 +36,11 @@ class ModelInfo:
     loaded: bool
     vision: bool | None
     trained_for_tool_use: bool | None
+
+
+@dataclass(frozen=True, slots=True)
+class ModelChatMessage:
+    """One stateless chat-history item passed to a model provider."""
+
+    role: str
+    content: str

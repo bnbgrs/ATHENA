@@ -50,6 +50,44 @@ class ChatService:
             content=content,
         )
 
+
+    def ensure_primary_model(self, *, provider_id: str, model_id: str) -> uuid.UUID:
+        """Return a stable primary-model actor for one backend model."""
+        display_name = f"{provider_id}:{model_id}"
+        actor_id = self.repository.find_active_actor(
+            actor_type="primary_model",
+            display_name=display_name,
+        )
+        if actor_id is not None:
+            return actor_id
+
+        return self.repository.create_actor(
+            actor_type="primary_model",
+            display_name=display_name,
+        )
+
+    def add_assistant_message(
+        self,
+        *,
+        chat_id: uuid.UUID,
+        content: str,
+        provider_id: str,
+        model_id: str,
+    ) -> ChatMessage:
+        if not content.strip():
+            raise EmptyMessageError("An assistant message must contain non-whitespace text.")
+
+        actor_id = self.ensure_primary_model(
+            provider_id=provider_id,
+            model_id=model_id,
+        )
+        return self.repository.append_message(
+            chat_id=chat_id,
+            actor_id=actor_id,
+            message_type=MessageType.ASSISTANT,
+            content=content,
+        )
+
     def load_chat(self, chat_id: uuid.UUID) -> ChatThread:
         return self.repository.load_chat(chat_id)
 

@@ -103,6 +103,7 @@ def test_lm_studio_defaults_to_loopback(tmp_path) -> None:
 
     assert settings.lm_studio_base_url == "http://127.0.0.1:1234"
     assert settings.model_request_timeout_seconds == 2.0
+    assert settings.model_generation_timeout_seconds == 300.0
 
 
 def test_lm_studio_base_url_normalizes_trailing_slash(tmp_path) -> None:
@@ -125,6 +126,23 @@ def test_lm_studio_remote_host_is_rejected(tmp_path) -> None:
 def test_invalid_model_timeout_environment_is_rejected(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("ATHENA_LOCAL_ROOT", str(tmp_path))
     monkeypatch.setenv("ATHENA_MODEL_REQUEST_TIMEOUT_SECONDS", "not-a-number")
+
+    with pytest.raises(ConfigurationError, match="greater than zero"):
+        AthenaSettings.from_environment()
+
+
+def test_model_generation_timeout_environment(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("ATHENA_LOCAL_ROOT", str(tmp_path))
+    monkeypatch.setenv("ATHENA_MODEL_GENERATION_TIMEOUT_SECONDS", "45")
+
+    settings = AthenaSettings.from_environment()
+
+    assert settings.model_generation_timeout_seconds == 45.0
+
+
+def test_invalid_model_generation_timeout_is_rejected(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("ATHENA_LOCAL_ROOT", str(tmp_path))
+    monkeypatch.setenv("ATHENA_MODEL_GENERATION_TIMEOUT_SECONDS", "0")
 
     with pytest.raises(ConfigurationError, match="greater than zero"):
         AthenaSettings.from_environment()

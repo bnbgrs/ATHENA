@@ -1,15 +1,15 @@
-"""LM Studio model discovery adapter."""
+"""LM Studio discovery and stateless streamed-chat adapter."""
 
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from athena.model.domain import ModelInfo, ProviderHealth, ProviderHealthStatus
+from athena.model.domain import ModelChatMessage, ModelInfo, ProviderHealth, ProviderHealthStatus
 
 
 class ModelProviderError(RuntimeError):
@@ -26,10 +26,16 @@ class ProviderProtocolError(ModelProviderError):
 
 @dataclass(frozen=True, slots=True)
 class LMStudioProvider:
-    """LM Studio adapter using its native v1 API for model discovery."""
+    """LM Studio adapter.
+
+    Discovery uses LM Studio's native v1 API. Chat generation intentionally
+    uses the OpenAI-compatible stateless chat-completions endpoint so ATHENA's
+    own persistent chat remains the source of truth for conversation history.
+    """
 
     base_url: str
     timeout_seconds: float = 2.0
+    generation_timeout_seconds: float = 300.0
 
     @property
     def provider_id(self) -> str:
@@ -38,6 +44,10 @@ class LMStudioProvider:
     @property
     def models_url(self) -> str:
         return f"{self.base_url}/api/v1/models"
+
+    @property
+    def chat_completions_url(self) -> str:
+        return f"{self.base_url}/v1/chat/completions"
 
     def health(self) -> ProviderHealth:
         try:
@@ -61,6 +71,78 @@ class LMStudioProvider:
             models.append(self._parse_model(cast(Mapping[str, Any], raw_model)))
         return tuple(models)
 
+    def stream_chat(
+        self,
+        *,
+        model_id: str,
+        messages: Sequence[ModelChatMessage],
+    ) -> Iterator[str]:
+        """Stream assistant text from LM Studio using SSE chat completions."""
+        if not model_id:
+            raise ValueError("model_id must not be empty.")
+        if not messages:
+            raise ValueError("At least one chat message is required.")
+
+        request_payload = {
+            "model": model_id,
+            "messages": [
+                {"role": message.role, "content": message.content}
+                for message in messages
+            ],
+            "stream": True,
+        }
+        raw_body = json.dumps(request_payload, ensure_ascii=False).encode("utf-8")
+        request = Request(
+            self.chat_completions_url,
+            data=raw_body,
+            method="POST",
+            headers={
+                "Accept": "text/event-stream",
+                "Content-Type": "application/json",
+            },
+        )
+
+        try:
+            with urlopen(request, timeout=self.generation_timeout_seconds) as response:
+                saw_done = False
+                for raw_line in response:
+                    try:
+                        line = raw_line.decode("utf-8").strip()
+                    except UnicodeDecodeError as exc:
+                        raise ProviderProtocolError(
+                            "LM Studio returned invalid UTF-8 in its chat stream."
+                        ) from exc
+
+                    if not line or line.startswith(":"):
+                        continue
+                    if not line.startswith("data:"):
+                        continue
+
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        saw_done = True
+                        break
+                    if not data:
+                        continue
+
+                    chunk = self._parse_chat_chunk(data)
+                    if chunk:
+                        yield chunk
+
+                if not saw_done:
+                    raise ProviderProtocolError(
+                        "LM Studio chat stream ended without a [DONE] marker."
+                    )
+        except HTTPError as exc:
+            detail = self._http_error_detail(exc)
+            raise ModelProviderError(
+                f"LM Studio returned HTTP {exc.code} during chat generation{detail}."
+            ) from exc
+        except (URLError, TimeoutError, OSError) as exc:
+            raise ProviderUnavailableError(
+                f"LM Studio chat generation failed at {self.base_url}."
+            ) from exc
+
     def _get_json(self, url: str) -> Mapping[str, Any]:
         request = Request(url, headers={"Accept": "application/json"})
         try:
@@ -83,6 +165,51 @@ class LMStudioProvider:
         if not isinstance(payload, Mapping):
             raise ProviderProtocolError("LM Studio returned a non-object JSON response.")
         return cast(Mapping[str, Any], payload)
+
+    @staticmethod
+    def _parse_chat_chunk(data: str) -> str:
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError as exc:
+            raise ProviderProtocolError(
+                "LM Studio returned invalid JSON in its chat stream."
+            ) from exc
+        if not isinstance(payload, Mapping):
+            raise ProviderProtocolError("LM Studio returned a non-object chat chunk.")
+
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ProviderProtocolError("LM Studio chat chunk is missing choices.")
+        choice = choices[0]
+        if not isinstance(choice, Mapping):
+            raise ProviderProtocolError("LM Studio returned an invalid chat choice.")
+        delta = choice.get("delta")
+        if not isinstance(delta, Mapping):
+            raise ProviderProtocolError("LM Studio chat choice is missing a delta object.")
+        content = delta.get("content")
+        if content is None:
+            return ""
+        if not isinstance(content, str):
+            raise ProviderProtocolError("LM Studio returned non-text chat content.")
+        return content
+
+    @staticmethod
+    def _http_error_detail(exc: HTTPError) -> str:
+        try:
+            raw = exc.read()
+            payload = json.loads(raw.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return ""
+        if not isinstance(payload, Mapping):
+            return ""
+        error = payload.get("error")
+        if isinstance(error, Mapping):
+            message = error.get("message")
+            if isinstance(message, str) and message:
+                return f": {message}"
+        if isinstance(error, str) and error:
+            return f": {error}"
+        return ""
 
     def _parse_model(self, raw: Mapping[str, Any]) -> ModelInfo:
         key = self._required_string(raw, "key")

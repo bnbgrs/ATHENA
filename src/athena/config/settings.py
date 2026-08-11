@@ -90,6 +90,7 @@ class AthenaSettings:
     projection_root: Path | None = None
     lm_studio_base_url: str = "http://127.0.0.1:1234"
     model_request_timeout_seconds: float = 2.0
+    model_generation_timeout_seconds: float = 300.0
 
     def __post_init__(self) -> None:
         normalized = self.log_level.strip().upper()
@@ -147,6 +148,10 @@ class AthenaSettings:
             raise ConfigurationError(
                 "ATHENA model request timeout must be greater than zero."
             )
+        if self.model_generation_timeout_seconds <= 0:
+            raise ConfigurationError(
+                "ATHENA model generation timeout must be greater than zero."
+            )
 
     @property
     def numeric_log_level(self) -> int:
@@ -190,5 +195,10 @@ class AthenaSettings:
                 os.getenv("ATHENA_MODEL_REQUEST_TIMEOUT_SECONDS"),
                 setting_name="ATHENA_MODEL_REQUEST_TIMEOUT_SECONDS",
                 default=2.0,
+            ),
+            model_generation_timeout_seconds=_parse_positive_float(
+                os.getenv("ATHENA_MODEL_GENERATION_TIMEOUT_SECONDS"),
+                setting_name="ATHENA_MODEL_GENERATION_TIMEOUT_SECONDS",
+                default=300.0,
             ),
         )

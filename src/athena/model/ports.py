@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Sequence
 from typing import Protocol
 
-from athena.model.domain import ModelInfo, ProviderHealth
+from athena.model.domain import ModelChatMessage, ModelInfo, ProviderHealth
 
 
 class ModelDiscoveryProvider(Protocol):
-    """Minimal discovery/health port used while Vertical Slice 1 is built."""
+    """Discovery/health operations used by the Core."""
 
     @property
     def provider_id(self) -> str:
@@ -21,4 +22,17 @@ class ModelDiscoveryProvider(Protocol):
 
     def discover_models(self) -> tuple[ModelInfo, ...]:
         """Return normalized models or raise a provider error."""
+        ...
+
+
+class ChatModelProvider(ModelDiscoveryProvider, Protocol):
+    """Provider capable of stateless streamed text chat."""
+
+    def stream_chat(
+        self,
+        *,
+        model_id: str,
+        messages: Sequence[ModelChatMessage],
+    ) -> Iterator[str]:
+        """Yield assistant text deltas for a complete local chat history."""
         ...

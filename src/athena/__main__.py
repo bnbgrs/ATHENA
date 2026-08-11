@@ -7,6 +7,10 @@ import sys
 import uuid
 from collections.abc import Sequence
 
+from athena.chat.generation import (
+    ModelSelectionError,
+    UnsupportedChatHistoryError,
+)
 from athena.chat.models import ChatThread
 from athena.chat.repository import ChatNotFoundError
 from athena.chat.service import EmptyMessageError
@@ -48,6 +52,18 @@ def build_parser() -> argparse.ArgumentParser:
     add_parser = chat_commands.add_parser("add", help="Append a local user message.")
     add_parser.add_argument("chat_id", type=_uuid_argument)
     add_parser.add_argument("content", help="Message text. Quote text containing spaces.")
+
+    send_parser = chat_commands.add_parser(
+        "send",
+        help="Persist a user message, stream a local model reply, then save it.",
+    )
+    send_parser.add_argument("chat_id", type=_uuid_argument)
+    send_parser.add_argument("content", help="Message text. Quote text containing spaces.")
+    send_parser.add_argument(
+        "--model",
+        dest="model_id",
+        help="Exact LM Studio model identifier. Required if multiple LLMs are loaded.",
+    )
 
     show_parser = chat_commands.add_parser("show", help="Load and print a persistent chat.")
     show_parser.add_argument("chat_id", type=_uuid_argument)
@@ -116,6 +132,28 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
         print(f"Sequence: {message.sequence_no}")
         return 0
 
+    if args.chat_command == "send":
+        print("Assistant: ", end="", flush=True)
+        try:
+            result = app.chat_generation.send_message(
+                chat_id=args.chat_id,
+                content=args.content,
+                requested_model_id=args.model_id,
+                on_delta=lambda chunk: print(chunk, end="", flush=True),
+            )
+        except KeyboardInterrupt:
+            print()
+            print(
+                "Generation cancelled. User message remains saved; "
+                "partial assistant text was not persisted.",
+                file=sys.stderr,
+            )
+            return 130
+        print()
+        print(f"Model: {result.model.backend_model_id}")
+        print(f"Assistant message saved: {result.assistant_message.message_id}")
+        return 0
+
     if args.chat_command == "show":
         _print_chat(app.chat.load_chat(args.chat_id))
         return 0
@@ -133,7 +171,6 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
         return 0
 
     raise RuntimeError(f"Unsupported chat command: {args.chat_command!r}")
-
 
 
 def _run_model_command(app: AthenaApplication, args: argparse.Namespace) -> int:
@@ -163,6 +200,7 @@ def _run_model_command(app: AthenaApplication, args: argparse.Namespace) -> int:
 
     raise RuntimeError(f"Unsupported model command: {args.model_command!r}")
 
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -178,7 +216,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "chat":
             try:
                 return _run_chat_command(app, args)
-            except (ChatNotFoundError, EmptyMessageError, ValueError) as exc:
+            except (
+                ChatNotFoundError,
+                EmptyMessageError,
+                ModelProviderError,
+                ModelSelectionError,
+                UnsupportedChatHistoryError,
+                ValueError,
+            ) as exc:
                 print(f"ATHENA chat error: {exc}", file=sys.stderr)
                 return 2
 
