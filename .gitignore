@@ -1,0 +1,63 @@
+# Python / tooling
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+/secrets/
+
+# ATHENA runtime roots — NEVER commit personal data.
+# Root anchors are intentional: source modules such as src/athena/archive/
+# and src/athena/recovery/ must remain trackable by Git.
+/state/
+/data/
+/runtime/
+/archive/
+/backups/
+/logs/
+/cache/
+/derived/
+/spool/
+/recovery/
+/projections/
+/.athena-local/
+
+# Runtime database / encrypted payload artifacts
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.athb
+
+# Explicitly allow synthetic, reviewed database fixtures for migration tests.
+!tests/fixtures/**/*.db
+!tests/migration/fixtures/**/*.db
+
+# Temporary files
+*.tmp
+*.part
+*.bak
+*.swp
+~$*
