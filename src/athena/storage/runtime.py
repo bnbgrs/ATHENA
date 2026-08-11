@@ -70,11 +70,11 @@ class RuntimeLayoutService:
         finally:
             try:
                 probe.unlink(missing_ok=True)
-            except OSError:
+            except OSError as exc:
                 # A failed probe cleanup is itself evidence that the directory
                 # is not healthy enough for durable ATHENA state.
                 if probe.exists():
                     raise RuntimePathError(
                         f"ATHENA could not clean its write probe in "
                         f"{str(path)!r}."
-                    )
+                    ) from exc

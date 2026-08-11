@@ -11,7 +11,9 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = [
-    "pytest",
+    "mypy==2.3.0",
+    "pytest==9.1.1",
+    "ruff==0.15.22",
 ]
 
 [project.scripts]
@@ -26,3 +28,35 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+required-version = "==0.15.22"
+exclude = [
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "build",
+    "dist",
+]
+
+[tool.ruff.lint]
+select = [
+    "E4",
+    "E7",
+    "E9",
+    "F",
+    "I",
+    "B",
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+show_error_codes = true
+pretty = true
+files = ["src/athena"]

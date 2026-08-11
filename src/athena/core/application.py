@@ -12,7 +12,6 @@ from athena.observability.logging import configure_logging
 from athena.storage.paths import RuntimePaths
 from athena.storage.runtime import RuntimeLayoutService
 
-
 logger = logging.getLogger(__name__)
 
 

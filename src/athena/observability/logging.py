@@ -7,7 +7,6 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-
 _HANDLER_MARKER = "_athena_console_handler"
 
 
