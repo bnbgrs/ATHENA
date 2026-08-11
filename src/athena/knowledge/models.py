@@ -137,6 +137,35 @@ class KnowledgeUnitRevision:
 
 
 @dataclass(frozen=True, slots=True)
+class KnowledgeUnitSnapshot:
+    """Current canonical state of one stable KnowledgeUnit entity."""
+
+    knowledge_id: uuid.UUID
+    lifecycle_state: str
+    revision: KnowledgeUnitRevision
+
+
+@dataclass(frozen=True, slots=True)
+class ProvenanceInputRef:
+    """Stable input reference that explains one semantic revision."""
+
+    provenance_id: uuid.UUID
+    input_entity_id: uuid.UUID
+    input_revision_id: uuid.UUID | None
+    input_role: str
+    ordinal: int
+
+    def __post_init__(self) -> None:
+        if self.ordinal < 0:
+            raise ValueError("ordinal must not be negative.")
+        object.__setattr__(
+            self,
+            "input_role",
+            _require_meaningful_text(self.input_role, field_name="input_role"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ClaimRevision:
     claim_id: uuid.UUID
     revision_id: uuid.UUID

@@ -3,18 +3,21 @@ import sqlite3
 from athena.common.ids import new_uuid7, uuid_to_blob
 from athena.storage.database import SQLiteDatabase
 from athena.storage.schema import (
-    KNOWLEDGE_CORE_MIGRATION_ID,
+    KNOWLEDGE_SCHEMA_VERSION,
     LEGACY_SCHEMA_VERSION,
+    PROVENANCE_INPUTS_MIGRATION_ID,
     SCHEMA_VERSION,
     _create_schema_v1,
+    _migrate_schema_v1_to_v2,
 )
 
-EXPECTED_KNOWLEDGE_TABLES = {
+EXPECTED_SEMANTIC_TABLES = {
     "knowledge_units",
     "knowledge_unit_revisions",
     "claims",
     "claim_revisions",
     "claim_evidence",
+    "provenance_inputs",
 }
 
 
@@ -25,13 +28,13 @@ def _table_names(connection: sqlite3.Connection) -> set[str]:
     return {str(row[0]) for row in rows}
 
 
-def test_fresh_database_contains_knowledge_schema(tmp_path) -> None:
+def test_fresh_database_contains_semantic_schema(tmp_path) -> None:
     database = SQLiteDatabase(tmp_path / "athena.db")
     database.start()
 
     connection = database.connection
     assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
-    assert EXPECTED_KNOWLEDGE_TABLES.issubset(_table_names(connection))
+    assert EXPECTED_SEMANTIC_TABLES.issubset(_table_names(connection))
 
     metadata = connection.execute(
         "SELECT schema_version, last_migration_id, minimum_reader_version "
@@ -39,7 +42,7 @@ def test_fresh_database_contains_knowledge_schema(tmp_path) -> None:
     ).fetchone()
     assert tuple(metadata) == (
         SCHEMA_VERSION,
-        KNOWLEDGE_CORE_MIGRATION_ID,
+        PROVENANCE_INPUTS_MIGRATION_ID,
         SCHEMA_VERSION,
     )
 
@@ -71,7 +74,7 @@ def test_v1_database_is_upgraded_without_losing_existing_actor(tmp_path) -> None
 
     connection = database.connection
     assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
-    assert EXPECTED_KNOWLEDGE_TABLES.issubset(_table_names(connection))
+    assert EXPECTED_SEMANTIC_TABLES.issubset(_table_names(connection))
     actor = connection.execute(
         "SELECT display_name FROM actors WHERE actor_id = ?",
         (uuid_to_blob(actor_id),),
@@ -79,6 +82,28 @@ def test_v1_database_is_upgraded_without_losing_existing_actor(tmp_path) -> None
     assert actor is not None
     assert actor["display_name"] == "migration-test-user"
 
+    database.stop()
+
+
+def test_v2_database_is_upgraded_additively_to_provenance_inputs(tmp_path) -> None:
+    path = tmp_path / "athena.db"
+
+    legacy = sqlite3.connect(path, autocommit=True)
+    legacy.row_factory = sqlite3.Row
+    legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
+    legacy.execute("PRAGMA application_id = 1096042574")
+    _create_schema_v1(legacy, created_at_us=1)
+    _migrate_schema_v1_to_v2(legacy)
+    assert legacy.execute("PRAGMA user_version").fetchone()[0] == KNOWLEDGE_SCHEMA_VERSION
+    assert "provenance_inputs" not in _table_names(legacy)
+    legacy.close()
+
+    database = SQLiteDatabase(path)
+    database.start()
+
+    connection = database.connection
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert "provenance_inputs" in _table_names(connection)
     database.stop()
 
 

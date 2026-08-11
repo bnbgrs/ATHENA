@@ -6,10 +6,12 @@ import sqlite3
 
 ATHENA_APPLICATION_ID = 1_096_042_574  # ASCII "ATHN" / 0x4154484E
 LEGACY_SCHEMA_VERSION = 1
-SCHEMA_VERSION = 2
+KNOWLEDGE_SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
+PROVENANCE_INPUTS_MIGRATION_ID = "0003_provenance_inputs"
 
 
 class DatabaseCompatibilityError(RuntimeError):
@@ -47,9 +49,9 @@ def _configure_connection(connection: sqlite3.Connection) -> None:
 def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> None:
     """Validate, initialize, or safely advance the ATHENA SQLite schema.
 
-    Schema v2 is the first additive evolution of the Vertical Slice 1 database.
-    Existing v1 databases are upgraded transactionally without rewriting chat
-    data. Unknown, unrelated, and newer databases fail closed.
+    Schema v3 adds explicit provenance inputs on top of the Knowledge schema.
+    Existing v1 and v2 databases are upgraded transactionally without rewriting
+    chat or Knowledge payloads. Unknown, unrelated, and newer databases fail closed.
     """
     existing_application_id = int(
         connection.execute("PRAGMA application_id").fetchone()[0]
@@ -73,7 +75,13 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
             f"version {SCHEMA_VERSION}."
         )
 
-    if existing_user_version not in {0, LEGACY_SCHEMA_VERSION, SCHEMA_VERSION}:
+    supported_versions = {
+        0,
+        LEGACY_SCHEMA_VERSION,
+        KNOWLEDGE_SCHEMA_VERSION,
+        SCHEMA_VERSION,
+    }
+    if existing_user_version not in supported_versions:
         raise DatabaseCompatibilityError(
             f"Database schema version {existing_user_version} requires an unsupported "
             "migration path."
@@ -88,9 +96,13 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
 
     if existing_user_version == LEGACY_SCHEMA_VERSION:
         _migrate_schema_v1_to_v2(connection)
+        existing_user_version = KNOWLEDGE_SCHEMA_VERSION
+
+    if existing_user_version == KNOWLEDGE_SCHEMA_VERSION:
+        _migrate_schema_v2_to_v3(connection)
 
     _configure_connection(connection)
-    _verify_schema_v2(connection)
+    _verify_schema_v3(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -395,8 +407,52 @@ def _migrate_schema_v1_to_v2(connection: sqlite3.Connection) -> None:
             WHERE message_id IS NOT NULL;
 
         UPDATE schema_metadata
-        SET schema_version = {SCHEMA_VERSION},
+        SET schema_version = {KNOWLEDGE_SCHEMA_VERSION},
             last_migration_id = '{KNOWLEDGE_CORE_MIGRATION_ID}',
+            minimum_reader_version = {KNOWLEDGE_SCHEMA_VERSION}
+        WHERE singleton_id = 1;
+
+        PRAGMA user_version = {KNOWLEDGE_SCHEMA_VERSION};
+        COMMIT;
+        """
+    )
+
+
+def _migrate_schema_v2_to_v3(connection: sqlite3.Connection) -> None:
+    """Add explicit multi-input provenance required by semantic writes."""
+    connection.executescript(
+        f"""
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE provenance_inputs (
+            provenance_id BLOB(16) NOT NULL CHECK(length(provenance_id) = 16),
+            input_entity_id BLOB(16) NOT NULL CHECK(length(input_entity_id) = 16),
+            input_revision_id BLOB(16) NULL,
+            input_role TEXT NOT NULL,
+            ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+            PRIMARY KEY(provenance_id, ordinal),
+            FOREIGN KEY(provenance_id) REFERENCES provenance_records(provenance_id),
+            FOREIGN KEY(input_entity_id) REFERENCES entity_registry(entity_id),
+            FOREIGN KEY(input_revision_id) REFERENCES revisions(revision_id),
+            CHECK(input_revision_id IS NULL OR length(input_revision_id) = 16)
+        ) WITHOUT ROWID;
+
+        CREATE UNIQUE INDEX uq_provenance_inputs_revision
+            ON provenance_inputs(
+                provenance_id, input_entity_id, input_revision_id, input_role
+            )
+            WHERE input_revision_id IS NOT NULL;
+
+        CREATE UNIQUE INDEX uq_provenance_inputs_entity_only
+            ON provenance_inputs(provenance_id, input_entity_id, input_role)
+            WHERE input_revision_id IS NULL;
+
+        CREATE INDEX idx_provenance_inputs_entity
+            ON provenance_inputs(input_entity_id, input_revision_id);
+
+        UPDATE schema_metadata
+        SET schema_version = {SCHEMA_VERSION},
+            last_migration_id = '{PROVENANCE_INPUTS_MIGRATION_ID}',
             minimum_reader_version = {SCHEMA_VERSION}
         WHERE singleton_id = 1;
 
@@ -406,7 +462,7 @@ def _migrate_schema_v1_to_v2(connection: sqlite3.Connection) -> None:
     )
 
 
-def _verify_schema_v2(connection: sqlite3.Connection) -> None:
+def _verify_schema_v3(connection: sqlite3.Connection) -> None:
     application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
     user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
@@ -424,7 +480,7 @@ def _verify_schema_v2(connection: sqlite3.Connection) -> None:
         SCHEMA_VERSION,
         STORAGE_LAYOUT_VERSION,
         BLOB_FORMAT_VERSION,
-        KNOWLEDGE_CORE_MIGRATION_ID,
+        PROVENANCE_INPUTS_MIGRATION_ID,
         SCHEMA_VERSION,
     )
     if metadata is None or tuple(metadata) != expected:
@@ -436,11 +492,12 @@ def _verify_schema_v2(connection: sqlite3.Connection) -> None:
         "claims",
         "claim_revisions",
         "claim_evidence",
+        "provenance_inputs",
     }
     missing_tables = required_tables.difference(_user_tables(connection))
     if missing_tables:
         missing = ", ".join(sorted(missing_tables))
-        raise DatabaseCompatibilityError(f"ATHENA knowledge schema is incomplete: {missing}.")
+        raise DatabaseCompatibilityError(f"ATHENA semantic schema is incomplete: {missing}.")
 
     foreign_key_failures = connection.execute("PRAGMA foreign_key_check").fetchall()
     if foreign_key_failures:

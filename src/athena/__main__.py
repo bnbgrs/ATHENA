@@ -7,15 +7,23 @@ import sys
 import uuid
 from collections.abc import Sequence
 
-from athena.chat.generation import (
-    ModelSelectionError,
-    UnsupportedChatHistoryError,
-)
+from athena.chat.generation import ModelSelectionError, UnsupportedChatHistoryError
 from athena.chat.models import ChatThread
 from athena.chat.repository import ChatNotFoundError
 from athena.chat.service import EmptyMessageError
 from athena.config.settings import ConfigurationError
 from athena.core.application import AthenaApplication
+from athena.knowledge.models import EpistemicStatus, KnowledgeKind, KnowledgeUnitSnapshot
+from athena.knowledge.repository import (
+    KnowledgeActorError,
+    KnowledgeConflictError,
+    KnowledgeNotFoundError,
+    KnowledgeSourceError,
+)
+from athena.knowledge.service import (
+    ChatMessageSequenceError,
+    UnsupportedKnowledgeSourceError,
+)
 from athena.model.adapters.lm_studio import ModelProviderError
 from athena.version import __version__
 
@@ -25,6 +33,26 @@ def _uuid_argument(value: str) -> uuid.UUID:
         return uuid.UUID(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"invalid UUID: {value!r}") from exc
+
+
+def _knowledge_kind_argument(value: str) -> KnowledgeKind:
+    try:
+        return KnowledgeKind(value)
+    except ValueError as exc:
+        allowed = ", ".join(item.value for item in KnowledgeKind)
+        raise argparse.ArgumentTypeError(
+            f"invalid knowledge kind {value!r}; choose one of: {allowed}"
+        ) from exc
+
+
+def _epistemic_status_argument(value: str) -> EpistemicStatus:
+    try:
+        return EpistemicStatus(value)
+    except ValueError as exc:
+        allowed = ", ".join(item.value for item in EpistemicStatus)
+        raise argparse.ArgumentTypeError(
+            f"invalid epistemic status {value!r}; choose one of: {allowed}"
+        ) from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -76,6 +104,62 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum number of chats to print (1-500).",
     )
 
+    knowledge_parser = commands.add_parser(
+        "knowledge",
+        help="Canonical versioned KnowledgeUnit commands.",
+    )
+    knowledge_commands = knowledge_parser.add_subparsers(
+        dest="knowledge_command",
+        required=True,
+    )
+
+    promote_parser = knowledge_commands.add_parser(
+        "promote",
+        help="Explicitly promote one exact chat message to canonical Knowledge.",
+    )
+    promote_parser.add_argument("chat_id", type=_uuid_argument)
+    promote_parser.add_argument("sequence_no", type=int)
+    promote_parser.add_argument("--kind", type=_knowledge_kind_argument, required=True)
+    promote_parser.add_argument("--title")
+    promote_parser.add_argument(
+        "--status",
+        type=_epistemic_status_argument,
+        default=EpistemicStatus.ASSERTED,
+    )
+
+    knowledge_show = knowledge_commands.add_parser(
+        "show",
+        help="Show the current revision and provenance inputs of a KnowledgeUnit.",
+    )
+    knowledge_show.add_argument("knowledge_id", type=_uuid_argument)
+
+    knowledge_history = knowledge_commands.add_parser(
+        "history",
+        help="Show all immutable revisions of a KnowledgeUnit.",
+    )
+    knowledge_history.add_argument("knowledge_id", type=_uuid_argument)
+
+    knowledge_revise = knowledge_commands.add_parser(
+        "revise",
+        help="Create a new direct-user revision of an existing KnowledgeUnit.",
+    )
+    knowledge_revise.add_argument("knowledge_id", type=_uuid_argument)
+    knowledge_revise.add_argument("body", help="Replacement body text.")
+    knowledge_revise.add_argument("--title")
+    knowledge_revise.add_argument("--kind", type=_knowledge_kind_argument)
+    knowledge_revise.add_argument("--status", type=_epistemic_status_argument)
+
+    knowledge_list = knowledge_commands.add_parser(
+        "list",
+        help="List current KnowledgeUnit heads.",
+    )
+    knowledge_list.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Maximum number of KnowledgeUnits to print (1-500).",
+    )
+
     model_parser = commands.add_parser("model", help="Local model provider commands.")
     model_commands = model_parser.add_subparsers(dest="model_command", required=True)
     model_commands.add_parser("status", help="Check LM Studio provider health.")
@@ -114,6 +198,30 @@ def _print_chat(thread: ChatThread) -> None:
     for message in thread.messages:
         content = message.content if message.content is not None else "<protected>"
         print(f"[{message.sequence_no}] {message.message_type.value}: {content}")
+
+
+def _print_knowledge(app: AthenaApplication, snapshot: KnowledgeUnitSnapshot) -> None:
+    revision = snapshot.revision
+    payload = revision.payload
+    print(f"Knowledge: {snapshot.knowledge_id}")
+    print(f"State: {snapshot.lifecycle_state}")
+    print(f"Revision: {revision.revision_no} ({revision.revision_id})")
+    print(f"Kind: {payload.knowledge_kind.value}")
+    print(f"Status: {payload.epistemic_status.value}")
+    print(f"Title: {payload.title if payload.title is not None else '<none>'}")
+    print(f"Body: {payload.body}")
+    inputs = app.knowledge.provenance_inputs(revision.provenance_id)
+    print(f"Provenance inputs: {len(inputs)}")
+    for item in inputs:
+        revision_text = (
+            str(item.input_revision_id)
+            if item.input_revision_id is not None
+            else "<entity-only>"
+        )
+        print(
+            f"[{item.ordinal}] role={item.input_role} "
+            f"entity={item.input_entity_id} revision={revision_text}"
+        )
 
 
 def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
@@ -173,6 +281,68 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
     raise RuntimeError(f"Unsupported chat command: {args.chat_command!r}")
 
 
+def _run_knowledge_command(app: AthenaApplication, args: argparse.Namespace) -> int:
+    if args.knowledge_command == "promote":
+        revision = app.knowledge.promote_chat_message(
+            chat_id=args.chat_id,
+            sequence_no=args.sequence_no,
+            knowledge_kind=args.kind,
+            title=args.title,
+            epistemic_status=args.status,
+        )
+        print(f"Knowledge created: {revision.knowledge_id}")
+        print(f"Revision: {revision.revision_no} ({revision.revision_id})")
+        print(f"Provenance: {revision.provenance_id}")
+        return 0
+
+    if args.knowledge_command == "show":
+        _print_knowledge(app, app.knowledge.load(args.knowledge_id))
+        return 0
+
+    if args.knowledge_command == "history":
+        revisions = app.knowledge.history(args.knowledge_id)
+        print(f"Knowledge: {args.knowledge_id}")
+        print(f"Revisions: {len(revisions)}")
+        for revision in revisions:
+            inputs = app.knowledge.provenance_inputs(revision.provenance_id)
+            print(
+                f"[{revision.revision_no}] revision={revision.revision_id} "
+                f"kind={revision.payload.knowledge_kind.value} "
+                f"status={revision.payload.epistemic_status.value} "
+                f"inputs={len(inputs)} body={revision.payload.body}"
+            )
+        return 0
+
+    if args.knowledge_command == "revise":
+        revision = app.knowledge.revise(
+            knowledge_id=args.knowledge_id,
+            body=args.body,
+            title=args.title,
+            knowledge_kind=args.kind,
+            epistemic_status=args.status,
+        )
+        print(f"Knowledge revised: {revision.knowledge_id}")
+        print(f"Revision: {revision.revision_no} ({revision.revision_id})")
+        print(f"Provenance: {revision.provenance_id}")
+        return 0
+
+    if args.knowledge_command == "list":
+        snapshots = app.knowledge.list(limit=args.limit)
+        if not snapshots:
+            print("No canonical KnowledgeUnits.")
+            return 0
+        for snapshot in snapshots:
+            revision = snapshot.revision
+            title = revision.payload.title or "<untitled>"
+            print(
+                f"{snapshot.knowledge_id}  rev={revision.revision_no}  "
+                f"kind={revision.payload.knowledge_kind.value}  title={title}"
+            )
+        return 0
+
+    raise RuntimeError(f"Unsupported knowledge command: {args.knowledge_command!r}")
+
+
 def _run_model_command(app: AthenaApplication, args: argparse.Namespace) -> int:
     if args.model_command == "status":
         health = app.model_provider.health()
@@ -225,6 +395,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ValueError,
             ) as exc:
                 print(f"ATHENA chat error: {exc}", file=sys.stderr)
+                return 2
+
+        if args.command == "knowledge":
+            try:
+                return _run_knowledge_command(app, args)
+            except (
+                ChatNotFoundError,
+                ChatMessageSequenceError,
+                KnowledgeActorError,
+                KnowledgeConflictError,
+                KnowledgeNotFoundError,
+                KnowledgeSourceError,
+                UnsupportedKnowledgeSourceError,
+                ValueError,
+            ) as exc:
+                print(f"ATHENA knowledge error: {exc}", file=sys.stderr)
                 return 2
 
         if args.command == "model":
