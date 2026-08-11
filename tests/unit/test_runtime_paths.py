@@ -8,6 +8,7 @@ def test_runtime_paths_keep_state_and_derived_separate(tmp_path) -> None:
     paths = RuntimePaths.from_settings(settings)
 
     assert paths.state_root == tmp_path / "state"
+    assert paths.database_path == tmp_path / "state" / "athena.db"
     assert paths.spool_root == tmp_path / "state" / "spool"
     assert paths.derived_root == tmp_path / "derived"
     assert paths.state_root != paths.derived_root

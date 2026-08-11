@@ -48,6 +48,7 @@ def main() -> int:
         if args.show_paths:
             print(f"Local root: {app.paths.local_root}")
             print(f"State root: {app.paths.state_root}")
+            print(f"Database: {app.paths.database_path}")
             print(f"Spool root: {app.paths.spool_root}")
             print(f"Derived root: {app.paths.derived_root}")
             print(f"Log root: {app.paths.log_root}")

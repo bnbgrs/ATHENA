@@ -14,6 +14,7 @@ class RuntimePaths:
 
     local_root: Path
     state_root: Path
+    database_path: Path
     spool_root: Path
     derived_root: Path
     log_root: Path
@@ -30,6 +31,7 @@ class RuntimePaths:
         return cls(
             local_root=local,
             state_root=state,
+            database_path=state / "athena.db",
             # Durable pending bytes belong underneath non-reconstructible state.
             spool_root=state / "spool",
             # Reconstructible indexes/caches are physically separate.

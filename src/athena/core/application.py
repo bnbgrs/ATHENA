@@ -9,6 +9,7 @@ from athena.config.settings import AthenaSettings
 from athena.core.services import LifecycleService, ServiceManager
 from athena.observability.health import HealthService
 from athena.observability.logging import configure_logging
+from athena.storage.database import SQLiteDatabase
 from athena.storage.paths import RuntimePaths
 from athena.storage.runtime import RuntimeLayoutService
 
@@ -37,9 +38,11 @@ class AthenaApplication:
         self.paths = RuntimePaths.from_settings(self.settings)
         self.state = ApplicationState.STOPPED
         self.health = HealthService()
+        self.database = SQLiteDatabase(self.paths.database_path)
 
         bootstrap_services: tuple[LifecycleService, ...] = (
             RuntimeLayoutService(self.paths),
+            self.database,
         )
         self.services = ServiceManager(bootstrap_services + services)
 
