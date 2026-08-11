@@ -1,13 +1,15 @@
-"""Initial ATHENA SQLite schema and compatibility checks."""
+"""ATHENA SQLite schema bootstrap, additive migrations, and compatibility checks."""
 
 from __future__ import annotations
 
 import sqlite3
 
 ATHENA_APPLICATION_ID = 1_096_042_574  # ASCII "ATHN" / 0x4154484E
-SCHEMA_VERSION = 1
+LEGACY_SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
+KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
 
 
 class DatabaseCompatibilityError(RuntimeError):
@@ -43,11 +45,11 @@ def _configure_connection(connection: sqlite3.Connection) -> None:
 
 
 def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> None:
-    """Validate or initialize the v1 SQLite schema.
+    """Validate, initialize, or safely advance the ATHENA SQLite schema.
 
-    The function refuses to adopt an unrelated pre-existing SQLite database.
-    Schema migrations beyond v1 are intentionally deferred to the migration
-    subsystem; opening a newer database fails closed.
+    Schema v2 is the first additive evolution of the Vertical Slice 1 database.
+    Existing v1 databases are upgraded transactionally without rewriting chat
+    data. Unknown, unrelated, and newer databases fail closed.
     """
     existing_application_id = int(
         connection.execute("PRAGMA application_id").fetchone()[0]
@@ -71,9 +73,10 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
             f"version {SCHEMA_VERSION}."
         )
 
-    if existing_user_version not in {0, SCHEMA_VERSION}:
+    if existing_user_version not in {0, LEGACY_SCHEMA_VERSION, SCHEMA_VERSION}:
         raise DatabaseCompatibilityError(
-            f"Database schema version {existing_user_version} requires a migration path."
+            f"Database schema version {existing_user_version} requires an unsupported "
+            "migration path."
         )
 
     if existing_user_version == 0:
@@ -81,12 +84,17 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         connection.execute("PRAGMA auto_vacuum = INCREMENTAL")
         connection.execute(f"PRAGMA application_id = {ATHENA_APPLICATION_ID}")
         _create_schema_v1(connection, created_at_us=created_at_us)
+        existing_user_version = LEGACY_SCHEMA_VERSION
+
+    if existing_user_version == LEGACY_SCHEMA_VERSION:
+        _migrate_schema_v1_to_v2(connection)
 
     _configure_connection(connection)
-    _verify_schema_v1(connection)
+    _verify_schema_v2(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
+    """Create the historical v1 foundation used as the migration baseline."""
     connection.executescript(
         f"""
         BEGIN IMMEDIATE;
@@ -114,7 +122,7 @@ def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> 
         ) VALUES (
             1,
             1,
-            {SCHEMA_VERSION},
+            {LEGACY_SCHEMA_VERSION},
             {STORAGE_LAYOUT_VERSION},
             {BLOB_FORMAT_VERSION},
             {created_at_us},
@@ -282,13 +290,123 @@ def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> 
         CREATE INDEX idx_commit_changes_entity
             ON commit_changes(entity_id, commit_seq);
 
+        PRAGMA user_version = {LEGACY_SCHEMA_VERSION};
+        COMMIT;
+        """
+    )
+
+
+def _migrate_schema_v1_to_v2(connection: sqlite3.Connection) -> None:
+    """Add the canonical Knowledge/Claim tables without rewriting v1 data."""
+    connection.executescript(
+        f"""
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE knowledge_units (
+            knowledge_id BLOB(16) PRIMARY KEY CHECK(length(knowledge_id) = 16),
+            FOREIGN KEY(knowledge_id) REFERENCES entity_registry(entity_id)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE knowledge_unit_revisions (
+            revision_id BLOB(16) PRIMARY KEY CHECK(length(revision_id) = 16),
+            knowledge_kind TEXT NULL,
+            title TEXT NULL,
+            body TEXT NULL,
+            valid_from_us INTEGER NULL,
+            valid_to_us INTEGER NULL,
+            epistemic_status TEXT NULL,
+            protected_payload_id BLOB(16) NULL,
+            FOREIGN KEY(revision_id) REFERENCES revisions(revision_id),
+            CHECK(valid_to_us IS NULL OR valid_from_us IS NULL OR valid_to_us >= valid_from_us),
+            CHECK(protected_payload_id IS NULL OR length(protected_payload_id) = 16)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE claims (
+            claim_id BLOB(16) PRIMARY KEY CHECK(length(claim_id) = 16),
+            FOREIGN KEY(claim_id) REFERENCES entity_registry(entity_id)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE claim_revisions (
+            revision_id BLOB(16) PRIMARY KEY CHECK(length(revision_id) = 16),
+            claim_kind TEXT NULL,
+            statement TEXT NULL,
+            subject_entity_id BLOB(16) NULL,
+            predicate TEXT NULL,
+            object_entity_id BLOB(16) NULL,
+            attributed_to_entity_id BLOB(16) NULL,
+            valid_from_us INTEGER NULL,
+            valid_to_us INTEGER NULL,
+            epistemic_status TEXT NULL,
+            protected_payload_id BLOB(16) NULL,
+            FOREIGN KEY(revision_id) REFERENCES revisions(revision_id),
+            FOREIGN KEY(subject_entity_id) REFERENCES entity_registry(entity_id),
+            FOREIGN KEY(object_entity_id) REFERENCES entity_registry(entity_id),
+            FOREIGN KEY(attributed_to_entity_id) REFERENCES entity_registry(entity_id),
+            CHECK(subject_entity_id IS NULL OR length(subject_entity_id) = 16),
+            CHECK(object_entity_id IS NULL OR length(object_entity_id) = 16),
+            CHECK(attributed_to_entity_id IS NULL OR length(attributed_to_entity_id) = 16),
+            CHECK(valid_to_us IS NULL OR valid_from_us IS NULL OR valid_to_us >= valid_from_us),
+            CHECK(protected_payload_id IS NULL OR length(protected_payload_id) = 16)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE claim_evidence (
+            claim_id BLOB(16) NOT NULL CHECK(length(claim_id) = 16),
+            anchor_id BLOB(16) NULL,
+            message_id BLOB(16) NULL,
+            evidence_entity_id BLOB(16) NULL,
+            evidence_revision_id BLOB(16) NULL,
+            evidence_role TEXT NOT NULL,
+            provenance_id BLOB(16) NOT NULL CHECK(length(provenance_id) = 16),
+            FOREIGN KEY(claim_id) REFERENCES claims(claim_id),
+            FOREIGN KEY(message_id) REFERENCES chat_messages(message_id),
+            FOREIGN KEY(evidence_entity_id) REFERENCES entity_registry(entity_id),
+            FOREIGN KEY(evidence_revision_id) REFERENCES revisions(revision_id),
+            FOREIGN KEY(provenance_id) REFERENCES provenance_records(provenance_id),
+            CHECK(anchor_id IS NULL OR length(anchor_id) = 16),
+            CHECK(message_id IS NULL OR length(message_id) = 16),
+            CHECK(evidence_entity_id IS NULL OR length(evidence_entity_id) = 16),
+            CHECK(evidence_revision_id IS NULL OR length(evidence_revision_id) = 16),
+            CHECK(
+                anchor_id IS NOT NULL
+                OR message_id IS NOT NULL
+                OR evidence_entity_id IS NOT NULL
+                OR evidence_revision_id IS NOT NULL
+            ),
+            UNIQUE(
+                claim_id,
+                anchor_id,
+                message_id,
+                evidence_entity_id,
+                evidence_revision_id,
+                evidence_role
+            )
+        );
+
+        CREATE INDEX idx_knowledge_unit_revisions_kind
+            ON knowledge_unit_revisions(knowledge_kind);
+        CREATE INDEX idx_claim_revisions_kind
+            ON claim_revisions(claim_kind);
+        CREATE INDEX idx_claim_revisions_subject_predicate
+            ON claim_revisions(subject_entity_id, predicate);
+        CREATE INDEX idx_claim_evidence_claim
+            ON claim_evidence(claim_id);
+        CREATE INDEX idx_claim_evidence_message
+            ON claim_evidence(message_id)
+            WHERE message_id IS NOT NULL;
+
+        UPDATE schema_metadata
+        SET schema_version = {SCHEMA_VERSION},
+            last_migration_id = '{KNOWLEDGE_CORE_MIGRATION_ID}',
+            minimum_reader_version = {SCHEMA_VERSION}
+        WHERE singleton_id = 1;
+
         PRAGMA user_version = {SCHEMA_VERSION};
         COMMIT;
         """
     )
 
 
-def _verify_schema_v1(connection: sqlite3.Connection) -> None:
+def _verify_schema_v2(connection: sqlite3.Connection) -> None:
     application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
     user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
@@ -298,9 +416,32 @@ def _verify_schema_v1(connection: sqlite3.Connection) -> None:
         raise DatabaseCompatibilityError("ATHENA schema version verification failed.")
 
     metadata = connection.execute(
-        "SELECT schema_version, storage_layout_version, blob_format_version "
+        "SELECT schema_version, storage_layout_version, blob_format_version, "
+        "last_migration_id, minimum_reader_version "
         "FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
-    expected = (SCHEMA_VERSION, STORAGE_LAYOUT_VERSION, BLOB_FORMAT_VERSION)
+    expected = (
+        SCHEMA_VERSION,
+        STORAGE_LAYOUT_VERSION,
+        BLOB_FORMAT_VERSION,
+        KNOWLEDGE_CORE_MIGRATION_ID,
+        SCHEMA_VERSION,
+    )
     if metadata is None or tuple(metadata) != expected:
         raise DatabaseCompatibilityError("ATHENA schema_metadata verification failed.")
+
+    required_tables = {
+        "knowledge_units",
+        "knowledge_unit_revisions",
+        "claims",
+        "claim_revisions",
+        "claim_evidence",
+    }
+    missing_tables = required_tables.difference(_user_tables(connection))
+    if missing_tables:
+        missing = ", ".join(sorted(missing_tables))
+        raise DatabaseCompatibilityError(f"ATHENA knowledge schema is incomplete: {missing}.")
+
+    foreign_key_failures = connection.execute("PRAGMA foreign_key_check").fetchall()
+    if foreign_key_failures:
+        raise DatabaseCompatibilityError("ATHENA foreign-key verification failed.")
