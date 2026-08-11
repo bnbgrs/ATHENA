@@ -35,3 +35,13 @@ class ChatThread:
     archive_mode: str
     lifecycle_state: str
     messages: tuple[ChatMessage, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ChatSummary:
+    chat_id: uuid.UUID
+    started_at_us: int
+    ended_at_us: int | None
+    archive_mode: str
+    lifecycle_state: str
+    message_count: int

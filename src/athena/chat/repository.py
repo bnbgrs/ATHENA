@@ -7,7 +7,7 @@ import json
 import sqlite3
 import uuid
 
-from athena.chat.models import ChatMessage, ChatThread, MessageType
+from athena.chat.models import ChatMessage, ChatSummary, ChatThread, MessageType
 from athena.common.ids import new_uuid7, uuid_from_blob, uuid_to_blob
 from athena.common.time import utc_now_us
 from athena.storage.database import SQLiteDatabase
@@ -35,6 +35,28 @@ class ChatRepository:
 
     def __init__(self, database: SQLiteDatabase) -> None:
         self.database = database
+
+    def find_active_actor(
+        self,
+        *,
+        actor_type: str,
+        display_name: str | None = None,
+    ) -> uuid.UUID | None:
+        row = self.database.connection.execute(
+            """
+            SELECT actor_id
+            FROM actors
+            WHERE actor_type = ?
+              AND display_name IS ?
+              AND active = 1
+            ORDER BY created_at_us ASC, actor_id ASC
+            LIMIT 1
+            """,
+            (actor_type, display_name),
+        ).fetchone()
+        if row is None:
+            return None
+        return uuid_from_blob(bytes(row["actor_id"]))
 
     def create_actor(self, *, actor_type: str, display_name: str | None = None) -> uuid.UUID:
         actor_id = new_uuid7()
@@ -244,6 +266,48 @@ class ChatRepository:
             revision_id=revision_id,
             content=content,
             content_format=content_format,
+        )
+
+    def list_chats(self, *, limit: int = 50) -> tuple[ChatSummary, ...]:
+        if limit < 1 or limit > 500:
+            raise ValueError("Chat list limit must be between 1 and 500.")
+
+        rows = self.database.connection.execute(
+            """
+            SELECT
+                c.chat_id,
+                c.started_at_us,
+                c.ended_at_us,
+                c.archive_mode,
+                c.lifecycle_state,
+                COUNT(m.message_id) AS message_count
+            FROM chats AS c
+            LEFT JOIN chat_messages AS m
+              ON m.chat_id = c.chat_id
+            GROUP BY
+                c.chat_id,
+                c.started_at_us,
+                c.ended_at_us,
+                c.archive_mode,
+                c.lifecycle_state
+            ORDER BY c.started_at_us DESC, c.chat_id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+        return tuple(
+            ChatSummary(
+                chat_id=uuid_from_blob(bytes(row["chat_id"])),
+                started_at_us=int(row["started_at_us"]),
+                ended_at_us=(
+                    int(row["ended_at_us"]) if row["ended_at_us"] is not None else None
+                ),
+                archive_mode=str(row["archive_mode"]),
+                lifecycle_state=str(row["lifecycle_state"]),
+                message_count=int(row["message_count"]),
+            )
+            for row in rows
         )
 
     def load_chat(self, chat_id: uuid.UUID) -> ChatThread:

@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from enum import Enum
 
+from athena.chat.repository import ChatRepository
+from athena.chat.service import ChatService
 from athena.config.settings import AthenaSettings
 from athena.core.services import LifecycleService, ServiceManager
 from athena.observability.health import HealthService
@@ -39,6 +41,8 @@ class AthenaApplication:
         self.state = ApplicationState.STOPPED
         self.health = HealthService()
         self.database = SQLiteDatabase(self.paths.database_path)
+        self.chat_repository = ChatRepository(self.database)
+        self.chat = ChatService(self.chat_repository)
 
         bootstrap_services: tuple[LifecycleService, ...] = (
             RuntimeLayoutService(self.paths),
