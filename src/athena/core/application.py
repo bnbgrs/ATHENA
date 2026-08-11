@@ -9,6 +9,8 @@ from athena.config.settings import AthenaSettings
 from athena.core.services import LifecycleService, ServiceManager
 from athena.observability.health import HealthService
 from athena.observability.logging import configure_logging
+from athena.storage.paths import RuntimePaths
+from athena.storage.runtime import RuntimeLayoutService
 
 
 logger = logging.getLogger(__name__)
@@ -25,7 +27,7 @@ class ApplicationState(str, Enum):
 
 
 class AthenaApplication:
-    """Minimal but failure-aware Phase-0 ATHENA Core."""
+    """Failure-aware Phase-0 ATHENA Core."""
 
     def __init__(
         self,
@@ -33,9 +35,14 @@ class AthenaApplication:
         services: tuple[LifecycleService, ...] = (),
     ) -> None:
         self.settings = settings or AthenaSettings.from_environment()
+        self.paths = RuntimePaths.from_settings(self.settings)
         self.state = ApplicationState.STOPPED
         self.health = HealthService()
-        self.services = ServiceManager(services)
+
+        bootstrap_services: tuple[LifecycleService, ...] = (
+            RuntimeLayoutService(self.paths),
+        )
+        self.services = ServiceManager(bootstrap_services + services)
 
     def start(self) -> None:
         """Start ATHENA and all registered services safely."""
