@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 from enum import Enum
 
 from athena.config.settings import AthenaSettings
+from athena.core.services import LifecycleService, ServiceManager
 from athena.observability.health import HealthService
 from athena.observability.logging import configure_logging
+
+
+logger = logging.getLogger(__name__)
 
 
 class ApplicationState(str, Enum):
@@ -16,46 +21,79 @@ class ApplicationState(str, Enum):
     STARTING = "starting"
     RUNNING = "running"
     STOPPING = "stopping"
+    FAILED = "failed"
 
 
 class AthenaApplication:
-    """Minimal Phase-0 ATHENA Core.
+    """Minimal but failure-aware Phase-0 ATHENA Core."""
 
-    Product/domain services will be attached here incrementally through
-    later vertical slices. Phase 0 deliberately contains no knowledge,
-    model, storage, network, or background-job logic.
-    """
-
-    def __init__(self, settings: AthenaSettings | None = None) -> None:
+    def __init__(
+        self,
+        settings: AthenaSettings | None = None,
+        services: tuple[LifecycleService, ...] = (),
+    ) -> None:
         self.settings = settings or AthenaSettings.from_environment()
         self.state = ApplicationState.STOPPED
         self.health = HealthService()
+        self.services = ServiceManager(services)
 
     def start(self) -> None:
-        """Start the application safely and idempotently."""
+        """Start ATHENA and all registered services safely."""
         if self.state is ApplicationState.RUNNING:
             return
         if self.state is not ApplicationState.STOPPED:
-            raise RuntimeError(f"Cannot start ATHENA from state {self.state.value!r}.")
+            raise RuntimeError(
+                f"Cannot start ATHENA from state {self.state.value!r}."
+            )
 
         self.state = ApplicationState.STARTING
-        configure_logging(self.settings.log_level)
         self.health.mark_starting()
+        configure_logging(self.settings.numeric_log_level)
 
-        # Later slices attach concrete services here only after their own
-        # initialization has succeeded.
+        logger.info("ATHENA Core starting", extra={"event": "core.starting"})
+
+        try:
+            self.services.start_all()
+        except Exception as exc:
+            self.state = ApplicationState.FAILED
+            self.health.mark_failed(str(exc))
+            logger.exception(
+                "ATHENA Core startup failed",
+                extra={"event": "core.start_failed"},
+            )
+            raise
+
         self.state = ApplicationState.RUNNING
         self.health.mark_ok()
+        logger.info("ATHENA Core running", extra={"event": "core.running"})
 
     def stop(self) -> None:
-        """Stop the application safely and idempotently."""
+        """Stop ATHENA and all registered services safely."""
         if self.state is ApplicationState.STOPPED:
             return
-        if self.state is not ApplicationState.RUNNING:
-            raise RuntimeError(f"Cannot stop ATHENA from state {self.state.value!r}.")
+        if self.state not in {
+            ApplicationState.RUNNING,
+            ApplicationState.FAILED,
+        }:
+            raise RuntimeError(
+                f"Cannot stop ATHENA from state {self.state.value!r}."
+            )
 
         self.state = ApplicationState.STOPPING
+        self.health.mark_stopping()
+        logger.info("ATHENA Core stopping", extra={"event": "core.stopping"})
 
-        # Later slices shut down concrete services here in reverse order.
-        self.health.mark_stopped()
+        try:
+            self.services.stop_all()
+        except Exception as exc:
+            self.state = ApplicationState.FAILED
+            self.health.mark_failed(str(exc))
+            logger.exception(
+                "ATHENA Core shutdown failed",
+                extra={"event": "core.stop_failed"},
+            )
+            raise
+
         self.state = ApplicationState.STOPPED
+        self.health.mark_stopped()
+        logger.info("ATHENA Core stopped", extra={"event": "core.stopped"})

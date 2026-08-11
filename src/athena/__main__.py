@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import sys
 
+from athena.config.settings import ConfigurationError
 from athena.core.application import AthenaApplication
 from athena.version import __version__
 
@@ -24,16 +26,23 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     build_parser().parse_args()
 
-    app = AthenaApplication()
-    app.start()
+    try:
+        app = AthenaApplication()
+    except ConfigurationError as exc:
+        print(f"ATHENA configuration error: {exc}", file=sys.stderr)
+        return 2
 
-    health = app.health.snapshot()
-    print(f"ATHENA {__version__}")
-    print(f"Core state: {app.state.value}")
-    print(f"Health: {health.status.value}")
+    try:
+        app.start()
+        health = app.health.snapshot()
 
-    app.stop()
-    return 0
+        print(f"ATHENA {__version__}")
+        print(f"Core state: {app.state.value}")
+        print(f"Health: {health.status.value}")
+        return 0
+    finally:
+        if app.state.value != "stopped":
+            app.stop()
 
 
 if __name__ == "__main__":
