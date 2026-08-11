@@ -1,4 +1,5 @@
 import logging
+import os
 from pathlib import Path
 
 import pytest
@@ -6,10 +7,9 @@ import pytest
 from athena.config.settings import AthenaSettings, ConfigurationError
 
 
-def test_settings_default_log_level(monkeypatch) -> None:
+def test_settings_default_log_level(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("ATHENA_LOG_LEVEL", raising=False)
-    monkeypatch.delenv("ATHENA_LOCAL_ROOT", raising=False)
-    monkeypatch.setenv("LOCALAPPDATA", str(Path("C:/Users/Test/AppData/Local")))
+    monkeypatch.setenv("ATHENA_LOCAL_ROOT", str(tmp_path))
 
     settings = AthenaSettings.from_environment()
 
@@ -72,3 +72,27 @@ def test_relative_runtime_root_is_rejected(monkeypatch) -> None:
 
     with pytest.raises(ConfigurationError, match="absolute path"):
         AthenaSettings.from_environment()
+
+
+def test_platform_default_root_is_absolute(monkeypatch) -> None:
+    monkeypatch.delenv("ATHENA_LOCAL_ROOT", raising=False)
+
+    if os.name == "nt":
+        monkeypatch.setenv("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
+    else:
+        monkeypatch.delenv("LOCALAPPDATA", raising=False)
+        monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+
+    settings = AthenaSettings.from_environment()
+
+    assert settings.local_root.is_absolute()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only XDG behavior")
+def test_posix_default_honors_absolute_xdg_data_home(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("ATHENA_LOCAL_ROOT", raising=False)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+
+    settings = AthenaSettings.from_environment()
+
+    assert settings.local_root == tmp_path / "athena"

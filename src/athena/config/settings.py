@@ -18,14 +18,25 @@ _VALID_LOG_LEVELS = frozenset(
 
 
 def _default_local_root() -> Path:
-    """Return a user-local default root for ATHENA runtime data.
+    """Return the platform-appropriate local ATHENA runtime root.
 
-    On Windows this resolves below LOCALAPPDATA. The fallback is primarily
-    useful for development and non-Windows test environments.
+    Windows uses LOCALAPPDATA. POSIX systems follow XDG_DATA_HOME when it is
+    configured and otherwise use the conventional ~/.local/share location.
     """
-    local_app_data = os.getenv("LOCALAPPDATA")
-    if local_app_data:
-        return Path(local_app_data) / "ATHENA"
+    if os.name == "nt":
+        local_app_data = os.getenv("LOCALAPPDATA")
+        if local_app_data:
+            return Path(local_app_data) / "ATHENA"
+
+        # LOCALAPPDATA should normally exist on supported Windows systems,
+        # but this deterministic fallback is safer than using the repository.
+        return Path.home() / "AppData" / "Local" / "ATHENA"
+
+    xdg_data_home = os.getenv("XDG_DATA_HOME")
+    if xdg_data_home:
+        xdg_root = Path(xdg_data_home).expanduser()
+        if xdg_root.is_absolute():
+            return xdg_root / "athena"
 
     return Path.home() / ".local" / "share" / "athena"
 
@@ -97,7 +108,7 @@ class AthenaSettings:
     def from_environment(cls) -> "AthenaSettings":
         """Create bootstrap settings from process environment.
 
-        Local operational storage gets a safe user-local default. Canonical
+        Local operational storage gets a safe platform-local default. Canonical
         archive, backup, and projection roots remain optional until explicitly
         configured; Phase 0 must not silently invent long-term storage.
         """
