@@ -1,0 +1,1 @@
+"""ATHENA application lifecycle."""
