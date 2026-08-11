@@ -13,7 +13,14 @@ from athena.chat.repository import ChatNotFoundError
 from athena.chat.service import EmptyMessageError
 from athena.config.settings import ConfigurationError
 from athena.core.application import AthenaApplication
-from athena.knowledge.models import EpistemicStatus, KnowledgeKind, KnowledgeUnitSnapshot
+from athena.knowledge.claim_repository import ClaimNotFoundError, ClaimRelationError
+from athena.knowledge.models import (
+    ClaimKind,
+    ClaimSnapshot,
+    EpistemicStatus,
+    KnowledgeKind,
+    KnowledgeUnitSnapshot,
+)
 from athena.knowledge.repository import (
     KnowledgeActorError,
     KnowledgeConflictError,
@@ -42,6 +49,16 @@ def _knowledge_kind_argument(value: str) -> KnowledgeKind:
         allowed = ", ".join(item.value for item in KnowledgeKind)
         raise argparse.ArgumentTypeError(
             f"invalid knowledge kind {value!r}; choose one of: {allowed}"
+        ) from exc
+
+
+def _claim_kind_argument(value: str) -> ClaimKind:
+    try:
+        return ClaimKind(value)
+    except ValueError as exc:
+        allowed = ", ".join(item.value for item in ClaimKind)
+        raise argparse.ArgumentTypeError(
+            f"invalid claim kind {value!r}; choose one of: {allowed}"
         ) from exc
 
 
@@ -160,6 +177,63 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum number of KnowledgeUnits to print (1-500).",
     )
 
+    claim_parser = commands.add_parser(
+        "claim",
+        help="Canonical versioned Claim and contradiction commands.",
+    )
+    claim_commands = claim_parser.add_subparsers(dest="claim_command", required=True)
+
+    claim_promote = claim_commands.add_parser(
+        "promote",
+        help="Explicitly promote one exact chat message to a canonical Claim.",
+    )
+    claim_promote.add_argument("chat_id", type=_uuid_argument)
+    claim_promote.add_argument("sequence_no", type=int)
+    claim_promote.add_argument("--kind", type=_claim_kind_argument, required=True)
+    claim_promote.add_argument(
+        "--status",
+        type=_epistemic_status_argument,
+        default=EpistemicStatus.ASSERTED,
+    )
+    claim_promote.add_argument("--valid-from-us", type=int)
+    claim_promote.add_argument("--valid-to-us", type=int)
+
+    claim_show = claim_commands.add_parser(
+        "show",
+        help="Show the current Claim revision, provenance inputs, and evidence links.",
+    )
+    claim_show.add_argument("claim_id", type=_uuid_argument)
+
+    claim_history = claim_commands.add_parser(
+        "history",
+        help="Show all immutable revisions of a Claim.",
+    )
+    claim_history.add_argument("claim_id", type=_uuid_argument)
+
+    claim_revise = claim_commands.add_parser(
+        "revise",
+        help="Create a new direct-user revision of an existing Claim.",
+    )
+    claim_revise.add_argument("claim_id", type=_uuid_argument)
+    claim_revise.add_argument("statement", help="Replacement natural-language statement.")
+    claim_revise.add_argument("--kind", type=_claim_kind_argument)
+    claim_revise.add_argument("--status", type=_epistemic_status_argument)
+
+    claim_contradict = claim_commands.add_parser(
+        "contradict",
+        help="Explicitly link two Claims as reciprocal contradictions.",
+    )
+    claim_contradict.add_argument("left_claim_id", type=_uuid_argument)
+    claim_contradict.add_argument("right_claim_id", type=_uuid_argument)
+
+    claim_list = claim_commands.add_parser("list", help="List current Claim heads.")
+    claim_list.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Maximum number of Claims to print (1-500).",
+    )
+
     model_parser = commands.add_parser("model", help="Local model provider commands.")
     model_commands = model_parser.add_subparsers(dest="model_command", required=True)
     model_commands.add_parser("status", help="Check LM Studio provider health.")
@@ -221,6 +295,40 @@ def _print_knowledge(app: AthenaApplication, snapshot: KnowledgeUnitSnapshot) ->
         print(
             f"[{item.ordinal}] role={item.input_role} "
             f"entity={item.input_entity_id} revision={revision_text}"
+        )
+
+
+def _print_claim(app: AthenaApplication, snapshot: ClaimSnapshot) -> None:
+    revision = snapshot.revision
+    payload = revision.payload
+    print(f"Claim: {snapshot.claim_id}")
+    print(f"State: {snapshot.lifecycle_state}")
+    print(f"Revision: {revision.revision_no} ({revision.revision_id})")
+    print(f"Kind: {payload.claim_kind.value}")
+    print(f"Status: {payload.epistemic_status.value}")
+    print(f"Statement: {payload.statement}")
+    print(f"Valid from us: {payload.valid_from_us if payload.valid_from_us is not None else '<open>'}")
+    print(f"Valid to us: {payload.valid_to_us if payload.valid_to_us is not None else '<open>'}")
+    inputs = app.claims.provenance_inputs(revision.provenance_id)
+    print(f"Provenance inputs: {len(inputs)}")
+    for item in inputs:
+        revision_text = (
+            str(item.input_revision_id)
+            if item.input_revision_id is not None
+            else "<entity-only>"
+        )
+        print(
+            f"[{item.ordinal}] role={item.input_role} "
+            f"entity={item.input_entity_id} revision={revision_text}"
+        )
+    evidence = app.claims.evidence(snapshot.claim_id)
+    print(f"Evidence links: {len(evidence)}")
+    for index, evidence_item in enumerate(evidence):
+        print(
+            f"[{index}] role={evidence_item.evidence_role.value} "
+            f"message={evidence_item.message_id if evidence_item.message_id is not None else '<none>'} "
+            f"entity={evidence_item.evidence_entity_id if evidence_item.evidence_entity_id is not None else '<none>'} "
+            f"revision={evidence_item.evidence_revision_id if evidence_item.evidence_revision_id is not None else '<none>'}"
         )
 
 
@@ -343,6 +451,78 @@ def _run_knowledge_command(app: AthenaApplication, args: argparse.Namespace) -> 
     raise RuntimeError(f"Unsupported knowledge command: {args.knowledge_command!r}")
 
 
+def _run_claim_command(app: AthenaApplication, args: argparse.Namespace) -> int:
+    if args.claim_command == "promote":
+        revision = app.claims.promote_chat_message(
+            chat_id=args.chat_id,
+            sequence_no=args.sequence_no,
+            claim_kind=args.kind,
+            epistemic_status=args.status,
+            valid_from_us=args.valid_from_us,
+            valid_to_us=args.valid_to_us,
+        )
+        print(f"Claim created: {revision.claim_id}")
+        print(f"Revision: {revision.revision_no} ({revision.revision_id})")
+        print(f"Provenance: {revision.provenance_id}")
+        return 0
+
+    if args.claim_command == "show":
+        _print_claim(app, app.claims.load(args.claim_id))
+        return 0
+
+    if args.claim_command == "history":
+        revisions = app.claims.history(args.claim_id)
+        print(f"Claim: {args.claim_id}")
+        print(f"Revisions: {len(revisions)}")
+        for revision in revisions:
+            print(
+                f"[{revision.revision_no}] revision={revision.revision_id} "
+                f"kind={revision.payload.claim_kind.value} "
+                f"status={revision.payload.epistemic_status.value} "
+                f"statement={revision.payload.statement}"
+            )
+        return 0
+
+    if args.claim_command == "revise":
+        revision = app.claims.revise(
+            claim_id=args.claim_id,
+            statement=args.statement,
+            claim_kind=args.kind,
+            epistemic_status=args.status,
+        )
+        print(f"Claim revised: {revision.claim_id}")
+        print(f"Revision: {revision.revision_no} ({revision.revision_id})")
+        print(f"Provenance: {revision.provenance_id}")
+        return 0
+
+    if args.claim_command == "contradict":
+        left, right = app.claims.mark_contradiction(
+            left_claim_id=args.left_claim_id,
+            right_claim_id=args.right_claim_id,
+        )
+        print(f"Contradiction linked: {args.left_claim_id} <-> {args.right_claim_id}")
+        print(f"Left provenance: {left.provenance_id}")
+        print(f"Right provenance: {right.provenance_id}")
+        return 0
+
+    if args.claim_command == "list":
+        snapshots = app.claims.list(limit=args.limit)
+        if not snapshots:
+            print("No canonical Claims.")
+            return 0
+        for snapshot in snapshots:
+            revision = snapshot.revision
+            print(
+                f"{snapshot.claim_id}  rev={revision.revision_no}  "
+                f"kind={revision.payload.claim_kind.value}  "
+                f"status={revision.payload.epistemic_status.value}  "
+                f"statement={revision.payload.statement}"
+            )
+        return 0
+
+    raise RuntimeError(f"Unsupported claim command: {args.claim_command!r}")
+
+
 def _run_model_command(app: AthenaApplication, args: argparse.Namespace) -> int:
     if args.model_command == "status":
         health = app.model_provider.health()
@@ -411,6 +591,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ValueError,
             ) as exc:
                 print(f"ATHENA knowledge error: {exc}", file=sys.stderr)
+                return 2
+
+        if args.command == "claim":
+            try:
+                return _run_claim_command(app, args)
+            except (
+                ChatNotFoundError,
+                ChatMessageSequenceError,
+                ClaimNotFoundError,
+                ClaimRelationError,
+                KnowledgeActorError,
+                KnowledgeConflictError,
+                KnowledgeSourceError,
+                UnsupportedKnowledgeSourceError,
+                ValueError,
+            ) as exc:
+                print(f"ATHENA claim error: {exc}", file=sys.stderr)
                 return 2
 
         if args.command == "model":

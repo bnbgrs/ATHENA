@@ -181,6 +181,15 @@ class ClaimRevision:
 
 
 @dataclass(frozen=True, slots=True)
+class ClaimSnapshot:
+    """Current canonical state of one stable Claim entity."""
+
+    claim_id: uuid.UUID
+    lifecycle_state: str
+    revision: ClaimRevision
+
+
+@dataclass(frozen=True, slots=True)
 class ClaimEvidenceRef:
     """One concrete evidence reference for a Claim."""
 

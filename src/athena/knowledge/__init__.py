@@ -1,10 +1,17 @@
 """Canonical ATHENA Knowledge domain."""
 
+from athena.knowledge.claim_repository import (
+    ClaimNotFoundError,
+    ClaimRelationError,
+    ClaimRepository,
+)
+from athena.knowledge.claim_service import ClaimService
 from athena.knowledge.models import (
     ClaimDraft,
     ClaimEvidenceRef,
     ClaimKind,
     ClaimRevision,
+    ClaimSnapshot,
     EpistemicStatus,
     EvidenceRole,
     KnowledgeKind,
@@ -31,7 +38,12 @@ __all__ = [
     "ClaimDraft",
     "ClaimEvidenceRef",
     "ClaimKind",
+    "ClaimNotFoundError",
+    "ClaimRelationError",
+    "ClaimRepository",
     "ClaimRevision",
+    "ClaimService",
+    "ClaimSnapshot",
     "EpistemicStatus",
     "EvidenceRole",
     "KnowledgeActorError",
