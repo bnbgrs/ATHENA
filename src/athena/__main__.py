@@ -12,6 +12,7 @@ from athena.chat.repository import ChatNotFoundError
 from athena.chat.service import EmptyMessageError
 from athena.config.settings import ConfigurationError
 from athena.core.application import AthenaApplication
+from athena.model.adapters.lm_studio import ModelProviderError
 from athena.version import __version__
 
 
@@ -58,6 +59,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=50,
         help="Maximum number of chats to print (1-500).",
     )
+
+    model_parser = commands.add_parser("model", help="Local model provider commands.")
+    model_commands = model_parser.add_subparsers(dest="model_command", required=True)
+    model_commands.add_parser("status", help="Check LM Studio provider health.")
+    model_commands.add_parser("list", help="List models discovered from LM Studio.")
 
     return parser
 
@@ -129,6 +135,34 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
     raise RuntimeError(f"Unsupported chat command: {args.chat_command!r}")
 
 
+
+def _run_model_command(app: AthenaApplication, args: argparse.Namespace) -> int:
+    if args.model_command == "status":
+        health = app.model_provider.health()
+        print(f"Provider: {app.model_provider.provider_id}")
+        print(f"Status: {health.status.value}")
+        print(f"Endpoint: {app.model_provider.base_url}")
+        if health.detail:
+            print(f"Detail: {health.detail}")
+        return 0 if health.status.value == "ready" else 1
+
+    if args.model_command == "list":
+        models = app.model_provider.discover_models()
+        if not models:
+            print("No models reported by LM Studio.")
+            return 0
+        for model in models:
+            context = str(model.context_capacity) if model.context_capacity else "unknown"
+            quantization = model.quantization or "unknown"
+            loaded = "yes" if model.loaded else "no"
+            print(
+                f"{model.backend_model_id}  type={model.model_type}  loaded={loaded}  "
+                f"context={context}  quantization={quantization}"
+            )
+        return 0
+
+    raise RuntimeError(f"Unsupported model command: {args.model_command!r}")
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -146,6 +180,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return _run_chat_command(app, args)
             except (ChatNotFoundError, EmptyMessageError, ValueError) as exc:
                 print(f"ATHENA chat error: {exc}", file=sys.stderr)
+                return 2
+
+        if args.command == "model":
+            try:
+                return _run_model_command(app, args)
+            except ModelProviderError as exc:
+                print(f"ATHENA model provider error: {exc}", file=sys.stderr)
                 return 2
 
         health = app.health.snapshot()

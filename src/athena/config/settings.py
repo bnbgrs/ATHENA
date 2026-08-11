@@ -6,6 +6,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 class ConfigurationError(ValueError):
@@ -61,6 +62,23 @@ def _parse_absolute_path(
     return path
 
 
+def _parse_positive_float(raw_value: str | None, *, setting_name: str, default: float) -> float:
+    value = raw_value.strip() if raw_value is not None else ""
+    if not value:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise ConfigurationError(
+            f"{setting_name} must be a number greater than zero, got {value!r}."
+        ) from exc
+    if parsed <= 0:
+        raise ConfigurationError(
+            f"{setting_name} must be greater than zero, got {value!r}."
+        )
+    return parsed
+
+
 @dataclass(frozen=True, slots=True)
 class AthenaSettings:
     """Settings safe to construct before persistent storage exists."""
@@ -70,6 +88,8 @@ class AthenaSettings:
     archive_root: Path | None = None
     backup_root: Path | None = None
     projection_root: Path | None = None
+    lm_studio_base_url: str = "http://127.0.0.1:1234"
+    model_request_timeout_seconds: float = 2.0
 
     def __post_init__(self) -> None:
         normalized = self.log_level.strip().upper()
@@ -99,6 +119,34 @@ class AthenaSettings:
                     f"got {str(normalized_path)!r}."
                 )
             object.__setattr__(self, field_name, normalized_path)
+
+        normalized_base_url = self.lm_studio_base_url.strip().rstrip("/")
+        parsed = urlsplit(normalized_base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ConfigurationError(
+                "ATHENA LM Studio base URL must be an absolute HTTP(S) URL."
+            )
+        if parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+            raise ConfigurationError(
+                "ATHENA v1 currently permits LM Studio only on the local machine."
+            )
+        if (
+            parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
+            raise ConfigurationError(
+                "ATHENA LM Studio base URL must be a server root without credentials, "
+                "path, query, or fragment."
+            )
+        object.__setattr__(self, "lm_studio_base_url", normalized_base_url)
+
+        if self.model_request_timeout_seconds <= 0:
+            raise ConfigurationError(
+                "ATHENA model request timeout must be greater than zero."
+            )
 
     @property
     def numeric_log_level(self) -> int:
@@ -134,5 +182,13 @@ class AthenaSettings:
             projection_root=_parse_absolute_path(
                 os.getenv("ATHENA_PROJECTION_ROOT"),
                 setting_name="ATHENA_PROJECTION_ROOT",
+            ),
+            lm_studio_base_url=os.getenv(
+                "ATHENA_LMSTUDIO_BASE_URL", "http://127.0.0.1:1234"
+            ),
+            model_request_timeout_seconds=_parse_positive_float(
+                os.getenv("ATHENA_MODEL_REQUEST_TIMEOUT_SECONDS"),
+                setting_name="ATHENA_MODEL_REQUEST_TIMEOUT_SECONDS",
+                default=2.0,
             ),
         )

@@ -96,3 +96,35 @@ def test_posix_default_honors_absolute_xdg_data_home(tmp_path, monkeypatch) -> N
     settings = AthenaSettings.from_environment()
 
     assert settings.local_root == tmp_path / "athena"
+
+
+def test_lm_studio_defaults_to_loopback(tmp_path) -> None:
+    settings = AthenaSettings(local_root=tmp_path)
+
+    assert settings.lm_studio_base_url == "http://127.0.0.1:1234"
+    assert settings.model_request_timeout_seconds == 2.0
+
+
+def test_lm_studio_base_url_normalizes_trailing_slash(tmp_path) -> None:
+    settings = AthenaSettings(
+        local_root=tmp_path,
+        lm_studio_base_url="http://localhost:1234/",
+    )
+
+    assert settings.lm_studio_base_url == "http://localhost:1234"
+
+
+def test_lm_studio_remote_host_is_rejected(tmp_path) -> None:
+    with pytest.raises(ConfigurationError, match="local machine"):
+        AthenaSettings(
+            local_root=tmp_path,
+            lm_studio_base_url="http://192.168.1.20:1234",
+        )
+
+
+def test_invalid_model_timeout_environment_is_rejected(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("ATHENA_LOCAL_ROOT", str(tmp_path))
+    monkeypatch.setenv("ATHENA_MODEL_REQUEST_TIMEOUT_SECONDS", "not-a-number")
+
+    with pytest.raises(ConfigurationError, match="greater than zero"):
+        AthenaSettings.from_environment()

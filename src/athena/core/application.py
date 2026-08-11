@@ -9,6 +9,7 @@ from athena.chat.repository import ChatRepository
 from athena.chat.service import ChatService
 from athena.config.settings import AthenaSettings
 from athena.core.services import LifecycleService, ServiceManager
+from athena.model.adapters.lm_studio import LMStudioProvider
 from athena.observability.health import HealthService
 from athena.observability.logging import configure_logging
 from athena.storage.database import SQLiteDatabase
@@ -43,6 +44,10 @@ class AthenaApplication:
         self.database = SQLiteDatabase(self.paths.database_path)
         self.chat_repository = ChatRepository(self.database)
         self.chat = ChatService(self.chat_repository)
+        self.model_provider = LMStudioProvider(
+            base_url=self.settings.lm_studio_base_url,
+            timeout_seconds=self.settings.model_request_timeout_seconds,
+        )
 
         bootstrap_services: tuple[LifecycleService, ...] = (
             RuntimeLayoutService(self.paths),
