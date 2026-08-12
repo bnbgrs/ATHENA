@@ -28,6 +28,22 @@ def _ref(
     )
 
 
+
+
+def _source_ref(context_id: str) -> GroundingEvidenceRef:
+    return GroundingEvidenceRef(
+        context_id=context_id,
+        entity_type="source_anchor",
+        entity_id=uuid.uuid4(),
+        revision_id=None,
+        evidence_class=EvidenceClass.SOURCE,
+        source_id=uuid.uuid4(),
+        representation_id=uuid.uuid4(),
+        start_offset=10,
+        end_offset=42,
+        quoted_hash=b"q" * 32,
+    )
+
 def test_grounding_accepts_canonical_context_and_inference_markers() -> None:
     contract = GroundingContract(
         evidence_refs=(_ref("CTX-001"), _ref("CTX-002")),
@@ -188,7 +204,7 @@ def test_durable_manifest_maps_ctx_to_stable_entity_revision_and_class() -> None
     )
 
     assert manifest.startswith("\n\nATHENA_PROVENANCE ")
-    assert '"athena_provenance_version":2' in manifest
+    assert '"athena_provenance_version":3' in manifest
     assert '"context_id":"CTX-001"' in manifest
     assert '"evidence_class":"canonical"' in manifest
     assert f'"entity_id":"{evidence.entity_id}"' in manifest
@@ -328,4 +344,67 @@ def test_grounding_rejects_user_statement_laundering_through_inference() -> None
         validate_grounded_answer(
             "The statement is independently true. [INFERENCE:CTX-002]",
             contract=contract,
+        )
+
+
+def test_grounding_accepts_typed_source_marker() -> None:
+    evidence = _source_ref("CTX-007")
+    contract = GroundingContract(evidence_refs=(evidence,))
+
+    report = validate_grounded_answer(
+        "The imported source says Berlin. [SOURCE:CTX-007]",
+        contract=contract,
+    )
+
+    assert report.source_context_ids == ("CTX-007",)
+    assert report.canonical_context_ids == ()
+
+
+def test_grounding_rejects_source_as_canonical_or_generic_inference() -> None:
+    evidence = _source_ref("CTX-007")
+    contract = GroundingContract(evidence_refs=(evidence,))
+
+    with pytest.raises(GroundingViolation, match="cannot use the canonical"):
+        validate_grounded_answer(
+            "The imported source says Berlin. [CTX-007]",
+            contract=contract,
+        )
+
+    with pytest.raises(GroundingViolation, match="canonical evidence only"):
+        validate_grounded_answer(
+            "Inferred from the imported source. [INFERENCE:CTX-007]",
+            contract=contract,
+        )
+
+
+def test_source_manifest_persists_anchor_not_chunk_identity() -> None:
+    evidence = _source_ref("CTX-007")
+    contract = GroundingContract(evidence_refs=(evidence,))
+    report = validate_grounded_answer(
+        "The imported source says Berlin. [SOURCE:CTX-007]",
+        contract=contract,
+    )
+
+    manifest = render_durable_provenance_manifest(contract=contract, report=report)
+
+    assert '"athena_provenance_version":3' in manifest
+    assert '"evidence_class":"source"' in manifest
+    assert f'"anchor_id":"{evidence.entity_id}"' in manifest
+    assert f'"source_id":"{evidence.source_id}"' in manifest
+    assert f'"representation_id":"{evidence.representation_id}"' in manifest
+    assert '"start_offset":10' in manifest
+    assert '"end_offset":42' in manifest
+    assert '"quoted_sha256":"' + (b"q" * 32).hex() + '"' in manifest
+    assert '"revision_id":null' in manifest
+    assert "chunk_id" not in manifest
+
+
+def test_source_evidence_requires_complete_persistent_anchor_metadata() -> None:
+    with pytest.raises(ValueError, match="complete stable anchor metadata"):
+        GroundingEvidenceRef(
+            context_id="CTX-001",
+            entity_type="source_anchor",
+            entity_id=uuid.uuid4(),
+            revision_id=None,
+            evidence_class=EvidenceClass.SOURCE,
         )

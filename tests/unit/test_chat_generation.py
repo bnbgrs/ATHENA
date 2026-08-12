@@ -302,3 +302,55 @@ def test_persisted_provenance_envelope_is_not_replayed_as_model_history(tmp_path
         assert "ATHENA_PROVENANCE" in (persisted.messages[1].content or "")
     finally:
         database.stop()
+
+
+def test_source_grounded_generation_persists_anchor_provenance_without_chunk_id(tmp_path) -> None:
+    from athena.retrieval.evidence import EvidenceClass
+
+    database, chat = _chat_service(tmp_path)
+    try:
+        chat_id = chat.create_chat()
+        provider = FakeProvider(
+            (_model(),),
+            ("The imported source mentions Berlin. [SOURCE:CTX-001]",),
+        )
+        service = ChatGenerationService(chat, provider)
+        anchor_id = uuid.uuid4()
+        source_id = uuid.uuid4()
+        representation_id = uuid.uuid4()
+        quoted_hash = b"s" * 32
+
+        result = service.send_message(
+            chat_id=chat_id,
+            content="What does the source say?",
+            retrieved_context='{"items":[{"context_id":"CTX-001"}]}',
+            grounding_contract=GroundingContract(
+                evidence_refs=(
+                    GroundingEvidenceRef(
+                        context_id="CTX-001",
+                        entity_type="source_anchor",
+                        entity_id=anchor_id,
+                        revision_id=None,
+                        evidence_class=EvidenceClass.SOURCE,
+                        source_id=source_id,
+                        representation_id=representation_id,
+                        start_offset=0,
+                        end_offset=42,
+                        quoted_hash=quoted_hash,
+                    ),
+                ),
+            ),
+        )
+
+        report = result.grounding_report
+        assert report is not None
+        assert report.source_context_ids == ("CTX-001",)
+        content = result.assistant_message.content or ""
+        assert "[SOURCE:CTX-001]" in content
+        assert '"athena_provenance_version":3' in content
+        assert f'"anchor_id":"{anchor_id}"' in content
+        assert f'"source_id":"{source_id}"' in content
+        assert f'"representation_id":"{representation_id}"' in content
+        assert "chunk_id" not in content
+    finally:
+        database.stop()

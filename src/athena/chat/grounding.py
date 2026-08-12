@@ -1,4 +1,4 @@
-"""Grounding contracts and durable provenance for memory-augmented chat."""
+"""Grounding contracts and durable provenance for retrieved ATHENA evidence."""
 
 from __future__ import annotations
 
@@ -17,14 +17,16 @@ _CONTEXT_ID_PATTERN = re.compile(r"CTX-\d{3}")
 _DIRECT_MARKER_PATTERN = re.compile(r"\[(CTX-\d{3})\]")
 _USER_STATEMENT_MARKER_PATTERN = re.compile(r"\[USER-STATEMENT:(CTX-\d{3})\]")
 _CONVERSATION_MARKER_PATTERN = re.compile(r"\[CONVERSATION:(CTX-\d{3})\]")
+_SOURCE_MARKER_PATTERN = re.compile(r"\[SOURCE:(CTX-\d{3})\]")
 _INFERENCE_MARKER_PATTERN = re.compile(r"\[INFERENCE:([^\]]+)\]")
 _MODEL_PRIOR_MARKER = "[MODEL-PRIOR]"
 _UNKNOWN_MARKER = "[UNKNOWN]"
-_PROVENANCE_VERSION = 2
+_PROVENANCE_VERSION = 3
 _MARKER_TOKEN_PATTERN = re.compile(
     r"(?:\[CTX-\d{3}\]"
     r"|\[USER-STATEMENT:CTX-\d{3}\]"
     r"|\[CONVERSATION:CTX-\d{3}\]"
+    r"|\[SOURCE:CTX-\d{3}\]"
     r"|\[INFERENCE:[^\]]+\]"
     r"|\[MODEL-PRIOR\]"
     r"|\[UNKNOWN\])"
@@ -43,8 +45,13 @@ class GroundingEvidenceRef:
     context_id: str
     entity_type: str
     entity_id: uuid.UUID
-    revision_id: uuid.UUID
+    revision_id: uuid.UUID | None
     evidence_class: EvidenceClass = EvidenceClass.CANONICAL
+    source_id: uuid.UUID | None = None
+    representation_id: uuid.UUID | None = None
+    start_offset: int | None = None
+    end_offset: int | None = None
+    quoted_hash: bytes | None = None
 
     def __post_init__(self) -> None:
         if _CONTEXT_ID_PATTERN.fullmatch(self.context_id) is None:
@@ -54,6 +61,35 @@ class GroundingEvidenceRef:
             )
         if not self.entity_type.strip():
             raise ValueError("Grounding evidence entity_type must not be blank.")
+
+        source_fields = (
+            self.source_id,
+            self.representation_id,
+            self.start_offset,
+            self.end_offset,
+            self.quoted_hash,
+        )
+        if self.evidence_class is EvidenceClass.SOURCE:
+            if self.entity_type != "source_anchor":
+                raise ValueError("Source evidence must identify a source_anchor entity.")
+            if self.revision_id is not None:
+                raise ValueError("SourceAnchor evidence must not invent a revision_id.")
+            if any(value is None for value in source_fields):
+                raise ValueError("Source evidence requires complete stable anchor metadata.")
+            assert self.start_offset is not None
+            assert self.end_offset is not None
+            assert self.quoted_hash is not None
+            if not 0 <= self.start_offset < self.end_offset:
+                raise ValueError("Source evidence range must be non-empty and ordered.")
+            if len(self.quoted_hash) != 32:
+                raise ValueError("Source evidence quoted_hash must be SHA-256 bytes.")
+        else:
+            if self.revision_id is None:
+                raise ValueError("Non-source grounding evidence requires a revision_id.")
+            if any(value is not None for value in source_fields):
+                raise ValueError(
+                    "Source anchor metadata is only valid for source evidence."
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +126,7 @@ class GroundingReport:
     canonical_context_ids: tuple[str, ...]
     user_statement_context_ids: tuple[str, ...]
     conversation_context_ids: tuple[str, ...]
+    source_context_ids: tuple[str, ...]
     invalid_context_ids: tuple[str, ...]
     uses_inference: bool
     uses_model_prior: bool
@@ -114,15 +151,23 @@ ATHENA distinguishes evidence roles:
   that this conversation record exists, useful for continuity or recap. Cite it
   as [CONVERSATION:CTX-NNN]. It must never be treated as an independent factual
   authority or used to self-confirm an earlier model answer.
+- source: an exact range from a retained SourceRepresentation, backed by a
+  persistent SourceAnchor. Cite directly supported statements as
+  [SOURCE:CTX-NNN]. The model must never invent an anchor identifier or treat a
+  Derived SourceChunk identifier as durable provenance.
 
 Provenance rules for the answer:
 - Use [CTX-NNN] only for evidence classified as canonical.
 - Use [USER-STATEMENT:CTX-NNN] only for evidence classified as user_statement.
 - Use [CONVERSATION:CTX-NNN] only for evidence classified as conversation_record.
+- Use [SOURCE:CTX-NNN] only for evidence classified as source. When a statement
+  synthesizes multiple source items, include every supporting [SOURCE:CTX-NNN]
+  marker on that same line.
 - An inference that combines supplied evidence may end with a marker such as
   [INFERENCE:CTX-NNN,CTX-NNN]. Only canonical CTX identifiers are allowed in
-  this generic inference marker; user statements and conversation records must
-  not be promoted through inference.
+  this generic inference marker; source evidence, user statements, and
+  conversation records retain their typed markers and must not be promoted
+  through generic inference.
 - If retrieved evidence and allowed model knowledge are insufficient, use
   [UNKNOWN] rather than inventing a fact.
 - Never invent, renumber, or alter CTX identifiers.
@@ -152,7 +197,7 @@ def render_grounding_instructions(contract: GroundingContract) -> str:
         prior_rule = (
             "Model prior knowledge is allowed, but any factual statement relying "
             "on it must be explicitly marked [MODEL-PRIOR]. Model prior is not "
-            "ATHENA memory and must never be presented as retrieved evidence."
+            "retrieved ATHENA evidence and must never be presented as such."
         )
     else:
         prior_rule = (
@@ -166,7 +211,7 @@ def render_grounding_instructions(contract: GroundingContract) -> str:
         + f"\nAllowed context IDs: {allowed}.\n"
         + f"Evidence classes: {class_map}.\n"
         + prior_rule
-        + "\n\nATHENA RETRIEVED MEMORY\n\n"
+        + "\n\nATHENA RETRIEVED EVIDENCE\n\n"
     )
 
 
@@ -190,6 +235,7 @@ def validate_grounded_answer(
     direct_ids = set(_DIRECT_MARKER_PATTERN.findall(normalized))
     user_statement_ids = set(_USER_STATEMENT_MARKER_PATTERN.findall(normalized))
     conversation_ids = set(_CONVERSATION_MARKER_PATTERN.findall(normalized))
+    source_ids = set(_SOURCE_MARKER_PATTERN.findall(normalized))
 
     inference_ids: set[str] = set()
     inference_markers = tuple(_INFERENCE_MARKER_PATTERN.findall(normalized))
@@ -207,7 +253,13 @@ def validate_grounded_answer(
         inference_ids.update(marker_parts)
 
     all_mentioned_ids = set(_CONTEXT_ID_PATTERN.findall(normalized))
-    cited_ids = direct_ids | user_statement_ids | conversation_ids | inference_ids
+    cited_ids = (
+        direct_ids
+        | user_statement_ids
+        | conversation_ids
+        | source_ids
+        | inference_ids
+    )
     allowed = set(contract.allowed_context_ids)
     invalid_ids = tuple(sorted(all_mentioned_ids - allowed))
     if invalid_ids:
@@ -221,6 +273,7 @@ def validate_grounded_answer(
         direct_ids=direct_ids,
         user_statement_ids=user_statement_ids,
         conversation_ids=conversation_ids,
+        source_ids=source_ids,
     )
     _validate_inference_inputs(contract=contract, inference_ids=inference_ids)
 
@@ -238,13 +291,14 @@ def validate_grounded_answer(
         raise GroundingViolation(
             "Answer contains no ATHENA provenance marker. Expected [CTX-NNN], "
             "[USER-STATEMENT:CTX-NNN], [CONVERSATION:CTX-NNN], "
-            "[INFERENCE:...], [UNKNOWN], or an explicitly allowed [MODEL-PRIOR]."
+            "[SOURCE:CTX-NNN], [INFERENCE:...], [UNKNOWN], or an explicitly "
+            "allowed [MODEL-PRIOR]."
         )
 
     if uses_model_prior and not contract.allow_model_prior:
         raise GroundingViolation(
             "Answer used [MODEL-PRIOR], but model prior knowledge is disabled for "
-            "this memory chat."
+            "this grounded chat."
         )
 
     if contract.require_provenance_markers:
@@ -274,12 +328,20 @@ def validate_grounded_answer(
             is EvidenceClass.CONVERSATION_RECORD
         )
     )
+    source_context_ids = tuple(
+        sorted(
+            context_id
+            for context_id in cited_ids
+            if contract.evidence_for(context_id).evidence_class is EvidenceClass.SOURCE
+        )
+    )
 
     return GroundingReport(
         cited_context_ids=tuple(sorted(cited_ids)),
         canonical_context_ids=canonical_context_ids,
         user_statement_context_ids=user_context_ids,
         conversation_context_ids=conversation_context_ids,
+        source_context_ids=source_context_ids,
         invalid_context_ids=invalid_ids,
         uses_inference=uses_inference,
         uses_model_prior=uses_model_prior,
@@ -382,8 +444,8 @@ def _validate_inference_inputs(
     if invalid:
         raise GroundingViolation(
             "Generic [INFERENCE:...] may reference canonical evidence only. "
-            "User statements and conversation records retain their typed roles: "
-            + ", ".join(invalid)
+            "Source evidence, user statements, and conversation records retain "
+            "their typed roles: " + ", ".join(invalid)
         )
 
 
@@ -393,6 +455,7 @@ def _validate_typed_markers(
     direct_ids: set[str],
     user_statement_ids: set[str],
     conversation_ids: set[str],
+    source_ids: set[str],
 ) -> None:
     for context_id in direct_ids:
         evidence = contract.evidence_for(context_id)
@@ -418,6 +481,14 @@ def _validate_typed_markers(
                 "[CONVERSATION:CTX-NNN]."
             )
 
+    for context_id in source_ids:
+        evidence = contract.evidence_for(context_id)
+        if evidence.evidence_class is not EvidenceClass.SOURCE:
+            raise GroundingViolation(
+                f"{context_id} is not source evidence and cannot use "
+                "[SOURCE:CTX-NNN]."
+            )
+
 
 def render_durable_provenance_manifest(
     *,
@@ -428,13 +499,7 @@ def render_durable_provenance_manifest(
 
     cited = set(report.cited_context_ids)
     evidence = [
-        {
-            "context_id": item.context_id,
-            "evidence_class": item.evidence_class.value,
-            "entity_type": item.entity_type,
-            "entity_id": str(item.entity_id),
-            "revision_id": str(item.revision_id),
-        }
+        _durable_evidence_payload(item)
         for item in contract.evidence_refs
         if item.context_id in cited
     ]
@@ -447,3 +512,31 @@ def render_durable_provenance_manifest(
     }
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     return f"\n\n{DURABLE_PROVENANCE_LABEL} {encoded}"
+
+
+def _durable_evidence_payload(item: GroundingEvidenceRef) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "context_id": item.context_id,
+        "evidence_class": item.evidence_class.value,
+        "entity_type": item.entity_type,
+        "entity_id": str(item.entity_id),
+        "revision_id": None if item.revision_id is None else str(item.revision_id),
+    }
+    if item.evidence_class is EvidenceClass.SOURCE:
+        assert item.source_id is not None
+        assert item.representation_id is not None
+        assert item.start_offset is not None
+        assert item.end_offset is not None
+        assert item.quoted_hash is not None
+        payload.update(
+            {
+                "anchor_id": str(item.entity_id),
+                "source_id": str(item.source_id),
+                "representation_id": str(item.representation_id),
+                "anchor_type": "text_range",
+                "start_offset": item.start_offset,
+                "end_offset": item.end_offset,
+                "quoted_sha256": item.quoted_hash.hex(),
+            }
+        )
+    return payload

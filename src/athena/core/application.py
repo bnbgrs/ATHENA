@@ -9,6 +9,7 @@ from athena.chat.generation import ChatGenerationService
 from athena.chat.memory import MemoryAugmentedChatService
 from athena.chat.repository import ChatRepository
 from athena.chat.service import ChatService
+from athena.chat.source_grounding import SourceGroundedChatService
 from athena.config.settings import AthenaSettings
 from athena.core.services import LifecycleService, ServiceManager
 from athena.knowledge.acceptance_service import ProposalAcceptanceService
@@ -35,6 +36,7 @@ from athena.retrieval.hybrid import HybridRetrievalService
 from athena.retrieval.ranking import RetrievalRankingService
 from athena.retrieval.search import LocalSearchService
 from athena.retrieval.semantic import LocalSemanticSearchService
+from athena.retrieval.source_context import SourceContextBuilderService
 from athena.source.anchor_repository import SourceAnchorRepository
 from athena.source.anchor_service import SourceAnchorService
 from athena.source.blob_store import BlobStore
@@ -139,6 +141,15 @@ class AthenaApplication:
         self.archive_hybrid_retrieval = ArchiveHybridRetrievalService(
             self.archive_search,
             self.archive_semantic_search,
+        )
+        self.source_context_builder = SourceContextBuilderService(
+            self.source_anchors
+        )
+        self.source_grounded_chat = SourceGroundedChatService(
+            chat_generation=self.chat_generation,
+            embedding_provider=self.embedding_provider,
+            archive_retrieval=self.archive_hybrid_retrieval,
+            context_builder=self.source_context_builder,
         )
         self.reviews = ReviewService(self.database)
         self.extraction_snapshots = ExtractionSnapshotRepository(

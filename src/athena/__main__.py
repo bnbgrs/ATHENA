@@ -9,9 +9,11 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from athena.chat.generation import ModelSelectionError, UnsupportedChatHistoryError
+from athena.chat.memory import MemoryChatGenerationResult
 from athena.chat.models import ChatThread
 from athena.chat.repository import ChatNotFoundError
 from athena.chat.service import EmptyMessageError
+from athena.chat.source_grounding import SourceGroundedChatResult
 from athena.config.settings import ConfigurationError
 from athena.core.application import AthenaApplication
 from athena.knowledge.claim_repository import ClaimNotFoundError, ClaimRelationError
@@ -140,9 +142,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Retrieve bounded local memory before calling the Primary Model.",
     )
     send_parser.add_argument(
+        "--sources",
+        action="store_true",
+        help=(
+            "Retrieve imported Raw Archive sources, materialize persistent "
+            "SourceAnchors, and require source-grounded citations."
+        ),
+    )
+    send_parser.add_argument(
         "--embedding-model",
         dest="embedding_model_id",
-        help="Exact LM Studio embedding model identifier for --memory.",
+        help="Exact LM Studio embedding model identifier for --memory or --sources.",
     )
     send_parser.add_argument(
         "--memory-max-tokens",
@@ -155,6 +165,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=8,
         help="Maximum retrieved memory items (1-100).",
+    )
+    send_parser.add_argument(
+        "--source-max-tokens",
+        type=int,
+        default=1200,
+        help="Estimated-token budget for retrieved source evidence (128-64000).",
+    )
+    send_parser.add_argument(
+        "--source-max-items",
+        type=int,
+        default=8,
+        help="Maximum retrieved source items (1-100).",
     )
     model_prior_group = send_parser.add_mutually_exclusive_group()
     model_prior_group.add_argument(
@@ -174,6 +196,26 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Disable Primary Model prior knowledge for this memory answer; "
             "retrieved evidence and [UNKNOWN] remain available."
+        ),
+    )
+    source_prior_group = send_parser.add_mutually_exclusive_group()
+    source_prior_group.add_argument(
+        "--source-allow-model-prior",
+        dest="source_allow_model_prior",
+        action="store_true",
+        default=None,
+        help=(
+            "Explicitly allow labeled [MODEL-PRIOR] facts in source-grounded "
+            "answers. This is the default for source chat."
+        ),
+    )
+    source_prior_group.add_argument(
+        "--source-no-model-prior",
+        dest="source_allow_model_prior",
+        action="store_false",
+        help=(
+            "Disable Primary Model prior knowledge for this source-grounded "
+            "answer; source evidence and [UNKNOWN] remain available."
         ),
     )
 
@@ -771,9 +813,16 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
         return 0
 
     if args.chat_command == "send":
-        if not args.memory and args.embedding_model_id is not None:
+        if args.memory and args.sources:
             print(
-                "ATHENA chat error: --embedding-model requires --memory.",
+                "ATHENA chat error: --memory and --sources cannot be combined in "
+                "VS4 Step 6.",
+                file=sys.stderr,
+            )
+            return 2
+        if not (args.memory or args.sources) and args.embedding_model_id is not None:
+            print(
+                "ATHENA chat error: --embedding-model requires --memory or --sources.",
                 file=sys.stderr,
             )
             return 2
@@ -783,8 +832,16 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
+        if not args.sources and args.source_allow_model_prior is not None:
+            print(
+                "ATHENA chat error: source model-prior options require --sources.",
+                file=sys.stderr,
+            )
+            return 2
 
         print("Assistant: ", end="", flush=True)
+        memory_result: MemoryChatGenerationResult | None = None
+        source_result: SourceGroundedChatResult | None = None
         try:
             if args.memory:
                 memory_result = app.memory_chat.send_message(
@@ -802,8 +859,23 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
                     on_delta=lambda chunk: print(chunk, end="", flush=True),
                 )
                 result = memory_result.generation
+            elif args.sources:
+                source_result = app.source_grounded_chat.send_message(
+                    chat_id=args.chat_id,
+                    content=args.content,
+                    requested_model_id=args.model_id,
+                    requested_embedding_model_id=args.embedding_model_id,
+                    max_context_tokens=args.source_max_tokens,
+                    max_context_items=args.source_max_items,
+                    allow_model_prior=(
+                        True
+                        if args.source_allow_model_prior is None
+                        else args.source_allow_model_prior
+                    ),
+                    on_delta=lambda chunk: print(chunk, end="", flush=True),
+                )
+                result = source_result.generation
             else:
-                memory_result = None
                 result = app.chat_generation.send_message(
                     chat_id=args.chat_id,
                     content=args.content,
@@ -852,6 +924,36 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
                     f"canonical={len(grounding.canonical_context_ids)} "
                     f"user_statements={len(grounding.user_statement_context_ids)} "
                     f"conversation={len(grounding.conversation_context_ids)} "
+                    f"sources={len(grounding.source_context_ids)} "
+                    f"inference={grounding.uses_inference} "
+                    f"model_prior={grounding.uses_model_prior} "
+                    f"unknown={grounding.uses_unknown}"
+                )
+        if source_result is not None:
+            print(
+                "Source context: "
+                f"items={len(source_result.context.items)} "
+                f"omitted={source_result.context.omitted_count} "
+                f"estimated_tokens={source_result.context.estimated_tokens}/"
+                f"{source_result.context.max_estimated_tokens} "
+                f"embedding_model={source_result.embedding_model.backend_model_id}"
+            )
+            if source_result.context.items:
+                refs = ", ".join(
+                    f"{item.context_id}={item.anchor_id}"
+                    for item in source_result.context.items
+                )
+                print(f"Source context anchors: {refs}")
+            grounding = result.grounding_report
+            if grounding is not None:
+                cited = ", ".join(grounding.cited_context_ids) or "<none>"
+                print(
+                    "Grounding: "
+                    f"cited={cited} "
+                    f"canonical={len(grounding.canonical_context_ids)} "
+                    f"user_statements={len(grounding.user_statement_context_ids)} "
+                    f"conversation={len(grounding.conversation_context_ids)} "
+                    f"sources={len(grounding.source_context_ids)} "
                     f"inference={grounding.uses_inference} "
                     f"model_prior={grounding.uses_model_prior} "
                     f"unknown={grounding.uses_unknown}"
@@ -1820,11 +1922,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             try:
                 return _run_chat_command(app, args)
             except (
+                ArchiveSearchError,
                 ChatNotFoundError,
                 EmptyMessageError,
                 ModelProviderError,
                 ModelSelectionError,
                 SemanticSearchError,
+                SourceAnchorIntegrityError,
+                SourceRepresentationNotFoundError,
+                TextRepresentationError,
                 UnsupportedChatHistoryError,
                 ValueError,
             ) as exc:
