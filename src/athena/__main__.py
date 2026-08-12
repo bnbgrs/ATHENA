@@ -253,6 +253,11 @@ def build_parser() -> argparse.ArgumentParser:
         dest="model_id",
         help="Exact loaded LM Studio model identifier when more than one LLM is loaded.",
     )
+    extract_chat.add_argument(
+        "--accept",
+        action="store_true",
+        help="After displaying the exact validated proposal set, ask for explicit user acceptance and atomically commit it.",
+    )
 
     model_parser = commands.add_parser("model", help="Local model provider commands.")
     model_commands = model_parser.add_subparsers(dest="model_command", required=True)
@@ -593,6 +598,23 @@ def _run_extract_command(app: AthenaApplication, args: argparse.Namespace) -> in
             requested_model_id=args.model_id,
         )
         _print_extraction(result)
+        if not args.accept:
+            return 0
+
+        answer = input("Accept ALL displayed proposals into canonical Knowledge? [y/N] ").strip().lower()
+        if answer not in {"y", "yes"}:
+            print("Acceptance cancelled. Canonical writes: 0")
+            return 0
+
+        accepted = app.proposal_acceptance.accept_all(result)
+        print(f"Canonical commit: {accepted.commit_id}")
+        print(f"Knowledge created: {len(accepted.knowledge_ids)}")
+        for knowledge_id in accepted.knowledge_ids:
+            print(f"  K -> {knowledge_id}")
+        print(f"Claims created: {len(accepted.claim_ids)}")
+        for claim_id in accepted.claim_ids:
+            print(f"  C -> {claim_id}")
+        print(f"Contradictions committed: {len(accepted.contradiction_pairs)}")
         return 0
 
     raise RuntimeError(f"Unsupported extraction command: {args.extract_command!r}")

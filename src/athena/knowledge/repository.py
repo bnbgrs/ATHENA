@@ -579,6 +579,8 @@ class KnowledgeRepository:
         actor_id: uuid.UUID,
         created_at_us: int,
         reason: str | None,
+        model_signature_id: uuid.UUID | None = None,
+        processing_run_id: uuid.UUID | None = None,
     ) -> None:
         connection.execute(
             """
@@ -593,7 +595,7 @@ class KnowledgeRepository:
                 processing_run_id,
                 reason,
                 protection_scope_id
-            ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
             """,
             (
                 uuid_to_blob(provenance_id),
@@ -602,6 +604,8 @@ class KnowledgeRepository:
                 operation,
                 uuid_to_blob(actor_id),
                 created_at_us,
+                uuid_to_blob(model_signature_id) if model_signature_id is not None else None,
+                uuid_to_blob(processing_run_id) if processing_run_id is not None else None,
                 reason,
             ),
         )

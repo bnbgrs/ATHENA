@@ -10,6 +10,7 @@ from athena.chat.repository import ChatRepository
 from athena.chat.service import ChatService
 from athena.config.settings import AthenaSettings
 from athena.core.services import LifecycleService, ServiceManager
+from athena.knowledge.acceptance_service import ProposalAcceptanceService
 from athena.knowledge.claim_repository import ClaimRepository
 from athena.knowledge.claim_service import ClaimService
 from athena.knowledge.extraction_service import ChatKnowledgeExtractionService
@@ -67,6 +68,12 @@ class AthenaApplication:
             chat_generation=self.chat_generation,
             provider=self.model_provider,
             runs=self.model_runs,
+        )
+        self.proposal_acceptance = ProposalAcceptanceService(
+            database=self.database,
+            chat=self.chat,
+            knowledge=self.knowledge_repository,
+            claims=self.claim_repository,
         )
 
         bootstrap_services: tuple[LifecycleService, ...] = (
