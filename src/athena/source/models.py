@@ -48,6 +48,22 @@ class SourceRepresentationType(str, Enum):
     NORMALIZED_TEXT = "normalized_text"
 
 
+
+
+class SourceAnchorType(str, Enum):
+    """Stable source location types from the persistent data model."""
+
+    WHOLE_SOURCE = "whole_source"
+    TEXT_RANGE = "text_range"
+    PAGE_RANGE = "page_range"
+    PAGE_REGION = "page_region"
+    AUDIO_TIME_RANGE = "audio_time_range"
+    VIDEO_TIME_RANGE = "video_time_range"
+    TABLE_CELL = "table_cell"
+    MESSAGE = "message"
+    STRUCTURED_PATH = "structured_path"
+
+
 class RepresentationRetentionState(str, Enum):
     """Whether one immutable representation is retained for durable provenance."""
 
@@ -113,3 +129,20 @@ class TextRepresentationResult:
     representation: SourceRepresentationRecord
     blob: BlobRecord
     reused_blob: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SourceAnchorRecord:
+    anchor_id: uuid.UUID
+    source_id: uuid.UUID
+    representation_id: uuid.UUID | None
+    anchor_type: SourceAnchorType
+    start_offset: int | None
+    end_offset: int | None
+    page_start: int | None
+    page_end: int | None
+    start_time_ms: int | None
+    end_time_ms: int | None
+    geometry_json: str | None
+    quoted_hash: bytes | None
+    created_at_us: int

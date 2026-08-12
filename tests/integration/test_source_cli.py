@@ -178,3 +178,52 @@ def test_source_archive_search_cli_returns_chunk_anchor_chain(tmp_path) -> None:
     assert "range=0:" in searched.stdout
     assert "sha256=" in searched.stdout
     assert "[retrieval]" in searched.stdout or "[marker]" in searched.stdout
+
+
+def test_source_anchor_cli_survives_rechunk_and_process_restarts(tmp_path) -> None:
+    original = tmp_path / "anchor-cli.md"
+    original.write_text("Berlin durable anchor marker.\n\nSecond paragraph.\n", encoding="utf-8")
+    local_root = tmp_path / "runtime"
+
+    imported = _run_cli(local_root, "source", "import", str(original))
+    assert imported.returncode == 0, imported.stderr
+    source_match = _UUID_RE.search(imported.stdout)
+    assert source_match is not None
+    source_id = source_match.group(0)
+
+    represented = _run_cli(local_root, "source", "represent-text", source_id)
+    assert represented.returncode == 0, represented.stderr
+    representation_match = _UUID_RE.search(represented.stdout)
+    assert representation_match is not None
+    representation_id = representation_match.group(0)
+
+    built = _run_cli(local_root, "source", "chunk-text", representation_id)
+    assert built.returncode == 0, built.stderr
+    ids = _UUID_RE.findall(built.stdout)
+    assert len(ids) >= 3
+    chunk_id = ids[2]
+
+    materialized = _run_cli(local_root, "source", "anchor-from-chunk", chunk_id)
+    assert materialized.returncode == 0, materialized.stderr
+    anchor_match = _UUID_RE.search(materialized.stdout)
+    assert anchor_match is not None
+    anchor_id = anchor_match.group(0)
+    assert f"Source: {source_id}" in materialized.stdout
+    assert f"Representation: {representation_id}" in materialized.stdout
+    assert "Type: text_range" in materialized.stdout
+
+    rebuilt = _run_cli(local_root, "source", "chunk-text", representation_id)
+    assert rebuilt.returncode == 0, rebuilt.stderr
+    assert chunk_id not in rebuilt.stdout
+
+    verified = _run_cli(local_root, "source", "anchor-verify", anchor_id)
+    assert verified.returncode == 0, verified.stderr
+    assert f"SourceAnchor verified: {anchor_id}" in verified.stdout
+
+    read = _run_cli(local_root, "source", "anchor-read", anchor_id)
+    assert read.returncode == 0, read.stderr
+    assert "Berlin durable anchor marker." in read.stdout
+
+    listing = _run_cli(local_root, "source", "anchor-list", source_id)
+    assert listing.returncode == 0, listing.stderr
+    assert anchor_id in listing.stdout

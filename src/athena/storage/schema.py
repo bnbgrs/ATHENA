@@ -18,7 +18,8 @@ LOCAL_EMBEDDINGS_SCHEMA_VERSION = 10
 SOURCE_CAPTURE_SCHEMA_VERSION = 11
 SOURCE_REPRESENTATION_SCHEMA_VERSION = 12
 SOURCE_CHUNK_PROFILE_SCHEMA_VERSION = 13
-SCHEMA_VERSION = SOURCE_CHUNK_PROFILE_SCHEMA_VERSION
+SOURCE_ANCHOR_SCHEMA_VERSION = 14
+SCHEMA_VERSION = SOURCE_ANCHOR_SCHEMA_VERSION
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
@@ -33,6 +34,7 @@ LOCAL_EMBEDDINGS_MIGRATION_ID = "0010_local_embeddings"
 SOURCE_CAPTURE_MIGRATION_ID = "0011_source_capture"
 SOURCE_REPRESENTATION_MIGRATION_ID = "0012_source_representations"
 SOURCE_CHUNK_PROFILE_MIGRATION_ID = "0013_source_chunk_profiles"
+SOURCE_ANCHOR_MIGRATION_ID = "0014_source_anchors"
 
 
 class DatabaseCompatibilityError(RuntimeError):
@@ -110,6 +112,7 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         LOCAL_EMBEDDINGS_SCHEMA_VERSION,
         SOURCE_CAPTURE_SCHEMA_VERSION,
         SOURCE_REPRESENTATION_SCHEMA_VERSION,
+        SOURCE_CHUNK_PROFILE_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -171,9 +174,13 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
 
     if existing_user_version == SOURCE_REPRESENTATION_SCHEMA_VERSION:
         _migrate_schema_v12_to_v13(connection)
+        existing_user_version = SOURCE_CHUNK_PROFILE_SCHEMA_VERSION
+
+    if existing_user_version == SOURCE_CHUNK_PROFILE_SCHEMA_VERSION:
+        _migrate_schema_v13_to_v14(connection)
 
     _configure_connection(connection)
-    _verify_schema_v13(connection)
+    _verify_schema_v14(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -1009,18 +1016,79 @@ def _migrate_schema_v12_to_v13(connection: sqlite3.Connection) -> None:
         ) WITHOUT ROWID;
 
         UPDATE schema_metadata
-        SET schema_version = {SCHEMA_VERSION},
+        SET schema_version = {SOURCE_CHUNK_PROFILE_SCHEMA_VERSION},
             last_migration_id = '{SOURCE_CHUNK_PROFILE_MIGRATION_ID}',
-            minimum_reader_version = {SCHEMA_VERSION}
+            minimum_reader_version = {SOURCE_CHUNK_PROFILE_SCHEMA_VERSION}
         WHERE singleton_id = 1;
 
-        PRAGMA user_version = {SCHEMA_VERSION};
+        PRAGMA user_version = {SOURCE_CHUNK_PROFILE_SCHEMA_VERSION};
         COMMIT;
         """
     )
 
 
-def _verify_schema_v13(connection: sqlite3.Connection) -> None:
+def _migrate_schema_v13_to_v14(connection: sqlite3.Connection) -> None:
+    """Add persistent SourceAnchors for durable evidence across re-chunking."""
+    connection.executescript(
+        f"""
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE source_anchors (
+            anchor_id BLOB(16) PRIMARY KEY CHECK(length(anchor_id) = 16),
+            source_id BLOB(16) NOT NULL CHECK(length(source_id) = 16),
+            representation_id BLOB(16) NULL CHECK(representation_id IS NULL OR length(representation_id) = 16),
+            anchor_type TEXT NOT NULL CHECK(anchor_type IN (
+                'whole_source', 'text_range', 'page_range', 'page_region',
+                'audio_time_range', 'video_time_range', 'table_cell',
+                'message', 'structured_path'
+            )),
+            start_offset INTEGER NULL CHECK(start_offset IS NULL OR start_offset >= 0),
+            end_offset INTEGER NULL CHECK(end_offset IS NULL OR end_offset >= 0),
+            page_start INTEGER NULL CHECK(page_start IS NULL OR page_start >= 1),
+            page_end INTEGER NULL CHECK(page_end IS NULL OR page_end >= 1),
+            start_time_ms INTEGER NULL CHECK(start_time_ms IS NULL OR start_time_ms >= 0),
+            end_time_ms INTEGER NULL CHECK(end_time_ms IS NULL OR end_time_ms >= 0),
+            geometry_json TEXT NULL CHECK(geometry_json IS NULL OR json_valid(geometry_json)),
+            quoted_hash BLOB(32) NULL CHECK(quoted_hash IS NULL OR length(quoted_hash) = 32),
+            FOREIGN KEY(anchor_id) REFERENCES entity_registry(entity_id),
+            FOREIGN KEY(source_id) REFERENCES sources(source_id),
+            FOREIGN KEY(representation_id) REFERENCES source_representations(representation_id),
+            CHECK(end_offset IS NULL OR start_offset IS NOT NULL),
+            CHECK(end_offset IS NULL OR end_offset >= start_offset),
+            CHECK(page_end IS NULL OR page_start IS NOT NULL),
+            CHECK(page_end IS NULL OR page_end >= page_start),
+            CHECK(end_time_ms IS NULL OR start_time_ms IS NOT NULL),
+            CHECK(end_time_ms IS NULL OR end_time_ms >= start_time_ms),
+            CHECK(anchor_type != 'text_range' OR (
+                representation_id IS NOT NULL AND start_offset IS NOT NULL
+                AND end_offset IS NOT NULL AND quoted_hash IS NOT NULL
+            ))
+        ) WITHOUT ROWID;
+
+        CREATE UNIQUE INDEX uq_source_anchor_text_range
+            ON source_anchors(
+                source_id, representation_id, start_offset, end_offset, quoted_hash
+            )
+            WHERE anchor_type = 'text_range';
+        CREATE INDEX idx_source_anchors_source
+            ON source_anchors(source_id, anchor_type, anchor_id);
+        CREATE INDEX idx_source_anchors_representation
+            ON source_anchors(representation_id, anchor_type, anchor_id)
+            WHERE representation_id IS NOT NULL;
+
+        UPDATE schema_metadata
+        SET schema_version = {SOURCE_ANCHOR_SCHEMA_VERSION},
+            last_migration_id = '{SOURCE_ANCHOR_MIGRATION_ID}',
+            minimum_reader_version = {SOURCE_ANCHOR_SCHEMA_VERSION}
+        WHERE singleton_id = 1;
+
+        PRAGMA user_version = {SOURCE_ANCHOR_SCHEMA_VERSION};
+        COMMIT;
+        """
+    )
+
+
+def _verify_schema_v14(connection: sqlite3.Connection) -> None:
     application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
     user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
@@ -1038,7 +1106,7 @@ def _verify_schema_v13(connection: sqlite3.Connection) -> None:
         SCHEMA_VERSION,
         STORAGE_LAYOUT_VERSION,
         BLOB_FORMAT_VERSION,
-        SOURCE_CHUNK_PROFILE_MIGRATION_ID,
+        SOURCE_ANCHOR_MIGRATION_ID,
         SCHEMA_VERSION,
     )
     if metadata is None or tuple(metadata) != expected:
@@ -1064,6 +1132,7 @@ def _verify_schema_v13(connection: sqlite3.Connection) -> None:
         "sources",
         "source_representations",
         "chunking_profiles",
+        "source_anchors",
     }
     missing_tables = required_tables.difference(_user_tables(connection))
     if missing_tables:

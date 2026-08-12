@@ -40,13 +40,20 @@ from athena.retrieval.archive import ArchiveSearchError
 from athena.retrieval.context import ContextBuilderError
 from athena.retrieval.search import SearchEntityType, SearchError
 from athena.retrieval.semantic import SemanticSearchError
+from athena.source.anchor_repository import SourceAnchorNotFoundError
+from athena.source.anchor_service import SourceAnchorIntegrityError
 from athena.source.blob_store import BlobStoreError
 from athena.source.chunk_store import (
     SourceChunkNotFoundError,
     SourceChunkStoreError,
 )
 from athena.source.chunking_service import SourceChunkIntegrityError
-from athena.source.models import BlobRecord, SourceRecord, SourceRepresentationRecord
+from athena.source.models import (
+    BlobRecord,
+    SourceAnchorRecord,
+    SourceRecord,
+    SourceRepresentationRecord,
+)
 from athena.source.repository import SourceActorError, SourceNotFoundError
 from athena.source.representation_repository import SourceRepresentationNotFoundError
 from athena.source.representation_store import TextRepresentationError
@@ -565,6 +572,41 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=500,
         help="Maximum number of chunks to print (1-5000).",
+    )
+    source_anchor_from_chunk = source_commands.add_parser(
+        "anchor-from-chunk",
+        help="Materialize a durable text SourceAnchor from one verified Derived SourceChunk.",
+    )
+    source_anchor_from_chunk.add_argument("chunk_id", type=_uuid_argument)
+    source_anchor_create_text = source_commands.add_parser(
+        "anchor-create-text",
+        help="Materialize a durable text SourceAnchor from a retained representation range.",
+    )
+    source_anchor_create_text.add_argument("representation_id", type=_uuid_argument)
+    source_anchor_create_text.add_argument("start_offset", type=int)
+    source_anchor_create_text.add_argument("end_offset", type=int)
+    source_anchor_show = source_commands.add_parser(
+        "anchor-show",
+        help="Show one persistent SourceAnchor.",
+    )
+    source_anchor_show.add_argument("anchor_id", type=_uuid_argument)
+    source_anchor_verify = source_commands.add_parser(
+        "anchor-verify",
+        help="Verify one SourceAnchor against its retained SourceRepresentation.",
+    )
+    source_anchor_verify.add_argument("anchor_id", type=_uuid_argument)
+    source_anchor_read = source_commands.add_parser(
+        "anchor-read",
+        help="Print the exact retained text referenced by one SourceAnchor.",
+    )
+    source_anchor_read.add_argument("anchor_id", type=_uuid_argument)
+    source_anchor_list = source_commands.add_parser(
+        "anchor-list",
+        help="List persistent SourceAnchors for one Source.",
+    )
+    source_anchor_list.add_argument("source_id", type=_uuid_argument)
+    source_anchor_list.add_argument(
+        "--limit", type=int, default=500, help="Maximum number of anchors to print (1-5000)."
     )
     source_search = source_commands.add_parser(
         "search",
@@ -1397,6 +1439,15 @@ def _run_search_command(app: AthenaApplication, args: argparse.Namespace) -> int
     return 0
 
 
+def _print_source_anchor(anchor: SourceAnchorRecord) -> None:
+    print(f"SourceAnchor: {anchor.anchor_id}")
+    print(f"Source: {anchor.source_id}")
+    print(f"Representation: {anchor.representation_id}")
+    print(f"Type: {anchor.anchor_type.value}")
+    print(f"Range: {anchor.start_offset}:{anchor.end_offset}")
+    print(f"Quoted SHA-256: {anchor.quoted_hash.hex() if anchor.quoted_hash else '<none>'}")
+
+
 def _print_source_record(source: SourceRecord, blob: BlobRecord) -> None:
     print(f"Source: {source.source_id}")
     print(f"State: {source.lifecycle_state.value}")
@@ -1593,6 +1644,52 @@ def _run_source_command(app: AthenaApplication, args: argparse.Namespace) -> int
                 f"{chunk.chunk_id} index={chunk.chunk_index} "
                 f"range={chunk.start_anchor_value}:{chunk.end_anchor_value} "
                 f"profile={chunk.chunking_profile_id} run={chunk.processing_run_id}"
+            )
+        return 0
+
+    if args.source_command == "anchor-from-chunk":
+        anchor = app.source_anchors.materialize_chunk(args.chunk_id)
+        _print_source_anchor(anchor)
+        return 0
+
+    if args.source_command == "anchor-create-text":
+        anchor = app.source_anchors.materialize_text_range(
+            args.representation_id,
+            start_offset=args.start_offset,
+            end_offset=args.end_offset,
+        )
+        _print_source_anchor(anchor)
+        return 0
+
+    if args.source_command == "anchor-show":
+        _print_source_anchor(app.source_anchors.get(args.anchor_id))
+        return 0
+
+    if args.source_command == "anchor-verify":
+        anchor = app.source_anchors.verify(args.anchor_id)
+        print(
+            f"SourceAnchor verified: {anchor.anchor_id} "
+            f"source={anchor.source_id} representation={anchor.representation_id} "
+            f"range={anchor.start_offset}:{anchor.end_offset} "
+            f"quoted_sha256={anchor.quoted_hash.hex() if anchor.quoted_hash else '<none>'}"
+        )
+        return 0
+
+    if args.source_command == "anchor-read":
+        print(app.source_anchors.read_text(args.anchor_id), end="")
+        return 0
+
+    if args.source_command == "anchor-list":
+        anchors = app.source_anchors.list_for_source(args.source_id, limit=args.limit)
+        if not anchors:
+            print("No SourceAnchors.")
+            return 0
+        for anchor in anchors:
+            print(
+                f"{anchor.anchor_id} type={anchor.anchor_type.value} "
+                f"representation={anchor.representation_id} "
+                f"range={anchor.start_offset}:{anchor.end_offset} "
+                f"quoted_sha256={anchor.quoted_hash.hex() if anchor.quoted_hash else '<none>'}"
             )
         return 0
 
@@ -1824,6 +1921,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             except (
                 BlobStoreError,
                 SourceActorError,
+                SourceAnchorNotFoundError,
+                SourceAnchorIntegrityError,
                 SourceNotFoundError,
                 SourceRepresentationNotFoundError,
                 SourceChunkNotFoundError,

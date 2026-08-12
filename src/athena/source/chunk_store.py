@@ -207,6 +207,16 @@ class SourceChunkStore:
             ).fetchone()
         return int(row["n"]) if row is not None else 0
 
+    def set_anchor_hint(self, chunk_id: uuid.UUID, anchor_id: uuid.UUID) -> None:
+        """Attach a non-authoritative durable-anchor hint to one current chunk."""
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE source_chunks SET anchor_id = ? WHERE chunk_id = ?",
+                (uuid_to_blob(anchor_id), uuid_to_blob(chunk_id)),
+            )
+        if cursor.rowcount != 1:
+            raise SourceChunkNotFoundError(f"SourceChunk {chunk_id} not found.")
+
     def current_generation(self) -> int:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
