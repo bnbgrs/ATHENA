@@ -248,6 +248,12 @@ class JobRepository:
                 raise JobTransitionError(
                     f"Job {job_id} waiting reason {reason!r} is not timer-retryable."
                 )
+            # Multiple scheduler processes may observe the same waiter before
+            # either has assigned its backoff. Re-read under BEGIN IMMEDIATE
+            # and make retry scheduling idempotent so one failure consumes
+            # exactly one retry-budget slot.
+            if row["next_run_at_us"] is not None:
+                return _job_from_row(row)
             retry_count = int(row["retry_count"])
             if retry_count >= max_retries:
                 connection.execute(

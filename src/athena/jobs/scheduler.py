@@ -192,7 +192,25 @@ class DurableJobScheduler:
                 "fencing_sequence": leased.fencing_sequence,
             },
         )
-        action, current = self._dispatch(leased)
+        try:
+            action, current = self._dispatch(leased)
+        except JobLeaseError:
+            # Lease expiry/loss is an expected distributed-scheduler race, not
+            # a reason to terminate the long-lived scheduler process. Fencing
+            # has already prevented the stale worker from committing its job
+            # checkpoint; report the persisted state and continue next tick.
+            current = self.jobs.get(leased.job_id)
+            action = "lost_lease"
+            logger.warning(
+                "Scheduler worker lost durable job lease",
+                extra={
+                    "event": "jobs.scheduler_lease_lost",
+                    "job_id": str(leased.job_id),
+                    "job_type": leased.job_type,
+                    "worker_id": normalized_worker_id,
+                    "fencing_sequence": leased.fencing_sequence,
+                },
+            )
         retry_at_us: int | None = None
         if current.state is JobState.WAITING:
             current, retry_at_us = self._schedule_retry_if_allowed(current, now)
