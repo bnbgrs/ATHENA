@@ -28,6 +28,11 @@ from athena.jobs.repository import (
     JobNotFoundError,
     JobTransitionError,
 )
+from athena.jobs.scheduler import (
+    JobSchedulerError,
+    SchedulerRunResult,
+    SchedulerTickResult,
+)
 from athena.jobs.source_processing import (
     SourceProcessingJobError,
     SourceProcessingStepResult,
@@ -889,6 +894,27 @@ def build_parser() -> argparse.ArgumentParser:
     job_run_embedding.add_argument("job_id", type=_uuid_argument)
     job_run_embedding.add_argument("--worker", default="athena-cli-embedding-worker")
     job_run_embedding.add_argument("--lease-seconds", type=int, default=120)
+    job_scheduler_once = job_commands.add_parser(
+        "scheduler-once",
+        help="Select and dispatch at most one eligible durable job.",
+    )
+    job_scheduler_once.add_argument("--worker", default="athena-scheduler")
+    job_scheduler_drain = job_commands.add_parser(
+        "scheduler-drain",
+        help="Process currently eligible supported jobs until the queue is idle.",
+    )
+    job_scheduler_drain.add_argument("--worker", default="athena-scheduler")
+    job_scheduler_drain.add_argument("--max-jobs", type=int, default=100)
+    job_scheduler_run = job_commands.add_parser(
+        "scheduler-run",
+        help="Run the low-frequency durable scheduler loop until interrupted.",
+    )
+    job_scheduler_run.add_argument("--worker", default="athena-scheduler")
+    job_scheduler_run.add_argument(
+        "--max-ticks",
+        type=int,
+        help="Optional bounded tick count for diagnostics/tests.",
+    )
     job_commands.add_parser(
         "recover",
         help="Recover only jobs whose worker lease has expired.",
@@ -2117,6 +2143,28 @@ def _print_embedding_rebuild_result(result: EmbeddingRebuildStepResult) -> None:
     print(f"Done: {result.done}")
 
 
+def _print_scheduler_tick(result: SchedulerTickResult) -> None:
+    print(f"Scheduler action: {result.action}")
+    print(f"Recovered jobs: {result.recovered_jobs}")
+    print(f"Scheduled retries: {result.scheduled_retries}")
+    print(f"Woken jobs: {result.woken_jobs}")
+    print(f"Job: {result.selected_job_id or '<none>'}")
+    print(f"Type: {result.selected_job_type or '<none>'}")
+    print(f"State: {result.final_state.value if result.final_state else '<none>'}")
+    print(f"Fencing sequence: {result.fencing_sequence or '<none>'}")
+    print(f"Retry at us: {result.retry_at_us or '<none>'}")
+
+
+def _print_scheduler_run(result: SchedulerRunResult) -> None:
+    print(f"Scheduler ticks: {result.ticks}")
+    print(f"Dispatched jobs: {result.dispatched_jobs}")
+    print(f"Completed jobs: {result.completed_jobs}")
+    print(f"Waiting jobs: {result.waiting_jobs}")
+    print(f"Failed jobs: {result.failed_jobs}")
+    print(f"Yielded jobs: {result.yielded_jobs}")
+    print(f"Idle: {result.idle}")
+
+
 def _run_job_command(app: AthenaApplication, args: argparse.Namespace) -> int:
     if args.job_command == "create":
         job = app.jobs.create(
@@ -2305,6 +2353,31 @@ def _run_job_command(app: AthenaApplication, args: argparse.Namespace) -> int:
         _print_embedding_rebuild_result(embedding_result)
         return 0
 
+    if args.job_command == "scheduler-once":
+        scheduler_result = app.job_scheduler.tick(worker_id=args.worker)
+        _print_scheduler_tick(scheduler_result)
+        return 0
+
+    if args.job_command == "scheduler-drain":
+        scheduler_run = app.job_scheduler.drain(
+            worker_id=args.worker,
+            max_jobs=args.max_jobs,
+        )
+        _print_scheduler_run(scheduler_run)
+        return 0
+
+    if args.job_command == "scheduler-run":
+        try:
+            scheduler_run = app.job_scheduler.run_loop(
+                worker_id=args.worker,
+                max_ticks=args.max_ticks,
+            )
+        except KeyboardInterrupt:
+            print("Scheduler interrupted.")
+            return 130
+        _print_scheduler_run(scheduler_run)
+        return 0
+
     if args.job_command == "recover":
         recovered = app.jobs.recover_startup()
         print(f"Recovered jobs: {len(recovered)}")
@@ -2466,6 +2539,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 JobLeaseError,
                 JobNotFoundError,
                 JobTransitionError,
+                JobSchedulerError,
                 EmbeddingRebuildJobError,
                 SourceProcessingJobError,
                 ValueError,

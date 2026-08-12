@@ -128,6 +128,148 @@ class JobRepository:
             ).fetchall()
         return tuple(_job_from_row(row) for row in rows)
 
+    def list_eligible_queued(
+        self,
+        *,
+        now_us: int,
+        job_types: Iterable[str] | None = None,
+        limit: int = 128,
+    ) -> tuple[JobRecord, ...]:
+        """Return currently eligible queued jobs without claiming ownership."""
+        if limit <= 0:
+            raise ValueError("Eligible job limit must be positive.")
+        type_values = tuple(job_types or ())
+        params: list[object] = [now_us]
+        type_clause = ""
+        if type_values:
+            placeholders = ", ".join("?" for _ in type_values)
+            type_clause = f" AND job_type IN ({placeholders})"
+            params.extend(type_values)
+        params.append(limit)
+        rows = self.database.connection.execute(
+            f"""
+            SELECT * FROM jobs
+            WHERE state = 'queued'
+              AND (next_run_at_us IS NULL OR next_run_at_us <= ?)
+              {type_clause}
+            ORDER BY priority ASC,
+                     COALESCE(next_run_at_us, created_at_us) ASC,
+                     created_at_us ASC,
+                     job_id ASC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+        return tuple(_job_from_row(row) for row in rows)
+
+    def list_waiting(self, *, limit: int = 128) -> tuple[JobRecord, ...]:
+        """Return waiting jobs in deterministic oldest-first order."""
+        if limit <= 0:
+            raise ValueError("Waiting job limit must be positive.")
+        rows = self.database.connection.execute(
+            """
+            SELECT * FROM jobs
+            WHERE state = 'waiting'
+            ORDER BY COALESCE(next_run_at_us, updated_at_us) ASC,
+                     updated_at_us ASC, job_id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return tuple(_job_from_row(row) for row in rows)
+
+    def wake_due_waiting(
+        self,
+        *,
+        now_us: int | None = None,
+    ) -> tuple[JobRecord, ...]:
+        """Wake only timer/backoff/resource waiters whose retry time is due."""
+        now = utc_now_us() if now_us is None else now_us
+        woken_ids: list[uuid.UUID] = []
+        with self.database.write_transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT job_id
+                FROM jobs
+                WHERE state = 'waiting'
+                  AND blocked_reason IN (
+                      'waiting_resource', 'waiting_storage', 'waiting_network',
+                      'waiting_schedule', 'waiting_backoff'
+                  )
+                  AND next_run_at_us IS NOT NULL
+                  AND next_run_at_us <= ?
+                ORDER BY next_run_at_us ASC, created_at_us ASC, job_id ASC
+                """,
+                (now,),
+            ).fetchall()
+            for row in rows:
+                job_id = uuid_from_blob(bytes(row["job_id"]))
+                connection.execute(
+                    """
+                    UPDATE jobs
+                    SET state = 'queued', blocked_reason = NULL,
+                        next_run_at_us = NULL, updated_at_us = ?
+                    WHERE job_id = ? AND state = 'waiting'
+                    """,
+                    (now, uuid_to_blob(job_id)),
+                )
+                woken_ids.append(job_id)
+        return tuple(self.get(job_id) for job_id in woken_ids)
+
+    def schedule_retry(
+        self,
+        job_id: uuid.UUID,
+        *,
+        next_run_at_us: int,
+        max_retries: int,
+        now_us: int | None = None,
+    ) -> JobRecord:
+        """Assign bounded automatic retry timing to a retryable waiting job."""
+        if max_retries < 0:
+            raise ValueError("max_retries must not be negative.")
+        now = utc_now_us() if now_us is None else now_us
+        if next_run_at_us <= now:
+            raise ValueError("Retry time must be in the future.")
+        with self.database.write_transaction() as connection:
+            row = self._require_job_row(connection, job_id)
+            state = JobState(str(row["state"]))
+            if state is not JobState.WAITING:
+                raise JobTransitionError(
+                    f"Job {job_id} cannot schedule retry from state {state.value!r}."
+                )
+            reason = str(row["blocked_reason"])
+            retryable = {
+                WaitingReason.NETWORK.value,
+                WaitingReason.RESOURCE.value,
+                WaitingReason.STORAGE.value,
+                WaitingReason.BACKOFF.value,
+            }
+            if reason not in retryable:
+                raise JobTransitionError(
+                    f"Job {job_id} waiting reason {reason!r} is not timer-retryable."
+                )
+            retry_count = int(row["retry_count"])
+            if retry_count >= max_retries:
+                connection.execute(
+                    """
+                    UPDATE jobs
+                    SET blocked_reason = 'waiting_user', next_run_at_us = NULL,
+                        updated_at_us = ?
+                    WHERE job_id = ?
+                    """,
+                    (now, uuid_to_blob(job_id)),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE jobs
+                    SET retry_count = ?, next_run_at_us = ?, updated_at_us = ?
+                    WHERE job_id = ?
+                    """,
+                    (retry_count + 1, next_run_at_us, now, uuid_to_blob(job_id)),
+                )
+        return self.get(job_id)
+
     def acquire_lease(
         self,
         *,
@@ -405,6 +547,36 @@ class JobRepository:
                 WHERE job_id = ?
                 """,
                 (now, uuid_to_blob(job_id)),
+            )
+        return self.get(job_id)
+
+    def yield_job(
+        self,
+        *,
+        job_id: uuid.UUID,
+        lease_token: bytes,
+        next_run_at_us: int | None = None,
+        now_us: int | None = None,
+    ) -> JobRecord:
+        """Release one live job back to queued at a confirmed safe boundary."""
+        now = utc_now_us() if now_us is None else now_us
+        with self.database.write_transaction() as connection:
+            row = self._require_live_lease(connection, job_id, lease_token, now)
+            state = JobState(str(row["state"]))
+            if state is not JobState.RUNNING:
+                raise JobTransitionError(
+                    f"Job {job_id} cannot yield from state {state.value!r}."
+                )
+            connection.execute(
+                """
+                UPDATE jobs
+                SET state = 'queued', blocked_reason = NULL,
+                    next_run_at_us = ?, worker_id = NULL, lease_token = NULL,
+                    lease_acquired_at_us = NULL, lease_expires_at_us = NULL,
+                    heartbeat_at_us = NULL, updated_at_us = ?
+                WHERE job_id = ?
+                """,
+                (next_run_at_us, now, uuid_to_blob(job_id)),
             )
         return self.get(job_id)
 

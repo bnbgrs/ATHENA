@@ -14,6 +14,7 @@ from athena.config.settings import AthenaSettings
 from athena.core.services import LifecycleService, ServiceManager
 from athena.jobs.embedding_processing import DurableEmbeddingRebuildWorker
 from athena.jobs.repository import JobRepository
+from athena.jobs.scheduler import DurableJobScheduler
 from athena.jobs.service import DurableJobService
 from athena.jobs.source_processing import DurableSourceProcessingWorker
 from athena.knowledge.acceptance_service import ProposalAcceptanceService
@@ -166,6 +167,11 @@ class AthenaApplication:
         self.embedding_rebuild = DurableEmbeddingRebuildWorker(
             jobs=self.jobs,
             semantic=self.archive_semantic_search,
+        )
+        self.job_scheduler = DurableJobScheduler(
+            jobs=self.jobs,
+            source_worker=self.source_processing,
+            embedding_worker=self.embedding_rebuild,
         )
         self.reviews = ReviewService(self.database)
         self.extraction_snapshots = ExtractionSnapshotRepository(

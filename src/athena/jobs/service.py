@@ -135,6 +135,59 @@ class DurableJobService:
     def list(self, *, limit: int = 100) -> tuple[JobRecord, ...]:
         return self.repository.list(limit=limit)
 
+    def eligible_queued(
+        self,
+        *,
+        now_us: int,
+        job_types: set[str] | frozenset[str] | None = None,
+        limit: int = 128,
+    ) -> tuple[JobRecord, ...]:
+        return self.repository.list_eligible_queued(
+            now_us=now_us,
+            job_types=job_types,
+            limit=limit,
+        )
+
+    def waiting(self, *, limit: int = 128) -> tuple[JobRecord, ...]:
+        return self.repository.list_waiting(limit=limit)
+
+    def wake_due_waiting(
+        self,
+        *,
+        now_us: int | None = None,
+    ) -> tuple[JobRecord, ...]:
+        return self.repository.wake_due_waiting(now_us=now_us)
+
+    def schedule_retry(
+        self,
+        job_id: uuid.UUID,
+        *,
+        next_run_at_us: int,
+        max_retries: int,
+        now_us: int | None = None,
+    ) -> JobRecord:
+        return self.repository.schedule_retry(
+            job_id,
+            next_run_at_us=next_run_at_us,
+            max_retries=max_retries,
+            now_us=now_us,
+        )
+
+    def yield_job(
+        self,
+        job_id: uuid.UUID,
+        *,
+        lease_token: bytes,
+        next_run_at_us: int | None = None,
+        now_us: int | None = None,
+    ) -> JobRecord:
+        return self.repository.yield_job(
+            job_id=job_id,
+            lease_token=lease_token,
+            next_run_at_us=next_run_at_us,
+            now_us=now_us,
+        )
+
     def checkpoints(self, job_id: uuid.UUID) -> tuple[CheckpointRecord, ...]:
         return self.repository.list_checkpoints(job_id)
 
