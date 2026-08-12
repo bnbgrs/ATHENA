@@ -215,3 +215,83 @@ def test_malformed_inference_marker_is_rejected() -> None:
             "Inference. [INFERENCE:CTX-001,external]",
             contract=contract,
         )
+
+
+def test_grounding_rejects_uncited_substantive_followup_line() -> None:
+    contract = GroundingContract(
+        evidence_refs=(_ref("CTX-001"), _ref("CTX-002")),
+    )
+
+    with pytest.raises(GroundingViolation, match="without provenance markers"):
+        validate_grounded_answer(
+            "The retrieved items conflict. [INFERENCE:CTX-001,CTX-002]\n\n"
+            "The conflict could reflect historical periods or alternative perspectives.",
+            contract=contract,
+        )
+
+
+def test_grounding_accepts_heading_without_marker_but_requires_body_marker() -> None:
+    contract = GroundingContract(evidence_refs=(_ref("CTX-001"),))
+
+    report = validate_grounded_answer(
+        "### Summary\n\nBerlin is one retrieved answer. [CTX-001]",
+        contract=contract,
+    )
+
+    assert report.canonical_context_ids == ("CTX-001",)
+
+
+def test_grounding_requires_provenance_on_each_bullet() -> None:
+    contract = GroundingContract(
+        evidence_refs=(_ref("CTX-001"), _ref("CTX-002")),
+    )
+
+    with pytest.raises(GroundingViolation, match="without provenance markers"):
+        validate_grounded_answer(
+            "- Berlin is one claim. [CTX-001]\n"
+            "- Munich is another claim.",
+            contract=contract,
+        )
+
+
+def test_grounding_requires_bracketed_marker_in_each_table_data_row() -> None:
+    contract = GroundingContract(
+        evidence_refs=(_ref("CTX-001"), _ref("CTX-002")),
+    )
+
+    with pytest.raises(GroundingViolation, match="without provenance markers"):
+        validate_grounded_answer(
+            "| Source | Claim |\n"
+            "| --- | --- |\n"
+            "| [CTX-001] | Berlin |\n"
+            "| CTX-002 | Munich |",
+            contract=contract,
+        )
+
+
+def test_grounding_accepts_table_rows_with_full_markers() -> None:
+    contract = GroundingContract(
+        evidence_refs=(_ref("CTX-001"), _ref("CTX-002")),
+    )
+
+    report = validate_grounded_answer(
+        "| Source | Claim |\n"
+        "| --- | --- |\n"
+        "| [CTX-001] | Berlin |\n"
+        "| [CTX-002] | Munich |",
+        contract=contract,
+    )
+
+    assert report.canonical_context_ids == ("CTX-001", "CTX-002")
+
+
+def test_grounding_rejects_bare_ctx_even_when_line_has_another_marker() -> None:
+    contract = GroundingContract(
+        evidence_refs=(_ref("CTX-001"), _ref("CTX-002")),
+    )
+
+    with pytest.raises(GroundingViolation, match="bare CTX identifiers"):
+        validate_grounded_answer(
+            "Source CTX-002 conflicts with Berlin. [CTX-001]",
+            contract=contract,
+        )

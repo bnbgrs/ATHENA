@@ -17,6 +17,15 @@ _INFERENCE_MARKER_PATTERN = re.compile(r"\[INFERENCE:([^\]]+)\]")
 _MODEL_PRIOR_MARKER = "[MODEL-PRIOR]"
 _UNKNOWN_MARKER = "[UNKNOWN]"
 _PROVENANCE_VERSION = 2
+_MARKER_TOKEN_PATTERN = re.compile(
+    r"(?:\[CTX-\d{3}\]"
+    r"|\[USER-STATEMENT:CTX-\d{3}\]"
+    r"|\[CONVERSATION:CTX-\d{3}\]"
+    r"|\[INFERENCE:[^\]]+\]"
+    r"|\[MODEL-PRIOR\]"
+    r"|\[UNKNOWN\])"
+)
+_TABLE_SEPARATOR_CELL_PATTERN = re.compile(r"^:?-{3,}:?$")
 
 
 class GroundingViolation(ValueError):
@@ -111,7 +120,11 @@ Provenance rules for the answer:
 - If retrieved evidence and allowed model knowledge are insufficient, use
   [UNKNOWN] rather than inventing a fact.
 - Never invent, renumber, or alter CTX identifiers.
-- Every factual sentence, bullet, or table row must carry a provenance marker.
+- Every substantive non-heading line, bullet, and table data row must carry at
+  least one provenance marker. Keep a factual statement and its marker on the
+  same line. Do not leave uncited explanatory or speculative prose.
+- Table source cells must use the full bracketed marker, for example [CTX-001],
+  not a bare CTX-001 identifier.
 - Preserve material contradictions. Do not claim that one side is more common,
   newer, official, historical, or otherwise superior unless the cited source or
   explicitly marked model prior actually supports that claim.
@@ -221,6 +234,9 @@ def validate_grounded_answer(
             "this memory chat."
         )
 
+    if contract.require_provenance_markers:
+        _validate_provenance_coverage(normalized)
+
     canonical_context_ids = tuple(
         sorted(
             context_id
@@ -256,6 +272,82 @@ def validate_grounded_answer(
         uses_model_prior=uses_model_prior,
         uses_unknown=uses_unknown,
         has_provenance_marker=has_marker,
+    )
+
+
+def _validate_provenance_coverage(answer: str) -> None:
+    """Require provenance on every substantive answer line.
+
+    This is deliberately structural rather than semantic. It prevents an
+    otherwise grounded response from appending uncited prose, bullets, or table
+    rows after a valid citation. Semantic entailment remains a separate concern.
+    """
+
+    lines = answer.splitlines()
+    in_fence = False
+    uncovered: list[str] = []
+
+    for index, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        if line.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence or not line:
+            continue
+        if _is_non_substantive_markdown_line(lines, index):
+            continue
+        if _MARKER_TOKEN_PATTERN.search(line) is None:
+            uncovered.append(line)
+
+    if uncovered:
+        preview = "; ".join(uncovered[:3])
+        if len(uncovered) > 3:
+            preview += f"; ... (+{len(uncovered) - 3} more)"
+        raise GroundingViolation(
+            "Grounded answer contains substantive lines without provenance "
+            f"markers: {preview}"
+        )
+
+    stripped_markers = _MARKER_TOKEN_PATTERN.sub("", answer)
+    bare_context_ids = tuple(sorted(set(_CONTEXT_ID_PATTERN.findall(stripped_markers))))
+    if bare_context_ids:
+        raise GroundingViolation(
+            "Grounded answer contains bare CTX identifiers outside provenance "
+            "markers: " + ", ".join(bare_context_ids)
+        )
+
+
+def _is_non_substantive_markdown_line(lines: list[str], index: int) -> bool:
+    line = lines[index].strip()
+    if re.fullmatch(r"#{1,6}\s+.+", line):
+        return True
+    if re.fullmatch(r"(?:-{3,}|\*{3,}|_{3,})", line):
+        return True
+    if _is_table_separator(line):
+        return True
+    if _is_table_header(lines, index):
+        return True
+    return False
+
+
+def _is_table_header(lines: list[str], index: int) -> bool:
+    line = lines[index].strip()
+    if "|" not in line:
+        return False
+    next_index = index + 1
+    while next_index < len(lines) and not lines[next_index].strip():
+        next_index += 1
+    if next_index >= len(lines):
+        return False
+    return _is_table_separator(lines[next_index].strip())
+
+
+def _is_table_separator(line: str) -> bool:
+    if "|" not in line:
+        return False
+    cells = tuple(cell.strip() for cell in line.strip("|").split("|"))
+    return bool(cells) and all(
+        _TABLE_SEPARATOR_CELL_PATTERN.fullmatch(cell) is not None for cell in cells
     )
 
 
