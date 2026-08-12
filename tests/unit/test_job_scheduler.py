@@ -80,7 +80,7 @@ def test_scheduler_dispatches_source_process_to_completion(tmp_path) -> None:
     assert tick.action == "completed"
     assert tick.final_state is JobState.COMPLETED
     assert tick.fencing_sequence == 1
-    assert len(app.jobs.checkpoints(job.job_id)) == 3
+    assert len(app.jobs.checkpoints(job.job_id)) == 5
     app.stop()
 
 

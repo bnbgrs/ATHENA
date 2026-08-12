@@ -46,7 +46,8 @@ def test_durable_source_process_cli_builds_representation_chunks_and_search(tmp_
     assert "Type: source.process" in queued.stdout
     assert "State: queued" in queued.stdout
     assert f'"source_id":"{source_id}"' in queued.stdout
-    assert '"pipeline_version":"source-process-v1"' in queued.stdout
+    assert '"pipeline_version":"source-process-v2"' in queued.stdout
+    assert '"chunk_batch_size":32' in queued.stdout
 
     run = _run_cli(
         local_root,
@@ -73,9 +74,11 @@ def test_durable_source_process_cli_builds_representation_chunks_and_search(tmp_
 
     checkpoints = _run_cli(local_root, "job", "checkpoints", job_id)
     assert checkpoints.returncode == 0, checkpoints.stderr
-    assert checkpoints.stdout.count("fence=1") == 3
+    assert checkpoints.stdout.count("fence=1") == 5
     assert '"next_stage":"represent"' in checkpoints.stdout
     assert '"next_stage":"chunk"' in checkpoints.stdout
+    assert '"next_stage":"chunk_batch"' in checkpoints.stdout
+    assert '"next_stage":"chunk_publish"' in checkpoints.stdout
     assert '"next_stage":"finalize"' in checkpoints.stdout
 
     representations = _run_cli(local_root, "source", "representation-list", source_id)

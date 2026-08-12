@@ -341,7 +341,7 @@ def test_derived_v1_store_migrates_and_backfills_archive_fts(tmp_path) -> None:
 
     store = SourceChunkStore(derived_root)
     with store.connect() as migrated:
-        assert int(migrated.execute("PRAGMA user_version").fetchone()[0]) == 2
+        assert int(migrated.execute("PRAGMA user_version").fetchone()[0]) == 3
         row = migrated.execute(
             "SELECT chunk_id, body FROM fts_archive WHERE fts_archive MATCH 'Berlin'"
         ).fetchone()

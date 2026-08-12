@@ -10,7 +10,14 @@ from typing import Any
 from athena.jobs.models import CheckpointRecord, JobPriority, JobRecord, JobState
 from athena.jobs.repository import JobLeaseError, JobTransitionError
 from athena.jobs.service import DurableJobService
-from athena.source.chunking_service import SourceChunkBuildResult, SourceChunkingService
+from athena.source.chunking_service import (
+    SourceChunkBuildResult,
+    SourceChunkingService,
+    SourceChunkPublishResult,
+    SourceChunkStagingBatchResult,
+    SourceChunkStagingLostError,
+    SourceChunkStagingPlanResult,
+)
 from athena.source.docx_representation_service import SourceDocxRepresentationService
 from athena.source.html_representation_service import SourceHtmlRepresentationService
 from athena.source.models import (
@@ -22,7 +29,9 @@ from athena.source.pdf_representation_service import SourcePdfRepresentationServ
 from athena.source.representation_service import SourceTextRepresentationService
 from athena.source.service import SourceCaptureService
 
-_PIPELINE_VERSION = "source-process-v1"
+_PIPELINE_VERSION = "source-process-v2"
+_LEGACY_PIPELINE_VERSION = "source-process-v1"
+_CHUNK_BATCH_SIZE = 32
 _TEXT_PARSER_ID = "athena.native_text"
 _TEXT_PARSER_VERSION = "1"
 _TEXT_OPTIONS: dict[str, object] = {
@@ -34,9 +43,18 @@ _TEXT_OPTIONS: dict[str, object] = {
 _STAGE_VERIFY = "verify"
 _STAGE_REPRESENT = "represent"
 _STAGE_CHUNK = "chunk"
+_STAGE_CHUNK_BATCH = "chunk_batch"
+_STAGE_CHUNK_PUBLISH = "chunk_publish"
 _STAGE_FINALIZE = "finalize"
 _ALLOWED_STAGES = frozenset(
-    {_STAGE_VERIFY, _STAGE_REPRESENT, _STAGE_CHUNK, _STAGE_FINALIZE}
+    {
+        _STAGE_VERIFY,
+        _STAGE_REPRESENT,
+        _STAGE_CHUNK,
+        _STAGE_CHUNK_BATCH,
+        _STAGE_CHUNK_PUBLISH,
+        _STAGE_FINALIZE,
+    }
 )
 _TOTAL_WORK_STAGES = 3
 
@@ -60,10 +78,13 @@ class SourceProcessingStepResult:
 @dataclass(frozen=True, slots=True)
 class _Cursor:
     source_id: uuid.UUID
+    pipeline_version: str
     next_stage: str
     representation_id: uuid.UUID | None = None
     build_signature: bytes | None = None
     chunk_count: int | None = None
+    next_chunk_index: int | None = None
+    repairing: bool = False
 
 
 class DurableSourceProcessingWorker:
@@ -107,6 +128,7 @@ class DurableSourceProcessingWorker:
                 "docx_parser": self.source_docx.parser_signature,
                 "html_parser": self.source_html.parser_signature,
                 "chunking_profile": "default",
+                "chunk_batch_size": _CHUNK_BATCH_SIZE,
                 "embedding_policy": "deferred",
             },
         )
@@ -129,10 +151,10 @@ class DurableSourceProcessingWorker:
         lease_token = leased.lease_token
         last_result: SourceProcessingStepResult | None = None
         try:
-            # The current v1 pipeline needs at most verify, represent, chunk,
-            # one optional derived repair, and finalize. The guard prevents a
-            # corrupt cursor from becoming an unbounded worker loop.
-            for _ in range(8):
+            # A large representation may require many checkpointed chunk
+            # batches. The high guard is only a corruption backstop; normal
+            # scheduler dispatches yield after a much smaller boundary count.
+            for _ in range(100_000):
                 last_result = self.step(
                     job_id,
                     lease_token=lease_token,
@@ -175,6 +197,12 @@ class DurableSourceProcessingWorker:
         job = self.jobs.get(job_id)
         self._validate_job_contract(job)
         if job.state is JobState.CANCEL_REQUESTED:
+            try:
+                cancel_cursor = self._cursor(job)
+            except SourceProcessingJobError:
+                cancel_cursor = None
+            if cancel_cursor is not None and cancel_cursor.build_signature is not None:
+                self.source_chunks.discard_staged_default(cancel_cursor.build_signature)
             cancelled = self.jobs.acknowledge_cancel(
                 job_id,
                 lease_token=lease_token,
@@ -208,6 +236,10 @@ class DurableSourceProcessingWorker:
                 return self._represent(job_id, lease_token, cursor)
             if cursor.next_stage == _STAGE_CHUNK:
                 return self._chunk(job_id, lease_token, cursor)
+            if cursor.next_stage == _STAGE_CHUNK_BATCH:
+                return self._chunk_batch(job_id, lease_token, cursor)
+            if cursor.next_stage == _STAGE_CHUNK_PUBLISH:
+                return self._chunk_publish(job_id, lease_token, cursor)
             if cursor.next_stage == _STAGE_FINALIZE:
                 return self._finalize(job_id, lease_token, cursor)
         except (JobLeaseError, JobTransitionError, SourceProcessingJobError):
@@ -242,6 +274,7 @@ class DurableSourceProcessingWorker:
             },
             resume_metadata=self._resume_payload(
                 source_id=cursor.source_id,
+                pipeline_version=cursor.pipeline_version,
                 next_stage=_STAGE_REPRESENT,
             ),
         )
@@ -303,6 +336,7 @@ class DurableSourceProcessingWorker:
             },
             resume_metadata=self._resume_payload(
                 source_id=cursor.source_id,
+                pipeline_version=cursor.pipeline_version,
                 next_stage=_STAGE_CHUNK,
                 representation_id=representation.representation_id,
             ),
@@ -322,22 +356,152 @@ class DurableSourceProcessingWorker:
         cursor: _Cursor,
     ) -> SourceProcessingStepResult:
         representation_id = self._require_representation(cursor)
-        self._verify_cursor_representation(cursor.source_id, representation_id)
-        built = self.source_chunks.build_default(representation_id)
-        checkpoint = self._checkpoint_chunks(
+        if cursor.pipeline_version == _LEGACY_PIPELINE_VERSION:
+            self._verify_cursor_representation(cursor.source_id, representation_id)
+            built = self.source_chunks.build_default(representation_id)
+            checkpoint = self._checkpoint_chunks(
+                job_id,
+                lease_token,
+                cursor.source_id,
+                representation_id,
+                built,
+                repaired=False,
+                pipeline_version=cursor.pipeline_version,
+            )
+            return self._after_checkpoint(
+                job_id,
+                checkpoint=checkpoint,
+                completed_stage=_STAGE_CHUNK,
+                representation_id=representation_id,
+                chunk_count=len(built.chunks),
+            )
+
+        planned = self.source_chunks.prepare_staged_default(representation_id)
+        checkpoint = self._checkpoint_chunk_plan(
             job_id,
             lease_token,
             cursor.source_id,
             representation_id,
-            built,
-            repaired=False,
+            planned,
+            repaired=cursor.repairing,
+            pipeline_version=cursor.pipeline_version,
         )
         return self._after_checkpoint(
             job_id,
             checkpoint=checkpoint,
-            completed_stage=_STAGE_CHUNK,
+            completed_stage="chunk_plan",
             representation_id=representation_id,
-            chunk_count=len(built.chunks),
+            chunk_count=planned.chunk_count,
+        )
+
+    def _chunk_batch(
+        self,
+        job_id: uuid.UUID,
+        lease_token: bytes,
+        cursor: _Cursor,
+    ) -> SourceProcessingStepResult:
+        representation_id = self._require_representation(cursor)
+        build_signature = self._require_build_signature(cursor)
+        chunk_count = self._require_chunk_count(cursor)
+        start_index = cursor.next_chunk_index
+        if start_index is None:
+            raise SourceProcessingJobError("Large-source resume cursor has no next_chunk_index.")
+        try:
+            batch = self.source_chunks.stage_staged_default_batch(
+                representation_id,
+                build_signature=build_signature,
+                start_index=start_index,
+                batch_size=self._chunk_batch_size(cursor),
+            )
+        except SourceChunkStagingLostError as exc:
+            planned = self.source_chunks.prepare_staged_default(representation_id)
+            if planned.build_signature != build_signature or planned.chunk_count != chunk_count:
+                raise SourceProcessingJobError(
+                    "Recreated large-source plan changed after Derived State loss."
+                ) from exc
+            checkpoint = self._checkpoint_chunk_plan(
+                job_id,
+                lease_token,
+                cursor.source_id,
+                representation_id,
+                planned,
+                repaired=True,
+                pipeline_version=cursor.pipeline_version,
+            )
+            return self._after_checkpoint(
+                job_id,
+                checkpoint=checkpoint,
+                completed_stage="derived_staging_repair",
+                representation_id=representation_id,
+                chunk_count=chunk_count,
+            )
+        if batch.total_chunks != chunk_count:
+            raise SourceProcessingJobError(
+                "Large-source staged plan count changed during resume."
+            )
+        checkpoint = self._checkpoint_chunk_batch(
+            job_id,
+            lease_token,
+            cursor,
+            batch,
+        )
+        return self._after_checkpoint(
+            job_id,
+            checkpoint=checkpoint,
+            completed_stage=_STAGE_CHUNK_BATCH,
+            representation_id=representation_id,
+            chunk_count=chunk_count,
+        )
+
+    def _chunk_publish(
+        self,
+        job_id: uuid.UUID,
+        lease_token: bytes,
+        cursor: _Cursor,
+    ) -> SourceProcessingStepResult:
+        representation_id = self._require_representation(cursor)
+        build_signature = self._require_build_signature(cursor)
+        chunk_count = self._require_chunk_count(cursor)
+        try:
+            published = self.source_chunks.publish_staged_default(
+                representation_id,
+                build_signature=build_signature,
+                expected_chunk_count=chunk_count,
+            )
+        except SourceChunkStagingLostError as exc:
+            planned = self.source_chunks.prepare_staged_default(representation_id)
+            if planned.build_signature != build_signature or planned.chunk_count != chunk_count:
+                raise SourceProcessingJobError(
+                    "Recreated large-source plan changed after pre-publication Derived State loss."
+                ) from exc
+            checkpoint = self._checkpoint_chunk_plan(
+                job_id,
+                lease_token,
+                cursor.source_id,
+                representation_id,
+                planned,
+                repaired=True,
+                pipeline_version=cursor.pipeline_version,
+            )
+            return self._after_checkpoint(
+                job_id,
+                checkpoint=checkpoint,
+                completed_stage="derived_staging_repair",
+                representation_id=representation_id,
+                chunk_count=chunk_count,
+            )
+        checkpoint = self._checkpoint_published_chunks(
+            job_id,
+            lease_token,
+            cursor,
+            published,
+        )
+        return self._after_checkpoint(
+            job_id,
+            checkpoint=checkpoint,
+            completed_stage=("derived_repair" if cursor.repairing else _STAGE_CHUNK_PUBLISH),
+            representation_id=representation_id,
+            chunk_count=published.chunk_count,
         )
 
     def _finalize(
@@ -347,44 +511,56 @@ class DurableSourceProcessingWorker:
         cursor: _Cursor,
     ) -> SourceProcessingStepResult:
         representation_id = self._require_representation(cursor)
-        text = self._verify_cursor_representation(cursor.source_id, representation_id)
-        chunks = self.source_chunks.list_for_representation(representation_id, limit=5000)
-        derived_valid = True
-        if text and not chunks:
-            derived_valid = False
-        elif chunks:
+        self._verify_cursor_representation(cursor.source_id, representation_id)
+        build_signature = self._require_build_signature(cursor)
+        chunk_count = self._require_chunk_count(cursor)
+        try:
+            verified_count = self.source_chunks.verify_current_build(
+                representation_id,
+                expected_build_signature=build_signature,
+                expected_chunk_count=chunk_count,
+            )
+        except Exception as exc:
+            if cursor.pipeline_version == _LEGACY_PIPELINE_VERSION:
+                built = self.source_chunks.build_default(representation_id)
+                checkpoint = self._checkpoint_chunks(
+                    job_id,
+                    lease_token,
+                    cursor.source_id,
+                    representation_id,
+                    built,
+                    repaired=True,
+                    pipeline_version=cursor.pipeline_version,
+                )
+                return self._after_checkpoint(
+                    job_id,
+                    checkpoint=checkpoint,
+                    completed_stage="derived_repair",
+                    representation_id=representation_id,
+                    chunk_count=len(built.chunks),
+                )
+            # Derived State is reconstructible. A v2 job repairs through the
+            # same bounded staging path rather than falling back to one large
+            # replacement transaction.
             try:
-                verified = tuple(self.source_chunks.verify(item.chunk_id) for item in chunks)
-            except Exception:
-                derived_valid = False
-            else:
-                if "".join(item.chunk_text for item in verified) != text:
-                    derived_valid = False
-                if cursor.build_signature is None:
-                    derived_valid = False
-                elif any(
-                    item.build_signature != cursor.build_signature for item in verified
-                ):
-                    derived_valid = False
-                if cursor.chunk_count is not None and len(verified) != cursor.chunk_count:
-                    derived_valid = False
-
-        if not derived_valid:
-            built = self.source_chunks.build_default(representation_id)
-            checkpoint = self._checkpoint_chunks(
+                planned = self.source_chunks.prepare_staged_default(representation_id)
+            except Exception as repair_exc:
+                raise exc from repair_exc
+            checkpoint = self._checkpoint_chunk_plan(
                 job_id,
                 lease_token,
                 cursor.source_id,
                 representation_id,
-                built,
+                planned,
                 repaired=True,
+                pipeline_version=cursor.pipeline_version,
             )
             return self._after_checkpoint(
                 job_id,
                 checkpoint=checkpoint,
-                completed_stage="derived_repair",
+                completed_stage="derived_repair_planned",
                 representation_id=representation_id,
-                chunk_count=len(built.chunks),
+                chunk_count=planned.chunk_count,
             )
 
         completed = self.jobs.complete(job_id, lease_token=lease_token)
@@ -393,7 +569,7 @@ class DurableSourceProcessingWorker:
             completed_stage=_STAGE_FINALIZE,
             checkpoint=None,
             representation_id=representation_id,
-            chunk_count=len(chunks),
+            chunk_count=verified_count,
             done=True,
         )
 
@@ -406,6 +582,7 @@ class DurableSourceProcessingWorker:
         built: SourceChunkBuildResult,
         *,
         repaired: bool,
+        pipeline_version: str,
     ) -> CheckpointRecord:
         return self.jobs.checkpoint(
             job_id,
@@ -422,10 +599,131 @@ class DurableSourceProcessingWorker:
             },
             resume_metadata=self._resume_payload(
                 source_id=source_id,
+                pipeline_version=pipeline_version,
                 next_stage=_STAGE_FINALIZE,
                 representation_id=representation_id,
                 build_signature=built.build_signature,
                 chunk_count=len(built.chunks),
+            ),
+        )
+
+    def _checkpoint_chunk_plan(
+        self,
+        job_id: uuid.UUID,
+        lease_token: bytes,
+        source_id: uuid.UUID,
+        representation_id: uuid.UUID,
+        planned: SourceChunkStagingPlanResult,
+        *,
+        repaired: bool,
+        pipeline_version: str,
+    ) -> CheckpointRecord:
+        next_stage = _STAGE_CHUNK_BATCH if planned.chunk_count else _STAGE_CHUNK_PUBLISH
+        return self.jobs.checkpoint(
+            job_id,
+            lease_token=lease_token,
+            current_stage="chunk_plan_ready",
+            progress_state={
+                "completed_stages": 2,
+                "total_stages": _TOTAL_WORK_STAGES,
+                "confirmed_chunks": 0,
+                "total_chunks": planned.chunk_count,
+            },
+            last_confirmed_input={"representation_id": str(representation_id)},
+            last_confirmed_output={
+                "build_signature": planned.build_signature.hex(),
+                "chunk_count": planned.chunk_count,
+                "chunking_profile_id": str(planned.profile.chunking_profile_id),
+                "derived_repair": repaired,
+                "publication_state": "staged_unpublished",
+            },
+            resume_metadata=self._resume_payload(
+                source_id=source_id,
+                pipeline_version=pipeline_version,
+                next_stage=next_stage,
+                representation_id=representation_id,
+                build_signature=planned.build_signature,
+                chunk_count=planned.chunk_count,
+                next_chunk_index=0,
+                repairing=repaired,
+            ),
+        )
+
+    def _checkpoint_chunk_batch(
+        self,
+        job_id: uuid.UUID,
+        lease_token: bytes,
+        cursor: _Cursor,
+        batch: SourceChunkStagingBatchResult,
+    ) -> CheckpointRecord:
+        representation_id = self._require_representation(cursor)
+        next_stage = (
+            _STAGE_CHUNK_PUBLISH
+            if batch.next_index >= batch.total_chunks
+            else _STAGE_CHUNK_BATCH
+        )
+        return self.jobs.checkpoint(
+            job_id,
+            lease_token=lease_token,
+            current_stage="chunks_staging",
+            progress_state={
+                "completed_stages": 2,
+                "total_stages": _TOTAL_WORK_STAGES,
+                "confirmed_chunks": batch.next_index,
+                "total_chunks": batch.total_chunks,
+            },
+            last_confirmed_input={
+                "representation_id": str(representation_id),
+                "start_chunk_index": batch.start_index,
+            },
+            last_confirmed_output={
+                "confirmed_through_chunk_index": batch.next_index - 1,
+                "confirmed_chunk_count": batch.next_index,
+                "batch_count": batch.batch_count,
+                "publication_state": "staged_unpublished",
+            },
+            resume_metadata=self._resume_payload(
+                source_id=cursor.source_id,
+                pipeline_version=cursor.pipeline_version,
+                next_stage=next_stage,
+                representation_id=representation_id,
+                build_signature=batch.build_signature,
+                chunk_count=batch.total_chunks,
+                next_chunk_index=batch.next_index,
+                repairing=cursor.repairing,
+            ),
+        )
+
+    def _checkpoint_published_chunks(
+        self,
+        job_id: uuid.UUID,
+        lease_token: bytes,
+        cursor: _Cursor,
+        published: SourceChunkPublishResult,
+    ) -> CheckpointRecord:
+        representation_id = self._require_representation(cursor)
+        return self.jobs.checkpoint(
+            job_id,
+            lease_token=lease_token,
+            current_stage="chunks_ready",
+            progress_state={"completed_stages": 3, "total_stages": _TOTAL_WORK_STAGES},
+            last_confirmed_input={"representation_id": str(representation_id)},
+            last_confirmed_output={
+                "build_signature": published.build_signature.hex(),
+                "chunk_count": published.chunk_count,
+                "derived_repair": cursor.repairing,
+                "lexical_search_index": "current",
+                "embedding_index": "deferred",
+                "publication_state": "atomically_published",
+            },
+            resume_metadata=self._resume_payload(
+                source_id=cursor.source_id,
+                pipeline_version=cursor.pipeline_version,
+                next_stage=_STAGE_FINALIZE,
+                representation_id=representation_id,
+                build_signature=published.build_signature,
+                chunk_count=published.chunk_count,
+                repairing=cursor.repairing,
             ),
         )
 
@@ -465,36 +763,69 @@ class DurableSourceProcessingWorker:
 
     def _cursor(self, job: JobRecord) -> _Cursor:
         source_id = self._source_id_from_scope(job)
+        config = _json_object(job.pinned_configuration_json, "pinned_configuration")
+        pipeline_version = config.get("pipeline_version")
+        if pipeline_version not in {_LEGACY_PIPELINE_VERSION, _PIPELINE_VERSION}:
+            raise SourceProcessingJobError("source.process pipeline_version is incompatible.")
+        assert isinstance(pipeline_version, str)
         if job.last_checkpoint_id is None:
-            return _Cursor(source_id=source_id, next_stage=_STAGE_VERIFY)
+            return _Cursor(
+                source_id=source_id,
+                pipeline_version=pipeline_version,
+                next_stage=_STAGE_VERIFY,
+            )
         checkpoint = self.jobs.get_checkpoint(job.last_checkpoint_id)
         if checkpoint.job_id != job.job_id:
             raise SourceProcessingJobError("Job checkpoint belongs to another job.")
         payload = _json_object(checkpoint.resume_metadata_json, "resume_metadata")
-        if payload.get("pipeline_version") != _PIPELINE_VERSION:
+        if payload.get("pipeline_version") != pipeline_version:
             raise SourceProcessingJobError("Checkpoint pipeline_version is incompatible.")
         if payload.get("source_id") != str(source_id):
             raise SourceProcessingJobError("Checkpoint source_id disagrees with job scope.")
         next_stage = payload.get("next_stage")
         if not isinstance(next_stage, str) or next_stage not in _ALLOWED_STAGES:
             raise SourceProcessingJobError("Checkpoint next_stage is invalid.")
+        if pipeline_version == _LEGACY_PIPELINE_VERSION and next_stage in {
+            _STAGE_CHUNK_BATCH,
+            _STAGE_CHUNK_PUBLISH,
+        }:
+            raise SourceProcessingJobError("Legacy source.process cursor uses a v2-only stage.")
         representation_id = _optional_uuid(payload.get("representation_id"), "representation_id")
         build_signature = _optional_hash(payload.get("build_signature"), "build_signature")
         chunk_count = _optional_nonnegative_int(payload.get("chunk_count"), "chunk_count")
-        if next_stage in {_STAGE_CHUNK, _STAGE_FINALIZE} and representation_id is None:
+        next_chunk_index = _optional_nonnegative_int(
+            payload.get("next_chunk_index"), "next_chunk_index"
+        )
+        repairing_value = payload.get("repairing", False)
+        if not isinstance(repairing_value, bool):
+            raise SourceProcessingJobError("Checkpoint repairing flag is invalid.")
+        if next_stage in {
+            _STAGE_CHUNK,
+            _STAGE_CHUNK_BATCH,
+            _STAGE_CHUNK_PUBLISH,
+            _STAGE_FINALIZE,
+        } and representation_id is None:
             raise SourceProcessingJobError(
                 "Checkpoint requires representation_id for the next stage."
             )
-        if next_stage == _STAGE_FINALIZE and build_signature is None:
+        if next_stage in {_STAGE_CHUNK_BATCH, _STAGE_CHUNK_PUBLISH, _STAGE_FINALIZE}:
+            if build_signature is None or chunk_count is None:
+                raise SourceProcessingJobError(
+                    "Checkpoint requires build_signature and chunk_count for this stage."
+                )
+        if next_stage == _STAGE_CHUNK_BATCH and next_chunk_index is None:
             raise SourceProcessingJobError(
-                "Finalize checkpoint requires a chunk build signature."
+                "Chunk-batch checkpoint requires next_chunk_index."
             )
         return _Cursor(
             source_id=source_id,
+            pipeline_version=pipeline_version,
             next_stage=next_stage,
             representation_id=representation_id,
             build_signature=build_signature,
             chunk_count=chunk_count,
+            next_chunk_index=next_chunk_index,
+            repairing=repairing_value,
         )
 
     def _validate_job_contract(self, job: JobRecord) -> None:
@@ -504,7 +835,7 @@ class DurableSourceProcessingWorker:
             )
         config = _json_object(job.pinned_configuration_json, "pinned_configuration")
         legacy_expected = {
-            "pipeline_version": _PIPELINE_VERSION,
+            "pipeline_version": _LEGACY_PIPELINE_VERSION,
             "text_parser": f"{_TEXT_PARSER_ID}@{_TEXT_PARSER_VERSION}",
             "chunking_profile": "default",
             "embedding_policy": "deferred",
@@ -517,11 +848,27 @@ class DurableSourceProcessingWorker:
             **pdf_expected,
             "docx_parser": self.source_docx.parser_signature,
         }
-        current_expected = {
+        html_expected = {
             **docx_expected,
             "html_parser": self.source_html.parser_signature,
         }
-        if config not in (legacy_expected, pdf_expected, docx_expected, current_expected):
+        current_expected = {
+            "pipeline_version": _PIPELINE_VERSION,
+            "text_parser": f"{_TEXT_PARSER_ID}@{_TEXT_PARSER_VERSION}",
+            "pdf_parser": self.source_pdf.parser_signature,
+            "docx_parser": self.source_docx.parser_signature,
+            "html_parser": self.source_html.parser_signature,
+            "chunking_profile": "default",
+            "chunk_batch_size": _CHUNK_BATCH_SIZE,
+            "embedding_policy": "deferred",
+        }
+        if config not in (
+            legacy_expected,
+            pdf_expected,
+            docx_expected,
+            html_expected,
+            current_expected,
+        ):
             raise SourceProcessingJobError(
                 "source.process pinned configuration is missing or incompatible."
             )
@@ -531,11 +878,18 @@ class DurableSourceProcessingWorker:
             raise SourceProcessingJobError(
                 "Legacy source.process job did not pin a PDF parser and cannot process PDFs."
             )
-        if self.source_docx.supports(source) and config not in (docx_expected, current_expected):
+        if self.source_docx.supports(source) and config not in (
+            docx_expected,
+            html_expected,
+            current_expected,
+        ):
             raise SourceProcessingJobError(
                 "Legacy source.process job did not pin a DOCX parser and cannot process DOCX."
             )
-        if self.source_html.supports(source) and config != current_expected:
+        if self.source_html.supports(source) and config not in (
+            html_expected,
+            current_expected,
+        ):
             raise SourceProcessingJobError(
                 "Legacy source.process job did not pin an HTML parser and cannot process HTML."
             )
@@ -637,16 +991,36 @@ class DurableSourceProcessingWorker:
         return cursor.representation_id
 
     @staticmethod
+    def _require_build_signature(cursor: _Cursor) -> bytes:
+        if cursor.build_signature is None:
+            raise SourceProcessingJobError("Resume cursor has no build_signature.")
+        return cursor.build_signature
+
+    @staticmethod
+    def _require_chunk_count(cursor: _Cursor) -> int:
+        if cursor.chunk_count is None:
+            raise SourceProcessingJobError("Resume cursor has no chunk_count.")
+        return cursor.chunk_count
+
+    def _chunk_batch_size(self, cursor: _Cursor) -> int:
+        if cursor.pipeline_version == _LEGACY_PIPELINE_VERSION:
+            raise SourceProcessingJobError("Legacy source.process has no chunk batching policy.")
+        return _CHUNK_BATCH_SIZE
+
+    @staticmethod
     def _resume_payload(
         *,
         source_id: uuid.UUID,
+        pipeline_version: str,
         next_stage: str,
         representation_id: uuid.UUID | None = None,
         build_signature: bytes | None = None,
         chunk_count: int | None = None,
+        next_chunk_index: int | None = None,
+        repairing: bool = False,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
-            "pipeline_version": _PIPELINE_VERSION,
+            "pipeline_version": pipeline_version,
             "source_id": str(source_id),
             "next_stage": next_stage,
         }
@@ -656,6 +1030,10 @@ class DurableSourceProcessingWorker:
             payload["build_signature"] = build_signature.hex()
         if chunk_count is not None:
             payload["chunk_count"] = chunk_count
+        if next_chunk_index is not None:
+            payload["next_chunk_index"] = next_chunk_index
+        if repairing:
+            payload["repairing"] = True
         return payload
 
 

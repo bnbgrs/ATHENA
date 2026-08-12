@@ -45,11 +45,11 @@ def test_source_process_job_runs_end_to_end_and_survives_restart(tmp_path) -> No
     assert result.representation_id is not None
     assert result.chunk_count is not None and result.chunk_count >= 2
     checkpoints = first.jobs.checkpoints(job.job_id)
-    assert len(checkpoints) == 3
+    assert len(checkpoints) == 5
     assert [
         json.loads(item.resume_metadata_json or "{}")["next_stage"]
         for item in checkpoints
-    ] == ["represent", "chunk", "finalize"]
+    ] == ["represent", "chunk", "chunk_batch", "chunk_publish", "finalize"]
     hits = first.archive_search.search("Berlin marker")
     assert hits and hits[0].source_id == captured.source.source_id
     representation_id = result.representation_id
@@ -141,9 +141,13 @@ def test_finalize_repairs_lost_derived_chunks_from_retained_representation(tmp_p
 
     app.source_processing.step(job.job_id, lease_token=leased.lease_token)
     represented = app.source_processing.step(job.job_id, lease_token=leased.lease_token)
-    chunked = app.source_processing.step(job.job_id, lease_token=leased.lease_token)
+    planned = app.source_processing.step(job.job_id, lease_token=leased.lease_token)
+    staged = app.source_processing.step(job.job_id, lease_token=leased.lease_token)
+    published = app.source_processing.step(job.job_id, lease_token=leased.lease_token)
     assert represented.representation_id is not None
-    assert chunked.completed_stage == "chunk"
+    assert planned.completed_stage == "chunk_plan"
+    assert staged.completed_stage == "chunk_batch"
+    assert published.completed_stage == "chunk_publish"
 
     search_db = app.paths.derived_root / "search.db"
     assert search_db.exists()
@@ -151,10 +155,14 @@ def test_finalize_repairs_lost_derived_chunks_from_retained_representation(tmp_p
 
     repaired = app.source_processing.step(job.job_id, lease_token=leased.lease_token)
     assert repaired.done is False
-    assert repaired.completed_stage == "derived_repair"
+    assert repaired.completed_stage == "derived_repair_planned"
     assert repaired.checkpoint is not None
     output = json.loads(repaired.checkpoint.last_confirmed_output_json or "{}")
     assert output["derived_repair"] is True
+
+    app.source_processing.step(job.job_id, lease_token=leased.lease_token)
+    republished = app.source_processing.step(job.job_id, lease_token=leased.lease_token)
+    assert republished.completed_stage == "derived_repair"
     assert app.source_chunks.list_for_representation(represented.representation_id)
 
     completed = app.source_processing.step(job.job_id, lease_token=leased.lease_token)
