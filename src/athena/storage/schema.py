@@ -14,7 +14,9 @@ MERGE_REVIEW_SCHEMA_VERSION = 6
 MERGE_REVIEW_MULTI_TARGET_SCHEMA_VERSION = 7
 EXTRACTION_SNAPSHOT_SCHEMA_VERSION = 8
 LOCAL_FTS_SCHEMA_VERSION = 9
-SCHEMA_VERSION = 10
+LOCAL_EMBEDDINGS_SCHEMA_VERSION = 10
+SOURCE_CAPTURE_SCHEMA_VERSION = 11
+SCHEMA_VERSION = SOURCE_CAPTURE_SCHEMA_VERSION
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
@@ -26,6 +28,7 @@ MERGE_REVIEW_MULTI_TARGET_MIGRATION_ID = "0007_merge_review_multi_target_identit
 EXTRACTION_SNAPSHOT_MIGRATION_ID = "0008_frozen_extraction_snapshots"
 LOCAL_FTS_SEARCH_MIGRATION_ID = "0009_local_fts_search"
 LOCAL_EMBEDDINGS_MIGRATION_ID = "0010_local_embeddings"
+SOURCE_CAPTURE_MIGRATION_ID = "0011_source_capture"
 
 
 class DatabaseCompatibilityError(RuntimeError):
@@ -100,6 +103,7 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         MERGE_REVIEW_MULTI_TARGET_SCHEMA_VERSION,
         EXTRACTION_SNAPSHOT_SCHEMA_VERSION,
         LOCAL_FTS_SCHEMA_VERSION,
+        LOCAL_EMBEDDINGS_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -149,9 +153,13 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
 
     if existing_user_version == LOCAL_FTS_SCHEMA_VERSION:
         _migrate_schema_v9_to_v10(connection)
+        existing_user_version = LOCAL_EMBEDDINGS_SCHEMA_VERSION
+
+    if existing_user_version == LOCAL_EMBEDDINGS_SCHEMA_VERSION:
+        _migrate_schema_v10_to_v11(connection)
 
     _configure_connection(connection)
-    _verify_schema_v10(connection)
+    _verify_schema_v11(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -847,8 +855,71 @@ def _migrate_schema_v9_to_v10(connection: sqlite3.Connection) -> None:
         ) WITHOUT ROWID;
 
         UPDATE schema_metadata
-        SET schema_version = {SCHEMA_VERSION},
+        SET schema_version = {LOCAL_EMBEDDINGS_SCHEMA_VERSION},
             last_migration_id = '{LOCAL_EMBEDDINGS_MIGRATION_ID}',
+            minimum_reader_version = {LOCAL_EMBEDDINGS_SCHEMA_VERSION}
+        WHERE singleton_id = 1;
+
+        PRAGMA user_version = {LOCAL_EMBEDDINGS_SCHEMA_VERSION};
+        COMMIT;
+        """
+    )
+
+
+def _migrate_schema_v10_to_v11(connection: sqlite3.Connection) -> None:
+    """Add authoritative Raw Archive Source and immutable BlobRecord capture."""
+    connection.executescript(
+        f"""
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE blob_records (
+            blob_id BLOB(16) PRIMARY KEY CHECK(length(blob_id) = 16),
+            byte_length INTEGER NOT NULL CHECK(byte_length >= 0),
+            media_type TEXT NULL,
+            storage_area TEXT NOT NULL CHECK(storage_area IN ('archive', 'spool')),
+            storage_locator TEXT NOT NULL CHECK(length(storage_locator) > 0),
+            integrity_sha256 BLOB(32) NOT NULL CHECK(length(integrity_sha256) = 32),
+            encryption_state TEXT NOT NULL CHECK(encryption_state IN ('none')),
+            created_at_us INTEGER NOT NULL,
+            verified_at_us INTEGER NOT NULL,
+            UNIQUE(integrity_sha256, byte_length, encryption_state),
+            UNIQUE(storage_area, storage_locator),
+            FOREIGN KEY(blob_id) REFERENCES entity_registry(entity_id)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE sources (
+            source_id BLOB(16) PRIMARY KEY CHECK(length(source_id) = 16),
+            source_type TEXT NOT NULL CHECK(source_type IN (
+                'file', 'web_snapshot', 'email', 'text', 'image',
+                'audio', 'video', 'document', 'api_capture',
+                'chat_export', 'other'
+            )),
+            created_at_us INTEGER NOT NULL,
+            acquired_at_us INTEGER NOT NULL,
+            original_name TEXT NULL,
+            original_modified_at_us INTEGER NULL,
+            mime_type TEXT NULL,
+            blob_id BLOB(16) NOT NULL CHECK(length(blob_id) = 16),
+            content_sha256 BLOB(32) NOT NULL CHECK(length(content_sha256) = 32),
+            source_uri TEXT NULL,
+            lifecycle_state TEXT NOT NULL CHECK(lifecycle_state IN (
+                'captured', 'processing', 'ready', 'partial',
+                'failed', 'quarantined', 'cancelled'
+            )),
+            provenance_id BLOB(16) NOT NULL CHECK(length(provenance_id) = 16),
+            FOREIGN KEY(source_id) REFERENCES entity_registry(entity_id),
+            FOREIGN KEY(blob_id) REFERENCES blob_records(blob_id),
+            FOREIGN KEY(provenance_id) REFERENCES provenance_records(provenance_id)
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_sources_acquired_at
+            ON sources(acquired_at_us DESC, source_id);
+        CREATE INDEX idx_sources_blob
+            ON sources(blob_id);
+
+        UPDATE schema_metadata
+        SET schema_version = {SCHEMA_VERSION},
+            last_migration_id = '{SOURCE_CAPTURE_MIGRATION_ID}',
             minimum_reader_version = {SCHEMA_VERSION}
         WHERE singleton_id = 1;
 
@@ -858,7 +929,7 @@ def _migrate_schema_v9_to_v10(connection: sqlite3.Connection) -> None:
     )
 
 
-def _verify_schema_v10(connection: sqlite3.Connection) -> None:
+def _verify_schema_v11(connection: sqlite3.Connection) -> None:
     application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
     user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
@@ -876,7 +947,7 @@ def _verify_schema_v10(connection: sqlite3.Connection) -> None:
         SCHEMA_VERSION,
         STORAGE_LAYOUT_VERSION,
         BLOB_FORMAT_VERSION,
-        LOCAL_EMBEDDINGS_MIGRATION_ID,
+        SOURCE_CAPTURE_MIGRATION_ID,
         SCHEMA_VERSION,
     )
     if metadata is None or tuple(metadata) != expected:
@@ -898,6 +969,8 @@ def _verify_schema_v10(connection: sqlite3.Connection) -> None:
         "search_index_state",
         "search_embeddings",
         "search_embedding_state",
+        "blob_records",
+        "sources",
     }
     missing_tables = required_tables.difference(_user_tables(connection))
     if missing_tables:

@@ -6,6 +6,7 @@ import argparse
 import sys
 import uuid
 from collections.abc import Sequence
+from pathlib import Path
 
 from athena.chat.generation import ModelSelectionError, UnsupportedChatHistoryError
 from athena.chat.models import ChatThread
@@ -38,6 +39,9 @@ from athena.model.adapters.lm_studio import ModelProviderError
 from athena.retrieval.context import ContextBuilderError
 from athena.retrieval.search import SearchEntityType, SearchError
 from athena.retrieval.semantic import SemanticSearchError
+from athena.source.blob_store import BlobStoreError
+from athena.source.models import BlobRecord, SourceRecord
+from athena.source.repository import SourceActorError, SourceNotFoundError
 from athena.version import __version__
 
 
@@ -458,6 +462,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Rebuild the reconstructible local semantic index.",
     )
     embedding_rebuild.add_argument("--model", dest="embedding_model")
+
+    source_parser = commands.add_parser(
+        "source",
+        help="Raw Archive source capture commands.",
+    )
+    source_commands = source_parser.add_subparsers(
+        dest="source_command",
+        required=True,
+    )
+    source_import = source_commands.add_parser(
+        "import",
+        help="Capture one local file into the immutable Raw Archive.",
+    )
+    source_import.add_argument("path", type=Path)
+    source_show = source_commands.add_parser(
+        "show",
+        help="Show one captured Source and its BlobRecord.",
+    )
+    source_show.add_argument("source_id", type=_uuid_argument)
+    source_verify = source_commands.add_parser(
+        "verify",
+        help="Stream and verify the stored original bytes for one Source.",
+    )
+    source_verify.add_argument("source_id", type=_uuid_argument)
+    source_list = source_commands.add_parser(
+        "list",
+        help="List recently captured Sources.",
+    )
+    source_list.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Maximum number of Sources to print (1-500).",
+    )
 
     model_parser = commands.add_parser("model", help="Local model provider commands.")
     model_commands = model_parser.add_subparsers(dest="model_command", required=True)
@@ -1241,6 +1279,67 @@ def _run_search_command(app: AthenaApplication, args: argparse.Namespace) -> int
         print(f"    {ranked_result.snippet}")
     return 0
 
+
+def _print_source_record(source: SourceRecord, blob: BlobRecord) -> None:
+    print(f"Source: {source.source_id}")
+    print(f"State: {source.lifecycle_state.value}")
+    print(f"Type: {source.source_type.value}")
+    print(f"Original name: {source.original_name or '<unknown>'}")
+    print(f"MIME: {source.mime_type or '<unknown>'}")
+    print(f"Bytes: {blob.byte_length}")
+    print(f"SHA-256: {source.content_sha256.hex()}")
+    print(f"Blob: {blob.blob_id}")
+    print(f"Storage: {blob.storage_area.value}:{blob.storage_locator}")
+    print(f"Source URI: {source.source_uri or '<unknown>'}")
+    print(f"Provenance: {source.provenance_id}")
+
+
+def _run_source_command(app: AthenaApplication, args: argparse.Namespace) -> int:
+    if args.source_command == "import":
+        result = app.sources.capture_file(args.path)
+        print(f"Source captured: {result.source.source_id}")
+        print(f"State: {result.source.lifecycle_state.value}")
+        print(f"Blob: {result.blob.blob_id} reused={'yes' if result.reused_blob else 'no'}")
+        print(f"Bytes: {result.blob.byte_length}")
+        print(f"SHA-256: {result.source.content_sha256.hex()}")
+        print(f"MIME: {result.source.mime_type or '<unknown>'}")
+        print(
+            f"Storage: {result.blob.storage_area.value}:"
+            f"{result.blob.storage_locator}"
+        )
+        return 0
+
+    if args.source_command == "show":
+        source, blob = app.sources.get(args.source_id)
+        _print_source_record(source, blob)
+        return 0
+
+    if args.source_command == "verify":
+        source, blob = app.sources.get(args.source_id)
+        path = app.sources.verify(args.source_id)
+        print(
+            f"Source verified: {source.source_id} "
+            f"bytes={blob.byte_length} sha256={blob.integrity_sha256.hex()}"
+        )
+        print(f"Stored at: {path}")
+        return 0
+
+    if args.source_command == "list":
+        sources = app.sources.list(limit=args.limit)
+        if not sources:
+            print("No captured Sources.")
+            return 0
+        for source, blob in sources:
+            print(
+                f"{source.source_id}  state={source.lifecycle_state.value} "
+                f"type={source.source_type.value} bytes={blob.byte_length} "
+                f"blob={blob.blob_id} name={source.original_name!r}"
+            )
+        return 0
+
+    raise RuntimeError(f"Unsupported source command: {args.source_command!r}")
+
+
 def _run_model_command(app: AthenaApplication, args: argparse.Namespace) -> int:
     if args.model_command == "status":
         health = app.model_provider.health()
@@ -1378,6 +1477,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 2
             except SemanticSearchError as exc:
                 print(f"ATHENA embedding error: {exc}", file=sys.stderr)
+                return 2
+
+        if args.command == "source":
+            try:
+                return _run_source_command(app, args)
+            except (
+                BlobStoreError,
+                SourceActorError,
+                SourceNotFoundError,
+                ValueError,
+            ) as exc:
+                print(f"ATHENA source error: {exc}", file=sys.stderr)
                 return 2
 
         if args.command == "model":

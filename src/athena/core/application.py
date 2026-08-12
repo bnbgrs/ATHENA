@@ -30,6 +30,9 @@ from athena.retrieval.hybrid import HybridRetrievalService
 from athena.retrieval.ranking import RetrievalRankingService
 from athena.retrieval.search import LocalSearchService
 from athena.retrieval.semantic import LocalSemanticSearchService
+from athena.source.blob_store import BlobStore
+from athena.source.repository import SourceRepository
+from athena.source.service import SourceCaptureService
 from athena.storage.database import SQLiteDatabase
 from athena.storage.paths import RuntimePaths
 from athena.storage.runtime import RuntimeLayoutService
@@ -62,6 +65,13 @@ class AthenaApplication:
         self.database = SQLiteDatabase(self.paths.database_path)
         self.chat_repository = ChatRepository(self.database)
         self.chat = ChatService(self.chat_repository)
+        self.blob_store = BlobStore(self.paths)
+        self.source_repository = SourceRepository(self.database)
+        self.sources = SourceCaptureService(
+            repository=self.source_repository,
+            blob_store=self.blob_store,
+            chat=self.chat,
+        )
         self.knowledge_repository = KnowledgeRepository(self.database)
         self.knowledge = KnowledgeService(self.knowledge_repository, self.chat)
         self.claim_repository = ClaimRepository(self.database)
