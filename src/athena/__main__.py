@@ -35,6 +35,7 @@ from athena.knowledge.service import (
     UnsupportedKnowledgeSourceError,
 )
 from athena.model.adapters.lm_studio import ModelProviderError
+from athena.retrieval.context import ContextBuilderError
 from athena.retrieval.search import SearchEntityType, SearchError
 from athena.retrieval.semantic import SemanticSearchError
 from athena.version import __version__
@@ -349,6 +350,48 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument(
         "--embedding-model",
         help="LM Studio embedding model id. Auto-selects only when unambiguous.",
+    )
+
+
+    context_parser = commands.add_parser(
+        "context",
+        help="Build bounded provenance-preserving context from local retrieval.",
+    )
+    context_commands = context_parser.add_subparsers(
+        dest="context_command",
+        required=True,
+    )
+    context_build = context_commands.add_parser(
+        "build",
+        help="Build model-facing JSON context without calling the Primary Model.",
+    )
+    context_build.add_argument("query", help="Retrieval query.")
+    context_build.add_argument(
+        "--type",
+        dest="context_type",
+        choices=("knowledge", "claim", "chat_message"),
+        help="Optional entity-type filter.",
+    )
+    context_build.add_argument(
+        "--hybrid",
+        action="store_true",
+        help="Use lexical + semantic hybrid retrieval.",
+    )
+    context_build.add_argument(
+        "--embedding-model",
+        help="LM Studio embedding model id for --hybrid.",
+    )
+    context_build.add_argument(
+        "--max-tokens",
+        type=int,
+        default=1200,
+        help="Deterministic estimated-token budget (128-64000).",
+    )
+    context_build.add_argument(
+        "--max-items",
+        type=int,
+        default=8,
+        help="Maximum context items (1-100).",
     )
 
     embedding_parser = commands.add_parser(
@@ -944,6 +987,56 @@ def _run_embedding_command(app: AthenaApplication, args: argparse.Namespace) -> 
         f"Unsupported embedding command: {args.embedding_command!r}"
     )
 
+
+def _run_context_command(app: AthenaApplication, args: argparse.Namespace) -> int:
+    if args.context_command != "build":
+        raise RuntimeError(f"Unsupported context command: {args.context_command!r}")
+
+    entity_type = (
+        None
+        if args.context_type is None
+        else SearchEntityType(args.context_type)
+    )
+    candidate_limit = min(200, max(40, args.max_items * 8))
+
+    if args.hybrid:
+        model_id = _resolve_embedding_model_id(app, args.embedding_model)
+        hybrid_results = app.hybrid_retrieval.search(
+            args.query,
+            model_id=model_id,
+            limit=candidate_limit,
+            entity_type=entity_type,
+        )
+        bundle = app.context_builder.build_from_hybrid(
+            query=args.query,
+            results=hybrid_results,
+            max_estimated_tokens=args.max_tokens,
+            max_items=args.max_items,
+        )
+        model_suffix = f" embedding_model={model_id}"
+    else:
+        ranked_results = app.retrieval.search(
+            args.query,
+            limit=candidate_limit,
+            entity_type=entity_type,
+        )
+        bundle = app.context_builder.build_from_ranked(
+            query=args.query,
+            results=ranked_results,
+            max_estimated_tokens=args.max_tokens,
+            max_items=args.max_items,
+        )
+        model_suffix = ""
+
+    print(
+        f"Context bundle: mode={bundle.mode} items={len(bundle.items)} "
+        f"omitted={bundle.omitted_count} "
+        f"estimated_tokens={bundle.estimated_tokens}/"
+        f"{bundle.max_estimated_tokens}{model_suffix}"
+    )
+    print(bundle.rendered_text)
+    return 0
+
 def _run_search_command(app: AthenaApplication, args: argparse.Namespace) -> int:
     if args.rebuild:
         count = app.search.rebuild()
@@ -1143,6 +1236,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return _run_review_command(app, args)
             except (ReviewError, ValueError) as exc:
                 print(f"ATHENA review error: {exc}", file=sys.stderr)
+                return 2
+
+        if args.command == "context":
+            try:
+                return _run_context_command(app, args)
+            except (
+                ContextBuilderError,
+                ModelProviderError,
+                SearchError,
+                SemanticSearchError,
+            ) as exc:
+                print(f"ATHENA context error: {exc}", file=sys.stderr)
                 return 2
 
         if args.command == "search":

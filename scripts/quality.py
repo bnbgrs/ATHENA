@@ -6,7 +6,6 @@ developer can reproduce CI failures locally before pushing a commit.
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -18,23 +17,7 @@ class Check:
     command: tuple[str, ...]
 
 
-def _ruff_command() -> str:
-    executable = shutil.which("ruff")
-    if executable is None:
-        raise RuntimeError(
-            "Ruff is not installed in the active environment. "
-            'Run: python -m pip install -e ".[dev]"'
-        )
-    return executable
-
-
 def main() -> int:
-    try:
-        ruff = _ruff_command()
-    except RuntimeError as exc:
-        print(f"QUALITY GATE ERROR: {exc}", file=sys.stderr)
-        return 2
-
     checks = (
         Check(
             name="Specification validator",
@@ -42,7 +25,15 @@ def main() -> int:
         ),
         Check(
             name="Ruff",
-            command=(ruff, "check", "src", "tests", "scripts"),
+            command=(
+                sys.executable,
+                "-m",
+                "ruff",
+                "check",
+                "src",
+                "tests",
+                "scripts",
+            ),
         ),
         Check(
             name="mypy",

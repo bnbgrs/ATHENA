@@ -23,6 +23,7 @@ from athena.model.adapters.lm_studio_embeddings import LMStudioEmbeddingProvider
 from athena.model.provenance import ModelRunRepository
 from athena.observability.health import HealthService
 from athena.observability.logging import configure_logging
+from athena.retrieval.context import ContextBuilderService
 from athena.retrieval.hybrid import HybridRetrievalService
 from athena.retrieval.ranking import RetrievalRankingService
 from athena.retrieval.search import LocalSearchService
@@ -95,6 +96,7 @@ class AthenaApplication:
             self.retrieval,
             self.semantic_search,
         )
+        self.context_builder = ContextBuilderService()
         self.proposal_acceptance = ProposalAcceptanceService(
             database=self.database,
             chat=self.chat,

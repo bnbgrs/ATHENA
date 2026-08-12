@@ -17,3 +17,13 @@ def test_project_remains_pinned_to_python_312() -> None:
     assert config["project"]["requires-python"] == ">=3.12,<3.13"
     assert config["tool"]["ruff"]["target-version"] == "py312"
     assert config["tool"]["mypy"]["python_version"] == "3.12"
+
+
+
+def test_quality_gate_invokes_ruff_via_current_python_interpreter() -> None:
+    source = Path("scripts/quality.py").read_text(encoding="utf-8")
+
+    assert 'sys.executable,' in source
+    assert '"-m",' in source
+    assert '"ruff",' in source
+    assert 'shutil.which("ruff")' not in source
