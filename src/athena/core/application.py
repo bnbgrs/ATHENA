@@ -25,6 +25,7 @@ from athena.model.provenance import ModelRunRepository
 from athena.observability.health import HealthService
 from athena.observability.logging import configure_logging
 from athena.retrieval.context import ContextBuilderService
+from athena.retrieval.evidence import MemoryEvidencePolicy
 from athena.retrieval.hybrid import HybridRetrievalService
 from athena.retrieval.ranking import RetrievalRankingService
 from athena.retrieval.search import LocalSearchService
@@ -98,11 +99,13 @@ class AthenaApplication:
             self.semantic_search,
         )
         self.context_builder = ContextBuilderService()
+        self.memory_evidence_policy = MemoryEvidencePolicy(self.database)
         self.memory_chat = MemoryAugmentedChatService(
             chat_generation=self.chat_generation,
             embedding_provider=self.embedding_provider,
             hybrid_retrieval=self.hybrid_retrieval,
             context_builder=self.context_builder,
+            evidence_policy=self.memory_evidence_policy,
         )
         self.proposal_acceptance = ProposalAcceptanceService(
             database=self.database,

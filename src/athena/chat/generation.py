@@ -6,6 +6,13 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from athena.chat.grounding import (
+    GroundingContract,
+    GroundingReport,
+    render_durable_provenance_manifest,
+    render_grounding_instructions,
+    validate_grounded_answer,
+)
 from athena.chat.models import ChatMessage, MessageType
 from athena.chat.service import ChatService
 from athena.model.domain import ModelChatMessage, ModelInfo
@@ -38,6 +45,7 @@ class ChatGenerationResult:
     user_message: ChatMessage
     assistant_message: ChatMessage
     model: ModelInfo
+    grounding_report: GroundingReport | None = None
 
 
 class ChatGenerationService:
@@ -61,19 +69,26 @@ class ChatGenerationService:
         requested_model_id: str | None = None,
         on_delta: Callable[[str], None] | None = None,
         retrieved_context: str | None = None,
+        grounding_contract: GroundingContract | None = None,
     ) -> ChatGenerationResult:
         model = self.select_model(requested_model_id)
         user_message = self.chat.add_user_message(chat_id=chat_id, content=content)
         thread = self.chat.load_chat(chat_id)
         history = tuple(self._to_model_message(message) for message in thread.messages)
+        if grounding_contract is not None and retrieved_context is None:
+            raise ValueError("Grounding requires retrieved context input.")
+
         if retrieved_context is not None:
             normalized_context = retrieved_context.strip()
             if not normalized_context:
                 raise ValueError("Retrieved context must not be blank.")
+            system_prefix = _RETRIEVED_CONTEXT_SYSTEM_PREFIX
+            if grounding_contract is not None:
+                system_prefix = render_grounding_instructions(grounding_contract)
             history = (
                 ModelChatMessage(
                     role="system",
-                    content=_RETRIEVED_CONTEXT_SYSTEM_PREFIX + normalized_context,
+                    content=system_prefix + normalized_context,
                 ),
                 *history,
             )
@@ -91,6 +106,20 @@ class ChatGenerationService:
         if not assistant_text.strip():
             raise ValueError("The model completed without returning assistant text.")
 
+        grounding_report = None
+        if grounding_contract is not None:
+            grounding_report = validate_grounded_answer(
+                assistant_text,
+                contract=grounding_contract,
+            )
+            provenance_manifest = render_durable_provenance_manifest(
+                contract=grounding_contract,
+                report=grounding_report,
+            )
+            assistant_text += provenance_manifest
+            if on_delta is not None:
+                on_delta(provenance_manifest)
+
         assistant_message = self.chat.add_assistant_message(
             chat_id=chat_id,
             content=assistant_text,
@@ -101,6 +130,7 @@ class ChatGenerationService:
             user_message=user_message,
             assistant_message=assistant_message,
             model=model,
+            grounding_report=grounding_report,
         )
 
     def select_model(self, requested_model_id: str | None = None) -> ModelInfo:

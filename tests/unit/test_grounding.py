@@ -12,18 +12,23 @@ from athena.chat.grounding import (
     render_grounding_instructions,
     validate_grounded_answer,
 )
+from athena.retrieval.evidence import EvidenceClass
 
 
-def _ref(context_id: str) -> GroundingEvidenceRef:
+def _ref(
+    context_id: str,
+    evidence_class: EvidenceClass = EvidenceClass.CANONICAL,
+) -> GroundingEvidenceRef:
     return GroundingEvidenceRef(
         context_id=context_id,
-        entity_type="knowledge",
+        entity_type="knowledge" if evidence_class is EvidenceClass.CANONICAL else "chat_message",
         entity_id=uuid.uuid4(),
         revision_id=uuid.uuid4(),
+        evidence_class=evidence_class,
     )
 
 
-def test_grounding_accepts_context_and_inference_markers() -> None:
+def test_grounding_accepts_canonical_context_and_inference_markers() -> None:
     contract = GroundingContract(
         evidence_refs=(_ref("CTX-001"), _ref("CTX-002")),
     )
@@ -35,9 +40,74 @@ def test_grounding_accepts_context_and_inference_markers() -> None:
     )
 
     assert report.cited_context_ids == ("CTX-001", "CTX-002")
+    assert report.canonical_context_ids == ("CTX-001", "CTX-002")
     assert report.uses_inference is True
     assert report.uses_model_prior is False
     assert report.uses_unknown is False
+
+
+def test_grounding_accepts_typed_user_statement_marker() -> None:
+    contract = GroundingContract(
+        evidence_refs=(_ref("CTX-001", EvidenceClass.USER_STATEMENT),)
+    )
+
+    report = validate_grounded_answer(
+        "The user previously said their car is a Volvo. "
+        "[USER-STATEMENT:CTX-001]",
+        contract=contract,
+    )
+
+    assert report.user_statement_context_ids == ("CTX-001",)
+    assert report.canonical_context_ids == ()
+
+
+def test_grounding_accepts_typed_conversation_marker() -> None:
+    contract = GroundingContract(
+        evidence_refs=(_ref("CTX-004", EvidenceClass.CONVERSATION_RECORD),)
+    )
+
+    report = validate_grounded_answer(
+        "A prior assistant message said Berlin is the capital. "
+        "[CONVERSATION:CTX-004]",
+        contract=contract,
+    )
+
+    assert report.conversation_context_ids == ("CTX-004",)
+    assert report.canonical_context_ids == ()
+
+
+def test_grounding_rejects_conversation_record_as_canonical_evidence() -> None:
+    contract = GroundingContract(
+        evidence_refs=(_ref("CTX-004", EvidenceClass.CONVERSATION_RECORD),)
+    )
+
+    with pytest.raises(GroundingViolation, match="cannot use the canonical"):
+        validate_grounded_answer(
+            "Berlin is officially the capital. [CTX-004]",
+            contract=contract,
+        )
+
+
+def test_grounding_rejects_user_statement_as_canonical_evidence() -> None:
+    contract = GroundingContract(
+        evidence_refs=(_ref("CTX-001", EvidenceClass.USER_STATEMENT),)
+    )
+
+    with pytest.raises(GroundingViolation, match="cannot use the canonical"):
+        validate_grounded_answer(
+            "The Earth is flat. [CTX-001]",
+            contract=contract,
+        )
+
+
+def test_grounding_rejects_wrong_typed_marker() -> None:
+    contract = GroundingContract(evidence_refs=(_ref("CTX-001"),))
+
+    with pytest.raises(GroundingViolation, match="not user_statement"):
+        validate_grounded_answer(
+            "The user said this. [USER-STATEMENT:CTX-001]",
+            contract=contract,
+        )
 
 
 def test_grounding_rejects_context_id_not_supplied_by_athena() -> None:
@@ -50,21 +120,8 @@ def test_grounding_rejects_context_id_not_supplied_by_athena() -> None:
         )
 
 
-def test_grounding_rejects_model_prior_by_default() -> None:
+def test_grounding_allows_model_prior_by_default() -> None:
     contract = GroundingContract(evidence_refs=(_ref("CTX-001"),))
-
-    with pytest.raises(GroundingViolation, match="model prior knowledge is disabled"):
-        validate_grounded_answer(
-            "Berlin is the official capital. [MODEL-PRIOR]",
-            contract=contract,
-        )
-
-
-def test_grounding_can_explicitly_allow_model_prior() -> None:
-    contract = GroundingContract(
-        evidence_refs=(_ref("CTX-001"),),
-        allow_model_prior=True,
-    )
 
     report = validate_grounded_answer(
         "General model knowledge says Berlin. [MODEL-PRIOR]",
@@ -73,6 +130,19 @@ def test_grounding_can_explicitly_allow_model_prior() -> None:
 
     assert report.uses_model_prior is True
     assert report.cited_context_ids == ()
+
+
+def test_grounding_can_explicitly_disable_model_prior() -> None:
+    contract = GroundingContract(
+        evidence_refs=(_ref("CTX-001"),),
+        allow_model_prior=False,
+    )
+
+    with pytest.raises(GroundingViolation, match="model prior knowledge is disabled"):
+        validate_grounded_answer(
+            "Berlin is the official capital. [MODEL-PRIOR]",
+            contract=contract,
+        )
 
 
 def test_grounding_requires_a_provenance_marker() -> None:
@@ -85,20 +155,26 @@ def test_grounding_requires_a_provenance_marker() -> None:
         )
 
 
-def test_grounding_instructions_name_only_allowed_context_ids() -> None:
+def test_grounding_instructions_explain_typed_roles_and_model_prior() -> None:
     contract = GroundingContract(
-        evidence_refs=(_ref("CTX-001"), _ref("CTX-002")),
-        allow_model_prior=False,
+        evidence_refs=(
+            _ref("CTX-001"),
+            _ref("CTX-002", EvidenceClass.USER_STATEMENT),
+            _ref("CTX-003", EvidenceClass.CONVERSATION_RECORD),
+        ),
     )
 
     rendered = render_grounding_instructions(contract)
 
-    assert "Allowed context IDs: CTX-001, CTX-002." in rendered
-    assert "[MODEL-PRIOR] is forbidden" in rendered
-    assert "Every factual sentence, bullet, or table row" in rendered
+    assert "Allowed context IDs: CTX-001, CTX-002, CTX-003." in rendered
+    assert "CTX-001=canonical" in rendered
+    assert "CTX-002=user_statement" in rendered
+    assert "CTX-003=conversation_record" in rendered
+    assert "[MODEL-PRIOR]" in rendered
+    assert "self-confirm an earlier model answer" in rendered
 
 
-def test_durable_manifest_maps_ctx_to_stable_entity_and_revision() -> None:
+def test_durable_manifest_maps_ctx_to_stable_entity_revision_and_class() -> None:
     evidence = _ref("CTX-001")
     contract = GroundingContract(evidence_refs=(evidence,))
     report = validate_grounded_answer(
@@ -112,7 +188,9 @@ def test_durable_manifest_maps_ctx_to_stable_entity_and_revision() -> None:
     )
 
     assert manifest.startswith("\n\nATHENA_PROVENANCE ")
+    assert '"athena_provenance_version":2' in manifest
     assert '"context_id":"CTX-001"' in manifest
+    assert '"evidence_class":"canonical"' in manifest
     assert f'"entity_id":"{evidence.entity_id}"' in manifest
     assert f'"revision_id":"{evidence.revision_id}"' in manifest
 

@@ -137,6 +137,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=8,
         help="Maximum retrieved memory items (1-100).",
     )
+    model_prior_group = send_parser.add_mutually_exclusive_group()
+    model_prior_group.add_argument(
+        "--memory-allow-model-prior",
+        dest="memory_allow_model_prior",
+        action="store_true",
+        default=None,
+        help=(
+            "Explicitly allow labeled [MODEL-PRIOR] facts in grounded memory "
+            "answers. This is the default for memory chat."
+        ),
+    )
+    model_prior_group.add_argument(
+        "--memory-no-model-prior",
+        dest="memory_allow_model_prior",
+        action="store_false",
+        help=(
+            "Disable Primary Model prior knowledge for this memory answer; "
+            "retrieved evidence and [UNKNOWN] remain available."
+        ),
+    )
 
     show_parser = chat_commands.add_parser("show", help="Load and print a persistent chat.")
     show_parser.add_argument("chat_id", type=_uuid_argument)
@@ -560,6 +580,12 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
+        if not args.memory and args.memory_allow_model_prior is not None:
+            print(
+                "ATHENA chat error: memory model-prior options require --memory.",
+                file=sys.stderr,
+            )
+            return 2
 
         print("Assistant: ", end="", flush=True)
         try:
@@ -571,6 +597,11 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
                     requested_embedding_model_id=args.embedding_model_id,
                     max_context_tokens=args.memory_max_tokens,
                     max_context_items=args.memory_max_items,
+                    allow_model_prior=(
+                        True
+                        if args.memory_allow_model_prior is None
+                        else args.memory_allow_model_prior
+                    ),
                     on_delta=lambda chunk: print(chunk, end="", flush=True),
                 )
                 result = memory_result.generation
@@ -606,6 +637,28 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
                     item.context_id for item in memory_result.context.items
                 )
                 print(f"Memory context IDs: {ids}")
+            evidence_counts = ", ".join(
+                f"{evidence_class.value}:{count}"
+                for evidence_class, count in memory_result.evidence_selection.counts
+            ) or "<none>"
+            print(
+                "Memory evidence: "
+                f"policy={memory_result.evidence_selection.policy_id} "
+                f"classes={evidence_counts}"
+            )
+            grounding = result.grounding_report
+            if grounding is not None:
+                cited = ", ".join(grounding.cited_context_ids) or "<none>"
+                print(
+                    "Grounding: "
+                    f"cited={cited} "
+                    f"canonical={len(grounding.canonical_context_ids)} "
+                    f"user_statements={len(grounding.user_statement_context_ids)} "
+                    f"conversation={len(grounding.conversation_context_ids)} "
+                    f"inference={grounding.uses_inference} "
+                    f"model_prior={grounding.uses_model_prior} "
+                    f"unknown={grounding.uses_unknown}"
+                )
         print(f"Assistant message saved: {result.assistant_message.message_id}")
         return 0
 

@@ -4,10 +4,16 @@ import uuid
 from collections.abc import Callable
 
 from athena.chat.generation import ChatGenerationResult
+from athena.chat.grounding import GroundingContract
 from athena.chat.memory import MemoryAugmentedChatService
 from athena.chat.models import ChatMessage, MessageType
 from athena.model.domain import ModelInfo
 from athena.retrieval.context import ContextBuilderService
+from athena.retrieval.evidence import (
+    EvidenceClass,
+    MemoryEvidenceClassification,
+    MemoryEvidenceSelection,
+)
 from athena.retrieval.hybrid import HybridSearchResult
 from athena.retrieval.search import SearchEntityType
 
@@ -30,22 +36,42 @@ class FakeEmbeddingProvider:
 class FakeHybrid:
     def __init__(self) -> None:
         self.queries: list[str] = []
+        self.result = HybridSearchResult(
+            entity_id=uuid.uuid4(),
+            revision_id=uuid.uuid4(),
+            entity_type=SearchEntityType.KNOWLEDGE,
+            title="Stored fact",
+            text="Berlin ist die Hauptstadt von Deutschland.",
+            score=0.95,
+            lexical_score=0.8,
+            semantic_score=1.0,
+            authority_score=1.0,
+            contradiction_count=1,
+            duplicate_count=2,
+        )
 
     def search(self, query: str, *, model_id: str, limit: int):
         self.queries.append(query)
-        return (
-            HybridSearchResult(
-                entity_id=uuid.uuid4(),
-                revision_id=uuid.uuid4(),
-                entity_type=SearchEntityType.KNOWLEDGE,
-                title="Stored fact",
-                text="Berlin ist die Hauptstadt von Deutschland.",
-                score=0.95,
-                lexical_score=0.8,
-                semantic_score=1.0,
-                authority_score=1.0,
-                contradiction_count=1,
-                duplicate_count=2,
+        return (self.result,)
+
+
+class FakeEvidencePolicy:
+    def classify(
+        self,
+        results: tuple[HybridSearchResult, ...],
+    ) -> MemoryEvidenceSelection:
+        return MemoryEvidenceSelection(
+            policy_id="typed-provenance-v1",
+            results=results,
+            classifications=tuple(
+                MemoryEvidenceClassification(
+                    entity_id=item.entity_id,
+                    revision_id=item.revision_id,
+                    entity_type=item.entity_type,
+                    evidence_class=EvidenceClass.CANONICAL,
+                    message_type=None,
+                )
+                for item in results
             ),
         )
 
@@ -62,6 +88,7 @@ class FakeChatGeneration:
         requested_model_id: str | None = None,
         on_delta: Callable[[str], None] | None = None,
         retrieved_context: str | None = None,
+        grounding_contract: GroundingContract | None = None,
     ) -> ChatGenerationResult:
         self.calls.append(
             {
@@ -69,6 +96,7 @@ class FakeChatGeneration:
                 "content": content,
                 "requested_model_id": requested_model_id,
                 "retrieved_context": retrieved_context,
+                "grounding_contract": grounding_contract,
             }
         )
         user = ChatMessage(
@@ -111,15 +139,20 @@ class FakeChatGeneration:
         )
 
 
-def test_memory_chat_retrieves_and_passes_bounded_ephemeral_context() -> None:
-    generation = FakeChatGeneration()
-    hybrid = FakeHybrid()
-    service = MemoryAugmentedChatService(
+def _service(generation: FakeChatGeneration, hybrid: FakeHybrid):
+    return MemoryAugmentedChatService(
         chat_generation=generation,  # type: ignore[arg-type]
         embedding_provider=FakeEmbeddingProvider(),  # type: ignore[arg-type]
         hybrid_retrieval=hybrid,  # type: ignore[arg-type]
         context_builder=ContextBuilderService(),
+        evidence_policy=FakeEvidencePolicy(),  # type: ignore[arg-type]
     )
+
+
+def test_memory_chat_retrieves_and_passes_typed_bounded_ephemeral_context() -> None:
+    generation = FakeChatGeneration()
+    hybrid = FakeHybrid()
+    service = _service(generation, hybrid)
 
     result = service.send_message(
         chat_id=uuid.uuid4(),
@@ -132,12 +165,37 @@ def test_memory_chat_retrieves_and_passes_bounded_ephemeral_context() -> None:
 
     assert hybrid.queries == ["Was ist die Hauptstadt Deutschlands?"]
     assert result.embedding_model.backend_model_id == "embed"
+    assert result.evidence_selection.policy_id == "typed-provenance-v1"
     assert len(result.context.items) == 1
     passed_context = generation.calls[0]["retrieved_context"]
     assert isinstance(passed_context, str)
     assert '"entity_id"' in passed_context
     assert '"contradiction_count": 1' in passed_context
     assert "Berlin ist die Hauptstadt von Deutschland." in passed_context
+    contract = generation.calls[0]["grounding_contract"]
+    assert isinstance(contract, GroundingContract)
+    assert contract.allowed_context_ids == ("CTX-001",)
+    assert contract.evidence_refs[0].entity_type == "knowledge"
+    assert contract.evidence_refs[0].evidence_class is EvidenceClass.CANONICAL
+    assert contract.evidence_refs[0].entity_id == result.context.items[0].entity_id
+    assert contract.evidence_refs[0].revision_id == result.context.items[0].revision_id
+    assert contract.allow_model_prior is True
+
+
+def test_memory_chat_can_explicitly_disable_model_prior() -> None:
+    generation = FakeChatGeneration()
+    hybrid = FakeHybrid()
+    service = _service(generation, hybrid)
+
+    service.send_message(
+        chat_id=uuid.uuid4(),
+        content="test",
+        allow_model_prior=False,
+    )
+
+    contract = generation.calls[0]["grounding_contract"]
+    assert isinstance(contract, GroundingContract)
+    assert contract.allow_model_prior is False
 
 
 def test_memory_chat_rejects_invalid_budget_before_retrieval() -> None:
@@ -145,12 +203,7 @@ def test_memory_chat_rejects_invalid_budget_before_retrieval() -> None:
 
     generation = FakeChatGeneration()
     hybrid = FakeHybrid()
-    service = MemoryAugmentedChatService(
-        chat_generation=generation,  # type: ignore[arg-type]
-        embedding_provider=FakeEmbeddingProvider(),  # type: ignore[arg-type]
-        hybrid_retrieval=hybrid,  # type: ignore[arg-type]
-        context_builder=ContextBuilderService(),
-    )
+    service = _service(generation, hybrid)
 
     with pytest.raises(ValueError, match="Context token budget"):
         service.send_message(
