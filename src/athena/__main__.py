@@ -620,6 +620,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Build retained DOCX text plus a stable technical structure map.",
     )
     source_represent_docx.add_argument("source_id", type=_uuid_argument)
+    source_represent_html = source_commands.add_parser(
+        "represent-html",
+        help="Build cleaned retained HTML text plus a stable DOM-derived structure map.",
+    )
+    source_represent_html.add_argument("source_id", type=_uuid_argument)
     source_representation_show = source_commands.add_parser(
         "representation-show",
         help="Show one immutable SourceRepresentation and its BlobRecord.",
@@ -653,7 +658,7 @@ def build_parser() -> argparse.ArgumentParser:
     source_representation_pages.add_argument("representation_id", type=_uuid_argument)
     source_representation_structures = source_commands.add_parser(
         "representation-structures",
-        help="List retained DOCX paragraph/heading/list/table structure.",
+        help="List retained document structure for DOCX/HTML SourceRepresentations.",
     )
     source_representation_structures.add_argument("representation_id", type=_uuid_argument)
     source_chunk_text = source_commands.add_parser(
@@ -1928,6 +1933,24 @@ def _run_source_command(app: AthenaApplication, args: argparse.Namespace) -> int
         print(f"Parser: {representation.parser_id}@{representation.parser_version}")
         print(f"Structures: {len(docx_build.structures)}")
         print(f"Blob: {blob.blob_id} reused={'yes' if docx_build.result.reused_blob else 'no'}")
+        print(f"Bytes: {blob.byte_length}")
+        print(f"SHA-256: {representation.content_hash.hex()}")
+        print(f"Storage: {blob.storage_area.value}:{blob.storage_locator}")
+        return 0
+
+    if args.source_command == "represent-html":
+        html_build = app.source_html.build(args.source_id)
+        representation = html_build.result.representation
+        blob = html_build.result.blob
+        print(f"Representation created: {representation.representation_id}")
+        print(f"Source: {representation.source_id}")
+        print(f"Type: {representation.representation_type.value}")
+        print(f"Retention: {representation.retention_state.value}")
+        print(f"ProcessingRun: {html_build.processing_run.processing_run_id}")
+        print(f"Run status: {html_build.processing_run.status}")
+        print(f"Parser: {representation.parser_id}@{representation.parser_version}")
+        print(f"Structures: {len(html_build.structures)}")
+        print(f"Blob: {blob.blob_id} reused={'yes' if html_build.result.reused_blob else 'no'}")
         print(f"Bytes: {blob.byte_length}")
         print(f"SHA-256: {representation.content_hash.hex()}")
         print(f"Storage: {blob.storage_area.value}:{blob.storage_locator}")

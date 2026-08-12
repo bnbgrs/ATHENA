@@ -12,6 +12,7 @@ from athena.jobs.repository import JobLeaseError, JobTransitionError
 from athena.jobs.service import DurableJobService
 from athena.source.chunking_service import SourceChunkBuildResult, SourceChunkingService
 from athena.source.docx_representation_service import SourceDocxRepresentationService
+from athena.source.html_representation_service import SourceHtmlRepresentationService
 from athena.source.models import (
     RepresentationRetentionState,
     SourceRepresentationRecord,
@@ -76,6 +77,7 @@ class DurableSourceProcessingWorker:
         source_text: SourceTextRepresentationService,
         source_pdf: SourcePdfRepresentationService,
         source_docx: SourceDocxRepresentationService,
+        source_html: SourceHtmlRepresentationService,
         source_chunks: SourceChunkingService,
     ) -> None:
         self.jobs = jobs
@@ -83,6 +85,7 @@ class DurableSourceProcessingWorker:
         self.source_text = source_text
         self.source_pdf = source_pdf
         self.source_docx = source_docx
+        self.source_html = source_html
         self.source_chunks = source_chunks
 
     def enqueue(
@@ -102,6 +105,7 @@ class DurableSourceProcessingWorker:
                 "text_parser": f"{_TEXT_PARSER_ID}@{_TEXT_PARSER_VERSION}",
                 "pdf_parser": self.source_pdf.parser_signature,
                 "docx_parser": self.source_docx.parser_signature,
+                "html_parser": self.source_html.parser_signature,
                 "chunking_profile": "default",
                 "embedding_policy": "deferred",
             },
@@ -258,10 +262,12 @@ class DurableSourceProcessingWorker:
         source, _blob = self.sources.get(cursor.source_id)
         is_pdf = self.source_pdf.supports(source)
         is_docx = self.source_docx.supports(source)
+        is_html = self.source_html.supports(source)
         representation = self._compatible_representation(
             cursor.source_id,
             is_pdf=is_pdf,
             is_docx=is_docx,
+            is_html=is_html,
         )
         reused_representation = representation is not None
         if representation is None:
@@ -271,6 +277,9 @@ class DurableSourceProcessingWorker:
             elif is_docx:
                 built_docx = self.source_docx.build(cursor.source_id)
                 representation = built_docx.result.representation
+            elif is_html:
+                built_html = self.source_html.build(cursor.source_id)
+                representation = built_html.result.representation
             else:
                 built_text = self.source_text.build(cursor.source_id)
                 representation = built_text.result.representation
@@ -279,6 +288,8 @@ class DurableSourceProcessingWorker:
             self.source_pdf.verify_page_map(representation.representation_id)
         if is_docx:
             self.source_docx.verify_structure_map(representation.representation_id)
+        if is_html:
+            self.source_html.verify_structure_map(representation.representation_id)
         checkpoint = self.jobs.checkpoint(
             job_id,
             lease_token=lease_token,
@@ -502,11 +513,15 @@ class DurableSourceProcessingWorker:
             **legacy_expected,
             "pdf_parser": self.source_pdf.parser_signature,
         }
-        current_expected = {
+        docx_expected = {
             **pdf_expected,
             "docx_parser": self.source_docx.parser_signature,
         }
-        if config not in (legacy_expected, pdf_expected, current_expected):
+        current_expected = {
+            **docx_expected,
+            "html_parser": self.source_html.parser_signature,
+        }
+        if config not in (legacy_expected, pdf_expected, docx_expected, current_expected):
             raise SourceProcessingJobError(
                 "source.process pinned configuration is missing or incompatible."
             )
@@ -516,9 +531,13 @@ class DurableSourceProcessingWorker:
             raise SourceProcessingJobError(
                 "Legacy source.process job did not pin a PDF parser and cannot process PDFs."
             )
-        if self.source_docx.supports(source) and config != current_expected:
+        if self.source_docx.supports(source) and config not in (docx_expected, current_expected):
             raise SourceProcessingJobError(
                 "Legacy source.process job did not pin a DOCX parser and cannot process DOCX."
+            )
+        if self.source_html.supports(source) and config != current_expected:
+            raise SourceProcessingJobError(
+                "Legacy source.process job did not pin an HTML parser and cannot process HTML."
             )
         self._source_id_from_scope(job)
 
@@ -536,10 +555,10 @@ class DurableSourceProcessingWorker:
             ) from exc
 
     def _compatible_representation(
-        self, source_id: uuid.UUID, *, is_pdf: bool, is_docx: bool
+        self, source_id: uuid.UUID, *, is_pdf: bool, is_docx: bool, is_html: bool
     ) -> SourceRepresentationRecord | None:
-        if is_pdf and is_docx:
-            raise SourceProcessingJobError("Source cannot be both PDF and DOCX.")
+        if sum((is_pdf, is_docx, is_html)) > 1:
+            raise SourceProcessingJobError("Source format detection is ambiguous.")
         if is_pdf:
             expected_type = SourceRepresentationType.EXTRACTED_TEXT
             expected_parser_id = self.source_pdf.parser_id
@@ -550,6 +569,11 @@ class DurableSourceProcessingWorker:
             expected_parser_id = self.source_docx.parser_id
             expected_parser_version = self.source_docx.parser_version
             expected_options = self.source_docx.parser_options
+        elif is_html:
+            expected_type = SourceRepresentationType.NORMALIZED_TEXT
+            expected_parser_id = self.source_html.parser_id
+            expected_parser_version = self.source_html.parser_version
+            expected_options = self.source_html.parser_options
         else:
             expected_type = SourceRepresentationType.NORMALIZED_TEXT
             expected_parser_id = _TEXT_PARSER_ID
@@ -578,6 +602,8 @@ class DurableSourceProcessingWorker:
                 self.source_pdf.verify_page_map(representation.representation_id)
             if is_docx:
                 self.source_docx.verify_structure_map(representation.representation_id)
+            if is_html:
+                self.source_html.verify_structure_map(representation.representation_id)
             return representation
         return None
 
@@ -600,6 +626,8 @@ class DurableSourceProcessingWorker:
             self.source_pdf.verify_page_map(representation_id)
         if representation.parser_id == self.source_docx.parser_id:
             self.source_docx.verify_structure_map(representation_id)
+        if representation.parser_id == self.source_html.parser_id:
+            self.source_html.verify_structure_map(representation_id)
         return text
 
     @staticmethod

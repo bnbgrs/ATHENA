@@ -64,9 +64,10 @@ class SourceChunkingService:
             )
         path = self.source_text.verify(representation_id)
         structures = self.source_text.list_structures(representation_id)
-        if representation.parser_id == "athena.native_docx" and not structures:
+        if representation.parser_id in {"athena.native_docx", "athena.native_html"} and not structures:
+            format_name = "DOCX" if representation.parser_id == "athena.native_docx" else "HTML"
             raise SourceChunkIntegrityError(
-                "Native DOCX representation is missing its retained structure map."
+                f"Native {format_name} representation is missing its retained structure map."
             )
         profile = (
             self.profiles.get_or_create_document_default()

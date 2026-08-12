@@ -50,6 +50,8 @@ from athena.source.chunking_repository import ChunkingProfileRepository
 from athena.source.chunking_service import SourceChunkingService
 from athena.source.docx_representation_service import SourceDocxRepresentationService
 from athena.source.docx_representation_store import DocxNativeTextRepresentationStore
+from athena.source.html_representation_service import SourceHtmlRepresentationService
+from athena.source.html_representation_store import HtmlNativeTextRepresentationStore
 from athena.source.pdf_representation_service import SourcePdfRepresentationService
 from athena.source.pdf_representation_store import PdfNativeTextRepresentationStore
 from athena.source.repository import SourceRepository
@@ -100,6 +102,7 @@ class AthenaApplication:
         self.text_representation_store = TextRepresentationStore(self.paths)
         self.pdf_representation_store = PdfNativeTextRepresentationStore(self.paths)
         self.docx_representation_store = DocxNativeTextRepresentationStore(self.paths)
+        self.html_representation_store = HtmlNativeTextRepresentationStore(self.paths)
         self.sources = SourceCaptureService(
             repository=self.source_repository,
             blob_store=self.blob_store,
@@ -141,6 +144,14 @@ class AthenaApplication:
             representations=self.source_representation_repository,
             blob_store=self.blob_store,
             representation_store=self.docx_representation_store,
+            runs=self.model_runs,
+            chat=self.chat,
+        )
+        self.source_html = SourceHtmlRepresentationService(
+            sources=self.source_repository,
+            representations=self.source_representation_repository,
+            blob_store=self.blob_store,
+            representation_store=self.html_representation_store,
             runs=self.model_runs,
             chat=self.chat,
         )
@@ -186,6 +197,7 @@ class AthenaApplication:
             source_text=self.source_text,
             source_pdf=self.source_pdf,
             source_docx=self.source_docx,
+            source_html=self.source_html,
             source_chunks=self.source_chunks,
         )
         self.embedding_rebuild = DurableEmbeddingRebuildWorker(
