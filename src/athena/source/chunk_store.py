@@ -10,9 +10,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from athena.common.ids import uuid_from_blob, uuid_to_blob
+from athena.common.time import utc_now_us
 
 _DERIVED_APPLICATION_ID = 1_096_042_564  # ASCII-ish ATHD
-_DERIVED_SCHEMA_VERSION = 1
+_DERIVED_SCHEMA_VERSION = 2
 
 
 class SourceChunkNotFoundError(LookupError):
@@ -60,9 +61,18 @@ class SourceChunkStore:
         chunks: tuple[SourceChunkRecord, ...],
     ) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as connection:
+        with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                representation_hex = representation_id.hex
+                profile_hex = chunking_profile_id.hex
+                connection.execute(
+                    """
+                    DELETE FROM fts_archive
+                    WHERE representation_id = ? AND chunking_profile_id = ?
+                    """,
+                    (representation_hex, profile_hex),
+                )
                 connection.execute(
                     """
                     DELETE FROM source_chunks
@@ -119,6 +129,40 @@ class SourceChunkStore:
                         for chunk in chunks
                     ),
                 )
+                connection.executemany(
+                    """
+                    INSERT INTO fts_archive (
+                        chunk_id, source_id, representation_id, chunk_index,
+                        chunking_profile_id, start_anchor_value, end_anchor_value,
+                        content_hash, build_signature, body
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        (
+                            chunk.chunk_id.hex,
+                            chunk.source_id.hex,
+                            chunk.representation_id.hex,
+                            str(chunk.chunk_index),
+                            chunk.chunking_profile_id.hex,
+                            str(chunk.start_anchor_value),
+                            str(chunk.end_anchor_value),
+                            chunk.content_hash.hex(),
+                            chunk.build_signature.hex(),
+                            chunk.chunk_text,
+                        )
+                        for chunk in chunks
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE archive_search_state
+                    SET chunk_generation = chunk_generation + 1,
+                        fts_generation = chunk_generation + 1,
+                        updated_at_us = ?
+                    WHERE singleton_id = 1
+                    """,
+                    (utc_now_us(),),
+                )
                 connection.execute("COMMIT")
             except BaseException:
                 if connection.in_transaction:
@@ -126,7 +170,7 @@ class SourceChunkStore:
                 raise
 
     def get(self, chunk_id: uuid.UUID) -> SourceChunkRecord:
-        with self._connect() as connection:
+        with self.connect() as connection:
             row = connection.execute(
                 "SELECT * FROM source_chunks WHERE chunk_id = ?",
                 (uuid_to_blob(chunk_id),),
@@ -143,7 +187,7 @@ class SourceChunkStore:
     ) -> tuple[SourceChunkRecord, ...]:
         if not 1 <= limit <= 5000:
             raise ValueError("Chunk list limit must be between 1 and 5000.")
-        with self._connect() as connection:
+        with self.connect() as connection:
             rows = connection.execute(
                 """
                 SELECT * FROM source_chunks
@@ -156,15 +200,76 @@ class SourceChunkStore:
         return tuple(_chunk_from_row(row) for row in rows)
 
     def count_for_representation(self, representation_id: uuid.UUID) -> int:
-        with self._connect() as connection:
+        with self.connect() as connection:
             row = connection.execute(
                 "SELECT count(*) AS n FROM source_chunks WHERE representation_id = ?",
                 (uuid_to_blob(representation_id),),
             ).fetchone()
         return int(row["n"]) if row is not None else 0
 
+    def current_generation(self) -> int:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT chunk_generation
+                FROM archive_search_state
+                WHERE singleton_id = 1
+                """
+            ).fetchone()
+        if row is None:
+            raise SourceChunkStoreError("Derived archive search state is missing.")
+        return int(row["chunk_generation"])
+
+    def rebuild_archive_fts(self) -> int:
+        """Reconstruct archive FTS from current SourceChunks without changing chunks."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute("DELETE FROM fts_archive")
+                connection.execute(
+                    """
+                    INSERT INTO fts_archive (
+                        chunk_id, source_id, representation_id, chunk_index,
+                        chunking_profile_id, start_anchor_value, end_anchor_value,
+                        content_hash, build_signature, body
+                    )
+                    SELECT
+                        lower(hex(chunk_id)), lower(hex(source_id)),
+                        lower(hex(representation_id)), CAST(chunk_index AS TEXT),
+                        lower(hex(chunking_profile_id)),
+                        CAST(start_anchor_value AS TEXT),
+                        CAST(end_anchor_value AS TEXT),
+                        lower(hex(content_hash)), lower(hex(build_signature)), chunk_text
+                    FROM source_chunks
+                    ORDER BY representation_id, chunking_profile_id, chunk_index, chunk_id
+                    """
+                )
+                connection.execute(
+                    """
+                    UPDATE archive_search_state
+                    SET fts_generation = chunk_generation,
+                        updated_at_us = ?
+                    WHERE singleton_id = 1
+                    """,
+                    (utc_now_us(),),
+                )
+                row = connection.execute(
+                    "SELECT count(*) AS n FROM fts_archive"
+                ).fetchone()
+                connection.execute("COMMIT")
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+        if row is None:
+            raise SourceChunkStoreError("Archive FTS row count failed.")
+        return int(row["n"])
+
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        """Open the reconstructible search store with schema validation."""
         connection = sqlite3.connect(self.path, timeout=5.0, autocommit=True)
         connection.row_factory = sqlite3.Row
         try:
@@ -190,7 +295,7 @@ def _initialize(connection: sqlite3.Connection) -> None:
         raise SourceChunkStoreError(
             "Refusing to adopt a non-empty derived search.db without ATHENA application_id."
         )
-    if user_version not in {0, _DERIVED_SCHEMA_VERSION}:
+    if user_version not in {0, 1, _DERIVED_SCHEMA_VERSION}:
         raise SourceChunkStoreError("Derived search.db schema version is unsupported.")
 
     connection.execute("PRAGMA journal_mode = WAL")
@@ -198,42 +303,156 @@ def _initialize(connection: sqlite3.Connection) -> None:
     connection.execute("PRAGMA busy_timeout = 5000")
 
     if user_version == 0:
-        connection.executescript(
-            f"""
-            BEGIN IMMEDIATE;
-            PRAGMA application_id = {_DERIVED_APPLICATION_ID};
-            CREATE TABLE source_chunk_builds (
-                representation_id BLOB(16) NOT NULL CHECK(length(representation_id) = 16),
-                chunking_profile_id BLOB(16) NOT NULL CHECK(length(chunking_profile_id) = 16),
-                build_signature BLOB(32) NOT NULL CHECK(length(build_signature) = 32),
-                processing_run_id BLOB(16) NOT NULL CHECK(length(processing_run_id) = 16),
-                created_at_us INTEGER NOT NULL,
-                PRIMARY KEY(representation_id, chunking_profile_id)
-            ) WITHOUT ROWID;
-            CREATE TABLE source_chunks (
-                chunk_id BLOB(16) PRIMARY KEY CHECK(length(chunk_id) = 16),
-                source_id BLOB(16) NOT NULL CHECK(length(source_id) = 16),
-                representation_id BLOB(16) NOT NULL CHECK(length(representation_id) = 16),
-                chunk_index INTEGER NOT NULL CHECK(chunk_index >= 0),
-                chunking_profile_id BLOB(16) NOT NULL CHECK(length(chunking_profile_id) = 16),
-                anchor_id BLOB(16) NULL CHECK(anchor_id IS NULL OR length(anchor_id) = 16),
-                start_anchor_value INTEGER NOT NULL CHECK(start_anchor_value >= 0),
-                end_anchor_value INTEGER NOT NULL CHECK(end_anchor_value >= start_anchor_value),
-                content_hash BLOB(32) NOT NULL CHECK(length(content_hash) = 32),
-                processing_run_id BLOB(16) NOT NULL CHECK(length(processing_run_id) = 16),
-                build_signature BLOB(32) NOT NULL CHECK(length(build_signature) = 32),
-                chunk_text TEXT NOT NULL,
-                created_at_us INTEGER NOT NULL,
-                UNIQUE(representation_id, chunking_profile_id, chunk_index)
-            ) WITHOUT ROWID;
-            CREATE INDEX idx_source_chunks_representation
-                ON source_chunks(representation_id, chunk_index);
-            CREATE INDEX idx_source_chunks_source
-                ON source_chunks(source_id, representation_id);
-            PRAGMA user_version = {_DERIVED_SCHEMA_VERSION};
-            COMMIT;
-            """
+        _create_schema_v2(connection)
+    elif user_version == 1:
+        _migrate_v1_to_v2(connection)
+
+
+def _create_schema_v2(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        f"""
+        BEGIN IMMEDIATE;
+        PRAGMA application_id = {_DERIVED_APPLICATION_ID};
+        CREATE TABLE source_chunk_builds (
+            representation_id BLOB(16) NOT NULL CHECK(length(representation_id) = 16),
+            chunking_profile_id BLOB(16) NOT NULL CHECK(length(chunking_profile_id) = 16),
+            build_signature BLOB(32) NOT NULL CHECK(length(build_signature) = 32),
+            processing_run_id BLOB(16) NOT NULL CHECK(length(processing_run_id) = 16),
+            created_at_us INTEGER NOT NULL,
+            PRIMARY KEY(representation_id, chunking_profile_id)
+        ) WITHOUT ROWID;
+        CREATE TABLE source_chunks (
+            chunk_id BLOB(16) PRIMARY KEY CHECK(length(chunk_id) = 16),
+            source_id BLOB(16) NOT NULL CHECK(length(source_id) = 16),
+            representation_id BLOB(16) NOT NULL CHECK(length(representation_id) = 16),
+            chunk_index INTEGER NOT NULL CHECK(chunk_index >= 0),
+            chunking_profile_id BLOB(16) NOT NULL CHECK(length(chunking_profile_id) = 16),
+            anchor_id BLOB(16) NULL CHECK(anchor_id IS NULL OR length(anchor_id) = 16),
+            start_anchor_value INTEGER NOT NULL CHECK(start_anchor_value >= 0),
+            end_anchor_value INTEGER NOT NULL CHECK(end_anchor_value >= start_anchor_value),
+            content_hash BLOB(32) NOT NULL CHECK(length(content_hash) = 32),
+            processing_run_id BLOB(16) NOT NULL CHECK(length(processing_run_id) = 16),
+            build_signature BLOB(32) NOT NULL CHECK(length(build_signature) = 32),
+            chunk_text TEXT NOT NULL,
+            created_at_us INTEGER NOT NULL,
+            UNIQUE(representation_id, chunking_profile_id, chunk_index)
+        ) WITHOUT ROWID;
+        CREATE INDEX idx_source_chunks_representation
+            ON source_chunks(representation_id, chunk_index);
+        CREATE INDEX idx_source_chunks_source
+            ON source_chunks(source_id, representation_id);
+        CREATE VIRTUAL TABLE fts_archive USING fts5(
+            chunk_id UNINDEXED,
+            source_id UNINDEXED,
+            representation_id UNINDEXED,
+            chunk_index UNINDEXED,
+            chunking_profile_id UNINDEXED,
+            start_anchor_value UNINDEXED,
+            end_anchor_value UNINDEXED,
+            content_hash UNINDEXED,
+            build_signature UNINDEXED,
+            body,
+            tokenize = 'unicode61 remove_diacritics 2'
+        );
+        CREATE TABLE archive_search_state (
+            singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+            chunk_generation INTEGER NOT NULL CHECK(chunk_generation >= 0),
+            fts_generation INTEGER NOT NULL CHECK(fts_generation >= 0),
+            updated_at_us INTEGER NOT NULL
+        );
+        INSERT INTO archive_search_state (
+            singleton_id, chunk_generation, fts_generation, updated_at_us
+        ) VALUES (1, 0, 0, 0);
+        CREATE TABLE archive_embeddings (
+            chunk_id BLOB(16) NOT NULL CHECK(length(chunk_id) = 16),
+            model_id TEXT NOT NULL,
+            indexed_chunk_generation INTEGER NOT NULL CHECK(indexed_chunk_generation >= 0),
+            dimensions INTEGER NOT NULL CHECK(dimensions > 0),
+            vector_blob BLOB NOT NULL,
+            text_sha256 BLOB(32) NOT NULL CHECK(length(text_sha256) = 32),
+            created_at_us INTEGER NOT NULL,
+            PRIMARY KEY(chunk_id, model_id, indexed_chunk_generation)
+        ) WITHOUT ROWID;
+        CREATE INDEX idx_archive_embeddings_model_generation
+            ON archive_embeddings(model_id, indexed_chunk_generation);
+        CREATE TABLE archive_embedding_state (
+            model_id TEXT PRIMARY KEY,
+            indexed_chunk_generation INTEGER NOT NULL CHECK(indexed_chunk_generation >= 0),
+            dimensions INTEGER NOT NULL CHECK(dimensions > 0),
+            document_count INTEGER NOT NULL CHECK(document_count >= 0),
+            rebuilt_at_us INTEGER NOT NULL
+        ) WITHOUT ROWID;
+        PRAGMA user_version = {_DERIVED_SCHEMA_VERSION};
+        COMMIT;
+        """
+    )
+
+
+def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        f"""
+        BEGIN IMMEDIATE;
+        CREATE VIRTUAL TABLE fts_archive USING fts5(
+            chunk_id UNINDEXED,
+            source_id UNINDEXED,
+            representation_id UNINDEXED,
+            chunk_index UNINDEXED,
+            chunking_profile_id UNINDEXED,
+            start_anchor_value UNINDEXED,
+            end_anchor_value UNINDEXED,
+            content_hash UNINDEXED,
+            build_signature UNINDEXED,
+            body,
+            tokenize = 'unicode61 remove_diacritics 2'
+        );
+        INSERT INTO fts_archive (
+            chunk_id, source_id, representation_id, chunk_index,
+            chunking_profile_id, start_anchor_value, end_anchor_value,
+            content_hash, build_signature, body
         )
+        SELECT
+            lower(hex(chunk_id)), lower(hex(source_id)), lower(hex(representation_id)),
+            CAST(chunk_index AS TEXT), lower(hex(chunking_profile_id)),
+            CAST(start_anchor_value AS TEXT), CAST(end_anchor_value AS TEXT),
+            lower(hex(content_hash)), lower(hex(build_signature)), chunk_text
+        FROM source_chunks
+        ORDER BY representation_id, chunking_profile_id, chunk_index, chunk_id;
+        CREATE TABLE archive_search_state (
+            singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+            chunk_generation INTEGER NOT NULL CHECK(chunk_generation >= 0),
+            fts_generation INTEGER NOT NULL CHECK(fts_generation >= 0),
+            updated_at_us INTEGER NOT NULL
+        );
+        INSERT INTO archive_search_state (
+            singleton_id, chunk_generation, fts_generation, updated_at_us
+        )
+        SELECT 1,
+               CASE WHEN EXISTS(SELECT 1 FROM source_chunks) THEN 1 ELSE 0 END,
+               CASE WHEN EXISTS(SELECT 1 FROM source_chunks) THEN 1 ELSE 0 END,
+               0;
+        CREATE TABLE archive_embeddings (
+            chunk_id BLOB(16) NOT NULL CHECK(length(chunk_id) = 16),
+            model_id TEXT NOT NULL,
+            indexed_chunk_generation INTEGER NOT NULL CHECK(indexed_chunk_generation >= 0),
+            dimensions INTEGER NOT NULL CHECK(dimensions > 0),
+            vector_blob BLOB NOT NULL,
+            text_sha256 BLOB(32) NOT NULL CHECK(length(text_sha256) = 32),
+            created_at_us INTEGER NOT NULL,
+            PRIMARY KEY(chunk_id, model_id, indexed_chunk_generation)
+        ) WITHOUT ROWID;
+        CREATE INDEX idx_archive_embeddings_model_generation
+            ON archive_embeddings(model_id, indexed_chunk_generation);
+        CREATE TABLE archive_embedding_state (
+            model_id TEXT PRIMARY KEY,
+            indexed_chunk_generation INTEGER NOT NULL CHECK(indexed_chunk_generation >= 0),
+            dimensions INTEGER NOT NULL CHECK(dimensions > 0),
+            document_count INTEGER NOT NULL CHECK(document_count >= 0),
+            rebuilt_at_us INTEGER NOT NULL
+        ) WITHOUT ROWID;
+        PRAGMA user_version = {_DERIVED_SCHEMA_VERSION};
+        COMMIT;
+        """
+    )
 
 
 def _chunk_from_row(row: sqlite3.Row) -> SourceChunkRecord:

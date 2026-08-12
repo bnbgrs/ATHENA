@@ -36,6 +36,7 @@ from athena.knowledge.service import (
     UnsupportedKnowledgeSourceError,
 )
 from athena.model.adapters.lm_studio import ModelProviderError
+from athena.retrieval.archive import ArchiveSearchError
 from athena.retrieval.context import ContextBuilderError
 from athena.retrieval.search import SearchEntityType, SearchError
 from athena.retrieval.semantic import SemanticSearchError
@@ -565,6 +566,53 @@ def build_parser() -> argparse.ArgumentParser:
         default=500,
         help="Maximum number of chunks to print (1-5000).",
     )
+    source_search = source_commands.add_parser(
+        "search",
+        help="Search current Derived SourceChunks with stable Source/Representation anchors.",
+    )
+    source_search.add_argument("query", help="Archive retrieval query.")
+    source_search.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum number of archive results (1-200).",
+    )
+    source_search.add_argument(
+        "--source",
+        dest="archive_source_id",
+        type=_uuid_argument,
+        help="Restrict retrieval to one Source.",
+    )
+    source_search.add_argument(
+        "--representation",
+        dest="archive_representation_id",
+        type=_uuid_argument,
+        help="Restrict retrieval to one retained SourceRepresentation.",
+    )
+    source_search.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Rebuild archive FTS from current SourceChunks before searching.",
+    )
+    source_search.add_argument(
+        "--hybrid",
+        action="store_true",
+        help="Fuse archive FTS with local semantic embeddings.",
+    )
+    source_search.add_argument(
+        "--embedding-model",
+        help="LM Studio embedding model id for --hybrid.",
+    )
+    source_embedding_status = source_commands.add_parser(
+        "search-embedding-status",
+        help="Show semantic-index status for Derived SourceChunks.",
+    )
+    source_embedding_status.add_argument("--model", dest="embedding_model")
+    source_embedding_rebuild = source_commands.add_parser(
+        "search-embedding-rebuild",
+        help="Rebuild semantic vectors for current Derived SourceChunks.",
+    )
+    source_embedding_rebuild.add_argument("--model", dest="embedding_model")
 
     model_parser = commands.add_parser("model", help="Local model provider commands.")
     model_commands = model_parser.add_subparsers(dest="model_command", required=True)
@@ -1548,6 +1596,86 @@ def _run_source_command(app: AthenaApplication, args: argparse.Namespace) -> int
             )
         return 0
 
+    if args.source_command == "search":
+        if args.rebuild:
+            count = app.archive_search.rebuild()
+            print(f"Archive FTS rebuilt: {count} SourceChunks")
+        if args.hybrid:
+            model_id = _resolve_embedding_model_id(app, args.embedding_model)
+            hybrid_results = app.archive_hybrid_retrieval.search(
+                args.query,
+                model_id=model_id,
+                limit=args.limit,
+                source_id=args.archive_source_id,
+                representation_id=args.archive_representation_id,
+            )
+            print(
+                f"Archive hybrid results: {len(hybrid_results)} "
+                f"embedding_model={model_id}"
+            )
+            for index, hybrid_result in enumerate(hybrid_results, start=1):
+                print(
+                    f"[{index}] chunk={hybrid_result.chunk_id} "
+                    f"source={hybrid_result.source_id} "
+                    f"representation={hybrid_result.representation_id} "
+                    f"index={hybrid_result.chunk_index} "
+                    f"range={hybrid_result.start_anchor_value}:"
+                    f"{hybrid_result.end_anchor_value} "
+                    f"score={hybrid_result.score:.4f} "
+                    f"lexical={hybrid_result.lexical_score:.4f} "
+                    f"semantic={hybrid_result.semantic_score:.4f} "
+                    f"sha256={hybrid_result.content_hash.hex()}"
+                )
+                print(f"    source_name={hybrid_result.source_name!r}")
+                print(f"    {hybrid_result.text}")
+            return 0
+
+        archive_results = app.archive_search.search(
+            args.query,
+            limit=args.limit,
+            source_id=args.archive_source_id,
+            representation_id=args.archive_representation_id,
+        )
+        print(f"Archive search results: {len(archive_results)}")
+        for index, archive_result in enumerate(archive_results, start=1):
+            print(
+                f"[{index}] chunk={archive_result.chunk_id} "
+                f"source={archive_result.source_id} "
+                f"representation={archive_result.representation_id} "
+                f"index={archive_result.chunk_index} "
+                f"range={archive_result.start_anchor_value}:"
+                f"{archive_result.end_anchor_value} "
+                f"fts_score={archive_result.score:.6f} "
+                f"sha256={archive_result.content_hash.hex()}"
+            )
+            print(f"    source_name={archive_result.source_name!r}")
+            print(f"    {archive_result.snippet}")
+        return 0
+
+    if args.source_command == "search-embedding-status":
+        model_id = _resolve_embedding_model_id(app, args.embedding_model)
+        status = app.archive_semantic_search.status(model_id)
+        if status is None:
+            print(f"Archive embedding index: absent model={model_id}")
+            return 0
+        print(
+            f"Archive embedding index: model={model_id} current={status.current} "
+            f"documents={status.document_count} dimensions={status.dimensions} "
+            f"indexed_chunk_generation={status.indexed_chunk_generation} "
+            f"current_chunk_generation={status.current_chunk_generation}"
+        )
+        return 0
+
+    if args.source_command == "search-embedding-rebuild":
+        model_id = _resolve_embedding_model_id(app, args.embedding_model)
+        status = app.archive_semantic_search.rebuild(model_id)
+        print(
+            f"Archive embedding index rebuilt: model={model_id} "
+            f"documents={status.document_count} dimensions={status.dimensions} "
+            f"chunk_generation={status.indexed_chunk_generation}"
+        )
+        return 0
+
     raise RuntimeError(f"Unsupported source command: {args.source_command!r}")
 
 
@@ -1701,6 +1829,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 SourceChunkNotFoundError,
                 SourceChunkStoreError,
                 SourceChunkIntegrityError,
+                ArchiveSearchError,
+                ModelProviderError,
                 TextRepresentationError,
                 ValueError,
             ) as exc:

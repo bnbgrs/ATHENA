@@ -134,3 +134,47 @@ def test_source_chunk_cli_survives_process_restarts(tmp_path) -> None:
     listing = _run_cli(local_root, "source", "chunk-list", representation_id)
     assert listing.returncode == 0, listing.stderr
     assert chunk_id in listing.stdout
+
+
+def test_source_archive_search_cli_returns_chunk_anchor_chain(tmp_path) -> None:
+    original = tmp_path / "archive-search.md"
+    original.write_text(
+        "Berlin archive retrieval marker.\n\nSecond paragraph.\n",
+        encoding="utf-8",
+    )
+    local_root = tmp_path / "runtime"
+
+    imported = _run_cli(local_root, "source", "import", str(original))
+    assert imported.returncode == 0, imported.stderr
+    source_match = _UUID_RE.search(imported.stdout)
+    assert source_match is not None
+    source_id = source_match.group(0)
+
+    represented = _run_cli(local_root, "source", "represent-text", source_id)
+    assert represented.returncode == 0, represented.stderr
+    representation_match = _UUID_RE.search(represented.stdout)
+    assert representation_match is not None
+    representation_id = representation_match.group(0)
+
+    built = _run_cli(local_root, "source", "chunk-text", representation_id)
+    assert built.returncode == 0, built.stderr
+    ids = _UUID_RE.findall(built.stdout)
+    assert len(ids) >= 3
+    chunk_id = ids[2]
+
+    searched = _run_cli(
+        local_root,
+        "source",
+        "search",
+        "retrieval marker",
+        "--representation",
+        representation_id,
+    )
+    assert searched.returncode == 0, searched.stderr
+    assert "Archive search results: 1" in searched.stdout
+    assert f"chunk={chunk_id}" in searched.stdout
+    assert f"source={source_id}" in searched.stdout
+    assert f"representation={representation_id}" in searched.stdout
+    assert "range=0:" in searched.stdout
+    assert "sha256=" in searched.stdout
+    assert "[retrieval]" in searched.stdout or "[marker]" in searched.stdout

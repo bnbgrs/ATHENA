@@ -24,6 +24,11 @@ from athena.model.adapters.lm_studio_embeddings import LMStudioEmbeddingProvider
 from athena.model.provenance import ModelRunRepository
 from athena.observability.health import HealthService
 from athena.observability.logging import configure_logging
+from athena.retrieval.archive import (
+    ArchiveHybridRetrievalService,
+    ArchiveSearchService,
+    ArchiveSemanticSearchService,
+)
 from athena.retrieval.context import ContextBuilderService
 from athena.retrieval.evidence import MemoryEvidencePolicy
 from athena.retrieval.hybrid import HybridRetrievalService
@@ -111,6 +116,19 @@ class AthenaApplication:
             store=self.source_chunk_store,
             runs=self.model_runs,
             chat=self.chat,
+        )
+        self.archive_search = ArchiveSearchService(
+            database=self.database,
+            chunk_store=self.source_chunk_store,
+            source_chunks=self.source_chunks,
+        )
+        self.archive_semantic_search = ArchiveSemanticSearchService(
+            lexical=self.archive_search,
+            provider=self.embedding_provider,
+        )
+        self.archive_hybrid_retrieval = ArchiveHybridRetrievalService(
+            self.archive_search,
+            self.archive_semantic_search,
         )
         self.reviews = ReviewService(self.database)
         self.extraction_snapshots = ExtractionSnapshotRepository(
