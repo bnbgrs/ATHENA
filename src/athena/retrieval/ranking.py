@@ -64,7 +64,7 @@ class RetrievalRankingService:
         limit: int = 20,
         entity_type: SearchEntityType | None = None,
     ) -> tuple[RankedSearchResult, ...]:
-        candidate_limit = min(500, max(50, limit * 8))
+        candidate_limit = min(200, max(50, limit * 8))
         raw = self.search_service.search(
             query,
             limit=candidate_limit,

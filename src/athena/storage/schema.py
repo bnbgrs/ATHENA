@@ -13,7 +13,8 @@ REVIEW_QUEUE_SCHEMA_VERSION = 5
 MERGE_REVIEW_SCHEMA_VERSION = 6
 MERGE_REVIEW_MULTI_TARGET_SCHEMA_VERSION = 7
 EXTRACTION_SNAPSHOT_SCHEMA_VERSION = 8
-SCHEMA_VERSION = 9
+LOCAL_FTS_SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
@@ -24,6 +25,7 @@ MERGE_REVIEW_MIGRATION_ID = "0006_persistent_merge_review_decisions"
 MERGE_REVIEW_MULTI_TARGET_MIGRATION_ID = "0007_merge_review_multi_target_identity"
 EXTRACTION_SNAPSHOT_MIGRATION_ID = "0008_frozen_extraction_snapshots"
 LOCAL_FTS_SEARCH_MIGRATION_ID = "0009_local_fts_search"
+LOCAL_EMBEDDINGS_MIGRATION_ID = "0010_local_embeddings"
 
 
 class DatabaseCompatibilityError(RuntimeError):
@@ -97,6 +99,7 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         MERGE_REVIEW_SCHEMA_VERSION,
         MERGE_REVIEW_MULTI_TARGET_SCHEMA_VERSION,
         EXTRACTION_SNAPSHOT_SCHEMA_VERSION,
+        LOCAL_FTS_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -142,9 +145,13 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
 
     if existing_user_version == EXTRACTION_SNAPSHOT_SCHEMA_VERSION:
         _migrate_schema_v8_to_v9(connection)
+        existing_user_version = LOCAL_FTS_SCHEMA_VERSION
+
+    if existing_user_version == LOCAL_FTS_SCHEMA_VERSION:
+        _migrate_schema_v9_to_v10(connection)
 
     _configure_connection(connection)
-    _verify_schema_v9(connection)
+    _verify_schema_v10(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -792,12 +799,12 @@ def _migrate_schema_v8_to_v9(connection: sqlite3.Connection) -> None:
             ) VALUES (1, 0, 0);
 
             UPDATE schema_metadata
-            SET schema_version = {SCHEMA_VERSION},
+            SET schema_version = {LOCAL_FTS_SCHEMA_VERSION},
                 last_migration_id = '{LOCAL_FTS_SEARCH_MIGRATION_ID}',
-                minimum_reader_version = {SCHEMA_VERSION}
+                minimum_reader_version = {LOCAL_FTS_SCHEMA_VERSION}
             WHERE singleton_id = 1;
 
-            PRAGMA user_version = {SCHEMA_VERSION};
+            PRAGMA user_version = {LOCAL_FTS_SCHEMA_VERSION};
             COMMIT;
             """
         )
@@ -809,7 +816,49 @@ def _migrate_schema_v8_to_v9(connection: sqlite3.Connection) -> None:
         ) from exc
 
 
-def _verify_schema_v9(connection: sqlite3.Connection) -> None:
+def _migrate_schema_v9_to_v10(connection: sqlite3.Connection) -> None:
+    """Add reconstructible local embedding vectors for hybrid retrieval."""
+    connection.executescript(
+        f"""
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE search_embeddings (
+            entity_type TEXT NOT NULL
+                CHECK(entity_type IN ('knowledge', 'claim', 'chat_message')),
+            entity_id BLOB(16) NOT NULL CHECK(length(entity_id) = 16),
+            revision_id BLOB(16) NOT NULL CHECK(length(revision_id) = 16),
+            model_id TEXT NOT NULL CHECK(length(model_id) > 0),
+            dimensions INTEGER NOT NULL CHECK(dimensions > 0),
+            vector_blob BLOB NOT NULL CHECK(length(vector_blob) = dimensions * 4),
+            text_sha256 BLOB(32) NOT NULL CHECK(length(text_sha256) = 32),
+            created_at_us INTEGER NOT NULL,
+            PRIMARY KEY(entity_type, entity_id, revision_id, model_id)
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_search_embeddings_model
+            ON search_embeddings(model_id, entity_type);
+
+        CREATE TABLE search_embedding_state (
+            model_id TEXT PRIMARY KEY CHECK(length(model_id) > 0),
+            indexed_commit_seq INTEGER NOT NULL CHECK(indexed_commit_seq >= 0),
+            dimensions INTEGER NOT NULL CHECK(dimensions > 0),
+            document_count INTEGER NOT NULL CHECK(document_count >= 0),
+            rebuilt_at_us INTEGER NOT NULL
+        ) WITHOUT ROWID;
+
+        UPDATE schema_metadata
+        SET schema_version = {SCHEMA_VERSION},
+            last_migration_id = '{LOCAL_EMBEDDINGS_MIGRATION_ID}',
+            minimum_reader_version = {SCHEMA_VERSION}
+        WHERE singleton_id = 1;
+
+        PRAGMA user_version = {SCHEMA_VERSION};
+        COMMIT;
+        """
+    )
+
+
+def _verify_schema_v10(connection: sqlite3.Connection) -> None:
     application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
     user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
@@ -827,7 +876,7 @@ def _verify_schema_v9(connection: sqlite3.Connection) -> None:
         SCHEMA_VERSION,
         STORAGE_LAYOUT_VERSION,
         BLOB_FORMAT_VERSION,
-        LOCAL_FTS_SEARCH_MIGRATION_ID,
+        LOCAL_EMBEDDINGS_MIGRATION_ID,
         SCHEMA_VERSION,
     )
     if metadata is None or tuple(metadata) != expected:
@@ -847,6 +896,8 @@ def _verify_schema_v9(connection: sqlite3.Connection) -> None:
         "extraction_result_snapshots",
         "search_fts",
         "search_index_state",
+        "search_embeddings",
+        "search_embedding_state",
     }
     missing_tables = required_tables.difference(_user_tables(connection))
     if missing_tables:

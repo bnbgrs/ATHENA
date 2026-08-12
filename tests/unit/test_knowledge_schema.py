@@ -6,7 +6,8 @@ from athena.storage.schema import (
     EXTRACTION_SNAPSHOT_SCHEMA_VERSION,
     KNOWLEDGE_SCHEMA_VERSION,
     LEGACY_SCHEMA_VERSION,
-    LOCAL_FTS_SEARCH_MIGRATION_ID,
+    LOCAL_EMBEDDINGS_MIGRATION_ID,
+    LOCAL_FTS_SCHEMA_VERSION,
     MERGE_REVIEW_MULTI_TARGET_SCHEMA_VERSION,
     MERGE_REVIEW_SCHEMA_VERSION,
     MODEL_RUNS_SCHEMA_VERSION,
@@ -32,6 +33,8 @@ EXPECTED_SEMANTIC_TABLES = {
     "extraction_result_snapshots",
     "search_fts",
     "search_index_state",
+    "search_embeddings",
+    "search_embedding_state",
 }
 
 
@@ -56,7 +59,7 @@ def test_fresh_database_contains_semantic_schema(tmp_path) -> None:
     ).fetchone()
     assert tuple(metadata) == (
         SCHEMA_VERSION,
-        LOCAL_FTS_SEARCH_MIGRATION_ID,
+        LOCAL_EMBEDDINGS_MIGRATION_ID,
         SCHEMA_VERSION,
     )
 
@@ -330,4 +333,40 @@ def test_v8_database_is_upgraded_additively_to_local_fts_search(tmp_path) -> Non
     assert database.connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert "search_fts" in _table_names(database.connection)
     assert "search_index_state" in _table_names(database.connection)
+    database.stop()
+
+
+def test_v9_database_is_upgraded_additively_to_local_embeddings(tmp_path) -> None:
+    from athena.storage.schema import (
+        _migrate_schema_v3_to_v4,
+        _migrate_schema_v4_to_v5,
+        _migrate_schema_v5_to_v6,
+        _migrate_schema_v6_to_v7,
+        _migrate_schema_v7_to_v8,
+        _migrate_schema_v8_to_v9,
+    )
+
+    path = tmp_path / "athena.db"
+    legacy = sqlite3.connect(path, autocommit=True)
+    legacy.row_factory = sqlite3.Row
+    legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
+    legacy.execute("PRAGMA application_id = 1096042574")
+    _create_schema_v1(legacy, created_at_us=1)
+    _migrate_schema_v1_to_v2(legacy)
+    _migrate_schema_v2_to_v3(legacy)
+    _migrate_schema_v3_to_v4(legacy)
+    _migrate_schema_v4_to_v5(legacy)
+    _migrate_schema_v5_to_v6(legacy)
+    _migrate_schema_v6_to_v7(legacy)
+    _migrate_schema_v7_to_v8(legacy)
+    _migrate_schema_v8_to_v9(legacy)
+    assert legacy.execute("PRAGMA user_version").fetchone()[0] == LOCAL_FTS_SCHEMA_VERSION
+    assert "search_embeddings" not in _table_names(legacy)
+    legacy.close()
+
+    database = SQLiteDatabase(path)
+    database.start()
+    assert database.connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert "search_embeddings" in _table_names(database.connection)
+    assert "search_embedding_state" in _table_names(database.connection)
     database.stop()

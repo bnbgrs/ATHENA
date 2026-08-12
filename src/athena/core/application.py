@@ -19,11 +19,14 @@ from athena.knowledge.repository import KnowledgeRepository
 from athena.knowledge.review_service import ReviewService
 from athena.knowledge.service import KnowledgeService
 from athena.model.adapters.lm_studio import LMStudioProvider
+from athena.model.adapters.lm_studio_embeddings import LMStudioEmbeddingProvider
 from athena.model.provenance import ModelRunRepository
 from athena.observability.health import HealthService
 from athena.observability.logging import configure_logging
+from athena.retrieval.hybrid import HybridRetrievalService
 from athena.retrieval.ranking import RetrievalRankingService
 from athena.retrieval.search import LocalSearchService
+from athena.retrieval.semantic import LocalSemanticSearchService
 from athena.storage.database import SQLiteDatabase
 from athena.storage.paths import RuntimePaths
 from athena.storage.runtime import RuntimeLayoutService
@@ -66,6 +69,10 @@ class AthenaApplication:
             generation_timeout_seconds=self.settings.model_generation_timeout_seconds,
         )
         self.chat_generation = ChatGenerationService(self.chat, self.model_provider)
+        self.embedding_provider = LMStudioEmbeddingProvider(
+            self.model_provider,
+            generation_timeout_seconds=self.settings.model_generation_timeout_seconds,
+        )
         self.model_runs = ModelRunRepository(self.database)
         self.reviews = ReviewService(self.database)
         self.extraction_snapshots = ExtractionSnapshotRepository(
@@ -80,6 +87,14 @@ class AthenaApplication:
         )
         self.search = LocalSearchService(self.database)
         self.retrieval = RetrievalRankingService(self.search)
+        self.semantic_search = LocalSemanticSearchService(
+            self.database,
+            self.embedding_provider,
+        )
+        self.hybrid_retrieval = HybridRetrievalService(
+            self.retrieval,
+            self.semantic_search,
+        )
         self.proposal_acceptance = ProposalAcceptanceService(
             database=self.database,
             chat=self.chat,

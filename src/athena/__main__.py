@@ -36,6 +36,7 @@ from athena.knowledge.service import (
 )
 from athena.model.adapters.lm_studio import ModelProviderError
 from athena.retrieval.search import SearchEntityType, SearchError
+from athena.retrieval.semantic import SemanticSearchError
 from athena.version import __version__
 
 
@@ -339,6 +340,39 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Show raw FTS results without consolidation or retrieval ranking.",
     )
+
+    search_parser.add_argument(
+        "--hybrid",
+        action="store_true",
+        help="Fuse lexical retrieval with local semantic embeddings.",
+    )
+    search_parser.add_argument(
+        "--embedding-model",
+        help="LM Studio embedding model id. Auto-selects only when unambiguous.",
+    )
+
+    embedding_parser = commands.add_parser(
+        "embedding",
+        help="Local infrastructure-embedding index commands.",
+    )
+    embedding_commands = embedding_parser.add_subparsers(
+        dest="embedding_command",
+        required=True,
+    )
+    embedding_commands.add_parser(
+        "models",
+        help="List embedding models visible through LM Studio.",
+    )
+    embedding_status = embedding_commands.add_parser(
+        "status",
+        help="Show the local semantic-index status for an embedding model.",
+    )
+    embedding_status.add_argument("--model", dest="embedding_model")
+    embedding_rebuild = embedding_commands.add_parser(
+        "rebuild",
+        help="Rebuild the reconstructible local semantic index.",
+    )
+    embedding_rebuild.add_argument("--model", dest="embedding_model")
 
     model_parser = commands.add_parser("model", help="Local model provider commands.")
     model_commands = model_parser.add_subparsers(dest="model_command", required=True)
@@ -860,6 +894,56 @@ def _run_review_command(app: AthenaApplication, args: argparse.Namespace) -> int
 
 
 
+
+def _resolve_embedding_model_id(
+    app: AthenaApplication,
+    requested_model_id: str | None,
+) -> str:
+    model = app.embedding_provider.resolve_model(requested_model_id)
+    return model.backend_model_id
+
+
+def _run_embedding_command(app: AthenaApplication, args: argparse.Namespace) -> int:
+    if args.embedding_command == "models":
+        models = app.embedding_provider.discover_embedding_models()
+        print(f"Embedding models: {len(models)}")
+        for model in models:
+            state = "loaded" if model.loaded else "available"
+            quant = "" if model.quantization is None else f" quant={model.quantization}"
+            print(
+                f"- {model.backend_model_id} [{state}] "
+                f"display={model.display_name!r}{quant}"
+            )
+        return 0
+
+    model_id = _resolve_embedding_model_id(app, args.embedding_model)
+
+    if args.embedding_command == "status":
+        status = app.semantic_search.status(model_id)
+        if status is None:
+            print(f"Embedding index: absent model={model_id}")
+            return 0
+        print(
+            f"Embedding index: model={model_id} current={status.current} "
+            f"documents={status.document_count} dimensions={status.dimensions} "
+            f"indexed_commit_seq={status.indexed_commit_seq} "
+            f"current_commit_seq={status.current_commit_seq}"
+        )
+        return 0
+
+    if args.embedding_command == "rebuild":
+        status = app.semantic_search.rebuild(model_id)
+        print(
+            f"Embedding index rebuilt: model={model_id} "
+            f"documents={status.document_count} dimensions={status.dimensions} "
+            f"commit_seq={status.indexed_commit_seq}"
+        )
+        return 0
+
+    raise RuntimeError(
+        f"Unsupported embedding command: {args.embedding_command!r}"
+    )
+
 def _run_search_command(app: AthenaApplication, args: argparse.Namespace) -> int:
     if args.rebuild:
         count = app.search.rebuild()
@@ -870,6 +954,44 @@ def _run_search_command(app: AthenaApplication, args: argparse.Namespace) -> int
         if args.search_type is None
         else SearchEntityType(args.search_type)
     )
+
+    if args.hybrid:
+        if args.raw:
+            print(
+                "ATHENA search error: --hybrid and --raw cannot be combined.",
+                file=sys.stderr,
+            )
+            return 2
+        model_id = _resolve_embedding_model_id(app, args.embedding_model)
+        hybrid_results = app.hybrid_retrieval.search(
+            args.query,
+            model_id=model_id,
+            limit=args.limit,
+            entity_type=entity_type,
+        )
+        print(
+            f"Hybrid retrieval results: {len(hybrid_results)} "
+            f"embedding_model={model_id}"
+        )
+        for index, hybrid_result in enumerate(hybrid_results, start=1):
+            title = (
+                ""
+                if hybrid_result.title is None
+                else f" title={hybrid_result.title!r}"
+            )
+            print(
+                f"[{index}] type={hybrid_result.entity_type.value} "
+                f"entity={hybrid_result.entity_id} "
+                f"revision={hybrid_result.revision_id} "
+                f"score={hybrid_result.score:.4f} "
+                f"lexical={hybrid_result.lexical_score:.4f} "
+                f"semantic={hybrid_result.semantic_score:.4f} "
+                f"authority={hybrid_result.authority_score:.2f} "
+                f"contradictions={hybrid_result.contradiction_count} "
+                f"duplicates={hybrid_result.duplicate_count}{title}"
+            )
+            print(f"    {hybrid_result.text}")
+        return 0
 
     if args.raw:
         raw_results = app.search.search(
@@ -1026,8 +1148,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "search":
             try:
                 return _run_search_command(app, args)
-            except SearchError as exc:
+            except (SearchError, ModelProviderError) as exc:
                 print(f"ATHENA search error: {exc}", file=sys.stderr)
+                return 2
+            except SemanticSearchError as exc:
+                print(f"ATHENA search error: {exc}", file=sys.stderr)
+                return 2
+
+        if args.command == "embedding":
+            try:
+                return _run_embedding_command(app, args)
+            except ModelProviderError as exc:
+                print(f"ATHENA embedding error: {exc}", file=sys.stderr)
+                return 2
+            except SemanticSearchError as exc:
+                print(f"ATHENA embedding error: {exc}", file=sys.stderr)
                 return 2
 
         if args.command == "model":
