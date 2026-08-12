@@ -12,6 +12,7 @@ from athena.chat.service import ChatService
 from athena.chat.source_grounding import SourceGroundedChatService
 from athena.config.settings import AthenaSettings
 from athena.core.services import LifecycleService, ServiceManager
+from athena.jobs.embedding_processing import DurableEmbeddingRebuildWorker
 from athena.jobs.repository import JobRepository
 from athena.jobs.service import DurableJobService
 from athena.jobs.source_processing import DurableSourceProcessingWorker
@@ -161,6 +162,10 @@ class AthenaApplication:
             sources=self.sources,
             source_text=self.source_text,
             source_chunks=self.source_chunks,
+        )
+        self.embedding_rebuild = DurableEmbeddingRebuildWorker(
+            jobs=self.jobs,
+            semantic=self.archive_semantic_search,
         )
         self.reviews = ReviewService(self.database)
         self.extraction_snapshots = ExtractionSnapshotRepository(

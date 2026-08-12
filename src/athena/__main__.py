@@ -17,6 +17,10 @@ from athena.chat.service import EmptyMessageError
 from athena.chat.source_grounding import SourceGroundedChatResult
 from athena.config.settings import ConfigurationError
 from athena.core.application import AthenaApplication
+from athena.jobs.embedding_processing import (
+    EmbeddingRebuildJobError,
+    EmbeddingRebuildStepResult,
+)
 from athena.jobs.models import JobPriority, JobRecord, WaitingReason
 from athena.jobs.repository import (
     CheckpointNotFoundError,
@@ -854,6 +858,37 @@ def build_parser() -> argparse.ArgumentParser:
     job_run_source.add_argument("job_id", type=_uuid_argument)
     job_run_source.add_argument("--worker", default="athena-cli-source-worker")
     job_run_source.add_argument("--lease-seconds", type=int, default=120)
+    job_embedding_rebuild = job_commands.add_parser(
+        "embedding-rebuild",
+        help="Queue a durable SourceChunk embedding rebuild pinned to current generation.",
+    )
+    job_embedding_rebuild.add_argument("--model", required=True)
+    job_embedding_rebuild.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="Provider batch size (1-256).",
+    )
+    job_embedding_rebuild.add_argument(
+        "--priority",
+        type=int,
+        choices=range(0, 6),
+        default=int(JobPriority.BACKGROUND),
+    )
+    job_embedding_step = job_commands.add_parser(
+        "embedding-step",
+        help="Execute one durable embedding batch/finalization boundary.",
+    )
+    job_embedding_step.add_argument("job_id", type=_uuid_argument)
+    job_embedding_step.add_argument("lease_token", type=_lease_token_argument)
+    job_embedding_step.add_argument("--extend-seconds", type=int, default=120)
+    job_run_embedding = job_commands.add_parser(
+        "run-embedding",
+        help="Acquire and run a queued embedding.rebuild job until completed or waiting.",
+    )
+    job_run_embedding.add_argument("job_id", type=_uuid_argument)
+    job_run_embedding.add_argument("--worker", default="athena-cli-embedding-worker")
+    job_run_embedding.add_argument("--lease-seconds", type=int, default=120)
     job_commands.add_parser(
         "recover",
         help="Recover only jobs whose worker lease has expired.",
@@ -2066,6 +2101,22 @@ def _print_source_processing_result(result: SourceProcessingStepResult) -> None:
     print(f"Done: {result.done}")
 
 
+def _print_embedding_rebuild_result(result: EmbeddingRebuildStepResult) -> None:
+    print(f"Embedding rebuild job: {result.job.job_id}")
+    print(f"State: {result.job.state.value}")
+    print(f"Completed stage: {result.completed_stage or '<none>'}")
+    print(f"Checkpoint: {result.checkpoint.checkpoint_id if result.checkpoint else '<none>'}")
+    print(f"Model: {result.model_id}")
+    print(f"Target chunk generation: {result.target_chunk_generation}")
+    print(
+        "Documents: "
+        f"{result.indexed_document_count}/{result.total_document_count}"
+    )
+    print(f"Dimensions: {result.dimensions if result.dimensions is not None else '<none>'}")
+    print(f"Waiting: {result.waiting}")
+    print(f"Done: {result.done}")
+
+
 def _run_job_command(app: AthenaApplication, args: argparse.Namespace) -> int:
     if args.job_command == "create":
         job = app.jobs.create(
@@ -2225,6 +2276,33 @@ def _run_job_command(app: AthenaApplication, args: argparse.Namespace) -> int:
             lease_seconds=args.lease_seconds,
         )
         _print_source_processing_result(result)
+        return 0
+
+    if args.job_command == "embedding-rebuild":
+        job = app.embedding_rebuild.enqueue(
+            args.model,
+            priority=JobPriority(args.priority),
+            batch_size=args.batch_size,
+        )
+        _print_job(job)
+        return 0
+
+    if args.job_command == "embedding-step":
+        embedding_result = app.embedding_rebuild.step(
+            args.job_id,
+            lease_token=args.lease_token,
+            extend_seconds=args.extend_seconds,
+        )
+        _print_embedding_rebuild_result(embedding_result)
+        return 0
+
+    if args.job_command == "run-embedding":
+        embedding_result = app.embedding_rebuild.run_to_boundary(
+            args.job_id,
+            worker_id=args.worker,
+            lease_seconds=args.lease_seconds,
+        )
+        _print_embedding_rebuild_result(embedding_result)
         return 0
 
     if args.job_command == "recover":
@@ -2388,6 +2466,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 JobLeaseError,
                 JobNotFoundError,
                 JobTransitionError,
+                EmbeddingRebuildJobError,
                 SourceProcessingJobError,
                 ValueError,
             ) as exc:

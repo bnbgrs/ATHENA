@@ -9,6 +9,7 @@ import sqlite3
 import struct
 import unicodedata
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from athena.common.time import utc_now_us
@@ -20,6 +21,10 @@ from athena.storage.database import SQLiteDatabase
 
 class ArchiveSearchError(RuntimeError):
     """Raised when reconstructible archive retrieval cannot be used safely."""
+
+
+class ArchiveEmbeddingGenerationChangedError(ArchiveSearchError):
+    """Raised when SourceChunks change during a pinned embedding rebuild."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +103,40 @@ class ArchiveEmbeddingIndexStatus:
     @property
     def current(self) -> bool:
         return self.indexed_chunk_generation == self.current_chunk_generation
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveEmbeddingBatchItem:
+    chunk_id: uuid.UUID
+    content_hash: bytes
+    embedding_input: str
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveEmbeddingBatchPlan:
+    model_id: str
+    target_chunk_generation: int
+    items: tuple[ArchiveEmbeddingBatchItem, ...]
+    expected_dimensions: int | None
+    indexed_document_count: int
+    total_document_count: int
+
+    @property
+    def complete(self) -> bool:
+        return self.indexed_document_count == self.total_document_count and not self.items
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveEmbeddingBuildProgress:
+    model_id: str
+    target_chunk_generation: int
+    indexed_document_count: int
+    total_document_count: int
+    dimensions: int | None
+
+    @property
+    def complete(self) -> bool:
+        return self.indexed_document_count == self.total_document_count
 
 
 class ArchiveSearchService:
@@ -296,6 +335,263 @@ class ArchiveSemanticSearchService:
             document_count=int(row["document_count"]),
             rebuilt_at_us=int(row["rebuilt_at_us"]),
         )
+
+    def prepare_rebuild_batch(
+        self,
+        model_id: str,
+        *,
+        target_chunk_generation: int,
+        limit: int | None = None,
+    ) -> ArchiveEmbeddingBatchPlan:
+        """Plan one resumable batch without calling the embedding provider."""
+        normalized_model_id = _require_model_id(model_id)
+        batch_limit = self.batch_size if limit is None else limit
+        if batch_limit <= 0:
+            raise ValueError("Embedding rebuild batch limit must be positive.")
+        current_generation = self.chunk_store.current_generation()
+        if current_generation != target_chunk_generation:
+            raise ArchiveEmbeddingGenerationChangedError(
+                "SourceChunks changed relative to the pinned embedding generation."
+            )
+
+        visible = self._visible_chunks_for_generation(target_chunk_generation)
+        storage_model_id = _storage_model_id(normalized_model_id)
+        with self.chunk_store.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT chunk_id, dimensions, vector_blob, text_sha256
+                FROM archive_embeddings
+                WHERE model_id = ? AND indexed_chunk_generation = ?
+                """,
+                (storage_model_id, target_chunk_generation),
+            ).fetchall()
+        persisted = {uuid.UUID(bytes=bytes(row["chunk_id"])): row for row in rows}
+
+        valid_ids: set[uuid.UUID] = set()
+        dimensions_seen: set[int] = set()
+        for chunk in visible:
+            row = persisted.get(chunk.chunk_id)
+            if row is None:
+                continue
+            dimensions = int(row["dimensions"])
+            vector_blob = bytes(row["vector_blob"])
+            if dimensions <= 0 or len(vector_blob) != dimensions * 4:
+                continue
+            if bytes(row["text_sha256"]) != chunk.content_hash:
+                continue
+            valid_ids.add(chunk.chunk_id)
+            dimensions_seen.add(dimensions)
+
+        if len(dimensions_seen) > 1:
+            raise ArchiveSearchError(
+                "Partial archive embedding rebuild contains inconsistent dimensions."
+            )
+        expected_dimensions = next(iter(dimensions_seen), None)
+        missing = [chunk for chunk in visible if chunk.chunk_id not in valid_ids]
+        selected = missing[:batch_limit]
+        return ArchiveEmbeddingBatchPlan(
+            model_id=normalized_model_id,
+            target_chunk_generation=target_chunk_generation,
+            items=tuple(
+                ArchiveEmbeddingBatchItem(
+                    chunk_id=chunk.chunk_id,
+                    content_hash=chunk.content_hash,
+                    embedding_input=_prepare_document_text(
+                        normalized_model_id, chunk.chunk_text
+                    ),
+                )
+                for chunk in selected
+            ),
+            expected_dimensions=expected_dimensions,
+            indexed_document_count=len(valid_ids),
+            total_document_count=len(visible),
+        )
+
+    def commit_rebuild_batch(
+        self,
+        plan: ArchiveEmbeddingBatchPlan,
+        vectors: Sequence[Sequence[float]],
+    ) -> ArchiveEmbeddingBuildProgress:
+        """Commit provider output for one pinned generation atomically."""
+        if len(vectors) != len(plan.items):
+            raise ArchiveSearchError(
+                "Embedding provider returned the wrong number of archive vectors."
+            )
+        if self.chunk_store.current_generation() != plan.target_chunk_generation:
+            raise ArchiveEmbeddingGenerationChangedError(
+                "SourceChunks changed before archive embedding batch commit."
+            )
+
+        normalized_vectors: list[tuple[float, ...]] = []
+        dimensions = plan.expected_dimensions
+        for raw_vector in vectors:
+            vector = _normalize_vector(tuple(float(component) for component in raw_vector))
+            if dimensions is None:
+                dimensions = len(vector)
+            elif len(vector) != dimensions:
+                raise ArchiveSearchError(
+                    "Embedding model returned inconsistent archive dimensions."
+                )
+            normalized_vectors.append(vector)
+
+        storage_model_id = _storage_model_id(plan.model_id)
+        with self.chunk_store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                if _generation_from_connection(connection) != plan.target_chunk_generation:
+                    raise ArchiveEmbeddingGenerationChangedError(
+                        "SourceChunks changed during archive embedding batch commit."
+                    )
+                for item in plan.items:
+                    row = connection.execute(
+                        """
+                        SELECT content_hash
+                        FROM source_chunks
+                        WHERE chunk_id = ?
+                        """,
+                        (item.chunk_id.bytes,),
+                    ).fetchone()
+                    if row is None or bytes(row["content_hash"]) != item.content_hash:
+                        raise ArchiveEmbeddingGenerationChangedError(
+                            "Pinned SourceChunk changed before embedding commit."
+                        )
+                if plan.items:
+                    if dimensions is None:
+                        raise ArchiveSearchError(
+                            "Archive embedding dimensions were not established."
+                        )
+                    connection.executemany(
+                        """
+                        INSERT OR REPLACE INTO archive_embeddings (
+                            chunk_id, model_id, indexed_chunk_generation,
+                            dimensions, vector_blob, text_sha256, created_at_us
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            (
+                                item.chunk_id.bytes,
+                                storage_model_id,
+                                plan.target_chunk_generation,
+                                dimensions,
+                                _pack_vector(vector),
+                                item.content_hash,
+                                utc_now_us(),
+                            )
+                            for item, vector in zip(
+                                plan.items, normalized_vectors, strict=True
+                            )
+                        ),
+                    )
+                connection.execute("COMMIT")
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+
+        next_plan = self.prepare_rebuild_batch(
+            plan.model_id,
+            target_chunk_generation=plan.target_chunk_generation,
+            limit=1,
+        )
+        return ArchiveEmbeddingBuildProgress(
+            model_id=plan.model_id,
+            target_chunk_generation=plan.target_chunk_generation,
+            indexed_document_count=next_plan.indexed_document_count,
+            total_document_count=next_plan.total_document_count,
+            dimensions=next_plan.expected_dimensions,
+        )
+
+    def finalize_resumable_rebuild(
+        self,
+        model_id: str,
+        *,
+        target_chunk_generation: int,
+    ) -> ArchiveEmbeddingIndexStatus:
+        """Publish one complete pinned generation as the current semantic index."""
+        normalized_model_id = _require_model_id(model_id)
+        plan = self.prepare_rebuild_batch(
+            normalized_model_id,
+            target_chunk_generation=target_chunk_generation,
+            limit=1,
+        )
+        if not plan.complete:
+            raise ArchiveSearchError(
+                "Archive embedding rebuild cannot finalize before all visible chunks are indexed."
+            )
+        persisted_dimensions = plan.expected_dimensions or 1
+        storage_model_id = _storage_model_id(normalized_model_id)
+        with self.chunk_store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                if _generation_from_connection(connection) != target_chunk_generation:
+                    raise ArchiveEmbeddingGenerationChangedError(
+                        "SourceChunks changed before archive embedding index publication."
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO archive_embedding_state (
+                        model_id, indexed_chunk_generation, dimensions,
+                        document_count, rebuilt_at_us
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(model_id) DO UPDATE SET
+                        indexed_chunk_generation = excluded.indexed_chunk_generation,
+                        dimensions = excluded.dimensions,
+                        document_count = excluded.document_count,
+                        rebuilt_at_us = excluded.rebuilt_at_us
+                    """,
+                    (
+                        storage_model_id,
+                        target_chunk_generation,
+                        persisted_dimensions,
+                        plan.total_document_count,
+                        utc_now_us(),
+                    ),
+                )
+                connection.execute(
+                    """
+                    DELETE FROM archive_embeddings
+                    WHERE model_id = ? AND indexed_chunk_generation <> ?
+                    """,
+                    (storage_model_id, target_chunk_generation),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+        status = self.status(normalized_model_id)
+        if status is None or not status.current:
+            raise ArchiveSearchError(
+                "Archive embedding index publication did not become current."
+            )
+        return status
+
+    def _visible_chunks_for_generation(
+        self,
+        target_chunk_generation: int,
+    ) -> tuple[SourceChunkRecord, ...]:
+        if self.chunk_store.current_generation() != target_chunk_generation:
+            raise ArchiveEmbeddingGenerationChangedError(
+                "SourceChunks changed relative to the pinned embedding generation."
+            )
+        with self.chunk_store.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT chunk_id
+                FROM source_chunks
+                ORDER BY representation_id, chunking_profile_id, chunk_index, chunk_id
+                """
+            ).fetchall()
+        visible: list[SourceChunkRecord] = []
+        for row in rows:
+            loaded = self.lexical.visible_chunk(uuid.UUID(bytes=bytes(row["chunk_id"])))
+            if loaded is not None:
+                visible.append(loaded[0])
+        if self.chunk_store.current_generation() != target_chunk_generation:
+            raise ArchiveEmbeddingGenerationChangedError(
+                "SourceChunks changed while planning an archive embedding batch."
+            )
+        return tuple(visible)
 
     def rebuild(self, model_id: str) -> ArchiveEmbeddingIndexStatus:
         normalized_model_id = _require_model_id(model_id)
