@@ -1,0 +1,209 @@
+"""Application-facing durable job use cases."""
+
+from __future__ import annotations
+
+import json
+import secrets
+import uuid
+from collections.abc import Mapping
+from typing import Any
+
+from athena.chat.service import ChatService
+from athena.jobs.models import (
+    CheckpointRecord,
+    JobPriority,
+    JobRecord,
+    WaitingReason,
+)
+from athena.jobs.repository import JobRepository
+
+
+class UnsupportedJobTypeError(ValueError):
+    """Raised when a caller tries to persist an unregistered job type."""
+
+
+class InvalidJobPayloadError(ValueError):
+    """Raised when durable job JSON cannot be canonicalized safely."""
+
+
+class DurableJobService:
+    """Validated durable job orchestration without an in-memory queue."""
+
+    BUILTIN_JOB_TYPES = frozenset(
+        {
+            "source.process",
+            "source.represent",
+            "source.chunk",
+            "search.rebuild",
+            "embedding.rebuild",
+            "integrity.sweep",
+        }
+    )
+
+    def __init__(self, repository: JobRepository, chat: ChatService) -> None:
+        self.repository = repository
+        self.chat = chat
+
+    def create(
+        self,
+        *,
+        job_type: str,
+        priority: JobPriority = JobPriority.NORMAL,
+        requested_scope: Mapping[str, Any] | None = None,
+        pinned_configuration: Mapping[str, Any] | None = None,
+        next_run_at_us: int | None = None,
+    ) -> JobRecord:
+        if job_type not in self.BUILTIN_JOB_TYPES:
+            raise UnsupportedJobTypeError(
+                f"Unregistered ATHENA job type {job_type!r}."
+            )
+        actor_id = self.chat.ensure_local_user()
+        return self.repository.create(
+            job_type=job_type,
+            actor_id=actor_id,
+            priority=priority,
+            requested_scope_json=_canonical_json(requested_scope),
+            pinned_configuration_json=_canonical_json(pinned_configuration),
+            next_run_at_us=next_run_at_us,
+        )
+
+    def acquire(
+        self,
+        job_id: uuid.UUID,
+        *,
+        worker_id: str,
+        lease_seconds: int = 60,
+        now_us: int | None = None,
+    ) -> JobRecord:
+        return self.repository.acquire_lease(
+            job_id=job_id,
+            worker_id=worker_id,
+            lease_token=secrets.token_bytes(32),
+            lease_duration_us=lease_seconds * 1_000_000,
+            now_us=now_us,
+        )
+
+    def heartbeat(
+        self,
+        job_id: uuid.UUID,
+        *,
+        lease_token: bytes,
+        extend_seconds: int = 60,
+        now_us: int | None = None,
+    ) -> JobRecord:
+        return self.repository.heartbeat(
+            job_id=job_id,
+            lease_token=lease_token,
+            extend_by_us=extend_seconds * 1_000_000,
+            now_us=now_us,
+        )
+
+    def checkpoint(
+        self,
+        job_id: uuid.UUID,
+        *,
+        lease_token: bytes,
+        current_stage: str | None,
+        progress_state: Mapping[str, Any] | None = None,
+        last_confirmed_input: Mapping[str, Any] | None = None,
+        last_confirmed_output: Mapping[str, Any] | None = None,
+        resume_metadata: Mapping[str, Any] | None = None,
+        processing_stage_id: uuid.UUID | None = None,
+        commit_id: uuid.UUID | None = None,
+        now_us: int | None = None,
+    ) -> CheckpointRecord:
+        return self.repository.add_checkpoint(
+            job_id=job_id,
+            lease_token=lease_token,
+            processing_stage_id=processing_stage_id,
+            progress_state_json=_canonical_json(progress_state),
+            last_confirmed_input_json=_canonical_json(last_confirmed_input),
+            last_confirmed_output_json=_canonical_json(last_confirmed_output),
+            resume_metadata_json=_canonical_json(resume_metadata),
+            commit_id=commit_id,
+            current_stage=current_stage,
+            now_us=now_us,
+        )
+
+    def recover_startup(self, *, now_us: int | None = None) -> tuple[JobRecord, ...]:
+        """Recover only expired leases; live worker leases are never stolen."""
+        return self.repository.recover_expired_leases(now_us=now_us)
+
+    def get(self, job_id: uuid.UUID) -> JobRecord:
+        return self.repository.get(job_id)
+
+    def list(self, *, limit: int = 100) -> tuple[JobRecord, ...]:
+        return self.repository.list(limit=limit)
+
+    def checkpoints(self, job_id: uuid.UUID) -> tuple[CheckpointRecord, ...]:
+        return self.repository.list_checkpoints(job_id)
+
+    def wait(
+        self,
+        job_id: uuid.UUID,
+        *,
+        lease_token: bytes,
+        reason: WaitingReason,
+        next_run_at_us: int | None = None,
+        now_us: int | None = None,
+    ) -> JobRecord:
+        return self.repository.wait(
+            job_id=job_id,
+            lease_token=lease_token,
+            reason=reason,
+            next_run_at_us=next_run_at_us,
+            now_us=now_us,
+        )
+
+    def wake(self, job_id: uuid.UUID) -> JobRecord:
+        return self.repository.wake(job_id)
+
+    def request_cancel(self, job_id: uuid.UUID) -> JobRecord:
+        return self.repository.request_cancel(job_id)
+
+    def pause(self, job_id: uuid.UUID) -> JobRecord:
+        return self.repository.pause(job_id)
+
+    def resume(self, job_id: uuid.UUID) -> JobRecord:
+        return self.repository.resume(job_id)
+
+    def complete(
+        self,
+        job_id: uuid.UUID,
+        *,
+        lease_token: bytes,
+        now_us: int | None = None,
+    ) -> JobRecord:
+        return self.repository.complete(
+            job_id=job_id,
+            lease_token=lease_token,
+            now_us=now_us,
+        )
+
+    def acknowledge_cancel(
+        self,
+        job_id: uuid.UUID,
+        *,
+        lease_token: bytes,
+        now_us: int | None = None,
+    ) -> JobRecord:
+        return self.repository.acknowledge_cancel(
+            job_id=job_id,
+            lease_token=lease_token,
+            now_us=now_us,
+        )
+
+
+def _canonical_json(value: Mapping[str, Any] | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise InvalidJobPayloadError("Job payload must be finite canonical JSON.") from exc

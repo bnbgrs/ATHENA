@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import uuid
 from collections.abc import Sequence
@@ -16,6 +17,13 @@ from athena.chat.service import EmptyMessageError
 from athena.chat.source_grounding import SourceGroundedChatResult
 from athena.config.settings import ConfigurationError
 from athena.core.application import AthenaApplication
+from athena.jobs.models import JobPriority, JobRecord, WaitingReason
+from athena.jobs.repository import (
+    CheckpointNotFoundError,
+    JobLeaseError,
+    JobNotFoundError,
+    JobTransitionError,
+)
 from athena.knowledge.claim_repository import ClaimNotFoundError, ClaimRelationError
 from athena.knowledge.extraction_models import ChatExtractionResult
 from athena.knowledge.extraction_snapshot import ExtractionSnapshotNotFoundError
@@ -67,6 +75,37 @@ def _uuid_argument(value: str) -> uuid.UUID:
         return uuid.UUID(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"invalid UUID: {value!r}") from exc
+
+
+
+def _json_object_argument(value: str) -> dict[str, object]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"invalid JSON object: {exc.msg}") from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("value must be a JSON object")
+    return parsed
+
+
+def _lease_token_argument(value: str) -> bytes:
+    try:
+        token = bytes.fromhex(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("lease token must be hexadecimal") from exc
+    if len(token) != 32:
+        raise argparse.ArgumentTypeError("lease token must encode exactly 32 bytes")
+    return token
+
+
+def _waiting_reason_argument(value: str) -> WaitingReason:
+    try:
+        return WaitingReason(value)
+    except ValueError as exc:
+        allowed = ", ".join(item.value for item in WaitingReason)
+        raise argparse.ArgumentTypeError(
+            f"invalid waiting reason {value!r}; choose one of: {allowed}"
+        ) from exc
 
 
 def _knowledge_kind_argument(value: str) -> KnowledgeKind:
@@ -697,6 +736,99 @@ def build_parser() -> argparse.ArgumentParser:
         help="Rebuild semantic vectors for current Derived SourceChunks.",
     )
     source_embedding_rebuild.add_argument("--model", dest="embedding_model")
+
+    job_parser = commands.add_parser(
+        "job",
+        help="Durable background-job and checkpoint commands.",
+    )
+    job_commands = job_parser.add_subparsers(dest="job_command", required=True)
+    job_create = job_commands.add_parser(
+        "create",
+        help="Create one durable queued job from a registered job type.",
+    )
+    job_create.add_argument("job_type")
+    job_create.add_argument(
+        "--priority",
+        type=int,
+        choices=range(0, 6),
+        default=int(JobPriority.NORMAL),
+        help="Priority class 0=data_safety through 5=maintenance.",
+    )
+    job_create.add_argument("--scope-json", type=_json_object_argument)
+    job_create.add_argument("--config-json", type=_json_object_argument)
+    job_show = job_commands.add_parser("show", help="Show one durable job.")
+    job_show.add_argument("job_id", type=_uuid_argument)
+    job_list = job_commands.add_parser("list", help="List durable jobs.")
+    job_list.add_argument("--limit", type=int, default=100)
+    job_acquire = job_commands.add_parser(
+        "acquire",
+        help="Acquire a time-limited worker lease and fencing sequence.",
+    )
+    job_acquire.add_argument("job_id", type=_uuid_argument)
+    job_acquire.add_argument("--worker", required=True)
+    job_acquire.add_argument("--lease-seconds", type=int, default=60)
+    job_heartbeat = job_commands.add_parser(
+        "heartbeat",
+        help="Renew a live worker lease.",
+    )
+    job_heartbeat.add_argument("job_id", type=_uuid_argument)
+    job_heartbeat.add_argument("lease_token", type=_lease_token_argument)
+    job_heartbeat.add_argument("--extend-seconds", type=int, default=60)
+    job_checkpoint = job_commands.add_parser(
+        "checkpoint",
+        help="Persist one confirmed checkpoint under the current worker fence.",
+    )
+    job_checkpoint.add_argument("job_id", type=_uuid_argument)
+    job_checkpoint.add_argument("lease_token", type=_lease_token_argument)
+    job_checkpoint.add_argument("--stage")
+    job_checkpoint.add_argument("--progress-json", type=_json_object_argument)
+    job_checkpoint.add_argument("--input-json", type=_json_object_argument)
+    job_checkpoint.add_argument("--output-json", type=_json_object_argument)
+    job_checkpoint.add_argument("--resume-json", type=_json_object_argument)
+    job_checkpoint.add_argument("--commit-id", type=_uuid_argument)
+    job_checkpoints = job_commands.add_parser(
+        "checkpoints",
+        help="List confirmed checkpoints for one job.",
+    )
+    job_checkpoints.add_argument("job_id", type=_uuid_argument)
+    job_complete = job_commands.add_parser("complete", help="Complete a leased job.")
+    job_complete.add_argument("job_id", type=_uuid_argument)
+    job_complete.add_argument("lease_token", type=_lease_token_argument)
+    job_wait = job_commands.add_parser(
+        "wait",
+        help="Release a live lease into a persistent waiting state.",
+    )
+    job_wait.add_argument("job_id", type=_uuid_argument)
+    job_wait.add_argument("lease_token", type=_lease_token_argument)
+    job_wait.add_argument("reason", type=_waiting_reason_argument)
+    job_wait.add_argument("--next-run-at-us", type=int)
+    job_wake = job_commands.add_parser(
+        "wake",
+        help="Return a waiting job to the durable queue.",
+    )
+    job_wake.add_argument("job_id", type=_uuid_argument)
+    job_cancel = job_commands.add_parser(
+        "cancel",
+        help="Cancel an idle job or request cancellation from its current worker.",
+    )
+    job_cancel.add_argument("job_id", type=_uuid_argument)
+    job_cancel_ack = job_commands.add_parser(
+        "cancel-ack",
+        help="Acknowledge a running job's cancellation under its live lease.",
+    )
+    job_cancel_ack.add_argument("job_id", type=_uuid_argument)
+    job_cancel_ack.add_argument("lease_token", type=_lease_token_argument)
+    job_pause = job_commands.add_parser(
+        "pause",
+        help="Pause an idle queued/waiting job at a safe boundary.",
+    )
+    job_pause.add_argument("job_id", type=_uuid_argument)
+    job_resume = job_commands.add_parser("resume", help="Resume a paused job.")
+    job_resume.add_argument("job_id", type=_uuid_argument)
+    job_commands.add_parser(
+        "recover",
+        help="Recover only jobs whose worker lease has expired.",
+    )
 
     model_parser = commands.add_parser("model", help="Local model provider commands.")
     model_commands = model_parser.add_subparsers(dest="model_command", required=True)
@@ -1878,6 +2010,167 @@ def _run_source_command(app: AthenaApplication, args: argparse.Namespace) -> int
     raise RuntimeError(f"Unsupported source command: {args.source_command!r}")
 
 
+def _print_job(job: JobRecord) -> None:
+    print(f"Job: {job.job_id}")
+    print(f"URI: {job.uri}")
+    print(f"Type: {job.job_type}")
+    print(f"State: {job.state.value}")
+    print(f"Priority: {int(job.priority)}")
+    print(f"Stage: {job.current_stage or '<none>'}")
+    print(f"Checkpoint: {job.last_checkpoint_id or '<none>'}")
+    print(f"Retry count: {job.retry_count}")
+    print(f"Blocked reason: {job.blocked_reason or '<none>'}")
+    print(f"Worker: {job.worker_id or '<none>'}")
+    print(f"Lease expires us: {job.lease_expires_at_us or '<none>'}")
+    print(f"Fencing sequence: {job.fencing_sequence}")
+    print(f"Scope: {job.requested_scope_json or '<none>'}")
+    print(f"Pinned config: {job.pinned_configuration_json or '<none>'}")
+
+
+def _run_job_command(app: AthenaApplication, args: argparse.Namespace) -> int:
+    if args.job_command == "create":
+        job = app.jobs.create(
+            job_type=args.job_type,
+            priority=JobPriority(args.priority),
+            requested_scope=args.scope_json,
+            pinned_configuration=args.config_json,
+        )
+        _print_job(job)
+        return 0
+
+    if args.job_command == "show":
+        _print_job(app.jobs.get(args.job_id))
+        return 0
+
+    if args.job_command == "list":
+        jobs = app.jobs.list(limit=args.limit)
+        if not jobs:
+            print("No durable jobs.")
+            return 0
+        for job in jobs:
+            print(
+                f"{job.job_id} state={job.state.value} priority={int(job.priority)} "
+                f"type={job.job_type} stage={job.current_stage or '<none>'} "
+                f"checkpoint={job.last_checkpoint_id or '<none>'}"
+            )
+        return 0
+
+    if args.job_command == "acquire":
+        job = app.jobs.acquire(
+            args.job_id,
+            worker_id=args.worker,
+            lease_seconds=args.lease_seconds,
+        )
+        if job.lease_token is None:
+            raise JobLeaseError("Lease acquisition returned no lease token.")
+        print(f"Job leased: {job.job_id}")
+        print(f"State: {job.state.value}")
+        print(f"Worker: {job.worker_id}")
+        print(f"Lease token: {job.lease_token.hex()}")
+        print(f"Lease expires us: {job.lease_expires_at_us}")
+        print(f"Fencing sequence: {job.fencing_sequence}")
+        return 0
+
+    if args.job_command == "heartbeat":
+        job = app.jobs.heartbeat(
+            args.job_id,
+            lease_token=args.lease_token,
+            extend_seconds=args.extend_seconds,
+        )
+        print(
+            f"Job heartbeat renewed: {job.job_id} "
+            f"lease_expires_us={job.lease_expires_at_us} "
+            f"fence={job.fencing_sequence}"
+        )
+        return 0
+
+    if args.job_command == "checkpoint":
+        checkpoint = app.jobs.checkpoint(
+            args.job_id,
+            lease_token=args.lease_token,
+            current_stage=args.stage,
+            progress_state=args.progress_json,
+            last_confirmed_input=args.input_json,
+            last_confirmed_output=args.output_json,
+            resume_metadata=args.resume_json,
+            commit_id=args.commit_id,
+        )
+        print(f"Checkpoint: {checkpoint.checkpoint_id}")
+        print(f"URI: {checkpoint.uri}")
+        print(f"Job: {checkpoint.job_id}")
+        print(f"Fencing sequence: {checkpoint.fencing_sequence}")
+        print(f"Progress: {checkpoint.progress_state_json or '<none>'}")
+        return 0
+
+    if args.job_command == "checkpoints":
+        checkpoints = app.jobs.checkpoints(args.job_id)
+        if not checkpoints:
+            print("No checkpoints.")
+            return 0
+        for checkpoint in checkpoints:
+            print(
+                f"{checkpoint.checkpoint_id} job={checkpoint.job_id} "
+                f"created_at_us={checkpoint.created_at_us} "
+                f"fence={checkpoint.fencing_sequence} "
+                f"progress={checkpoint.progress_state_json or '<none>'}"
+            )
+        return 0
+
+    if args.job_command == "complete":
+        job = app.jobs.complete(args.job_id, lease_token=args.lease_token)
+        print(f"Job completed: {job.job_id}")
+        return 0
+
+    if args.job_command == "wait":
+        job = app.jobs.wait(
+            args.job_id,
+            lease_token=args.lease_token,
+            reason=args.reason,
+            next_run_at_us=args.next_run_at_us,
+        )
+        print(
+            f"Job waiting: {job.job_id} reason={job.blocked_reason} "
+            f"next_run_at_us={job.next_run_at_us or '<none>'}"
+        )
+        return 0
+
+    if args.job_command == "wake":
+        job = app.jobs.wake(args.job_id)
+        print(f"Job queued: {job.job_id}")
+        return 0
+
+    if args.job_command == "cancel":
+        job = app.jobs.request_cancel(args.job_id)
+        print(f"Job cancellation state: {job.job_id} state={job.state.value}")
+        return 0
+
+    if args.job_command == "cancel-ack":
+        job = app.jobs.acknowledge_cancel(
+            args.job_id, lease_token=args.lease_token
+        )
+        print(f"Job cancelled: {job.job_id}")
+        return 0
+
+    if args.job_command == "pause":
+        job = app.jobs.pause(args.job_id)
+        print(f"Job paused: {job.job_id}")
+        return 0
+
+    if args.job_command == "resume":
+        job = app.jobs.resume(args.job_id)
+        print(f"Job resumed: {job.job_id} state={job.state.value}")
+        return 0
+
+    if args.job_command == "recover":
+        recovered = app.jobs.recover_startup()
+        print(f"Recovered jobs: {len(recovered)}")
+        for job in recovered:
+            print(f"{job.job_id} state={job.state.value} reason={job.blocked_reason}")
+        return 0
+
+    raise RuntimeError(f"Unsupported job command: {args.job_command!r}")
+
+
 def _run_model_command(app: AthenaApplication, args: argparse.Namespace) -> int:
     if args.model_command == "status":
         health = app.model_provider.health()
@@ -2019,6 +2312,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 2
             except SemanticSearchError as exc:
                 print(f"ATHENA embedding error: {exc}", file=sys.stderr)
+                return 2
+
+        if args.command == "job":
+            try:
+                return _run_job_command(app, args)
+            except (
+                CheckpointNotFoundError,
+                JobLeaseError,
+                JobNotFoundError,
+                JobTransitionError,
+                ValueError,
+            ) as exc:
+                print(f"ATHENA job error: {exc}", file=sys.stderr)
                 return 2
 
         if args.command == "source":

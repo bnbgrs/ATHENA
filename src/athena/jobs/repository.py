@@ -1,0 +1,637 @@
+"""Transactional persistence for durable jobs and checkpoints."""
+
+from __future__ import annotations
+
+import sqlite3
+import uuid
+from collections.abc import Iterable
+
+from athena.common.ids import new_uuid7, uuid_from_blob, uuid_to_blob
+from athena.common.time import utc_now_us
+from athena.jobs.models import (
+    CheckpointRecord,
+    JobPriority,
+    JobRecord,
+    JobState,
+    WaitingReason,
+)
+from athena.storage.database import SQLiteDatabase
+
+
+class JobNotFoundError(LookupError):
+    """Raised when a durable job does not exist."""
+
+
+class CheckpointNotFoundError(LookupError):
+    """Raised when a durable checkpoint does not exist."""
+
+
+class JobLeaseError(RuntimeError):
+    """Raised when a worker does not own the current live lease."""
+
+
+class JobTransitionError(RuntimeError):
+    """Raised for invalid durable job-state transitions."""
+
+
+class JobRepository:
+    """Low-level durable job state with transactional fencing."""
+
+    def __init__(self, database: SQLiteDatabase) -> None:
+        self.database = database
+
+    def create(
+        self,
+        *,
+        job_type: str,
+        actor_id: uuid.UUID,
+        priority: JobPriority,
+        requested_scope_json: str | None,
+        pinned_configuration_json: str | None,
+        next_run_at_us: int | None = None,
+    ) -> JobRecord:
+        job_id = new_uuid7()
+        now_us = utc_now_us()
+        with self.database.write_transaction() as connection:
+            self._require_active_actor(connection, actor_id)
+            connection.execute(
+                """
+                INSERT INTO jobs (
+                    job_id, job_type, created_at_us, created_by_actor_id,
+                    priority, state, requested_scope_json, processing_run_id,
+                    current_stage, last_checkpoint_id, retry_count,
+                    next_run_at_us, blocked_reason, pinned_configuration_json,
+                    protection_scope_id, protected_payload_id, worker_id,
+                    lease_token, lease_acquired_at_us, lease_expires_at_us,
+                    heartbeat_at_us, fencing_sequence, updated_at_us
+                ) VALUES (
+                    ?, ?, ?, ?, ?, 'queued', ?, NULL,
+                    NULL, NULL, 0, ?, NULL, ?,
+                    NULL, NULL, NULL, NULL, NULL, NULL,
+                    NULL, 0, ?
+                )
+                """,
+                (
+                    uuid_to_blob(job_id),
+                    job_type,
+                    now_us,
+                    uuid_to_blob(actor_id),
+                    int(priority),
+                    requested_scope_json,
+                    next_run_at_us,
+                    pinned_configuration_json,
+                    now_us,
+                ),
+            )
+        return self.get(job_id)
+
+    def get(self, job_id: uuid.UUID) -> JobRecord:
+        row = self.database.connection.execute(
+            "SELECT * FROM jobs WHERE job_id = ?",
+            (uuid_to_blob(job_id),),
+        ).fetchone()
+        if row is None:
+            raise JobNotFoundError(str(job_id))
+        return _job_from_row(row)
+
+    def list(
+        self,
+        *,
+        states: Iterable[JobState] | None = None,
+        limit: int = 100,
+    ) -> tuple[JobRecord, ...]:
+        if limit <= 0:
+            raise ValueError("Job list limit must be positive.")
+        state_values = tuple(state.value for state in states or ())
+        if state_values:
+            placeholders = ", ".join("?" for _ in state_values)
+            rows = self.database.connection.execute(
+                f"""
+                SELECT * FROM jobs
+                WHERE state IN ({placeholders})
+                ORDER BY priority ASC,
+                         COALESCE(next_run_at_us, created_at_us) ASC,
+                         created_at_us ASC,
+                         job_id ASC
+                LIMIT ?
+                """,
+                (*state_values, limit),
+            ).fetchall()
+        else:
+            rows = self.database.connection.execute(
+                """
+                SELECT * FROM jobs
+                ORDER BY created_at_us DESC, job_id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return tuple(_job_from_row(row) for row in rows)
+
+    def acquire_lease(
+        self,
+        *,
+        job_id: uuid.UUID,
+        worker_id: str,
+        lease_token: bytes,
+        lease_duration_us: int,
+        now_us: int | None = None,
+    ) -> JobRecord:
+        if len(lease_token) != 32:
+            raise ValueError("Job lease tokens must contain exactly 32 bytes.")
+        if not worker_id.strip():
+            raise ValueError("worker_id must not be empty.")
+        if lease_duration_us <= 0:
+            raise ValueError("lease_duration_us must be positive.")
+        now = utc_now_us() if now_us is None else now_us
+        expires = now + lease_duration_us
+
+        with self.database.write_transaction() as connection:
+            row = self._require_job_row(connection, job_id)
+            state = JobState(str(row["state"]))
+            if state is not JobState.QUEUED:
+                raise JobTransitionError(
+                    f"Job {job_id} cannot acquire a lease from state {state.value!r}."
+                )
+            next_run_at = row["next_run_at_us"]
+            if next_run_at is not None and int(next_run_at) > now:
+                raise JobTransitionError(f"Job {job_id} is not eligible yet.")
+            fencing_sequence = int(row["fencing_sequence"]) + 1
+            connection.execute(
+                """
+                UPDATE jobs
+                SET state = 'running', worker_id = ?, lease_token = ?,
+                    lease_acquired_at_us = ?, lease_expires_at_us = ?,
+                    heartbeat_at_us = ?, fencing_sequence = ?,
+                    blocked_reason = NULL, updated_at_us = ?
+                WHERE job_id = ?
+                """,
+                (
+                    worker_id,
+                    lease_token,
+                    now,
+                    expires,
+                    now,
+                    fencing_sequence,
+                    now,
+                    uuid_to_blob(job_id),
+                ),
+            )
+        return self.get(job_id)
+
+    def heartbeat(
+        self,
+        *,
+        job_id: uuid.UUID,
+        lease_token: bytes,
+        extend_by_us: int,
+        now_us: int | None = None,
+    ) -> JobRecord:
+        if extend_by_us <= 0:
+            raise ValueError("extend_by_us must be positive.")
+        now = utc_now_us() if now_us is None else now_us
+        with self.database.write_transaction() as connection:
+            row = self._require_live_lease(connection, job_id, lease_token, now)
+            state = JobState(str(row["state"]))
+            if state not in {JobState.RUNNING, JobState.CANCEL_REQUESTED}:
+                raise JobLeaseError(
+                    f"Job {job_id} is not heartbeat-eligible in state {state.value!r}."
+                )
+            connection.execute(
+                """
+                UPDATE jobs
+                SET heartbeat_at_us = ?, lease_expires_at_us = ?, updated_at_us = ?
+                WHERE job_id = ?
+                """,
+                (now, now + extend_by_us, now, uuid_to_blob(job_id)),
+            )
+        return self.get(job_id)
+
+    def add_checkpoint(
+        self,
+        *,
+        job_id: uuid.UUID,
+        lease_token: bytes,
+        processing_stage_id: uuid.UUID | None,
+        progress_state_json: str | None,
+        last_confirmed_input_json: str | None,
+        last_confirmed_output_json: str | None,
+        resume_metadata_json: str | None,
+        commit_id: uuid.UUID | None,
+        current_stage: str | None,
+        now_us: int | None = None,
+    ) -> CheckpointRecord:
+        now = utc_now_us() if now_us is None else now_us
+        checkpoint_id = new_uuid7()
+        with self.database.write_transaction() as connection:
+            row = self._require_live_lease(connection, job_id, lease_token, now)
+            state = JobState(str(row["state"]))
+            if state not in {JobState.RUNNING, JobState.CANCEL_REQUESTED}:
+                raise JobLeaseError(
+                    f"Job {job_id} cannot checkpoint in state {state.value!r}."
+                )
+            if commit_id is not None:
+                commit_row = connection.execute(
+                    "SELECT 1 FROM commit_records WHERE commit_id = ?",
+                    (uuid_to_blob(commit_id),),
+                ).fetchone()
+                if commit_row is None:
+                    raise ValueError(
+                        "Checkpoint commit_id must reference an existing durable commit."
+                    )
+            fencing_sequence = int(row["fencing_sequence"])
+            connection.execute(
+                """
+                INSERT INTO checkpoints (
+                    checkpoint_id, job_id, processing_stage_id, created_at_us,
+                    progress_state_json, last_confirmed_input_json,
+                    last_confirmed_output_json, resume_metadata_json, commit_id,
+                    protection_scope_id, protected_payload_id, fencing_sequence
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+                """,
+                (
+                    uuid_to_blob(checkpoint_id),
+                    uuid_to_blob(job_id),
+                    _maybe_uuid_blob(processing_stage_id),
+                    now,
+                    progress_state_json,
+                    last_confirmed_input_json,
+                    last_confirmed_output_json,
+                    resume_metadata_json,
+                    _maybe_uuid_blob(commit_id),
+                    fencing_sequence,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE jobs
+                SET last_checkpoint_id = ?, current_stage = ?, updated_at_us = ?
+                WHERE job_id = ?
+                """,
+                (uuid_to_blob(checkpoint_id), current_stage, now, uuid_to_blob(job_id)),
+            )
+        return self.get_checkpoint(checkpoint_id)
+
+    def get_checkpoint(self, checkpoint_id: uuid.UUID) -> CheckpointRecord:
+        row = self.database.connection.execute(
+            "SELECT * FROM checkpoints WHERE checkpoint_id = ?",
+            (uuid_to_blob(checkpoint_id),),
+        ).fetchone()
+        if row is None:
+            raise CheckpointNotFoundError(str(checkpoint_id))
+        return _checkpoint_from_row(row)
+
+    def list_checkpoints(self, job_id: uuid.UUID) -> tuple[CheckpointRecord, ...]:
+        self.get(job_id)
+        rows = self.database.connection.execute(
+            """
+            SELECT * FROM checkpoints
+            WHERE job_id = ?
+            ORDER BY created_at_us ASC, checkpoint_id ASC
+            """,
+            (uuid_to_blob(job_id),),
+        ).fetchall()
+        return tuple(_checkpoint_from_row(row) for row in rows)
+
+    def wait(
+        self,
+        *,
+        job_id: uuid.UUID,
+        lease_token: bytes,
+        reason: WaitingReason,
+        next_run_at_us: int | None = None,
+        now_us: int | None = None,
+    ) -> JobRecord:
+        now = utc_now_us() if now_us is None else now_us
+        with self.database.write_transaction() as connection:
+            row = self._require_live_lease(connection, job_id, lease_token, now)
+            state = JobState(str(row["state"]))
+            if state is not JobState.RUNNING:
+                raise JobTransitionError(
+                    f"Job {job_id} cannot wait from state {state.value!r}."
+                )
+            connection.execute(
+                """
+                UPDATE jobs
+                SET state = 'waiting', blocked_reason = ?, next_run_at_us = ?,
+                    worker_id = NULL, lease_token = NULL,
+                    lease_acquired_at_us = NULL, lease_expires_at_us = NULL,
+                    heartbeat_at_us = NULL, updated_at_us = ?
+                WHERE job_id = ?
+                """,
+                (reason.value, next_run_at_us, now, uuid_to_blob(job_id)),
+            )
+        return self.get(job_id)
+
+    def wake(self, job_id: uuid.UUID) -> JobRecord:
+        now = utc_now_us()
+        with self.database.write_transaction() as connection:
+            row = self._require_job_row(connection, job_id)
+            state = JobState(str(row["state"]))
+            if state is not JobState.WAITING:
+                raise JobTransitionError(
+                    f"Job {job_id} cannot wake from state {state.value!r}."
+                )
+            connection.execute(
+                """
+                UPDATE jobs
+                SET state = 'queued', blocked_reason = NULL, next_run_at_us = NULL,
+                    updated_at_us = ?
+                WHERE job_id = ?
+                """,
+                (now, uuid_to_blob(job_id)),
+            )
+        return self.get(job_id)
+
+    def request_cancel(self, job_id: uuid.UUID) -> JobRecord:
+        now = utc_now_us()
+        with self.database.write_transaction() as connection:
+            row = self._require_job_row(connection, job_id)
+            state = JobState(str(row["state"]))
+            if state.terminal:
+                raise JobTransitionError(
+                    f"Terminal job {job_id} cannot be cancelled again."
+                )
+            if state in {JobState.QUEUED, JobState.WAITING, JobState.PAUSED}:
+                target = JobState.CANCELLED
+                clear_lease = True
+            elif state is JobState.RUNNING:
+                target = JobState.CANCEL_REQUESTED
+                clear_lease = False
+            elif state is JobState.CANCEL_REQUESTED:
+                return _job_from_row(row)
+            else:
+                raise JobTransitionError(
+                    f"Job {job_id} cannot be cancelled from {state.value!r}."
+                )
+            if clear_lease:
+                self._update_state_and_clear_lease(connection, job_id, target, now)
+            else:
+                connection.execute(
+                    "UPDATE jobs SET state = ?, updated_at_us = ? WHERE job_id = ?",
+                    (target.value, now, uuid_to_blob(job_id)),
+                )
+        return self.get(job_id)
+
+    def pause(self, job_id: uuid.UUID) -> JobRecord:
+        now = utc_now_us()
+        with self.database.write_transaction() as connection:
+            row = self._require_job_row(connection, job_id)
+            state = JobState(str(row["state"]))
+            if state not in {JobState.QUEUED, JobState.WAITING}:
+                raise JobTransitionError(
+                    "Step-1 pause is safe only before a worker owns the job; running "
+                    "worker-coordinated pause arrives with the scheduler slice."
+                )
+            self._update_state_and_clear_lease(
+                connection, job_id, JobState.PAUSED, now
+            )
+        return self.get(job_id)
+
+    def resume(self, job_id: uuid.UUID) -> JobRecord:
+        now = utc_now_us()
+        with self.database.write_transaction() as connection:
+            row = self._require_job_row(connection, job_id)
+            state = JobState(str(row["state"]))
+            if state is not JobState.PAUSED:
+                raise JobTransitionError(
+                    f"Job {job_id} cannot resume from state {state.value!r}."
+                )
+            connection.execute(
+                """
+                UPDATE jobs
+                SET state = 'queued', blocked_reason = NULL, next_run_at_us = NULL,
+                    updated_at_us = ?
+                WHERE job_id = ?
+                """,
+                (now, uuid_to_blob(job_id)),
+            )
+        return self.get(job_id)
+
+    def complete(
+        self,
+        *,
+        job_id: uuid.UUID,
+        lease_token: bytes,
+        now_us: int | None = None,
+    ) -> JobRecord:
+        now = utc_now_us() if now_us is None else now_us
+        with self.database.write_transaction() as connection:
+            row = self._require_live_lease(connection, job_id, lease_token, now)
+            state = JobState(str(row["state"]))
+            if state is not JobState.RUNNING:
+                raise JobTransitionError(
+                    f"Job {job_id} cannot complete from state {state.value!r}."
+                )
+            self._update_state_and_clear_lease(
+                connection, job_id, JobState.COMPLETED, now
+            )
+        return self.get(job_id)
+
+    def acknowledge_cancel(
+        self,
+        *,
+        job_id: uuid.UUID,
+        lease_token: bytes,
+        now_us: int | None = None,
+    ) -> JobRecord:
+        now = utc_now_us() if now_us is None else now_us
+        with self.database.write_transaction() as connection:
+            row = self._require_live_lease(connection, job_id, lease_token, now)
+            state = JobState(str(row["state"]))
+            if state is not JobState.CANCEL_REQUESTED:
+                raise JobTransitionError(
+                    f"Job {job_id} has no cancel request to acknowledge."
+                )
+            self._update_state_and_clear_lease(
+                connection, job_id, JobState.CANCELLED, now
+            )
+        return self.get(job_id)
+
+    def fail(
+        self,
+        *,
+        job_id: uuid.UUID,
+        lease_token: bytes,
+        blocked_reason: str,
+        now_us: int | None = None,
+    ) -> JobRecord:
+        now = utc_now_us() if now_us is None else now_us
+        with self.database.write_transaction() as connection:
+            self._require_live_lease(connection, job_id, lease_token, now)
+            connection.execute(
+                """
+                UPDATE jobs
+                SET state = 'failed', blocked_reason = ?, worker_id = NULL,
+                    lease_token = NULL, lease_acquired_at_us = NULL,
+                    lease_expires_at_us = NULL, heartbeat_at_us = NULL,
+                    updated_at_us = ?
+                WHERE job_id = ?
+                """,
+                (blocked_reason, now, uuid_to_blob(job_id)),
+            )
+        return self.get(job_id)
+
+    def recover_expired_leases(self, *, now_us: int | None = None) -> tuple[JobRecord, ...]:
+        now = utc_now_us() if now_us is None else now_us
+        recovered_ids: list[uuid.UUID] = []
+        with self.database.write_transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT job_id, state
+                FROM jobs
+                WHERE state IN ('running', 'cancel_requested')
+                  AND lease_expires_at_us IS NOT NULL
+                  AND lease_expires_at_us <= ?
+                ORDER BY lease_expires_at_us ASC, job_id ASC
+                """,
+                (now,),
+            ).fetchall()
+            for row in rows:
+                job_id = uuid_from_blob(bytes(row["job_id"]))
+                state = JobState(str(row["state"]))
+                if state is JobState.CANCEL_REQUESTED:
+                    target = JobState.CANCELLED
+                    reason = "recovered_cancel_after_expired_lease"
+                else:
+                    target = JobState.QUEUED
+                    reason = "recovered_after_expired_lease"
+                connection.execute(
+                    """
+                    UPDATE jobs
+                    SET state = ?, blocked_reason = ?, worker_id = NULL,
+                        lease_token = NULL, lease_acquired_at_us = NULL,
+                        lease_expires_at_us = NULL, heartbeat_at_us = NULL,
+                        updated_at_us = ?
+                    WHERE job_id = ?
+                    """,
+                    (target.value, reason, now, uuid_to_blob(job_id)),
+                )
+                recovered_ids.append(job_id)
+        return tuple(self.get(job_id) for job_id in recovered_ids)
+
+    @staticmethod
+    def _require_active_actor(connection: sqlite3.Connection, actor_id: uuid.UUID) -> None:
+        row = connection.execute(
+            "SELECT active FROM actors WHERE actor_id = ?",
+            (uuid_to_blob(actor_id),),
+        ).fetchone()
+        if row is None or int(row["active"]) != 1:
+            raise ValueError(f"Actor {actor_id} does not exist or is inactive.")
+
+    @staticmethod
+    def _require_job_row(
+        connection: sqlite3.Connection, job_id: uuid.UUID
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM jobs WHERE job_id = ?",
+            (uuid_to_blob(job_id),),
+        ).fetchone()
+        if row is None:
+            raise JobNotFoundError(str(job_id))
+        if not isinstance(row, sqlite3.Row):
+            raise TypeError("Job query did not return sqlite3.Row.")
+        return row
+
+    def _require_live_lease(
+        self,
+        connection: sqlite3.Connection,
+        job_id: uuid.UUID,
+        lease_token: bytes,
+        now_us: int,
+    ) -> sqlite3.Row:
+        row = self._require_job_row(connection, job_id)
+        stored_token = row["lease_token"]
+        expires_at = row["lease_expires_at_us"]
+        if stored_token is None or bytes(stored_token) != lease_token:
+            raise JobLeaseError(f"Worker does not own the current lease for job {job_id}.")
+        if expires_at is None or int(expires_at) <= now_us:
+            raise JobLeaseError(f"Lease for job {job_id} has expired.")
+        return row
+
+    @staticmethod
+    def _update_state_and_clear_lease(
+        connection: sqlite3.Connection,
+        job_id: uuid.UUID,
+        state: JobState,
+        now_us: int,
+    ) -> None:
+        connection.execute(
+            """
+            UPDATE jobs
+            SET state = ?, worker_id = NULL, lease_token = NULL,
+                lease_acquired_at_us = NULL, lease_expires_at_us = NULL,
+                heartbeat_at_us = NULL, updated_at_us = ?
+            WHERE job_id = ?
+            """,
+            (state.value, now_us, uuid_to_blob(job_id)),
+        )
+
+
+def _job_from_row(row: sqlite3.Row) -> JobRecord:
+    return JobRecord(
+        job_id=uuid_from_blob(bytes(row["job_id"])),
+        job_type=str(row["job_type"]),
+        created_at_us=int(row["created_at_us"]),
+        created_by_actor_id=uuid_from_blob(bytes(row["created_by_actor_id"])),
+        priority=JobPriority(int(row["priority"])),
+        state=JobState(str(row["state"])),
+        requested_scope_json=_maybe_text(row["requested_scope_json"]),
+        processing_run_id=_maybe_uuid(row["processing_run_id"]),
+        current_stage=_maybe_text(row["current_stage"]),
+        last_checkpoint_id=_maybe_uuid(row["last_checkpoint_id"]),
+        retry_count=int(row["retry_count"]),
+        next_run_at_us=_maybe_int(row["next_run_at_us"]),
+        blocked_reason=_maybe_text(row["blocked_reason"]),
+        pinned_configuration_json=_maybe_text(row["pinned_configuration_json"]),
+        protection_scope_id=_maybe_uuid(row["protection_scope_id"]),
+        protected_payload_id=_maybe_uuid(row["protected_payload_id"]),
+        worker_id=_maybe_text(row["worker_id"]),
+        lease_token=None if row["lease_token"] is None else bytes(row["lease_token"]),
+        lease_acquired_at_us=_maybe_int(row["lease_acquired_at_us"]),
+        lease_expires_at_us=_maybe_int(row["lease_expires_at_us"]),
+        heartbeat_at_us=_maybe_int(row["heartbeat_at_us"]),
+        fencing_sequence=int(row["fencing_sequence"]),
+        updated_at_us=int(row["updated_at_us"]),
+    )
+
+
+def _checkpoint_from_row(row: sqlite3.Row) -> CheckpointRecord:
+    return CheckpointRecord(
+        checkpoint_id=uuid_from_blob(bytes(row["checkpoint_id"])),
+        job_id=uuid_from_blob(bytes(row["job_id"])),
+        processing_stage_id=_maybe_uuid(row["processing_stage_id"]),
+        created_at_us=int(row["created_at_us"]),
+        progress_state_json=_maybe_text(row["progress_state_json"]),
+        last_confirmed_input_json=_maybe_text(row["last_confirmed_input_json"]),
+        last_confirmed_output_json=_maybe_text(row["last_confirmed_output_json"]),
+        resume_metadata_json=_maybe_text(row["resume_metadata_json"]),
+        commit_id=_maybe_uuid(row["commit_id"]),
+        protection_scope_id=_maybe_uuid(row["protection_scope_id"]),
+        protected_payload_id=_maybe_uuid(row["protected_payload_id"]),
+        fencing_sequence=int(row["fencing_sequence"]),
+    )
+
+
+def _maybe_uuid(value: object) -> uuid.UUID | None:
+    if value is None:
+        return None
+    if not isinstance(value, (bytes, bytearray, memoryview)):
+        raise TypeError("Expected a SQLite BLOB value for UUID conversion.")
+    return uuid_from_blob(bytes(value))
+
+
+def _maybe_uuid_blob(value: uuid.UUID | None) -> bytes | None:
+    return None if value is None else uuid_to_blob(value)
+
+
+def _maybe_text(value: object) -> str | None:
+    return None if value is None else str(value)
+
+
+def _maybe_int(value: object) -> int | None:
+    if value is None:
+        return None
+    if not isinstance(value, int):
+        raise TypeError("Expected a SQLite INTEGER value.")
+    return value

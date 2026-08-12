@@ -12,6 +12,8 @@ from athena.chat.service import ChatService
 from athena.chat.source_grounding import SourceGroundedChatService
 from athena.config.settings import AthenaSettings
 from athena.core.services import LifecycleService, ServiceManager
+from athena.jobs.repository import JobRepository
+from athena.jobs.service import DurableJobService
 from athena.knowledge.acceptance_service import ProposalAcceptanceService
 from athena.knowledge.claim_repository import ClaimRepository
 from athena.knowledge.claim_service import ClaimService
@@ -80,6 +82,8 @@ class AthenaApplication:
         self.database = SQLiteDatabase(self.paths.database_path)
         self.chat_repository = ChatRepository(self.database)
         self.chat = ChatService(self.chat_repository)
+        self.job_repository = JobRepository(self.database)
+        self.jobs = DurableJobService(self.job_repository, self.chat)
         self.blob_store = BlobStore(self.paths)
         self.source_repository = SourceRepository(self.database)
         self.source_representation_repository = SourceRepresentationRepository(self.database)
@@ -212,6 +216,15 @@ class AthenaApplication:
 
         try:
             self.services.start_all()
+            recovered_jobs = self.jobs.recover_startup()
+            if recovered_jobs:
+                logger.warning(
+                    "Recovered expired durable job leases",
+                    extra={
+                        "event": "jobs.startup_recovered",
+                        "recovered_job_count": len(recovered_jobs),
+                    },
+                )
         except Exception as exc:
             self.state = ApplicationState.FAILED
             self.health.mark_failed(str(exc))

@@ -19,7 +19,8 @@ SOURCE_CAPTURE_SCHEMA_VERSION = 11
 SOURCE_REPRESENTATION_SCHEMA_VERSION = 12
 SOURCE_CHUNK_PROFILE_SCHEMA_VERSION = 13
 SOURCE_ANCHOR_SCHEMA_VERSION = 14
-SCHEMA_VERSION = SOURCE_ANCHOR_SCHEMA_VERSION
+DURABLE_JOBS_SCHEMA_VERSION = 15
+SCHEMA_VERSION = DURABLE_JOBS_SCHEMA_VERSION
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
@@ -35,6 +36,7 @@ SOURCE_CAPTURE_MIGRATION_ID = "0011_source_capture"
 SOURCE_REPRESENTATION_MIGRATION_ID = "0012_source_representations"
 SOURCE_CHUNK_PROFILE_MIGRATION_ID = "0013_source_chunk_profiles"
 SOURCE_ANCHOR_MIGRATION_ID = "0014_source_anchors"
+DURABLE_JOBS_MIGRATION_ID = "0015_durable_jobs_checkpoints"
 
 
 class DatabaseCompatibilityError(RuntimeError):
@@ -113,6 +115,7 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         SOURCE_CAPTURE_SCHEMA_VERSION,
         SOURCE_REPRESENTATION_SCHEMA_VERSION,
         SOURCE_CHUNK_PROFILE_SCHEMA_VERSION,
+        SOURCE_ANCHOR_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -178,9 +181,13 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
 
     if existing_user_version == SOURCE_CHUNK_PROFILE_SCHEMA_VERSION:
         _migrate_schema_v13_to_v14(connection)
+        existing_user_version = SOURCE_ANCHOR_SCHEMA_VERSION
+
+    if existing_user_version == SOURCE_ANCHOR_SCHEMA_VERSION:
+        _migrate_schema_v14_to_v15(connection)
 
     _configure_connection(connection)
-    _verify_schema_v14(connection)
+    _verify_schema_v15(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -1088,7 +1095,126 @@ def _migrate_schema_v13_to_v14(connection: sqlite3.Connection) -> None:
     )
 
 
-def _verify_schema_v14(connection: sqlite3.Connection) -> None:
+def _migrate_schema_v14_to_v15(connection: sqlite3.Connection) -> None:
+    """Add durable jobs, worker leases/fencing, and confirmed checkpoints."""
+    connection.executescript(
+        f"""
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE jobs (
+            job_id BLOB(16) PRIMARY KEY CHECK(length(job_id) = 16),
+            job_type TEXT NOT NULL CHECK(length(job_type) > 0),
+            created_at_us INTEGER NOT NULL,
+            created_by_actor_id BLOB(16) NOT NULL CHECK(length(created_by_actor_id) = 16),
+            priority INTEGER NOT NULL CHECK(priority BETWEEN 0 AND 5),
+            state TEXT NOT NULL CHECK(state IN (
+                'queued', 'waiting', 'running', 'paused',
+                'cancel_requested', 'cancelled', 'failed', 'completed'
+            )),
+            requested_scope_json TEXT NULL CHECK(
+                requested_scope_json IS NULL OR json_valid(requested_scope_json)
+            ),
+            processing_run_id BLOB(16) NULL CHECK(
+                processing_run_id IS NULL OR length(processing_run_id) = 16
+            ),
+            current_stage TEXT NULL,
+            last_checkpoint_id BLOB(16) NULL CHECK(
+                last_checkpoint_id IS NULL OR length(last_checkpoint_id) = 16
+            ),
+            retry_count INTEGER NOT NULL CHECK(retry_count >= 0),
+            next_run_at_us INTEGER NULL,
+            blocked_reason TEXT NULL,
+            pinned_configuration_json TEXT NULL CHECK(
+                pinned_configuration_json IS NULL OR json_valid(pinned_configuration_json)
+            ),
+            protection_scope_id BLOB(16) NULL CHECK(
+                protection_scope_id IS NULL OR length(protection_scope_id) = 16
+            ),
+            protected_payload_id BLOB(16) NULL CHECK(
+                protected_payload_id IS NULL OR length(protected_payload_id) = 16
+            ),
+            worker_id TEXT NULL,
+            lease_token BLOB(32) NULL CHECK(
+                lease_token IS NULL OR length(lease_token) = 32
+            ),
+            lease_acquired_at_us INTEGER NULL,
+            lease_expires_at_us INTEGER NULL,
+            heartbeat_at_us INTEGER NULL,
+            fencing_sequence INTEGER NOT NULL DEFAULT 0 CHECK(fencing_sequence >= 0),
+            updated_at_us INTEGER NOT NULL,
+            FOREIGN KEY(created_by_actor_id) REFERENCES actors(actor_id),
+            FOREIGN KEY(processing_run_id) REFERENCES processing_runs(processing_run_id),
+            FOREIGN KEY(last_checkpoint_id) REFERENCES checkpoints(checkpoint_id),
+            CHECK((state IN ('running', 'cancel_requested')) = (lease_token IS NOT NULL)),
+            CHECK(state != 'waiting' OR blocked_reason IN (
+                'waiting_resource', 'waiting_storage', 'waiting_network',
+                'waiting_dependency', 'waiting_schedule', 'waiting_user',
+                'waiting_backoff'
+            )),
+            CHECK((worker_id IS NULL) = (lease_token IS NULL)),
+            CHECK((lease_acquired_at_us IS NULL) = (lease_token IS NULL)),
+            CHECK((lease_expires_at_us IS NULL) = (lease_token IS NULL)),
+            CHECK((heartbeat_at_us IS NULL) = (lease_token IS NULL)),
+            CHECK(lease_expires_at_us IS NULL OR lease_acquired_at_us IS NOT NULL),
+            CHECK(lease_expires_at_us IS NULL OR lease_expires_at_us > lease_acquired_at_us)
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_jobs_queue
+            ON jobs(priority, next_run_at_us, created_at_us, job_id)
+            WHERE state = 'queued';
+        CREATE INDEX idx_jobs_state_updated
+            ON jobs(state, updated_at_us, job_id);
+        CREATE INDEX idx_jobs_expired_lease
+            ON jobs(lease_expires_at_us, job_id)
+            WHERE state IN ('running', 'cancel_requested');
+
+        CREATE TABLE checkpoints (
+            checkpoint_id BLOB(16) PRIMARY KEY CHECK(length(checkpoint_id) = 16),
+            job_id BLOB(16) NOT NULL CHECK(length(job_id) = 16),
+            processing_stage_id BLOB(16) NULL CHECK(
+                processing_stage_id IS NULL OR length(processing_stage_id) = 16
+            ),
+            created_at_us INTEGER NOT NULL,
+            progress_state_json TEXT NULL CHECK(
+                progress_state_json IS NULL OR json_valid(progress_state_json)
+            ),
+            last_confirmed_input_json TEXT NULL CHECK(
+                last_confirmed_input_json IS NULL OR json_valid(last_confirmed_input_json)
+            ),
+            last_confirmed_output_json TEXT NULL CHECK(
+                last_confirmed_output_json IS NULL OR json_valid(last_confirmed_output_json)
+            ),
+            resume_metadata_json TEXT NULL CHECK(
+                resume_metadata_json IS NULL OR json_valid(resume_metadata_json)
+            ),
+            commit_id BLOB(16) NULL CHECK(commit_id IS NULL OR length(commit_id) = 16),
+            protection_scope_id BLOB(16) NULL CHECK(
+                protection_scope_id IS NULL OR length(protection_scope_id) = 16
+            ),
+            protected_payload_id BLOB(16) NULL CHECK(
+                protected_payload_id IS NULL OR length(protected_payload_id) = 16
+            ),
+            fencing_sequence INTEGER NOT NULL CHECK(fencing_sequence > 0),
+            FOREIGN KEY(job_id) REFERENCES jobs(job_id),
+            FOREIGN KEY(commit_id) REFERENCES commit_records(commit_id)
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_checkpoints_job
+            ON checkpoints(job_id, created_at_us, checkpoint_id);
+
+        UPDATE schema_metadata
+        SET schema_version = {DURABLE_JOBS_SCHEMA_VERSION},
+            last_migration_id = '{DURABLE_JOBS_MIGRATION_ID}',
+            minimum_reader_version = {DURABLE_JOBS_SCHEMA_VERSION}
+        WHERE singleton_id = 1;
+
+        PRAGMA user_version = {DURABLE_JOBS_SCHEMA_VERSION};
+        COMMIT;
+        """
+    )
+
+
+def _verify_schema_v15(connection: sqlite3.Connection) -> None:
     application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
     user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
@@ -1106,7 +1232,7 @@ def _verify_schema_v14(connection: sqlite3.Connection) -> None:
         SCHEMA_VERSION,
         STORAGE_LAYOUT_VERSION,
         BLOB_FORMAT_VERSION,
-        SOURCE_ANCHOR_MIGRATION_ID,
+        DURABLE_JOBS_MIGRATION_ID,
         SCHEMA_VERSION,
     )
     if metadata is None or tuple(metadata) != expected:
@@ -1133,6 +1259,8 @@ def _verify_schema_v14(connection: sqlite3.Connection) -> None:
         "source_representations",
         "chunking_profiles",
         "source_anchors",
+        "jobs",
+        "checkpoints",
     }
     missing_tables = required_tables.difference(_user_tables(connection))
     if missing_tables:
