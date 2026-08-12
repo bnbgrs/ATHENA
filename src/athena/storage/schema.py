@@ -20,7 +20,8 @@ SOURCE_REPRESENTATION_SCHEMA_VERSION = 12
 SOURCE_CHUNK_PROFILE_SCHEMA_VERSION = 13
 SOURCE_ANCHOR_SCHEMA_VERSION = 14
 DURABLE_JOBS_SCHEMA_VERSION = 15
-SCHEMA_VERSION = DURABLE_JOBS_SCHEMA_VERSION
+SOURCE_PAGE_MAP_SCHEMA_VERSION = 16
+SCHEMA_VERSION = SOURCE_PAGE_MAP_SCHEMA_VERSION
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
@@ -37,6 +38,7 @@ SOURCE_REPRESENTATION_MIGRATION_ID = "0012_source_representations"
 SOURCE_CHUNK_PROFILE_MIGRATION_ID = "0013_source_chunk_profiles"
 SOURCE_ANCHOR_MIGRATION_ID = "0014_source_anchors"
 DURABLE_JOBS_MIGRATION_ID = "0015_durable_jobs_checkpoints"
+SOURCE_PAGE_MAP_MIGRATION_ID = "0016_source_representation_page_map"
 
 
 class DatabaseCompatibilityError(RuntimeError):
@@ -116,6 +118,7 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         SOURCE_REPRESENTATION_SCHEMA_VERSION,
         SOURCE_CHUNK_PROFILE_SCHEMA_VERSION,
         SOURCE_ANCHOR_SCHEMA_VERSION,
+        DURABLE_JOBS_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -185,9 +188,13 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
 
     if existing_user_version == SOURCE_ANCHOR_SCHEMA_VERSION:
         _migrate_schema_v14_to_v15(connection)
+        existing_user_version = DURABLE_JOBS_SCHEMA_VERSION
+
+    if existing_user_version == DURABLE_JOBS_SCHEMA_VERSION:
+        _migrate_schema_v15_to_v16(connection)
 
     _configure_connection(connection)
-    _verify_schema_v15(connection)
+    _verify_schema_v16(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -1214,10 +1221,40 @@ def _migrate_schema_v14_to_v15(connection: sqlite3.Connection) -> None:
     )
 
 
-def _verify_schema_v15(connection: sqlite3.Connection) -> None:
+def _migrate_schema_v15_to_v16(connection: sqlite3.Connection) -> None:
+    """Add retained page-offset maps for paginated SourceRepresentations."""
+    connection.executescript(
+        f"""
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE source_representation_pages (
+            representation_id BLOB(16) NOT NULL CHECK(length(representation_id) = 16),
+            page_number INTEGER NOT NULL CHECK(page_number >= 1),
+            start_offset INTEGER NOT NULL CHECK(start_offset >= 0),
+            end_offset INTEGER NOT NULL CHECK(end_offset >= start_offset),
+            content_hash BLOB(32) NOT NULL CHECK(length(content_hash) = 32),
+            PRIMARY KEY(representation_id, page_number),
+            FOREIGN KEY(representation_id) REFERENCES source_representations(representation_id)
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_source_representation_pages_offset
+            ON source_representation_pages(representation_id, start_offset, end_offset);
+
+        UPDATE schema_metadata
+        SET schema_version = {SOURCE_PAGE_MAP_SCHEMA_VERSION},
+            last_migration_id = '{SOURCE_PAGE_MAP_MIGRATION_ID}',
+            minimum_reader_version = {SOURCE_PAGE_MAP_SCHEMA_VERSION}
+        WHERE singleton_id = 1;
+
+        PRAGMA user_version = {SOURCE_PAGE_MAP_SCHEMA_VERSION};
+        COMMIT;
+        """
+    )
+
+
+def _verify_schema_v16(connection: sqlite3.Connection) -> None:
     application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
     user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-
     if application_id != ATHENA_APPLICATION_ID:
         raise DatabaseCompatibilityError("ATHENA application_id verification failed.")
     if user_version != SCHEMA_VERSION:
@@ -1232,8 +1269,48 @@ def _verify_schema_v15(connection: sqlite3.Connection) -> None:
         SCHEMA_VERSION,
         STORAGE_LAYOUT_VERSION,
         BLOB_FORMAT_VERSION,
-        DURABLE_JOBS_MIGRATION_ID,
+        SOURCE_PAGE_MAP_MIGRATION_ID,
         SCHEMA_VERSION,
+    )
+    if metadata is None or tuple(metadata) != expected:
+        raise DatabaseCompatibilityError("ATHENA schema_metadata verification failed.")
+
+    required_tables = {
+        "knowledge_units", "knowledge_unit_revisions", "claims", "claim_revisions",
+        "claim_evidence", "provenance_inputs", "model_signatures", "processing_runs",
+        "semantic_review_items", "semantic_merge_review_payloads",
+        "extraction_result_snapshots", "search_fts", "search_index_state",
+        "search_embeddings", "search_embedding_state", "blob_records", "sources",
+        "source_representations", "source_representation_pages", "chunking_profiles",
+        "source_anchors", "jobs", "checkpoints",
+    }
+    missing_tables = required_tables.difference(_user_tables(connection))
+    if missing_tables:
+        missing = ", ".join(sorted(missing_tables))
+        raise DatabaseCompatibilityError(f"ATHENA semantic schema is incomplete: {missing}.")
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise DatabaseCompatibilityError("ATHENA foreign-key verification failed.")
+
+def _verify_schema_v15(connection: sqlite3.Connection) -> None:
+    application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
+    user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+
+    if application_id != ATHENA_APPLICATION_ID:
+        raise DatabaseCompatibilityError("ATHENA application_id verification failed.")
+    if user_version != DURABLE_JOBS_SCHEMA_VERSION:
+        raise DatabaseCompatibilityError("ATHENA schema version verification failed.")
+
+    metadata = connection.execute(
+        "SELECT schema_version, storage_layout_version, blob_format_version, "
+        "last_migration_id, minimum_reader_version "
+        "FROM schema_metadata WHERE singleton_id = 1"
+    ).fetchone()
+    expected = (
+        DURABLE_JOBS_SCHEMA_VERSION,
+        STORAGE_LAYOUT_VERSION,
+        BLOB_FORMAT_VERSION,
+        DURABLE_JOBS_MIGRATION_ID,
+        DURABLE_JOBS_SCHEMA_VERSION,
     )
     if metadata is None or tuple(metadata) != expected:
         raise DatabaseCompatibilityError("ATHENA schema_metadata verification failed.")

@@ -46,8 +46,7 @@ class SourceRepresentationType(str, Enum):
     """Technical representations derived from immutable Source bytes."""
 
     NORMALIZED_TEXT = "normalized_text"
-
-
+    EXTRACTED_TEXT = "extracted_text"
 
 
 class SourceAnchorType(str, Enum):
@@ -122,6 +121,15 @@ class SourceRepresentationRecord:
     options_json: str
     created_at_us: int
     provenance_id: uuid.UUID
+
+
+@dataclass(frozen=True, slots=True)
+class SourceRepresentationPageRecord:
+    representation_id: uuid.UUID
+    page_number: int
+    start_offset: int
+    end_offset: int
+    content_hash: bytes
 
 
 @dataclass(frozen=True, slots=True)

@@ -39,6 +39,8 @@ class SourceContextItem:
     representation_id: uuid.UUID
     start_offset: int
     end_offset: int
+    page_start: int | None
+    page_end: int | None
     quoted_hash: bytes
     source_name: str | None
     source_uri: str | None
@@ -202,6 +204,10 @@ class SourceContextBuilderService:
                 raise SourceContextIntegrityError(
                     f"Source context {item.context_id} changed its anchored range."
                 )
+            if anchor.page_start != item.page_start or anchor.page_end != item.page_end:
+                raise SourceContextIntegrityError(
+                    f"Source context {item.context_id} changed its page range."
+                )
             if anchor.quoted_hash != item.quoted_hash:
                 raise SourceContextIntegrityError(
                     f"Source context {item.context_id} changed its quoted source hash."
@@ -330,6 +336,8 @@ class SourceContextBuilderService:
             representation_id=anchor.representation_id,
             start_offset=anchor.start_offset,
             end_offset=anchor.end_offset,
+            page_start=anchor.page_start,
+            page_end=anchor.page_end,
             quoted_hash=anchor.quoted_hash,
             source_name=planned.result.source_name,
             source_uri=planned.result.source_uri,
@@ -365,6 +373,8 @@ def _preview_item(planned: _PlannedSourceItem) -> SourceContextItem:
         representation_id=planned.result.representation_id,
         start_offset=planned.start_offset,
         end_offset=planned.end_offset,
+        page_start=None,
+        page_end=None,
         quoted_hash=planned.quoted_hash,
         source_name=planned.result.source_name,
         source_uri=planned.result.source_uri,
@@ -397,6 +407,8 @@ def _render_source_context(
                 "anchor_type": "text_range",
                 "start_offset": item.start_offset,
                 "end_offset": item.end_offset,
+                "page_start": item.page_start,
+                "page_end": item.page_end,
                 "quoted_sha256": item.quoted_hash.hex(),
                 "source_name": item.source_name,
                 "source_uri": item.source_uri,

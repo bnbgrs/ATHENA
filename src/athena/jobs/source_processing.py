@@ -16,6 +16,7 @@ from athena.source.models import (
     SourceRepresentationRecord,
     SourceRepresentationType,
 )
+from athena.source.pdf_representation_service import SourcePdfRepresentationService
 from athena.source.representation_service import SourceTextRepresentationService
 from athena.source.service import SourceCaptureService
 
@@ -72,11 +73,13 @@ class DurableSourceProcessingWorker:
         jobs: DurableJobService,
         sources: SourceCaptureService,
         source_text: SourceTextRepresentationService,
+        source_pdf: SourcePdfRepresentationService,
         source_chunks: SourceChunkingService,
     ) -> None:
         self.jobs = jobs
         self.sources = sources
         self.source_text = source_text
+        self.source_pdf = source_pdf
         self.source_chunks = source_chunks
 
     def enqueue(
@@ -94,6 +97,7 @@ class DurableSourceProcessingWorker:
             pinned_configuration={
                 "pipeline_version": _PIPELINE_VERSION,
                 "text_parser": f"{_TEXT_PARSER_ID}@{_TEXT_PARSER_VERSION}",
+                "pdf_parser": self.source_pdf.parser_signature,
                 "chunking_profile": "default",
                 "embedding_policy": "deferred",
             },
@@ -247,12 +251,20 @@ class DurableSourceProcessingWorker:
         lease_token: bytes,
         cursor: _Cursor,
     ) -> SourceProcessingStepResult:
-        representation = self._compatible_representation(cursor.source_id)
+        source, _blob = self.sources.get(cursor.source_id)
+        is_pdf = self.source_pdf.supports(source)
+        representation = self._compatible_representation(cursor.source_id, is_pdf=is_pdf)
         reused_representation = representation is not None
         if representation is None:
-            built = self.source_text.build(cursor.source_id)
-            representation = built.result.representation
+            if is_pdf:
+                built_pdf = self.source_pdf.build(cursor.source_id)
+                representation = built_pdf.result.representation
+            else:
+                built_text = self.source_text.build(cursor.source_id)
+                representation = built_text.result.representation
         self.source_text.verify(representation.representation_id)
+        if is_pdf:
+            self.source_pdf.verify_page_map(representation.representation_id)
         checkpoint = self.jobs.checkpoint(
             job_id,
             lease_token=lease_token,
@@ -466,15 +478,25 @@ class DurableSourceProcessingWorker:
                 f"Job {job.job_id} has type {job.job_type!r}, not 'source.process'."
             )
         config = _json_object(job.pinned_configuration_json, "pinned_configuration")
-        expected = {
+        legacy_expected = {
             "pipeline_version": _PIPELINE_VERSION,
             "text_parser": f"{_TEXT_PARSER_ID}@{_TEXT_PARSER_VERSION}",
             "chunking_profile": "default",
             "embedding_policy": "deferred",
         }
-        if config != expected:
+        current_expected = {
+            **legacy_expected,
+            "pdf_parser": self.source_pdf.parser_signature,
+        }
+        if config not in (legacy_expected, current_expected):
             raise SourceProcessingJobError(
                 "source.process pinned configuration is missing or incompatible."
+            )
+        source_id = self._source_id_from_scope(job)
+        source, _blob = self.sources.get(source_id)
+        if self.source_pdf.supports(source) and config == legacy_expected:
+            raise SourceProcessingJobError(
+                "Legacy source.process job did not pin a PDF parser and cannot process PDFs."
             )
         self._source_id_from_scope(job)
 
@@ -492,16 +514,28 @@ class DurableSourceProcessingWorker:
             ) from exc
 
     def _compatible_representation(
-        self, source_id: uuid.UUID
+        self, source_id: uuid.UUID, *, is_pdf: bool
     ) -> SourceRepresentationRecord | None:
+        expected_type = (
+            SourceRepresentationType.EXTRACTED_TEXT
+            if is_pdf
+            else SourceRepresentationType.NORMALIZED_TEXT
+        )
+        expected_parser_id = self.source_pdf.parser_id if is_pdf else _TEXT_PARSER_ID
+        expected_parser_version = (
+            self.source_pdf.parser_version if is_pdf else _TEXT_PARSER_VERSION
+        )
+        expected_options = (
+            self.source_pdf.parser_options if is_pdf else _TEXT_OPTIONS
+        )
         for representation, _blob in self.source_text.list_for_source(source_id, limit=100):
-            if not _is_normalized_text_representation(representation.representation_type):
+            if representation.representation_type is not expected_type:
                 continue
             if representation.retention_state is not RepresentationRetentionState.RETAINED:
                 continue
-            if representation.parser_id != _TEXT_PARSER_ID:
+            if representation.parser_id != expected_parser_id:
                 continue
-            if representation.parser_version != _TEXT_PARSER_VERSION:
+            if representation.parser_version != expected_parser_version:
                 continue
             try:
                 options = json.loads(representation.options_json)
@@ -509,9 +543,11 @@ class DurableSourceProcessingWorker:
                 raise SourceProcessingJobError(
                     "Retained representation has invalid parser options JSON."
                 ) from exc
-            if options != _TEXT_OPTIONS:
+            if options != expected_options:
                 continue
             self.source_text.verify(representation.representation_id)
+            if is_pdf:
+                self.source_pdf.verify_page_map(representation.representation_id)
             return representation
         return None
 
@@ -558,13 +594,6 @@ class DurableSourceProcessingWorker:
         if chunk_count is not None:
             payload["chunk_count"] = chunk_count
         return payload
-
-
-def _is_normalized_text_representation(
-    representation_type: SourceRepresentationType,
-) -> bool:
-    """Keep the compatibility guard explicit as representation types expand."""
-    return representation_type.value == SourceRepresentationType.NORMALIZED_TEXT.value
 
 
 def _json_object(value: str | None, label: str) -> dict[str, Any]:

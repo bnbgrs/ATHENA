@@ -30,11 +30,18 @@ class SourceAnchorRepository:
         start_offset: int,
         end_offset: int,
         quoted_hash: bytes,
+        page_start: int | None = None,
+        page_end: int | None = None,
     ) -> SourceAnchorRecord:
         if start_offset < 0 or end_offset <= start_offset:
             raise ValueError("Text SourceAnchor requires 0 <= start_offset < end_offset.")
         if len(quoted_hash) != 32:
             raise ValueError("quoted_hash must be a 32-byte SHA-256 digest.")
+        if (page_start is None) != (page_end is None):
+            raise ValueError("Text SourceAnchor page range must provide both endpoints or neither.")
+        if page_start is not None and page_end is not None:
+            if page_start < 1 or page_end < page_start:
+                raise ValueError("Text SourceAnchor page range is invalid.")
 
         with self.database.write_transaction() as connection:
             self._require_active_actor(connection, actor_id)
@@ -92,7 +99,7 @@ class SourceAnchorRepository:
                     anchor_id, source_id, representation_id, anchor_type,
                     start_offset, end_offset, page_start, page_end,
                     start_time_ms, end_time_ms, geometry_json, quoted_hash
-                ) VALUES (?, ?, ?, 'text_range', ?, ?, NULL, NULL, NULL, NULL, NULL, ?)
+                ) VALUES (?, ?, ?, 'text_range', ?, ?, ?, ?, NULL, NULL, NULL, ?)
                 """,
                 (
                     anchor_blob,
@@ -100,6 +107,8 @@ class SourceAnchorRepository:
                     uuid_to_blob(representation_id),
                     start_offset,
                     end_offset,
+                    page_start,
+                    page_end,
                     quoted_hash,
                 ),
             )
@@ -143,8 +152,8 @@ class SourceAnchorRepository:
                 anchor_type=SourceAnchorType.TEXT_RANGE,
                 start_offset=start_offset,
                 end_offset=end_offset,
-                page_start=None,
-                page_end=None,
+                page_start=page_start,
+                page_end=page_end,
                 start_time_ms=None,
                 end_time_ms=None,
                 geometry_json=None,

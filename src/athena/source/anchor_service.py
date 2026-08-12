@@ -38,6 +38,11 @@ class SourceAnchorService:
     def materialize_chunk(self, chunk_id: uuid.UUID) -> SourceAnchorRecord:
         chunk = self.source_chunks.verify(chunk_id)
         actor_id = self.chat.ensure_local_user()
+        page_range = self.source_text.page_range_for_text_range(
+            chunk.representation_id,
+            start_offset=chunk.start_anchor_value,
+            end_offset=chunk.end_anchor_value,
+        )
         anchor = self.repository.materialize_text_range(
             actor_id=actor_id,
             source_id=chunk.source_id,
@@ -45,6 +50,8 @@ class SourceAnchorService:
             start_offset=chunk.start_anchor_value,
             end_offset=chunk.end_anchor_value,
             quoted_hash=chunk.content_hash,
+            page_start=page_range[0] if page_range is not None else None,
+            page_end=page_range[1] if page_range is not None else None,
         )
         self.chunk_store.set_anchor_hint(chunk.chunk_id, anchor.anchor_id)
         return anchor
@@ -61,6 +68,11 @@ class SourceAnchorService:
         if not 0 <= start_offset < end_offset <= len(text):
             raise ValueError("SourceAnchor range is outside the retained representation.")
         quoted_hash = hashlib.sha256(text[start_offset:end_offset].encode("utf-8")).digest()
+        page_range = self.source_text.page_range_for_text_range(
+            representation_id,
+            start_offset=start_offset,
+            end_offset=end_offset,
+        )
         actor_id = self.chat.ensure_local_user()
         return self.repository.materialize_text_range(
             actor_id=actor_id,
@@ -69,6 +81,8 @@ class SourceAnchorService:
             start_offset=start_offset,
             end_offset=end_offset,
             quoted_hash=quoted_hash,
+            page_start=page_range[0] if page_range is not None else None,
+            page_end=page_range[1] if page_range is not None else None,
         )
 
     def get(self, anchor_id: uuid.UUID) -> SourceAnchorRecord:
@@ -88,6 +102,20 @@ class SourceAnchorService:
         ).digest()
         if anchor.quoted_hash is None or actual_hash != anchor.quoted_hash:
             raise SourceAnchorIntegrityError("SourceAnchor quoted hash disagrees with representation.")
+        expected_pages = self.source_text.page_range_for_text_range(
+            anchor.representation_id,
+            start_offset=anchor.start_offset,
+            end_offset=anchor.end_offset,
+        )
+        actual_pages = (
+            (anchor.page_start, anchor.page_end)
+            if anchor.page_start is not None and anchor.page_end is not None
+            else None
+        )
+        if expected_pages != actual_pages:
+            raise SourceAnchorIntegrityError(
+                "SourceAnchor page range disagrees with retained representation page map."
+            )
         return anchor
 
     def read_text(self, anchor_id: uuid.UUID) -> str:

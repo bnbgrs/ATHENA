@@ -7,7 +7,9 @@ name = "athena-local"
 version = "0.0.1"
 description = "ATHENA local-first personal knowledge system"
 requires-python = ">=3.12,<3.13"
-dependencies = []
+dependencies = [
+    "pypdf==6.12.2",
+]
 
 [project.optional-dependencies]
 dev = [

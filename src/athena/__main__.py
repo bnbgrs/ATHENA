@@ -610,6 +610,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Build a deterministic retained UTF-8 text representation from one TXT/Markdown Source.",
     )
     source_represent_text.add_argument("source_id", type=_uuid_argument)
+    source_represent_pdf = source_commands.add_parser(
+        "represent-pdf",
+        help="Build retained native PDF text plus a stable page-offset map.",
+    )
+    source_represent_pdf.add_argument("source_id", type=_uuid_argument)
     source_representation_show = source_commands.add_parser(
         "representation-show",
         help="Show one immutable SourceRepresentation and its BlobRecord.",
@@ -636,6 +641,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=50,
         help="Maximum number of representations to print (1-500).",
     )
+    source_representation_pages = source_commands.add_parser(
+        "representation-pages",
+        help="List retained PDF page-map offsets for one SourceRepresentation.",
+    )
+    source_representation_pages.add_argument("representation_id", type=_uuid_argument)
     source_chunk_text = source_commands.add_parser(
         "chunk-text",
         help="Build a deterministic Derived SourceChunk set from one retained text representation.",
@@ -1769,6 +1779,12 @@ def _print_source_anchor(anchor: SourceAnchorRecord) -> None:
     print(f"Representation: {anchor.representation_id}")
     print(f"Type: {anchor.anchor_type.value}")
     print(f"Range: {anchor.start_offset}:{anchor.end_offset}")
+    page_value = (
+        "<none>"
+        if anchor.page_start is None or anchor.page_end is None
+        else (str(anchor.page_start) if anchor.page_start == anchor.page_end else f"{anchor.page_start}:{anchor.page_end}")
+    )
+    print(f"Page: {page_value}")
     print(f"Quoted SHA-256: {anchor.quoted_hash.hex() if anchor.quoted_hash else '<none>'}")
 
 
@@ -1866,6 +1882,24 @@ def _run_source_command(app: AthenaApplication, args: argparse.Namespace) -> int
         print(f"Storage: {blob.storage_area.value}:{blob.storage_locator}")
         return 0
 
+    if args.source_command == "represent-pdf":
+        pdf_build = app.source_pdf.build(args.source_id)
+        representation = pdf_build.result.representation
+        blob = pdf_build.result.blob
+        print(f"Representation created: {representation.representation_id}")
+        print(f"Source: {representation.source_id}")
+        print(f"Type: {representation.representation_type.value}")
+        print(f"Retention: {representation.retention_state.value}")
+        print(f"ProcessingRun: {pdf_build.processing_run.processing_run_id}")
+        print(f"Run status: {pdf_build.processing_run.status}")
+        print(f"Parser: {representation.parser_id}@{representation.parser_version}")
+        print(f"Pages: {len(pdf_build.pages)}")
+        print(f"Blob: {blob.blob_id} reused={'yes' if pdf_build.result.reused_blob else 'no'}")
+        print(f"Bytes: {blob.byte_length}")
+        print(f"SHA-256: {representation.content_hash.hex()}")
+        print(f"Storage: {blob.storage_area.value}:{blob.storage_locator}")
+        return 0
+
     if args.source_command == "representation-show":
         representation, blob = app.source_text.get(args.representation_id)
         _print_source_representation_record(representation, blob)
@@ -1900,6 +1934,19 @@ def _run_source_command(app: AthenaApplication, args: argparse.Namespace) -> int
                 f"retention={representation.retention_state.value} "
                 f"bytes={blob.byte_length} blob={blob.blob_id} "
                 f"run={representation.processing_run_id}"
+            )
+        return 0
+
+    if args.source_command == "representation-pages":
+        pages = app.source_text.list_pages(args.representation_id)
+        if not pages:
+            print("No retained page map for this SourceRepresentation.")
+            return 0
+        print(f"Representation pages: {len(pages)}")
+        for page in pages:
+            print(
+                f"page={page.page_number} range={page.start_offset}:{page.end_offset} "
+                f"sha256={page.content_hash.hex()}"
             )
         return 0
 

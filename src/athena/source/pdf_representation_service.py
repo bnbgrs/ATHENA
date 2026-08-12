@@ -1,50 +1,55 @@
-"""Use cases for deterministic retained text SourceRepresentations."""
+"""Use cases for retained native-text PDF SourceRepresentations."""
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+
+import pypdf
 
 from athena.chat.service import ChatService
 from athena.model.provenance import ModelRunRepository, ProcessingRun
 from athena.source.blob_store import BlobStore
 from athena.source.models import (
-    BlobRecord,
     SourceRecord,
     SourceRepresentationPageRecord,
-    SourceRepresentationRecord,
+    SourceRepresentationType,
     TextRepresentationResult,
+)
+from athena.source.pdf_representation_store import (
+    PdfNativeTextRepresentationStore,
+    PreparedPdfTextRepresentation,
+    UnsupportedPdfSourceError,
 )
 from athena.source.repository import SourceRepository
 from athena.source.representation_repository import SourceRepresentationRepository
-from athena.source.representation_store import (
-    PreparedTextRepresentation,
-    TextRepresentationStore,
-    UnsupportedTextSourceError,
-)
 
-_TEXT_SUFFIXES = {".txt", ".md", ".markdown"}
-_TEXT_MIME_TYPES = {"text/plain", "text/markdown", "text/x-markdown"}
-_PARSER_ID = "athena.native_text"
-_PARSER_VERSION = "1"
-_PIPELINE_VERSION = "native-text-v1"
-_TEXT_OPTIONS: dict[str, object] = {
-    "encoding": "utf-8-strict",
-    "utf8_bom": "strip",
+_PDF_SUFFIXES = {".pdf"}
+_PDF_MIME_TYPES = {"application/pdf"}
+_PARSER_ID = "athena.native_pdf"
+_PARSER_VERSION = f"1+pypdf-{pypdf.__version__}"
+_PIPELINE_VERSION = "native-pdf-text-v1"
+_PDF_OPTIONS: dict[str, object] = {
+    "engine": "pypdf",
+    "engine_version": pypdf.__version__,
     "line_endings": "lf",
+    "page_order": "document",
+    "page_separator": "\n\n",
     "unicode_normalization": "none",
 }
 
 
 @dataclass(frozen=True, slots=True)
-class TextRepresentationBuildResult:
+class PdfRepresentationBuildResult:
     result: TextRepresentationResult
     processing_run: ProcessingRun
+    pages: tuple[SourceRepresentationPageRecord, ...]
 
 
-class SourceTextRepresentationService:
-    """Create retained normalized text from a verified archived Source blob."""
+class SourcePdfRepresentationService:
+    """Create retained native PDF text plus a stable page-offset map."""
 
     def __init__(
         self,
@@ -52,7 +57,7 @@ class SourceTextRepresentationService:
         sources: SourceRepository,
         representations: SourceRepresentationRepository,
         blob_store: BlobStore,
-        representation_store: TextRepresentationStore,
+        representation_store: PdfNativeTextRepresentationStore,
         runs: ModelRunRepository,
         chat: ChatService,
     ) -> None:
@@ -77,21 +82,20 @@ class SourceTextRepresentationService:
 
     @property
     def parser_options(self) -> dict[str, object]:
-        return dict(_TEXT_OPTIONS)
+        return dict(_PDF_OPTIONS)
 
     def supports(self, source: SourceRecord) -> bool:
-        try:
-            _require_supported_text_source(source)
-        except UnsupportedTextSourceError:
-            return False
-        return True
+        suffix = Path(source.original_name or "").suffix.lower()
+        if source.mime_type in _PDF_MIME_TYPES:
+            return True
+        return source.mime_type in {None, "application/octet-stream"} and suffix in _PDF_SUFFIXES
 
-    def build(self, source_id: uuid.UUID) -> TextRepresentationBuildResult:
+    def build(self, source_id: uuid.UUID) -> PdfRepresentationBuildResult:
         source, source_blob = self.sources.get(source_id)
-        _require_supported_text_source(source)
+        _require_supported_pdf_source(source)
         actor_id = self.chat.ensure_local_user()
         run = self.runs.start_run(
-            run_type="source_text_representation",
+            run_type="source_pdf_native_text_representation",
             trigger_actor_id=actor_id,
             pipeline_version=_PIPELINE_VERSION,
             input_snapshot={
@@ -103,18 +107,19 @@ class SourceTextRepresentationService:
                 "original_name": source.original_name,
             },
             configuration={
-                "representation_type": "normalized_text",
+                "representation_type": SourceRepresentationType.EXTRACTED_TEXT.value,
                 "retention_state": "retained",
                 "parser_id": _PARSER_ID,
                 "parser_version": _PARSER_VERSION,
-                "options": _TEXT_OPTIONS,
+                "options": _PDF_OPTIONS,
+                "page_map": "codepoint_offsets_v1",
             },
             model_signature_id=None,
             prompt_template_id=None,
             prompt_template_version=None,
         )
 
-        prepared: PreparedTextRepresentation | None = None
+        prepared: PreparedPdfTextRepresentation | None = None
         try:
             source_path = self.blob_store.verify_blob(
                 storage_area=source_blob.storage_area,
@@ -136,11 +141,19 @@ class SourceTextRepresentationService:
                     expected_length=existing_blob.byte_length,
                 )
                 self.representation_store.discard(prepared)
-                prepared = None
                 stored_blob = None
             else:
                 stored_blob = self.representation_store.commit(prepared)
-                prepared = None
+            page_map = tuple(
+                (
+                    page.page_number,
+                    page.start_offset,
+                    page.end_offset,
+                    page.content_sha256,
+                )
+                for page in prepared.pages
+            )
+            prepared = None
 
             result = self.representations.create_retained_text(
                 actor_id=actor_id,
@@ -151,11 +164,16 @@ class SourceTextRepresentationService:
                 content_hash=content_hash,
                 parser_id=_PARSER_ID,
                 parser_version=_PARSER_VERSION,
-                options=_TEXT_OPTIONS,
+                options=_PDF_OPTIONS,
+                representation_type=SourceRepresentationType.EXTRACTED_TEXT,
+                operation="source.representation.pdf_text.create",
+                page_map=page_map,
             )
-            return TextRepresentationBuildResult(
+            pages = self.verify_page_map(result.representation.representation_id)
+            return PdfRepresentationBuildResult(
                 result=result,
                 processing_run=self.runs.load_run(run.processing_run_id),
+                pages=pages,
             )
         except Exception as exc:
             if prepared is not None:
@@ -169,59 +187,46 @@ class SourceTextRepresentationService:
                 )
             raise
 
-    def get(self, representation_id: uuid.UUID) -> tuple[SourceRepresentationRecord, BlobRecord]:
-        return self.representations.get(representation_id)
-
-    def list_for_source(
-        self,
-        source_id: uuid.UUID,
-        *,
-        limit: int = 50,
-    ) -> tuple[tuple[SourceRepresentationRecord, BlobRecord], ...]:
-        # Preserve SourceNotFound behavior even when the representation list is empty.
-        self.sources.get(source_id)
-        return self.representations.list_for_source(source_id, limit=limit)
-
-    def verify(self, representation_id: uuid.UUID) -> Path:
+    def verify_page_map(
+        self, representation_id: uuid.UUID
+    ) -> tuple[SourceRepresentationPageRecord, ...]:
         representation, blob = self.representations.get(representation_id)
-        if representation.content_hash != blob.integrity_sha256:
-            raise RuntimeError("SourceRepresentation content hash disagrees with its BlobRecord.")
-        return self.blob_store.verify_blob(
+        if representation.representation_type is not SourceRepresentationType.EXTRACTED_TEXT:
+            raise ValueError("PDF page-map verification requires extracted_text representation.")
+        text_path = self.blob_store.verify_blob(
             storage_area=blob.storage_area,
             storage_locator=blob.storage_locator,
             expected_sha256=representation.content_hash,
             expected_length=blob.byte_length,
         )
-
-    def read_text(self, representation_id: uuid.UUID) -> str:
-        return self.verify(representation_id).read_text(encoding="utf-8")
-
-
-    def list_pages(
-        self, representation_id: uuid.UUID
-    ) -> tuple[SourceRepresentationPageRecord, ...]:
-        return self.representations.list_pages(representation_id)
-
-    def page_range_for_text_range(
-        self,
-        representation_id: uuid.UUID,
-        *,
-        start_offset: int,
-        end_offset: int,
-    ) -> tuple[int, int] | None:
-        return self.representations.page_range_for_text_range(
-            representation_id,
-            start_offset=start_offset,
-            end_offset=end_offset,
-        )
+        text = text_path.read_text(encoding="utf-8")
+        pages = self.representations.list_pages(representation_id)
+        if not pages:
+            raise RuntimeError("Native PDF representation is missing its retained page map.")
+        expected_numbers = tuple(range(1, len(pages) + 1))
+        if tuple(page.page_number for page in pages) != expected_numbers:
+            raise RuntimeError("PDF page map is not contiguous from page 1.")
+        previous_end = 0
+        for page in pages:
+            if page.start_offset < previous_end or page.end_offset < page.start_offset:
+                raise RuntimeError("PDF page map contains overlapping or invalid offsets.")
+            if page.end_offset > len(text):
+                raise RuntimeError("PDF page map extends beyond retained text.")
+            actual = hashlib.sha256(
+                text[page.start_offset : page.end_offset].encode("utf-8")
+            ).digest()
+            if actual != page.content_hash:
+                raise RuntimeError("PDF page-map text hash verification failed.")
+            previous_end = page.end_offset
+        return pages
 
 
-def _require_supported_text_source(source: SourceRecord) -> None:
+def _require_supported_pdf_source(source: SourceRecord) -> None:
     suffix = Path(source.original_name or "").suffix.lower()
-    if source.mime_type in _TEXT_MIME_TYPES:
+    if source.mime_type in _PDF_MIME_TYPES:
         return
-    if source.mime_type in {None, "application/octet-stream"} and suffix in _TEXT_SUFFIXES:
+    if source.mime_type in {None, "application/octet-stream"} and suffix in _PDF_SUFFIXES:
         return
-    raise UnsupportedTextSourceError(
-        "VS4 Step 2 supports deterministic text representations only for TXT/Markdown Sources."
+    raise UnsupportedPdfSourceError(
+        "VS6 Step 1 native PDF extraction supports PDF Sources only."
     )

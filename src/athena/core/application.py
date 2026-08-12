@@ -48,6 +48,8 @@ from athena.source.blob_store import BlobStore
 from athena.source.chunk_store import SourceChunkStore
 from athena.source.chunking_repository import ChunkingProfileRepository
 from athena.source.chunking_service import SourceChunkingService
+from athena.source.pdf_representation_service import SourcePdfRepresentationService
+from athena.source.pdf_representation_store import PdfNativeTextRepresentationStore
 from athena.source.repository import SourceRepository
 from athena.source.representation_repository import SourceRepresentationRepository
 from athena.source.representation_service import SourceTextRepresentationService
@@ -94,6 +96,7 @@ class AthenaApplication:
         self.chunking_profiles = ChunkingProfileRepository(self.database)
         self.source_chunk_store = SourceChunkStore(self.paths.derived_root)
         self.text_representation_store = TextRepresentationStore(self.paths)
+        self.pdf_representation_store = PdfNativeTextRepresentationStore(self.paths)
         self.sources = SourceCaptureService(
             repository=self.source_repository,
             blob_store=self.blob_store,
@@ -119,6 +122,14 @@ class AthenaApplication:
             representations=self.source_representation_repository,
             blob_store=self.blob_store,
             representation_store=self.text_representation_store,
+            runs=self.model_runs,
+            chat=self.chat,
+        )
+        self.source_pdf = SourcePdfRepresentationService(
+            sources=self.source_repository,
+            representations=self.source_representation_repository,
+            blob_store=self.blob_store,
+            representation_store=self.pdf_representation_store,
             runs=self.model_runs,
             chat=self.chat,
         )
@@ -162,6 +173,7 @@ class AthenaApplication:
             jobs=self.jobs,
             sources=self.sources,
             source_text=self.source_text,
+            source_pdf=self.source_pdf,
             source_chunks=self.source_chunks,
         )
         self.embedding_rebuild = DurableEmbeddingRebuildWorker(

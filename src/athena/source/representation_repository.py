@@ -12,6 +12,7 @@ from athena.source.models import (
     BlobRecord,
     BlobStorageArea,
     RepresentationRetentionState,
+    SourceRepresentationPageRecord,
     SourceRepresentationRecord,
     SourceRepresentationType,
     TextRepresentationResult,
@@ -46,6 +47,9 @@ class SourceRepresentationRepository:
         parser_id: str,
         parser_version: str,
         options: dict[str, object],
+        representation_type: SourceRepresentationType = SourceRepresentationType.NORMALIZED_TEXT,
+        operation: str = "source.representation.text.create",
+        page_map: tuple[tuple[int, int, int, bytes], ...] = (),
     ) -> TextRepresentationResult:
         if (stored_blob is None) == (existing_blob is None):
             raise ValueError("Exactly one of stored_blob or existing_blob is required.")
@@ -106,7 +110,7 @@ class SourceRepresentationRepository:
                 connection,
                 commit_id=commit_id,
                 actor_id=actor_id,
-                operation_type="source.representation.text.create",
+                operation_type=operation,
                 committed_at_us=now_us,
             )
 
@@ -169,7 +173,7 @@ class SourceRepresentationRepository:
                 connection,
                 provenance_id=representation_provenance_id,
                 entity_id=representation_id,
-                operation="source.representation.text.create",
+                operation=operation,
                 actor_id=actor_id,
                 created_at_us=now_us,
                 processing_run_id=processing_run_id,
@@ -212,11 +216,12 @@ class SourceRepresentationRepository:
                     options_json,
                     created_at_us,
                     provenance_id
-                ) VALUES (?, ?, 'normalized_text', ?, ?, ?, 'retained', ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, 'retained', ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     uuid_to_blob(representation_id),
                     uuid_to_blob(source_id),
+                    representation_type.value,
                     uuid_to_blob(blob.blob_id),
                     uuid_to_blob(processing_run_id),
                     content_hash,
@@ -228,6 +233,36 @@ class SourceRepresentationRepository:
                     uuid_to_blob(representation_provenance_id),
                 ),
             )
+            if page_map:
+                expected_numbers = tuple(range(1, len(page_map) + 1))
+                actual_numbers = tuple(item[0] for item in page_map)
+                if actual_numbers != expected_numbers:
+                    raise ValueError("SourceRepresentation page map must be contiguous from page 1.")
+                previous_end = 0
+                for _page_number, start_offset, end_offset, page_hash in page_map:
+                    if start_offset < previous_end or end_offset < start_offset:
+                        raise ValueError("SourceRepresentation page offsets are invalid or overlapping.")
+                    if len(page_hash) != 32:
+                        raise ValueError("SourceRepresentation page hash must be SHA-256 bytes.")
+                    previous_end = end_offset
+                connection.executemany(
+                    """
+                    INSERT INTO source_representation_pages (
+                        representation_id, page_number, start_offset, end_offset, content_hash
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        (
+                            uuid_to_blob(representation_id),
+                            page_number,
+                            start_offset,
+                            end_offset,
+                            page_hash,
+                        )
+                        for page_number, start_offset, end_offset, page_hash in page_map
+                    ),
+                )
+
             connection.execute(
                 """
                 UPDATE sources
@@ -266,7 +301,7 @@ class SourceRepresentationRepository:
         representation = SourceRepresentationRecord(
             representation_id=representation_id,
             source_id=source_id,
-            representation_type=SourceRepresentationType.NORMALIZED_TEXT,
+            representation_type=representation_type,
             blob_id=blob.blob_id,
             processing_run_id=processing_run_id,
             content_hash=content_hash,
@@ -360,6 +395,62 @@ class SourceRepresentationRepository:
             (uuid_to_blob(source_id), limit),
         ).fetchall()
         return tuple((self._representation_from_row(row), self._blob_from_row(row)) for row in rows)
+
+    def list_pages(
+        self, representation_id: uuid.UUID
+    ) -> tuple[SourceRepresentationPageRecord, ...]:
+        self.get(representation_id)
+        rows = self.database.connection.execute(
+            """
+            SELECT representation_id, page_number, start_offset, end_offset, content_hash
+            FROM source_representation_pages
+            WHERE representation_id = ?
+            ORDER BY page_number
+            """,
+            (uuid_to_blob(representation_id),),
+        ).fetchall()
+        return tuple(
+            SourceRepresentationPageRecord(
+                representation_id=uuid_from_blob(bytes(row["representation_id"])),
+                page_number=int(row["page_number"]),
+                start_offset=int(row["start_offset"]),
+                end_offset=int(row["end_offset"]),
+                content_hash=bytes(row["content_hash"]),
+            )
+            for row in rows
+        )
+
+    def page_range_for_text_range(
+        self,
+        representation_id: uuid.UUID,
+        *,
+        start_offset: int,
+        end_offset: int,
+    ) -> tuple[int, int] | None:
+        if start_offset < 0 or end_offset <= start_offset:
+            raise ValueError("Page lookup requires a non-empty ordered text range.")
+        pages = self.list_pages(representation_id)
+        if not pages:
+            return None
+        touched = tuple(
+            page.page_number
+            for page in pages
+            if page.end_offset > start_offset and page.start_offset < end_offset
+        )
+        if touched:
+            return touched[0], touched[-1]
+        # A range can theoretically land only inside an inserted page separator.
+        # Map it to the nearest preceding/following page rather than inventing page 0.
+        preceding = tuple(page.page_number for page in pages if page.end_offset <= start_offset)
+        following = tuple(page.page_number for page in pages if page.start_offset >= end_offset)
+        if preceding and following:
+            return preceding[-1], following[0]
+        if preceding:
+            return preceding[-1], preceding[-1]
+        if following:
+            return following[0], following[0]
+        return None
+
 
     @staticmethod
     def _find_blob_by_integrity(

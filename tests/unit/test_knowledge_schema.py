@@ -3,7 +3,6 @@ import sqlite3
 from athena.common.ids import new_uuid7, uuid_to_blob
 from athena.storage.database import SQLiteDatabase
 from athena.storage.schema import (
-    DURABLE_JOBS_MIGRATION_ID,
     DURABLE_JOBS_SCHEMA_VERSION,
     EXTRACTION_SNAPSHOT_SCHEMA_VERSION,
     KNOWLEDGE_SCHEMA_VERSION,
@@ -18,6 +17,8 @@ from athena.storage.schema import (
     SCHEMA_VERSION,
     SOURCE_ANCHOR_SCHEMA_VERSION,
     SOURCE_CAPTURE_SCHEMA_VERSION,
+    SOURCE_PAGE_MAP_MIGRATION_ID,
+    SOURCE_PAGE_MAP_SCHEMA_VERSION,
     SOURCE_REPRESENTATION_SCHEMA_VERSION,
     _create_schema_v1,
     _migrate_schema_v1_to_v2,
@@ -43,6 +44,7 @@ EXPECTED_SEMANTIC_TABLES = {
     "blob_records",
     "sources",
     "source_representations",
+    "source_representation_pages",
     "chunking_profiles",
     "source_anchors",
     "jobs",
@@ -71,7 +73,7 @@ def test_fresh_database_contains_semantic_schema(tmp_path) -> None:
     ).fetchone()
     assert tuple(metadata) == (
         SCHEMA_VERSION,
-        DURABLE_JOBS_MIGRATION_ID,
+        SOURCE_PAGE_MAP_MIGRATION_ID,
         SCHEMA_VERSION,
     )
 
@@ -595,12 +597,60 @@ def test_v14_database_is_upgraded_additively_to_durable_jobs(tmp_path) -> None:
 
     database = SQLiteDatabase(path)
     database.start()
-    assert database.connection.execute("PRAGMA user_version").fetchone()[0] == DURABLE_JOBS_SCHEMA_VERSION
+    assert database.connection.execute("PRAGMA user_version").fetchone()[0] == SOURCE_PAGE_MAP_SCHEMA_VERSION
     assert "jobs" in _table_names(database.connection)
     assert "checkpoints" in _table_names(database.connection)
+    assert "source_representation_pages" in _table_names(database.connection)
     metadata = database.connection.execute(
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == DURABLE_JOBS_MIGRATION_ID
+    assert metadata["last_migration_id"] == SOURCE_PAGE_MAP_MIGRATION_ID
+    database.stop()
+
+
+def test_v15_database_is_upgraded_additively_to_pdf_page_map(tmp_path) -> None:
+    from athena.storage.schema import (
+        _migrate_schema_v3_to_v4,
+        _migrate_schema_v4_to_v5,
+        _migrate_schema_v5_to_v6,
+        _migrate_schema_v6_to_v7,
+        _migrate_schema_v7_to_v8,
+        _migrate_schema_v8_to_v9,
+        _migrate_schema_v9_to_v10,
+        _migrate_schema_v10_to_v11,
+        _migrate_schema_v11_to_v12,
+        _migrate_schema_v12_to_v13,
+        _migrate_schema_v13_to_v14,
+        _migrate_schema_v14_to_v15,
+    )
+
+    path = tmp_path / "athena.db"
+    legacy = sqlite3.connect(path, autocommit=True)
+    legacy.row_factory = sqlite3.Row
+    legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
+    legacy.execute("PRAGMA application_id = 1096042574")
+    _create_schema_v1(legacy, created_at_us=1)
+    _migrate_schema_v1_to_v2(legacy)
+    _migrate_schema_v2_to_v3(legacy)
+    _migrate_schema_v3_to_v4(legacy)
+    _migrate_schema_v4_to_v5(legacy)
+    _migrate_schema_v5_to_v6(legacy)
+    _migrate_schema_v6_to_v7(legacy)
+    _migrate_schema_v7_to_v8(legacy)
+    _migrate_schema_v8_to_v9(legacy)
+    _migrate_schema_v9_to_v10(legacy)
+    _migrate_schema_v10_to_v11(legacy)
+    _migrate_schema_v11_to_v12(legacy)
+    _migrate_schema_v12_to_v13(legacy)
+    _migrate_schema_v13_to_v14(legacy)
+    _migrate_schema_v14_to_v15(legacy)
+    assert legacy.execute("PRAGMA user_version").fetchone()[0] == DURABLE_JOBS_SCHEMA_VERSION
+    assert "source_representation_pages" not in _table_names(legacy)
+    legacy.close()
+
+    database = SQLiteDatabase(path)
+    database.start()
+    assert database.connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert "source_representation_pages" in _table_names(database.connection)
     database.stop()

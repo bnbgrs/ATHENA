@@ -51,8 +51,13 @@ class SourceChunkingService:
 
     def build_default(self, representation_id: uuid.UUID) -> SourceChunkBuildResult:
         representation, blob = self.source_text.get(representation_id)
-        if representation.representation_type is not SourceRepresentationType.NORMALIZED_TEXT:
-            raise ValueError("VS4 Step 3 chunks only normalized text representations.")
+        if representation.representation_type not in {
+            SourceRepresentationType.NORMALIZED_TEXT,
+            SourceRepresentationType.EXTRACTED_TEXT,
+        }:
+            raise ValueError(
+                "Source chunking requires a retained normalized_text or extracted_text representation."
+            )
         path = self.source_text.verify(representation_id)
         profile = self.profiles.get_or_create_default()
         build_signature = _build_signature(
