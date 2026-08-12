@@ -20,6 +20,7 @@ from athena.knowledge.extraction_models import (
     parse_claim_pair_audit,
     parse_extraction_proposals,
 )
+from athena.knowledge.extraction_snapshot import ExtractionSnapshotRepository
 from athena.model.domain import ModelChatMessage
 from athena.model.ports import ChatModelProvider
 from athena.model.provenance import ModelRunRepository
@@ -54,11 +55,13 @@ class ChatKnowledgeExtractionService:
         chat_generation: ChatGenerationService,
         provider: ChatModelProvider,
         runs: ModelRunRepository,
+        snapshots: ExtractionSnapshotRepository | None = None,
     ) -> None:
         self.chat = chat
         self.chat_generation = chat_generation
         self.provider = provider
         self.runs = runs
+        self.snapshots = snapshots
 
     def extract_chat(
         self,
@@ -147,13 +150,16 @@ class ChatKnowledgeExtractionService:
             raise
 
         finished_run = self.runs.finish_run(run.processing_run_id, status="succeeded")
-        return ChatExtractionResult(
+        result = ChatExtractionResult(
             chat_id=chat_id,
             model=model,
             model_signature=signature,
             processing_run=finished_run,
             proposals=proposals,
         )
+        if self.snapshots is not None:
+            self.snapshots.save(result)
+        return result
 
     def _audit_claim_pairs(
         self,

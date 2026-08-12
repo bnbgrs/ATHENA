@@ -9,13 +9,21 @@ LEGACY_SCHEMA_VERSION = 1
 KNOWLEDGE_SCHEMA_VERSION = 2
 PROVENANCE_SCHEMA_VERSION = 3
 MODEL_RUNS_SCHEMA_VERSION = 4
-SCHEMA_VERSION = 5
+REVIEW_QUEUE_SCHEMA_VERSION = 5
+MERGE_REVIEW_SCHEMA_VERSION = 6
+MERGE_REVIEW_MULTI_TARGET_SCHEMA_VERSION = 7
+EXTRACTION_SNAPSHOT_SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
 PROVENANCE_INPUTS_MIGRATION_ID = "0003_provenance_inputs"
 MODEL_RUNS_MIGRATION_ID = "0004_model_signatures_processing_runs"
 REVIEW_QUEUE_MIGRATION_ID = "0005_semantic_review_queue"
+MERGE_REVIEW_MIGRATION_ID = "0006_persistent_merge_review_decisions"
+MERGE_REVIEW_MULTI_TARGET_MIGRATION_ID = "0007_merge_review_multi_target_identity"
+EXTRACTION_SNAPSHOT_MIGRATION_ID = "0008_frozen_extraction_snapshots"
+LOCAL_FTS_SEARCH_MIGRATION_ID = "0009_local_fts_search"
 
 
 class DatabaseCompatibilityError(RuntimeError):
@@ -85,6 +93,10 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         KNOWLEDGE_SCHEMA_VERSION,
         PROVENANCE_SCHEMA_VERSION,
         MODEL_RUNS_SCHEMA_VERSION,
+        REVIEW_QUEUE_SCHEMA_VERSION,
+        MERGE_REVIEW_SCHEMA_VERSION,
+        MERGE_REVIEW_MULTI_TARGET_SCHEMA_VERSION,
+        EXTRACTION_SNAPSHOT_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -114,9 +126,25 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
 
     if existing_user_version == MODEL_RUNS_SCHEMA_VERSION:
         _migrate_schema_v4_to_v5(connection)
+        existing_user_version = REVIEW_QUEUE_SCHEMA_VERSION
+
+    if existing_user_version == REVIEW_QUEUE_SCHEMA_VERSION:
+        _migrate_schema_v5_to_v6(connection)
+        existing_user_version = MERGE_REVIEW_SCHEMA_VERSION
+
+    if existing_user_version == MERGE_REVIEW_SCHEMA_VERSION:
+        _migrate_schema_v6_to_v7(connection)
+        existing_user_version = MERGE_REVIEW_MULTI_TARGET_SCHEMA_VERSION
+
+    if existing_user_version == MERGE_REVIEW_MULTI_TARGET_SCHEMA_VERSION:
+        _migrate_schema_v7_to_v8(connection)
+        existing_user_version = EXTRACTION_SNAPSHOT_SCHEMA_VERSION
+
+    if existing_user_version == EXTRACTION_SNAPSHOT_SCHEMA_VERSION:
+        _migrate_schema_v8_to_v9(connection)
 
     _configure_connection(connection)
-    _verify_schema_v5(connection)
+    _verify_schema_v9(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -609,18 +637,179 @@ def _migrate_schema_v4_to_v5(connection: sqlite3.Connection) -> None:
             ON semantic_review_items(status, review_type, created_at_us);
 
         UPDATE schema_metadata
-        SET schema_version = {SCHEMA_VERSION},
+        SET schema_version = {REVIEW_QUEUE_SCHEMA_VERSION},
             last_migration_id = '{REVIEW_QUEUE_MIGRATION_ID}',
-            minimum_reader_version = {SCHEMA_VERSION}
+            minimum_reader_version = {REVIEW_QUEUE_SCHEMA_VERSION}
         WHERE singleton_id = 1;
 
-        PRAGMA user_version = {SCHEMA_VERSION};
+        PRAGMA user_version = {REVIEW_QUEUE_SCHEMA_VERSION};
         COMMIT;
         """
     )
 
 
-def _verify_schema_v5(connection: sqlite3.Connection) -> None:
+def _migrate_schema_v5_to_v6(connection: sqlite3.Connection) -> None:
+    """Persist merge-candidate identity and the user's explicit resolution."""
+    connection.executescript(
+        f"""
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE semantic_merge_review_payloads (
+            review_id BLOB(16) PRIMARY KEY CHECK(length(review_id) = 16),
+            proposal_type TEXT NOT NULL CHECK(proposal_type IN ('knowledge', 'claim')),
+            proposal_index INTEGER NOT NULL CHECK(proposal_index >= 0),
+            source_entity_id BLOB(16) NOT NULL CHECK(length(source_entity_id) = 16),
+            source_revision_id BLOB(16) NOT NULL CHECK(length(source_revision_id) = 16),
+            proposal_text TEXT NOT NULL CHECK(length(proposal_text) > 0),
+            proposal_kind TEXT NOT NULL CHECK(length(proposal_kind) > 0),
+            proposal_epistemic_status TEXT NOT NULL CHECK(length(proposal_epistemic_status) > 0),
+            similarity REAL NOT NULL CHECK(similarity >= 0.0 AND similarity <= 1.0),
+            decision TEXT NULL CHECK(decision IN ('merge', 'keep_separate')),
+            FOREIGN KEY(review_id) REFERENCES semantic_review_items(review_id) ON DELETE CASCADE,
+            FOREIGN KEY(source_entity_id) REFERENCES entity_registry(entity_id),
+            FOREIGN KEY(source_revision_id) REFERENCES revisions(revision_id)
+        ) WITHOUT ROWID;
+
+        CREATE UNIQUE INDEX uq_semantic_merge_review_identity
+            ON semantic_merge_review_payloads(
+                proposal_type,
+                source_entity_id,
+                source_revision_id,
+                proposal_kind,
+                proposal_epistemic_status,
+                proposal_text
+            );
+
+        CREATE INDEX idx_semantic_merge_review_decision
+            ON semantic_merge_review_payloads(decision);
+
+        UPDATE schema_metadata
+        SET schema_version = {MERGE_REVIEW_SCHEMA_VERSION},
+            last_migration_id = '{MERGE_REVIEW_MIGRATION_ID}',
+            minimum_reader_version = {MERGE_REVIEW_SCHEMA_VERSION}
+        WHERE singleton_id = 1;
+
+        PRAGMA user_version = {MERGE_REVIEW_SCHEMA_VERSION};
+        COMMIT;
+        """
+    )
+
+
+def _migrate_schema_v6_to_v7(connection: sqlite3.Connection) -> None:
+    """Allow one proposal to have multiple distinct canonical merge targets."""
+    connection.executescript(
+        f"""
+        BEGIN IMMEDIATE;
+
+        DROP INDEX IF EXISTS uq_semantic_merge_review_identity;
+
+        CREATE INDEX idx_semantic_merge_review_identity
+            ON semantic_merge_review_payloads(
+                proposal_type,
+                source_entity_id,
+                source_revision_id,
+                proposal_kind,
+                proposal_epistemic_status,
+                proposal_text
+            );
+
+        CREATE UNIQUE INDEX uq_semantic_merge_review_target
+            ON semantic_review_items(
+                review_type,
+                processing_run_id,
+                left_entity_id,
+                left_revision_id
+            )
+            WHERE review_type = 'merge_candidate';
+
+        UPDATE schema_metadata
+        SET schema_version = {MERGE_REVIEW_MULTI_TARGET_SCHEMA_VERSION},
+            last_migration_id = '{MERGE_REVIEW_MULTI_TARGET_MIGRATION_ID}',
+            minimum_reader_version = {MERGE_REVIEW_MULTI_TARGET_SCHEMA_VERSION}
+        WHERE singleton_id = 1;
+
+        PRAGMA user_version = {MERGE_REVIEW_MULTI_TARGET_SCHEMA_VERSION};
+        COMMIT;
+        """
+    )
+
+
+def _migrate_schema_v7_to_v8(connection: sqlite3.Connection) -> None:
+    """Persist immutable proposal snapshots for reproducible post-review acceptance."""
+    connection.executescript(
+        f"""
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE extraction_result_snapshots (
+            processing_run_id BLOB(16) PRIMARY KEY CHECK(length(processing_run_id) = 16),
+            chat_id BLOB(16) NOT NULL CHECK(length(chat_id) = 16),
+            model_json TEXT NOT NULL CHECK(length(model_json) > 0),
+            proposals_json TEXT NOT NULL CHECK(length(proposals_json) > 0),
+            created_at_us INTEGER NOT NULL,
+            FOREIGN KEY(processing_run_id) REFERENCES processing_runs(processing_run_id),
+            FOREIGN KEY(chat_id) REFERENCES entity_registry(entity_id)
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_extraction_result_snapshots_chat
+            ON extraction_result_snapshots(chat_id, created_at_us);
+
+        UPDATE schema_metadata
+        SET schema_version = {EXTRACTION_SNAPSHOT_SCHEMA_VERSION},
+            last_migration_id = '{EXTRACTION_SNAPSHOT_MIGRATION_ID}',
+            minimum_reader_version = {EXTRACTION_SNAPSHOT_SCHEMA_VERSION}
+        WHERE singleton_id = 1;
+
+        PRAGMA user_version = {EXTRACTION_SNAPSHOT_SCHEMA_VERSION};
+        COMMIT;
+        """
+    )
+
+
+def _migrate_schema_v8_to_v9(connection: sqlite3.Connection) -> None:
+    """Add a reconstructible local FTS5 index for current unprotected text."""
+    try:
+        connection.executescript(
+            f"""
+            BEGIN IMMEDIATE;
+
+            CREATE VIRTUAL TABLE search_fts USING fts5(
+                entity_id UNINDEXED,
+                revision_id UNINDEXED,
+                entity_type UNINDEXED,
+                title,
+                body,
+                tokenize = 'unicode61 remove_diacritics 2'
+            );
+
+            CREATE TABLE search_index_state (
+                singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+                indexed_commit_seq INTEGER NOT NULL CHECK(indexed_commit_seq >= 0),
+                rebuilt_at_us INTEGER NOT NULL
+            );
+
+            INSERT INTO search_index_state (
+                singleton_id, indexed_commit_seq, rebuilt_at_us
+            ) VALUES (1, 0, 0);
+
+            UPDATE schema_metadata
+            SET schema_version = {SCHEMA_VERSION},
+                last_migration_id = '{LOCAL_FTS_SEARCH_MIGRATION_ID}',
+                minimum_reader_version = {SCHEMA_VERSION}
+            WHERE singleton_id = 1;
+
+            PRAGMA user_version = {SCHEMA_VERSION};
+            COMMIT;
+            """
+        )
+    except sqlite3.OperationalError as exc:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise DatabaseCompatibilityError(
+            "ATHENA local retrieval requires SQLite FTS5 support."
+        ) from exc
+
+
+def _verify_schema_v9(connection: sqlite3.Connection) -> None:
     application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
     user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
@@ -638,7 +827,7 @@ def _verify_schema_v5(connection: sqlite3.Connection) -> None:
         SCHEMA_VERSION,
         STORAGE_LAYOUT_VERSION,
         BLOB_FORMAT_VERSION,
-        REVIEW_QUEUE_MIGRATION_ID,
+        LOCAL_FTS_SEARCH_MIGRATION_ID,
         SCHEMA_VERSION,
     )
     if metadata is None or tuple(metadata) != expected:
@@ -654,6 +843,10 @@ def _verify_schema_v5(connection: sqlite3.Connection) -> None:
         "model_signatures",
         "processing_runs",
         "semantic_review_items",
+        "semantic_merge_review_payloads",
+        "extraction_result_snapshots",
+        "search_fts",
+        "search_index_state",
     }
     missing_tables = required_tables.difference(_user_tables(connection))
     if missing_tables:

@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import cast
 
+from athena.chat.models import ChatMessage
 from athena.common.ids import new_uuid7, uuid_from_blob, uuid_to_blob
 from athena.common.time import utc_now_us
 from athena.knowledge.claim_repository import ClaimRepository
+from athena.knowledge.deduplication import CanonicalMergeCandidate
+from athena.knowledge.extraction_models import ChatExtractionResult, ProposalEntityType
 from athena.knowledge.models import EvidenceRole
 from athena.storage.database import SQLiteDatabase
 
@@ -43,6 +47,23 @@ class ReviewItem:
     reason: str
     decision_actor_id: uuid.UUID | None
     decision_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class MergeReviewDetails:
+    review_id: uuid.UUID
+    proposal_type: ProposalEntityType
+    proposal_index: int
+    source_entity_id: uuid.UUID
+    source_revision_id: uuid.UUID
+    proposal_text: str
+    proposal_kind: str
+    proposal_epistemic_status: str
+    similarity: float
+    decision: str | None
+    existing_entity_id: uuid.UUID
+    existing_revision_id: uuid.UUID
+
 
 
 class ReviewService:
@@ -112,6 +133,238 @@ class ReviewService:
             ),
         )
         return review_id
+
+    def enqueue_merge_candidates(
+        self,
+        *,
+        result: ChatExtractionResult,
+        candidates: tuple[CanonicalMergeCandidate, ...],
+        source_by_sequence: Mapping[int, ChatMessage],
+    ) -> tuple[uuid.UUID, ...]:
+        """Persist unresolved canonical near-duplicate decisions without canonical writes."""
+        review_ids: list[uuid.UUID] = []
+        created_at_us = utc_now_us()
+        with self.database.write_transaction() as connection:
+            for candidate in candidates:
+                if candidate.proposal_type is ProposalEntityType.KNOWLEDGE:
+                    knowledge_proposal = result.proposals.knowledge_units[
+                        candidate.proposal_index
+                    ]
+                    source_sequence_no = knowledge_proposal.source_sequence_no
+                    proposal_text = knowledge_proposal.body
+                    proposal_kind = knowledge_proposal.knowledge_kind.value
+                    proposal_epistemic_status = knowledge_proposal.epistemic_status.value
+                else:
+                    claim_proposal = result.proposals.claims[candidate.proposal_index]
+                    source_sequence_no = claim_proposal.source_sequence_no
+                    proposal_text = claim_proposal.statement
+                    proposal_kind = claim_proposal.claim_kind.value
+                    proposal_epistemic_status = claim_proposal.epistemic_status.value
+
+                source = source_by_sequence[source_sequence_no]
+                source_entity_id = source.message_id
+                source_revision_id = source.revision_id
+
+                existing = connection.execute(
+                    """
+                    SELECT p.review_id
+                    FROM semantic_merge_review_payloads AS p
+                    JOIN semantic_review_items AS r ON r.review_id = p.review_id
+                    WHERE p.proposal_type = ?
+                      AND p.source_entity_id = ?
+                      AND p.source_revision_id = ?
+                      AND p.proposal_kind = ?
+                      AND p.proposal_epistemic_status = ?
+                      AND p.proposal_text = ?
+                      AND r.left_entity_id = ?
+                      AND r.left_revision_id = ?
+                    """,
+                    (
+                        candidate.proposal_type.value,
+                        uuid_to_blob(source_entity_id),
+                        uuid_to_blob(source_revision_id),
+                        proposal_kind,
+                        proposal_epistemic_status,
+                        proposal_text,
+                        uuid_to_blob(candidate.existing_entity_id),
+                        uuid_to_blob(candidate.existing_revision_id),
+                    ),
+                ).fetchone()
+                if existing is not None:
+                    review_ids.append(uuid_from_blob(bytes(existing["review_id"])))
+                    continue
+
+                review_id = new_uuid7()
+                connection.execute(
+                    """
+                    INSERT INTO semantic_review_items (
+                        review_id, review_type, status, created_at_us, resolved_at_us,
+                        processing_run_id, model_signature_id,
+                        left_entity_id, left_revision_id,
+                        right_entity_id, right_revision_id,
+                        confidence, reason, decision_actor_id, decision_reason
+                    ) VALUES (
+                        ?, 'merge_candidate', 'pending', ?, NULL,
+                        ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, NULL
+                    )
+                    """,
+                    (
+                        uuid_to_blob(review_id),
+                        created_at_us,
+                        uuid_to_blob(result.processing_run.processing_run_id),
+                        uuid_to_blob(result.model_signature.model_signature_id),
+                        uuid_to_blob(candidate.existing_entity_id),
+                        uuid_to_blob(candidate.existing_revision_id),
+                        candidate.similarity,
+                        candidate.reason,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO semantic_merge_review_payloads (
+                        review_id, proposal_type, proposal_index,
+                        source_entity_id, source_revision_id,
+                        proposal_text, proposal_kind, proposal_epistemic_status,
+                        similarity, decision
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        uuid_to_blob(review_id),
+                        candidate.proposal_type.value,
+                        candidate.proposal_index,
+                        uuid_to_blob(source_entity_id),
+                        uuid_to_blob(source_revision_id),
+                        proposal_text,
+                        proposal_kind,
+                        proposal_epistemic_status,
+                        candidate.similarity,
+                    ),
+                )
+                review_ids.append(review_id)
+        return tuple(review_ids)
+
+    def merge_details(self, review_id: uuid.UUID) -> MergeReviewDetails:
+        row = self.database.connection.execute(
+            """
+            SELECT
+                p.*,
+                r.left_entity_id,
+                r.left_revision_id
+            FROM semantic_merge_review_payloads AS p
+            JOIN semantic_review_items AS r ON r.review_id = p.review_id
+            WHERE p.review_id = ?
+            """,
+            (uuid_to_blob(review_id),),
+        ).fetchone()
+        if row is None:
+            raise ReviewError(f"Merge review payload not found: {review_id}")
+        return MergeReviewDetails(
+            review_id=review_id,
+            proposal_type=ProposalEntityType(str(row["proposal_type"])),
+            proposal_index=int(row["proposal_index"]),
+            source_entity_id=uuid_from_blob(bytes(row["source_entity_id"])),
+            source_revision_id=uuid_from_blob(bytes(row["source_revision_id"])),
+            proposal_text=str(row["proposal_text"]),
+            proposal_kind=str(row["proposal_kind"]),
+            proposal_epistemic_status=str(row["proposal_epistemic_status"]),
+            similarity=float(row["similarity"]),
+            decision=None if row["decision"] is None else str(row["decision"]),
+            existing_entity_id=uuid_from_blob(bytes(row["left_entity_id"])),
+            existing_revision_id=uuid_from_blob(bytes(row["left_revision_id"])),
+        )
+
+    def resolve_merge(
+        self,
+        review_id: uuid.UUID,
+        *,
+        actor_id: uuid.UUID,
+        decision: str,
+    ) -> ReviewItem:
+        if decision not in {"merge", "keep_separate"}:
+            raise ReviewError("Merge decision must be 'merge' or 'keep_separate'.")
+        with self.database.write_transaction() as connection:
+            row = self._require_pending(connection, review_id)
+            if str(row["review_type"]) != "merge_candidate":
+                raise ReviewError("Review item is not a merge candidate.")
+            self._validate_single_current_revision(
+                connection,
+                entity_blob=row["left_entity_id"],
+                revision_blob=row["left_revision_id"],
+            )
+            payload = connection.execute(
+                "SELECT source_entity_id, source_revision_id "
+                "FROM semantic_merge_review_payloads WHERE review_id = ?",
+                (uuid_to_blob(review_id),),
+            ).fetchone()
+            if payload is None:
+                raise ReviewError("Merge review payload is missing.")
+            self._validate_source_revision(
+                connection,
+                entity_blob=payload["source_entity_id"],
+                revision_blob=payload["source_revision_id"],
+            )
+            connection.execute(
+                "UPDATE semantic_merge_review_payloads SET decision = ? WHERE review_id = ?",
+                (decision, uuid_to_blob(review_id)),
+            )
+            self._resolve(
+                connection,
+                row,
+                status=ReviewStatus.ACCEPTED,
+                actor_id=actor_id,
+                decision_reason=f"explicit user merge decision: {decision}",
+            )
+        return self.get(review_id)
+
+    def lookup_merge_decision(
+        self,
+        *,
+        candidate: CanonicalMergeCandidate,
+        result: ChatExtractionResult,
+        source_entity_id: uuid.UUID,
+        source_revision_id: uuid.UUID,
+    ) -> str | None:
+        if candidate.proposal_type is ProposalEntityType.KNOWLEDGE:
+            knowledge_proposal = result.proposals.knowledge_units[
+                candidate.proposal_index
+            ]
+            proposal_text = knowledge_proposal.body
+            proposal_kind = knowledge_proposal.knowledge_kind.value
+            proposal_epistemic_status = knowledge_proposal.epistemic_status.value
+        else:
+            claim_proposal = result.proposals.claims[candidate.proposal_index]
+            proposal_text = claim_proposal.statement
+            proposal_kind = claim_proposal.claim_kind.value
+            proposal_epistemic_status = claim_proposal.epistemic_status.value
+        row = self.database.connection.execute(
+            """
+            SELECT p.decision
+            FROM semantic_merge_review_payloads AS p
+            JOIN semantic_review_items AS r ON r.review_id = p.review_id
+            WHERE p.proposal_type = ?
+              AND p.source_entity_id = ?
+              AND p.source_revision_id = ?
+              AND p.proposal_kind = ?
+              AND p.proposal_epistemic_status = ?
+              AND p.proposal_text = ?
+              AND r.left_entity_id = ?
+              AND r.left_revision_id = ?
+              AND r.status = 'accepted'
+            """,
+            (
+                candidate.proposal_type.value,
+                uuid_to_blob(source_entity_id),
+                uuid_to_blob(source_revision_id),
+                proposal_kind,
+                proposal_epistemic_status,
+                proposal_text,
+                uuid_to_blob(candidate.existing_entity_id),
+                uuid_to_blob(candidate.existing_revision_id),
+            ),
+        ).fetchone()
+        if row is None or row["decision"] is None:
+            return None
+        return str(row["decision"])
 
     def list_pending(
         self,
@@ -186,6 +439,10 @@ class ReviewService:
     def reject(self, review_id: uuid.UUID, *, actor_id: uuid.UUID) -> ReviewItem:
         with self.database.write_transaction() as connection:
             row = self._require_pending(connection, review_id)
+            if str(row["review_type"]) != "contradiction":
+                raise ReviewError(
+                    "Merge candidates require 'review merge' or 'review keep-separate'."
+                )
             self._resolve(
                 connection,
                 row,
@@ -229,6 +486,55 @@ class ReviewService:
         if str(row["status"]) != ReviewStatus.PENDING.value:
             raise ReviewError("Review item is no longer pending.")
         return cast(sqlite3.Row, row)
+
+    @staticmethod
+    def _validate_single_current_revision(
+        connection: sqlite3.Connection,
+        *,
+        entity_blob: object,
+        revision_blob: object,
+    ) -> None:
+        if not isinstance(entity_blob, (bytes, bytearray, memoryview)):
+            raise ReviewError("Merge review lacks a valid canonical entity.")
+        if not isinstance(revision_blob, (bytes, bytearray, memoryview)):
+            raise ReviewError("Merge review lacks a valid canonical revision.")
+        current = connection.execute(
+            """
+            SELECT h.current_revision_id, e.lifecycle_state
+            FROM entity_heads AS h
+            JOIN entity_registry AS e ON e.entity_id = h.entity_id
+            WHERE h.entity_id = ?
+            """,
+            (bytes(entity_blob),),
+        ).fetchone()
+        if (
+            current is None
+            or str(current["lifecycle_state"]) != "active"
+            or bytes(current["current_revision_id"]) != bytes(revision_blob)
+        ):
+            raise ReviewError(
+                "Canonical merge target changed since review was queued; re-extraction is required."
+            )
+
+    @staticmethod
+    def _validate_source_revision(
+        connection: sqlite3.Connection,
+        *,
+        entity_blob: object,
+        revision_blob: object,
+    ) -> None:
+        if not isinstance(entity_blob, (bytes, bytearray, memoryview)):
+            raise ReviewError("Merge review lacks a valid source entity.")
+        if not isinstance(revision_blob, (bytes, bytearray, memoryview)):
+            raise ReviewError("Merge review lacks a valid source revision.")
+        row = connection.execute(
+            "SELECT 1 FROM revisions WHERE entity_id = ? AND revision_id = ?",
+            (bytes(entity_blob), bytes(revision_blob)),
+        ).fetchone()
+        if row is None:
+            raise ReviewError(
+                "Merge review source revision changed or disappeared; re-extraction is required."
+            )
 
     @staticmethod
     def _validate_current_revisions(

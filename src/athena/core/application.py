@@ -14,6 +14,7 @@ from athena.knowledge.acceptance_service import ProposalAcceptanceService
 from athena.knowledge.claim_repository import ClaimRepository
 from athena.knowledge.claim_service import ClaimService
 from athena.knowledge.extraction_service import ChatKnowledgeExtractionService
+from athena.knowledge.extraction_snapshot import ExtractionSnapshotRepository
 from athena.knowledge.repository import KnowledgeRepository
 from athena.knowledge.review_service import ReviewService
 from athena.knowledge.service import KnowledgeService
@@ -21,6 +22,8 @@ from athena.model.adapters.lm_studio import LMStudioProvider
 from athena.model.provenance import ModelRunRepository
 from athena.observability.health import HealthService
 from athena.observability.logging import configure_logging
+from athena.retrieval.ranking import RetrievalRankingService
+from athena.retrieval.search import LocalSearchService
 from athena.storage.database import SQLiteDatabase
 from athena.storage.paths import RuntimePaths
 from athena.storage.runtime import RuntimeLayoutService
@@ -65,12 +68,18 @@ class AthenaApplication:
         self.chat_generation = ChatGenerationService(self.chat, self.model_provider)
         self.model_runs = ModelRunRepository(self.database)
         self.reviews = ReviewService(self.database)
+        self.extraction_snapshots = ExtractionSnapshotRepository(
+            self.database, self.model_runs
+        )
         self.extraction = ChatKnowledgeExtractionService(
             chat=self.chat,
             chat_generation=self.chat_generation,
             provider=self.model_provider,
             runs=self.model_runs,
+            snapshots=self.extraction_snapshots,
         )
+        self.search = LocalSearchService(self.database)
+        self.retrieval = RetrievalRankingService(self.search)
         self.proposal_acceptance = ProposalAcceptanceService(
             database=self.database,
             chat=self.chat,

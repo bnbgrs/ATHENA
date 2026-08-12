@@ -14,6 +14,7 @@ from athena.common.time import utc_now_us
 from athena.knowledge.claim_repository import ClaimRepository, _claim_payload_hash
 from athena.knowledge.deduplication import (
     CanonicalDeduplicationService,
+    CanonicalMergeCandidate,
     DedupAction,
     DedupDecision,
     DeduplicationPlan,
@@ -74,7 +75,8 @@ class ProposalAcceptanceService:
             raise ProposalAcceptanceError(
                 "Extractor returned unresolved merge candidates; acceptance is blocked."
             )
-        return CanonicalDeduplicationService.plan(self.database.connection, result)
+        plan = CanonicalDeduplicationService.plan(self.database.connection, result)
+        return self._apply_resolved_merge_reviews(result, plan)
 
     def accept_all(
         self,
@@ -113,6 +115,7 @@ class ProposalAcceptanceService:
 
         with self.database.write_transaction() as connection:
             current_plan = CanonicalDeduplicationService.plan(connection, result)
+            current_plan = self._apply_resolved_merge_reviews(result, current_plan)
             if expected_plan is not None and current_plan != expected_plan:
                 raise ProposalAcceptanceError(
                     "Canonical state changed after deduplication preflight; review proposals again."
@@ -260,6 +263,95 @@ class ProposalAcceptanceService:
             contradiction_pairs=tuple(contradiction_pairs),
             contradiction_pairs_reused=tuple(contradiction_pairs_reused),
             contradiction_review_ids=tuple(contradiction_review_ids),
+        )
+
+    def queue_merge_reviews(
+        self,
+        result: ChatExtractionResult,
+        plan: DeduplicationPlan,
+    ) -> tuple[uuid.UUID, ...]:
+        """Persist unresolved canonical merge candidates without canonical semantic writes."""
+        thread = self.chat.load_chat(result.chat_id)
+        source_by_sequence = {message.sequence_no: message for message in thread.messages}
+        self._validate_snapshot(result, source_by_sequence)
+        self._validate_sources(result, source_by_sequence)
+        return self.reviews.enqueue_merge_candidates(
+            result=result,
+            candidates=plan.merge_candidates,
+            source_by_sequence=source_by_sequence,
+        )
+
+    def _apply_resolved_merge_reviews(
+        self,
+        result: ChatExtractionResult,
+        plan: DeduplicationPlan,
+    ) -> DeduplicationPlan:
+        if not plan.merge_candidates:
+            return plan
+
+        thread = self.chat.load_chat(result.chat_id)
+        source_by_sequence = {message.sequence_no: message for message in thread.messages}
+
+        knowledge = list(plan.knowledge)
+        claims = list(plan.claims)
+        unresolved: list[CanonicalMergeCandidate] = []
+        merge_target_by_proposal: dict[tuple[str, int], uuid.UUID] = {}
+
+        for candidate in plan.merge_candidates:
+            proposal = (
+                result.proposals.knowledge_units[candidate.proposal_index]
+                if candidate.proposal_type is ProposalEntityType.KNOWLEDGE
+                else result.proposals.claims[candidate.proposal_index]
+            )
+            source = source_by_sequence[proposal.source_sequence_no]
+            decision = self.reviews.lookup_merge_decision(
+                candidate=candidate,
+                result=result,
+                source_entity_id=source.message_id,
+                source_revision_id=source.revision_id,
+            )
+            if decision is None:
+                unresolved.append(candidate)
+                continue
+            if decision == "keep_separate":
+                continue
+            if decision != "merge":
+                raise ProposalAcceptanceError(f"Unsupported persisted merge decision: {decision!r}")
+
+            key = (candidate.proposal_type.value, candidate.proposal_index)
+            prior_target = merge_target_by_proposal.get(key)
+            if prior_target is not None and prior_target != candidate.existing_entity_id:
+                raise ProposalAcceptanceError(
+                    "Conflicting accepted merge targets exist for one proposal."
+                )
+            merge_target_by_proposal[key] = candidate.existing_entity_id
+            replacement = DedupDecision(
+                proposal_type=candidate.proposal_type,
+                proposal_index=candidate.proposal_index,
+                action=DedupAction.REUSE_CANONICAL,
+                existing_entity_id=candidate.existing_entity_id,
+                existing_revision_id=candidate.existing_revision_id,
+            )
+            if candidate.proposal_type is ProposalEntityType.KNOWLEDGE:
+                knowledge[candidate.proposal_index] = replacement
+            else:
+                claims[candidate.proposal_index] = replacement
+
+        # Once a proposal has an explicit merge target, its other near-duplicate
+        # candidates no longer need an independent decision for this acceptance.
+        filtered_unresolved = tuple(
+            candidate
+            for candidate in unresolved
+            if (
+                candidate.proposal_type.value,
+                candidate.proposal_index,
+            )
+            not in merge_target_by_proposal
+        )
+        return DeduplicationPlan(
+            knowledge=tuple(knowledge),
+            claims=tuple(claims),
+            merge_candidates=filtered_unresolved,
         )
 
     @staticmethod

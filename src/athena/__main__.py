@@ -15,6 +15,7 @@ from athena.config.settings import ConfigurationError
 from athena.core.application import AthenaApplication
 from athena.knowledge.claim_repository import ClaimNotFoundError, ClaimRelationError
 from athena.knowledge.extraction_models import ChatExtractionResult
+from athena.knowledge.extraction_snapshot import ExtractionSnapshotNotFoundError
 from athena.knowledge.models import (
     ClaimKind,
     ClaimSnapshot,
@@ -34,6 +35,7 @@ from athena.knowledge.service import (
     UnsupportedKnowledgeSourceError,
 )
 from athena.model.adapters.lm_studio import ModelProviderError
+from athena.retrieval.search import SearchEntityType, SearchError
 from athena.version import __version__
 
 
@@ -260,6 +262,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="After displaying the exact validated proposal set, ask for explicit user acceptance and atomically commit it.",
     )
 
+    extract_accept_run = extract_commands.add_parser(
+        "accept-run",
+        help="Load and accept one frozen successful extraction run without calling the model again.",
+    )
+    extract_accept_run.add_argument("processing_run_id", type=_uuid_argument)
+
     review_parser = commands.add_parser(
         "review",
         help="Persistent semantic review queue.",
@@ -279,6 +287,18 @@ def build_parser() -> argparse.ArgumentParser:
     review_reject = review_commands.add_parser("reject", help="Reject one pending review item.")
     review_reject.add_argument("review_id", type=_uuid_argument)
 
+    review_merge = review_commands.add_parser(
+        "merge",
+        help="Resolve a merge candidate by reusing the displayed canonical target.",
+    )
+    review_merge.add_argument("review_id", type=_uuid_argument)
+
+    review_keep_separate = review_commands.add_parser(
+        "keep-separate",
+        help="Resolve a merge candidate by keeping the proposal as a separate canonical entity.",
+    )
+    review_keep_separate.add_argument("review_id", type=_uuid_argument)
+
     review_accept_all = review_commands.add_parser(
         "accept-all",
         help="Batch-accept pending review items at or above a confidence threshold.",
@@ -290,6 +310,35 @@ def build_parser() -> argparse.ArgumentParser:
         default="contradiction",
     )
     review_accept_all.add_argument("--min-confidence", type=float, default=0.0)
+
+    search_parser = commands.add_parser(
+        "search",
+        help="Search current local Knowledge, Claims, and archived chat messages.",
+    )
+    search_parser.add_argument("query", help="Local full-text search query.")
+    search_parser.add_argument(
+        "--type",
+        dest="search_type",
+        choices=("knowledge", "claim", "chat_message"),
+        help="Optional entity-type filter.",
+    )
+    search_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum number of results (1-200).",
+    )
+    search_parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Force a complete rebuild of the derived FTS index before searching.",
+    )
+
+    search_parser.add_argument(
+        "--raw",
+        action="store_true",
+        help="Show raw FTS results without consolidation or retrieval ranking.",
+    )
 
     model_parser = commands.add_parser("model", help="Local model provider commands.")
     model_commands = model_parser.add_subparsers(dest="model_command", required=True)
@@ -623,6 +672,70 @@ def _print_extraction(result: ChatExtractionResult) -> None:
     print("Canonical writes: 0 (proposal-only)")
 
 
+def _accept_extraction_result(
+    app: AthenaApplication,
+    result: ChatExtractionResult,
+) -> int:
+    plan = app.proposal_acceptance.preflight(result)
+    knowledge_reuse = sum(1 for item in plan.knowledge if item.action.value != "create")
+    claim_reuse = sum(1 for item in plan.claims if item.action.value != "create")
+    print(
+        "Dedup preflight: "
+        f"knowledge_create={len(plan.knowledge) - knowledge_reuse} "
+        f"knowledge_reuse={knowledge_reuse} "
+        f"claim_create={len(plan.claims) - claim_reuse} "
+        f"claim_reuse={claim_reuse}"
+    )
+    if plan.merge_candidates:
+        print(f"Canonical merge candidates: {len(plan.merge_candidates)}")
+        for index, candidate in enumerate(plan.merge_candidates):
+            print(
+                f"[DM{index}] {candidate.proposal_type.value}[{candidate.proposal_index}] "
+                f"~ {candidate.existing_entity_id} similarity={candidate.similarity:.3f} "
+                f"reason={candidate.reason}"
+            )
+        review_ids = app.proposal_acceptance.queue_merge_reviews(result, plan)
+        print("Acceptance blocked: persistent merge review required.")
+        for review_id in review_ids:
+            print(f"  MERGE REVIEW -> {review_id}")
+        print("Use 'athena review show <id>' then choose 'merge' or 'keep-separate'.")
+        print(
+            "After resolving reviews, run: "
+            f"athena extract accept-run {result.processing_run.processing_run_id}"
+        )
+        return 2
+
+    answer = input("Accept ALL displayed proposals after deduplication? [y/N] ").strip().lower()
+    if answer not in {"y", "yes"}:
+        print("Acceptance cancelled. Canonical writes: 0")
+        return 0
+
+    accepted = app.proposal_acceptance.accept_all(result, expected_plan=plan)
+    print(f"Canonical commit: {accepted.commit_id}")
+    print(
+        f"Knowledge resolved: {len(accepted.knowledge_ids)} "
+        f"(created={len(accepted.knowledge_created_ids)} "
+        f"reused={len(accepted.knowledge_reused_ids)})"
+    )
+    for knowledge_id in accepted.knowledge_ids:
+        print(f"  K -> {knowledge_id}")
+    print(
+        f"Claims resolved: {len(accepted.claim_ids)} "
+        f"(created={len(accepted.claim_created_ids)} "
+        f"reused={len(accepted.claim_reused_ids)})"
+    )
+    for claim_id in accepted.claim_ids:
+        print(f"  C -> {claim_id}")
+    print(f"Contradictions committed: {len(accepted.contradiction_pairs)}")
+    print(f"Contradictions reused: {len(accepted.contradiction_pairs_reused)}")
+    print(f"Contradictions queued for review: {len(accepted.contradiction_review_ids)}")
+    if accepted.contradiction_review_ids:
+        print("All model-proposed contradictions require review in Step 7.")
+        for review_id in accepted.contradiction_review_ids:
+            print(f"  REVIEW -> {review_id}")
+    return 0
+
+
 def _run_extract_command(app: AthenaApplication, args: argparse.Namespace) -> int:
     if args.extract_command == "chat":
         result = app.extraction.extract_chat(
@@ -630,62 +743,22 @@ def _run_extract_command(app: AthenaApplication, args: argparse.Namespace) -> in
             requested_model_id=args.model_id,
         )
         _print_extraction(result)
+        print(f"Frozen extraction run: {result.processing_run.processing_run_id}")
         if not args.accept:
             return 0
+        return _accept_extraction_result(app, result)
 
-        plan = app.proposal_acceptance.preflight(result)
-        knowledge_reuse = sum(1 for item in plan.knowledge if item.action.value != "create")
-        claim_reuse = sum(1 for item in plan.claims if item.action.value != "create")
-        print(
-            "Dedup preflight: "
-            f"knowledge_create={len(plan.knowledge) - knowledge_reuse} "
-            f"knowledge_reuse={knowledge_reuse} "
-            f"claim_create={len(plan.claims) - claim_reuse} "
-            f"claim_reuse={claim_reuse}"
-        )
-        if plan.merge_candidates:
-            print(f"Canonical merge candidates: {len(plan.merge_candidates)}")
-            for index, candidate in enumerate(plan.merge_candidates):
-                print(
-                    f"[DM{index}] {candidate.proposal_type.value}[{candidate.proposal_index}] "
-                    f"~ {candidate.existing_entity_id} similarity={candidate.similarity:.3f} "
-                    f"reason={candidate.reason}"
-                )
-            print("Acceptance blocked: resolve canonical merge candidates first.")
+    if args.extract_command == "accept-run":
+        try:
+            result = app.extraction_snapshots.load(args.processing_run_id)
+        except ExtractionSnapshotNotFoundError as exc:
+            print(f"ATHENA extraction snapshot error: {exc}", file=sys.stderr)
             return 2
-
-        answer = input("Accept ALL displayed proposals after deduplication? [y/N] ").strip().lower()
-        if answer not in {"y", "yes"}:
-            print("Acceptance cancelled. Canonical writes: 0")
-            return 0
-
-        accepted = app.proposal_acceptance.accept_all(result, expected_plan=plan)
-        print(f"Canonical commit: {accepted.commit_id}")
-        print(
-            f"Knowledge resolved: {len(accepted.knowledge_ids)} "
-            f"(created={len(accepted.knowledge_created_ids)} "
-            f"reused={len(accepted.knowledge_reused_ids)})"
-        )
-        for knowledge_id in accepted.knowledge_ids:
-            print(f"  K -> {knowledge_id}")
-        print(
-            f"Claims resolved: {len(accepted.claim_ids)} "
-            f"(created={len(accepted.claim_created_ids)} "
-            f"reused={len(accepted.claim_reused_ids)})"
-        )
-        for claim_id in accepted.claim_ids:
-            print(f"  C -> {claim_id}")
-        print(f"Contradictions committed: {len(accepted.contradiction_pairs)}")
-        print(f"Contradictions reused: {len(accepted.contradiction_pairs_reused)}")
-        print(f"Contradictions queued for review: {len(accepted.contradiction_review_ids)}")
-        if accepted.contradiction_review_ids:
-            print("All model-proposed contradictions require review in Step 7.")
-            for review_id in accepted.contradiction_review_ids:
-                print(f"  REVIEW -> {review_id}")
-        return 0
+        print("Loaded frozen extraction proposal snapshot; Primary Model was not called.")
+        _print_extraction(result)
+        return _accept_extraction_result(app, result)
 
     raise RuntimeError(f"Unsupported extraction command: {args.extract_command!r}")
-
 
 
 def _print_review_item(item: object) -> None:
@@ -725,7 +798,19 @@ def _run_review_command(app: AthenaApplication, args: argparse.Namespace) -> int
         return 0
 
     if args.review_command == "show":
-        _print_review_item(app.reviews.get(args.review_id))
+        item = app.reviews.get(args.review_id)
+        _print_review_item(item)
+        if item.review_type == "merge_candidate":
+            details = app.reviews.merge_details(args.review_id)
+            print(f"Proposal type: {details.proposal_type.value}")
+            print(f"Proposal index: {details.proposal_index}")
+            print(f"Proposal text: {details.proposal_text}")
+            print(f"Proposal kind: {details.proposal_kind}")
+            print(f"Proposal status: {details.proposal_epistemic_status}")
+            print(f"Similarity: {details.similarity:.3f}")
+            print(f"Canonical target: {details.existing_entity_id}")
+            print(f"Canonical target revision: {details.existing_revision_id}")
+            print(f"Merge decision: {details.decision or '<pending>'}")
         return 0
 
     actor_id = app.chat.ensure_local_user()
@@ -740,6 +825,26 @@ def _run_review_command(app: AthenaApplication, args: argparse.Namespace) -> int
         print(f"Review rejected: {item.review_id}")
         return 0
 
+    if args.review_command == "merge":
+        item = app.reviews.resolve_merge(
+            args.review_id,
+            actor_id=actor_id,
+            decision="merge",
+        )
+        print(f"Merge review resolved: {item.review_id} -> merge")
+        print("Rerun the original extraction acceptance to apply the decision atomically.")
+        return 0
+
+    if args.review_command == "keep-separate":
+        item = app.reviews.resolve_merge(
+            args.review_id,
+            actor_id=actor_id,
+            decision="keep_separate",
+        )
+        print(f"Merge review resolved: {item.review_id} -> keep_separate")
+        print("Rerun the original extraction acceptance to apply the decision atomically.")
+        return 0
+
     if args.review_command == "accept-all":
         review_ids = app.reviews.accept_all(
             actor_id=actor_id,
@@ -752,6 +857,65 @@ def _run_review_command(app: AthenaApplication, args: argparse.Namespace) -> int
         return 0
 
     raise RuntimeError(f"Unsupported review command: {args.review_command!r}")
+
+
+
+def _run_search_command(app: AthenaApplication, args: argparse.Namespace) -> int:
+    if args.rebuild:
+        count = app.search.rebuild()
+        print(f"Search index rebuilt: {count} current unprotected documents")
+
+    entity_type = (
+        None
+        if args.search_type is None
+        else SearchEntityType(args.search_type)
+    )
+
+    if args.raw:
+        raw_results = app.search.search(
+            args.query,
+            limit=args.limit,
+            entity_type=entity_type,
+        )
+        print(f"Raw search results: {len(raw_results)}")
+        for index, raw_result in enumerate(raw_results, start=1):
+            title = (
+                ""
+                if raw_result.title is None
+                else f" title={raw_result.title!r}"
+            )
+            print(
+                f"[{index}] type={raw_result.entity_type.value} "
+                f"entity={raw_result.entity_id} revision={raw_result.revision_id} "
+                f"fts_score={raw_result.score:.6f} "
+                f"contradictions={raw_result.contradiction_count}{title}"
+            )
+            print(f"    {raw_result.snippet}")
+        return 0
+
+    ranked_results = app.retrieval.search(
+        args.query,
+        limit=args.limit,
+        entity_type=entity_type,
+    )
+    print(f"Retrieval results: {len(ranked_results)}")
+    for index, ranked_result in enumerate(ranked_results, start=1):
+        title = (
+            ""
+            if ranked_result.title is None
+            else f" title={ranked_result.title!r}"
+        )
+        print(
+            f"[{index}] type={ranked_result.entity_type.value} "
+            f"entity={ranked_result.entity_id} revision={ranked_result.revision_id} "
+            f"score={ranked_result.score:.4f} "
+            f"lexical={ranked_result.lexical_score:.4f} "
+            f"authority={ranked_result.authority_score:.2f} "
+            f"contradictions={ranked_result.contradiction_count} "
+            f"duplicates={ranked_result.duplicate_count}{title}"
+        )
+        print(f"    {ranked_result.snippet}")
+    return 0
 
 def _run_model_command(app: AthenaApplication, args: argparse.Namespace) -> int:
     if args.model_command == "status":
@@ -857,6 +1021,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return _run_review_command(app, args)
             except (ReviewError, ValueError) as exc:
                 print(f"ATHENA review error: {exc}", file=sys.stderr)
+                return 2
+
+        if args.command == "search":
+            try:
+                return _run_search_command(app, args)
+            except SearchError as exc:
+                print(f"ATHENA search error: {exc}", file=sys.stderr)
                 return 2
 
         if args.command == "model":
