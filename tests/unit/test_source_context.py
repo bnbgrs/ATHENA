@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from dataclasses import replace
 
 import pytest
 
 from athena.retrieval.archive import ArchiveHybridSearchResult
 from athena.retrieval.context import ContextBuilderError
-from athena.retrieval.source_context import SourceContextBuilderService
+from athena.retrieval.source_context import (
+    SourceContextBuilderService,
+    SourceContextIntegrityError,
+)
 from athena.source.models import SourceAnchorRecord, SourceAnchorType
 
 
@@ -15,6 +19,8 @@ class FakeAnchors:
     def __init__(self, source_id: uuid.UUID) -> None:
         self.source_id = source_id
         self.calls: list[tuple[uuid.UUID, int, int]] = []
+        self.records: dict[uuid.UUID, SourceAnchorRecord] = {}
+        self.texts: dict[uuid.UUID, str] = {}
 
     def materialize_text_range(
         self,
@@ -29,7 +35,7 @@ class FakeAnchors:
             uuid.NAMESPACE_URL,
             f"{representation_id}:{start_offset}:{end_offset}:{quoted}",
         )
-        return SourceAnchorRecord(
+        record = SourceAnchorRecord(
             anchor_id=anchor_id,
             source_id=self.source_id,
             representation_id=representation_id,
@@ -44,6 +50,15 @@ class FakeAnchors:
             quoted_hash=hashlib.sha256(quoted.encode("utf-8")).digest(),
             created_at_us=1,
         )
+        self.records[anchor_id] = record
+        self.texts[anchor_id] = quoted
+        return record
+
+    def verify(self, anchor_id: uuid.UUID) -> SourceAnchorRecord:
+        return self.records[anchor_id]
+
+    def read_text(self, anchor_id: uuid.UUID) -> str:
+        return self.texts[anchor_id]
 
 
 CURRENT_TEXT = ""
@@ -149,3 +164,40 @@ def test_source_context_rejects_tampered_archive_text_before_anchor_materializat
         builder.build_from_hybrid(query="Berlin", results=(tampered,))
 
     assert anchors.calls == []
+
+
+def test_source_context_verify_bundle_rejects_tampered_ephemeral_text() -> None:
+    result = _result("Berlin is durable source evidence.")
+    anchors = FakeAnchors(result.source_id)
+    builder = SourceContextBuilderService(anchors)  # type: ignore[arg-type]
+    bundle = builder.build_from_hybrid(query="Berlin", results=(result,))
+    item = bundle.items[0]
+
+    tampered_item = replace(item, text=item.text + " injected")
+    tampered_bundle = replace(bundle, items=(tampered_item,))
+
+    with pytest.raises(SourceContextIntegrityError, match="text hash changed"):
+        builder.verify_bundle(tampered_bundle)
+
+
+def test_source_context_verify_bundle_rejects_anchor_metadata_tamper() -> None:
+    result = _result("Berlin anchor integrity.")
+    anchors = FakeAnchors(result.source_id)
+    builder = SourceContextBuilderService(anchors)  # type: ignore[arg-type]
+    bundle = builder.build_from_hybrid(query="Berlin", results=(result,))
+    anchor_id = bundle.items[0].anchor_id
+    anchor = anchors.records[anchor_id]
+
+    anchors.records[anchor_id] = replace(anchor, quoted_hash=b"x" * 32)
+
+    with pytest.raises(SourceContextIntegrityError, match="quoted source hash"):
+        builder.verify_bundle(bundle)
+
+
+def test_source_context_verify_bundle_accepts_untampered_bundle() -> None:
+    result = _result("Berlin verified source evidence.")
+    anchors = FakeAnchors(result.source_id)
+    builder = SourceContextBuilderService(anchors)  # type: ignore[arg-type]
+    bundle = builder.build_from_hybrid(query="Berlin", results=(result,))
+
+    builder.verify_bundle(bundle)

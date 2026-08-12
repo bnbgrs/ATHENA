@@ -82,6 +82,10 @@ class SourceGroundedChatService:
             max_estimated_tokens=max_context_tokens,
             max_items=max_context_items,
         )
+        # Re-resolve every durable anchor immediately before generation. This
+        # catches tampering or storage corruption after retrieval/materialization
+        # and ensures failure occurs before the new user turn is persisted.
+        self.context_builder.verify_bundle(context)
 
         evidence_refs = tuple(
             GroundingEvidenceRef(

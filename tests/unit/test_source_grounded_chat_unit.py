@@ -51,6 +51,8 @@ class FakeAnchors:
         self.result = result
         self.calls: list[tuple[uuid.UUID, int, int]] = []
         self.anchor_id = uuid.uuid4()
+        self.record: SourceAnchorRecord | None = None
+        self.text = ""
 
     def materialize_text_range(
         self,
@@ -64,7 +66,8 @@ class FakeAnchors:
             start_offset - self.result.start_anchor_value :
             end_offset - self.result.start_anchor_value
         ]
-        return SourceAnchorRecord(
+        self.text = text
+        self.record = SourceAnchorRecord(
             anchor_id=self.anchor_id,
             source_id=self.result.source_id,
             representation_id=representation_id,
@@ -79,6 +82,16 @@ class FakeAnchors:
             quoted_hash=hashlib.sha256(text.encode("utf-8")).digest(),
             created_at_us=1,
         )
+        return self.record
+
+    def verify(self, anchor_id: uuid.UUID) -> SourceAnchorRecord:
+        assert anchor_id == self.anchor_id
+        assert self.record is not None
+        return self.record
+
+    def read_text(self, anchor_id: uuid.UUID) -> str:
+        assert anchor_id == self.anchor_id
+        return self.text
 
 
 class FakeChatGeneration:

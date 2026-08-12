@@ -71,6 +71,10 @@ class _PlannedSourceItem:
     truncated: bool
 
 
+class SourceContextIntegrityError(RuntimeError):
+    """Raised when a built source context no longer matches durable evidence."""
+
+
 class SourceContextBuilderService:
     """Select archive hits, materialize durable anchors, and render model input.
 
@@ -156,6 +160,75 @@ class SourceContextBuilderService:
             max_estimated_tokens=max_estimated_tokens,
             rendered_text=rendered,
         )
+
+    def verify_bundle(self, bundle: SourceContextBundle) -> None:
+        """Re-verify a completed bundle immediately before model generation.
+
+        This deliberately does not trust the ephemeral retrieval result or the
+        previously rendered JSON. Every selected item is checked against the
+        durable SourceAnchor and retained SourceRepresentation again.
+        """
+
+        expected_context_ids = tuple(
+            f"CTX-{index:03d}" for index in range(1, len(bundle.items) + 1)
+        )
+        actual_context_ids = tuple(item.context_id for item in bundle.items)
+        if actual_context_ids != expected_context_ids:
+            raise SourceContextIntegrityError(
+                "Source context IDs are not contiguous and deterministic."
+            )
+
+        for item in bundle.items:
+            actual_hash = hashlib.sha256(item.text.encode("utf-8")).digest()
+            if actual_hash != item.quoted_hash:
+                raise SourceContextIntegrityError(
+                    f"Source context {item.context_id} text hash changed after build."
+                )
+
+            anchor = self.source_anchors.verify(item.anchor_id)
+            if anchor.anchor_type is not SourceAnchorType.TEXT_RANGE:
+                raise SourceContextIntegrityError(
+                    f"Source context {item.context_id} resolved to a non-text anchor."
+                )
+            if anchor.source_id != item.source_id:
+                raise SourceContextIntegrityError(
+                    f"Source context {item.context_id} changed source identity."
+                )
+            if anchor.representation_id != item.representation_id:
+                raise SourceContextIntegrityError(
+                    f"Source context {item.context_id} changed representation identity."
+                )
+            if anchor.start_offset != item.start_offset or anchor.end_offset != item.end_offset:
+                raise SourceContextIntegrityError(
+                    f"Source context {item.context_id} changed its anchored range."
+                )
+            if anchor.quoted_hash != item.quoted_hash:
+                raise SourceContextIntegrityError(
+                    f"Source context {item.context_id} changed its quoted source hash."
+                )
+            if self.source_anchors.read_text(item.anchor_id) != item.text:
+                raise SourceContextIntegrityError(
+                    f"Source context {item.context_id} text no longer matches its anchor."
+                )
+
+        rendered = _render_source_context(
+            query=bundle.query,
+            mode=bundle.mode,
+            items=bundle.items,
+        )
+        if rendered != bundle.rendered_text:
+            raise SourceContextIntegrityError(
+                "Rendered source context changed after deterministic construction."
+            )
+        estimated = estimate_tokens(rendered)
+        if estimated != bundle.estimated_tokens:
+            raise SourceContextIntegrityError(
+                "Source context token estimate changed after deterministic construction."
+            )
+        if estimated > bundle.max_estimated_tokens:
+            raise SourceContextIntegrityError(
+                "Source context exceeds its persisted deterministic token budget."
+            )
 
     @staticmethod
     def _validate_archive_result(result: ArchiveHybridSearchResult) -> None:
