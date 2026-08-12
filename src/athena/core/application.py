@@ -6,6 +6,7 @@ import logging
 from enum import Enum
 
 from athena.chat.generation import ChatGenerationService
+from athena.chat.memory import MemoryAugmentedChatService
 from athena.chat.repository import ChatRepository
 from athena.chat.service import ChatService
 from athena.config.settings import AthenaSettings
@@ -97,6 +98,12 @@ class AthenaApplication:
             self.semantic_search,
         )
         self.context_builder = ContextBuilderService()
+        self.memory_chat = MemoryAugmentedChatService(
+            chat_generation=self.chat_generation,
+            embedding_provider=self.embedding_provider,
+            hybrid_retrieval=self.hybrid_retrieval,
+            context_builder=self.context_builder,
+        )
         self.proposal_acceptance = ProposalAcceptanceService(
             database=self.database,
             chat=self.chat,

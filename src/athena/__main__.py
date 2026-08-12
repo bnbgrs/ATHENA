@@ -115,6 +115,28 @@ def build_parser() -> argparse.ArgumentParser:
         dest="model_id",
         help="Exact LM Studio model identifier. Required if multiple LLMs are loaded.",
     )
+    send_parser.add_argument(
+        "--memory",
+        action="store_true",
+        help="Retrieve bounded local memory before calling the Primary Model.",
+    )
+    send_parser.add_argument(
+        "--embedding-model",
+        dest="embedding_model_id",
+        help="Exact LM Studio embedding model identifier for --memory.",
+    )
+    send_parser.add_argument(
+        "--memory-max-tokens",
+        type=int,
+        default=1200,
+        help="Estimated-token budget for retrieved memory (128-64000).",
+    )
+    send_parser.add_argument(
+        "--memory-max-items",
+        type=int,
+        default=8,
+        help="Maximum retrieved memory items (1-100).",
+    )
 
     show_parser = chat_commands.add_parser("show", help="Load and print a persistent chat.")
     show_parser.add_argument("chat_id", type=_uuid_argument)
@@ -532,24 +554,58 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
         return 0
 
     if args.chat_command == "send":
+        if not args.memory and args.embedding_model_id is not None:
+            print(
+                "ATHENA chat error: --embedding-model requires --memory.",
+                file=sys.stderr,
+            )
+            return 2
+
         print("Assistant: ", end="", flush=True)
         try:
-            result = app.chat_generation.send_message(
-                chat_id=args.chat_id,
-                content=args.content,
-                requested_model_id=args.model_id,
-                on_delta=lambda chunk: print(chunk, end="", flush=True),
-            )
+            if args.memory:
+                memory_result = app.memory_chat.send_message(
+                    chat_id=args.chat_id,
+                    content=args.content,
+                    requested_model_id=args.model_id,
+                    requested_embedding_model_id=args.embedding_model_id,
+                    max_context_tokens=args.memory_max_tokens,
+                    max_context_items=args.memory_max_items,
+                    on_delta=lambda chunk: print(chunk, end="", flush=True),
+                )
+                result = memory_result.generation
+            else:
+                memory_result = None
+                result = app.chat_generation.send_message(
+                    chat_id=args.chat_id,
+                    content=args.content,
+                    requested_model_id=args.model_id,
+                    on_delta=lambda chunk: print(chunk, end="", flush=True),
+                )
         except KeyboardInterrupt:
             print()
             print(
-                "Generation cancelled. User message remains saved; "
-                "partial assistant text was not persisted.",
+                "Generation cancelled. User message remains saved if generation "
+                "had already started; partial assistant text was not persisted.",
                 file=sys.stderr,
             )
             return 130
         print()
         print(f"Model: {result.model.backend_model_id}")
+        if memory_result is not None:
+            print(
+                "Memory context: "
+                f"items={len(memory_result.context.items)} "
+                f"omitted={memory_result.context.omitted_count} "
+                f"estimated_tokens={memory_result.context.estimated_tokens}/"
+                f"{memory_result.context.max_estimated_tokens} "
+                f"embedding_model={memory_result.embedding_model.backend_model_id}"
+            )
+            if memory_result.context.items:
+                ids = ", ".join(
+                    item.context_id for item in memory_result.context.items
+                )
+                print(f"Memory context IDs: {ids}")
         print(f"Assistant message saved: {result.assistant_message.message_id}")
         return 0
 
@@ -1180,6 +1236,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 EmptyMessageError,
                 ModelProviderError,
                 ModelSelectionError,
+                SemanticSearchError,
                 UnsupportedChatHistoryError,
                 ValueError,
             ) as exc:

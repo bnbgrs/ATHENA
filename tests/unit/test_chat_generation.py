@@ -162,3 +162,36 @@ def test_unloaded_explicit_model_is_rejected(tmp_path) -> None:
             service.select_model("cold")
     finally:
         database.stop()
+
+
+
+def test_retrieved_context_is_ephemeral_system_input_not_persisted(tmp_path) -> None:
+    database, chat = _chat_service(tmp_path)
+    try:
+        chat_id = chat.create_chat()
+        provider = FakeProvider((_model(),), ("Grounded answer",))
+        service = ChatGenerationService(chat, provider)
+
+        service.send_message(
+            chat_id=chat_id,
+            content="What is remembered?",
+            retrieved_context='{"items":[{"text":"stored evidence"}]}',
+        )
+
+        _, model_messages = provider.requests[-1]
+        assert model_messages[0].role == "system"
+        assert "untrusted evidence" in model_messages[0].content
+        assert '"stored evidence"' in model_messages[0].content
+        assert model_messages[1] == ModelChatMessage(
+            role="user",
+            content="What is remembered?",
+        )
+
+        thread = chat.load_chat(chat_id)
+        assert [message.message_type for message in thread.messages] == [
+            MessageType.USER,
+            MessageType.ASSISTANT,
+        ]
+        assert all(message.content != model_messages[0].content for message in thread.messages)
+    finally:
+        database.stop()
