@@ -143,6 +143,107 @@ class LMStudioProvider:
                 f"LM Studio chat generation failed at {self.base_url}."
             ) from exc
 
+    def generate_structured(
+        self,
+        *,
+        model_id: str,
+        messages: Sequence[ModelChatMessage],
+        schema_id: str,
+        json_schema: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Generate one JSON object constrained by LM Studio structured output."""
+        if not model_id:
+            raise ValueError("model_id must not be empty.")
+        if not messages:
+            raise ValueError("At least one chat message is required.")
+        normalized_schema_id = schema_id.strip()
+        if not normalized_schema_id:
+            raise ValueError("schema_id must not be empty.")
+
+        request_payload = {
+            "model": model_id,
+            "messages": [
+                {"role": message.role, "content": message.content}
+                for message in messages
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": normalized_schema_id,
+                    "strict": True,
+                    "schema": dict(json_schema),
+                },
+            },
+            "temperature": 0.0,
+            "stream": False,
+        }
+        raw_body = json.dumps(request_payload, ensure_ascii=False).encode("utf-8")
+        request = Request(
+            self.chat_completions_url,
+            data=raw_body,
+            method="POST",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+        )
+
+        try:
+            with urlopen(request, timeout=self.generation_timeout_seconds) as response:
+                raw = response.read()
+        except HTTPError as exc:
+            detail = self._http_error_detail(exc)
+            raise ModelProviderError(
+                f"LM Studio returned HTTP {exc.code} during structured generation{detail}."
+            ) from exc
+        except (URLError, TimeoutError, OSError) as exc:
+            raise ProviderUnavailableError(
+                f"LM Studio structured generation failed at {self.base_url}."
+            ) from exc
+
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ProviderProtocolError(
+                "LM Studio returned invalid JSON for structured generation."
+            ) from exc
+        if not isinstance(payload, Mapping):
+            raise ProviderProtocolError(
+                "LM Studio returned a non-object structured response."
+            )
+
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ProviderProtocolError(
+                "LM Studio structured response is missing choices."
+            )
+        choice = choices[0]
+        if not isinstance(choice, Mapping):
+            raise ProviderProtocolError(
+                "LM Studio returned an invalid structured choice."
+            )
+        message = choice.get("message")
+        if not isinstance(message, Mapping):
+            raise ProviderProtocolError(
+                "LM Studio structured choice is missing a message object."
+            )
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise ProviderProtocolError(
+                "LM Studio structured response is missing JSON content."
+            )
+        try:
+            structured = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ProviderProtocolError(
+                "LM Studio structured content is not valid JSON."
+            ) from exc
+        if not isinstance(structured, Mapping):
+            raise ProviderProtocolError(
+                "LM Studio structured content must be a JSON object."
+            )
+        return cast(Mapping[str, Any], structured)
+
     def _get_json(self, url: str) -> Mapping[str, Any]:
         request = Request(url, headers={"Accept": "application/json"})
         try:

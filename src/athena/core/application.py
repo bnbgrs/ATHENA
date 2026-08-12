@@ -12,9 +12,11 @@ from athena.config.settings import AthenaSettings
 from athena.core.services import LifecycleService, ServiceManager
 from athena.knowledge.claim_repository import ClaimRepository
 from athena.knowledge.claim_service import ClaimService
+from athena.knowledge.extraction_service import ChatKnowledgeExtractionService
 from athena.knowledge.repository import KnowledgeRepository
 from athena.knowledge.service import KnowledgeService
 from athena.model.adapters.lm_studio import LMStudioProvider
+from athena.model.provenance import ModelRunRepository
 from athena.observability.health import HealthService
 from athena.observability.logging import configure_logging
 from athena.storage.database import SQLiteDatabase
@@ -59,6 +61,13 @@ class AthenaApplication:
             generation_timeout_seconds=self.settings.model_generation_timeout_seconds,
         )
         self.chat_generation = ChatGenerationService(self.chat, self.model_provider)
+        self.model_runs = ModelRunRepository(self.database)
+        self.extraction = ChatKnowledgeExtractionService(
+            chat=self.chat,
+            chat_generation=self.chat_generation,
+            provider=self.model_provider,
+            runs=self.model_runs,
+        )
 
         bootstrap_services: tuple[LifecycleService, ...] = (
             RuntimeLayoutService(self.paths),

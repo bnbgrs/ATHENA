@@ -7,11 +7,13 @@ import sqlite3
 ATHENA_APPLICATION_ID = 1_096_042_574  # ASCII "ATHN" / 0x4154484E
 LEGACY_SCHEMA_VERSION = 1
 KNOWLEDGE_SCHEMA_VERSION = 2
-SCHEMA_VERSION = 3
+PROVENANCE_SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
 PROVENANCE_INPUTS_MIGRATION_ID = "0003_provenance_inputs"
+MODEL_RUNS_MIGRATION_ID = "0004_model_signatures_processing_runs"
 
 
 class DatabaseCompatibilityError(RuntimeError):
@@ -49,9 +51,9 @@ def _configure_connection(connection: sqlite3.Connection) -> None:
 def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> None:
     """Validate, initialize, or safely advance the ATHENA SQLite schema.
 
-    Schema v3 adds explicit provenance inputs on top of the Knowledge schema.
-    Existing v1 and v2 databases are upgraded transactionally without rewriting
-    chat or Knowledge payloads. Unknown, unrelated, and newer databases fail closed.
+    Schema v4 adds persistent ModelSignatures and ProcessingRuns. Existing v1-v3
+    databases are upgraded transactionally without rewriting chat or Knowledge
+    payloads. Unknown, unrelated, and newer databases fail closed.
     """
     existing_application_id = int(
         connection.execute("PRAGMA application_id").fetchone()[0]
@@ -79,6 +81,7 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         0,
         LEGACY_SCHEMA_VERSION,
         KNOWLEDGE_SCHEMA_VERSION,
+        PROVENANCE_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -100,9 +103,13 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
 
     if existing_user_version == KNOWLEDGE_SCHEMA_VERSION:
         _migrate_schema_v2_to_v3(connection)
+        existing_user_version = PROVENANCE_SCHEMA_VERSION
+
+    if existing_user_version == PROVENANCE_SCHEMA_VERSION:
+        _migrate_schema_v3_to_v4(connection)
 
     _configure_connection(connection)
-    _verify_schema_v3(connection)
+    _verify_schema_v4(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -451,8 +458,71 @@ def _migrate_schema_v2_to_v3(connection: sqlite3.Connection) -> None:
             ON provenance_inputs(input_entity_id, input_revision_id);
 
         UPDATE schema_metadata
-        SET schema_version = {SCHEMA_VERSION},
+        SET schema_version = {PROVENANCE_SCHEMA_VERSION},
             last_migration_id = '{PROVENANCE_INPUTS_MIGRATION_ID}',
+            minimum_reader_version = {PROVENANCE_SCHEMA_VERSION}
+        WHERE singleton_id = 1;
+
+        PRAGMA user_version = {PROVENANCE_SCHEMA_VERSION};
+        COMMIT;
+        """
+    )
+
+
+
+def _migrate_schema_v3_to_v4(connection: sqlite3.Connection) -> None:
+    """Add reproducibility metadata required for model-driven semantic work."""
+    connection.executescript(
+        f"""
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE model_signatures (
+            model_signature_id BLOB(16) PRIMARY KEY CHECK(length(model_signature_id) = 16),
+            provider TEXT NOT NULL,
+            model_identifier TEXT NOT NULL,
+            model_revision TEXT NULL,
+            quantization TEXT NULL,
+            generation_parameters_json TEXT NOT NULL,
+            context_configuration_json TEXT NULL,
+            signature_hash BLOB(32) NOT NULL UNIQUE CHECK(length(signature_hash) = 32),
+            created_at_us INTEGER NOT NULL
+        ) WITHOUT ROWID;
+
+        CREATE TABLE processing_runs (
+            processing_run_id BLOB(16) PRIMARY KEY CHECK(length(processing_run_id) = 16),
+            run_type TEXT NOT NULL,
+            started_at_us INTEGER NOT NULL,
+            finished_at_us INTEGER NULL,
+            status TEXT NOT NULL CHECK(status IN (
+                'running', 'succeeded', 'failed', 'cancelled'
+            )),
+            trigger_actor_id BLOB(16) NOT NULL CHECK(length(trigger_actor_id) = 16),
+            pipeline_version TEXT NOT NULL,
+            input_snapshot_json TEXT NOT NULL,
+            configuration_hash BLOB(32) NOT NULL CHECK(length(configuration_hash) = 32),
+            model_signature_id BLOB(16) NULL,
+            prompt_template_id TEXT NULL,
+            prompt_template_version TEXT NULL,
+            error_detail TEXT NULL,
+            FOREIGN KEY(trigger_actor_id) REFERENCES actors(actor_id),
+            FOREIGN KEY(model_signature_id) REFERENCES model_signatures(model_signature_id),
+            CHECK(model_signature_id IS NULL OR length(model_signature_id) = 16),
+            CHECK(finished_at_us IS NULL OR finished_at_us >= started_at_us),
+            CHECK(
+                (status = 'running' AND finished_at_us IS NULL)
+                OR (status != 'running' AND finished_at_us IS NOT NULL)
+            )
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_processing_runs_status_started
+            ON processing_runs(status, started_at_us);
+        CREATE INDEX idx_processing_runs_model_signature
+            ON processing_runs(model_signature_id)
+            WHERE model_signature_id IS NOT NULL;
+
+        UPDATE schema_metadata
+        SET schema_version = {SCHEMA_VERSION},
+            last_migration_id = '{MODEL_RUNS_MIGRATION_ID}',
             minimum_reader_version = {SCHEMA_VERSION}
         WHERE singleton_id = 1;
 
@@ -462,7 +532,7 @@ def _migrate_schema_v2_to_v3(connection: sqlite3.Connection) -> None:
     )
 
 
-def _verify_schema_v3(connection: sqlite3.Connection) -> None:
+def _verify_schema_v4(connection: sqlite3.Connection) -> None:
     application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
     user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
@@ -480,7 +550,7 @@ def _verify_schema_v3(connection: sqlite3.Connection) -> None:
         SCHEMA_VERSION,
         STORAGE_LAYOUT_VERSION,
         BLOB_FORMAT_VERSION,
-        PROVENANCE_INPUTS_MIGRATION_ID,
+        MODEL_RUNS_MIGRATION_ID,
         SCHEMA_VERSION,
     )
     if metadata is None or tuple(metadata) != expected:
@@ -493,6 +563,8 @@ def _verify_schema_v3(connection: sqlite3.Connection) -> None:
         "claim_revisions",
         "claim_evidence",
         "provenance_inputs",
+        "model_signatures",
+        "processing_runs",
     }
     missing_tables = required_tables.difference(_user_tables(connection))
     if missing_tables:

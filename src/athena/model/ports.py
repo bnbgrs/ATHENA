@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
-from typing import Protocol
+from collections.abc import Iterator, Mapping, Sequence
+from typing import Any, Protocol
 
 from athena.model.domain import ModelChatMessage, ModelInfo, ProviderHealth
 
@@ -26,7 +26,7 @@ class ModelDiscoveryProvider(Protocol):
 
 
 class ChatModelProvider(ModelDiscoveryProvider, Protocol):
-    """Provider capable of stateless streamed text chat."""
+    """Provider capable of streamed chat and schema-constrained output."""
 
     def stream_chat(
         self,
@@ -35,4 +35,15 @@ class ChatModelProvider(ModelDiscoveryProvider, Protocol):
         messages: Sequence[ModelChatMessage],
     ) -> Iterator[str]:
         """Yield assistant text deltas for a complete local chat history."""
+        ...
+
+    def generate_structured(
+        self,
+        *,
+        model_id: str,
+        messages: Sequence[ModelChatMessage],
+        schema_id: str,
+        json_schema: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Return one JSON object constrained by the supplied schema."""
         ...

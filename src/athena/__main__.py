@@ -14,6 +14,7 @@ from athena.chat.service import EmptyMessageError
 from athena.config.settings import ConfigurationError
 from athena.core.application import AthenaApplication
 from athena.knowledge.claim_repository import ClaimNotFoundError, ClaimRelationError
+from athena.knowledge.extraction_models import ChatExtractionResult
 from athena.knowledge.models import (
     ClaimKind,
     ClaimSnapshot,
@@ -232,6 +233,25 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=50,
         help="Maximum number of Claims to print (1-500).",
+    )
+
+    extract_parser = commands.add_parser(
+        "extract",
+        help="Primary Model extraction proposals; no canonical writes yet.",
+    )
+    extract_commands = extract_parser.add_subparsers(
+        dest="extract_command",
+        required=True,
+    )
+    extract_chat = extract_commands.add_parser(
+        "chat",
+        help="Generate validated Knowledge/Claim proposals from a persistent chat.",
+    )
+    extract_chat.add_argument("chat_id", type=_uuid_argument)
+    extract_chat.add_argument(
+        "--model",
+        dest="model_id",
+        help="Exact loaded LM Studio model identifier when more than one LLM is loaded.",
     )
 
     model_parser = commands.add_parser("model", help="Local model provider commands.")
@@ -523,6 +543,61 @@ def _run_claim_command(app: AthenaApplication, args: argparse.Namespace) -> int:
     raise RuntimeError(f"Unsupported claim command: {args.claim_command!r}")
 
 
+def _print_extraction(result: ChatExtractionResult) -> None:
+    proposals = result.proposals
+    print(f"Extraction run: {result.processing_run.processing_run_id}")
+    print(f"Run status: {result.processing_run.status}")
+    print(f"Model: {result.model.backend_model_id}")
+    print(f"Model signature: {result.model_signature.model_signature_id}")
+    print(f"Knowledge proposals: {len(proposals.knowledge_units)}")
+    for index, proposal in enumerate(proposals.knowledge_units):
+        title = proposal.title if proposal.title is not None else "<none>"
+        print(
+            f"[K{index}] source=[{proposal.source_sequence_no}] "
+            f"kind={proposal.knowledge_kind.value} "
+            f"status={proposal.epistemic_status.value} "
+            f"confidence={proposal.confidence:.3f} title={title} "
+            f"quote={proposal.source_quote!r} body={proposal.body}"
+        )
+    print(f"Claim proposals: {len(proposals.claims)}")
+    for index, claim_proposal in enumerate(proposals.claims):
+        print(
+            f"[C{index}] source=[{claim_proposal.source_sequence_no}] "
+            f"kind={claim_proposal.claim_kind.value} "
+            f"status={claim_proposal.epistemic_status.value} "
+            f"confidence={claim_proposal.confidence:.3f} "
+            f"quote={claim_proposal.source_quote!r} "
+            f"statement={claim_proposal.statement}"
+        )
+    print(f"Relation proposals: {len(proposals.relations)}")
+    for index, relation in enumerate(proposals.relations):
+        print(
+            f"[R{index}] {relation.left_type.value}[{relation.left_index}] "
+            f"--{relation.relation_type}--> "
+            f"{relation.right_type.value}[{relation.right_index}] "
+            f"confidence={relation.confidence:.3f}"
+        )
+    print(f"Merge candidates: {len(proposals.merge_candidates)}")
+    for index, candidate in enumerate(proposals.merge_candidates):
+        print(
+            f"[M{index}] {candidate.proposal_type.value}[{candidate.proposal_index}] "
+            f"confidence={candidate.confidence:.3f} reason={candidate.reason}"
+        )
+    print("Canonical writes: 0 (proposal-only)")
+
+
+def _run_extract_command(app: AthenaApplication, args: argparse.Namespace) -> int:
+    if args.extract_command == "chat":
+        result = app.extraction.extract_chat(
+            chat_id=args.chat_id,
+            requested_model_id=args.model_id,
+        )
+        _print_extraction(result)
+        return 0
+
+    raise RuntimeError(f"Unsupported extraction command: {args.extract_command!r}")
+
+
 def _run_model_command(app: AthenaApplication, args: argparse.Namespace) -> int:
     if args.model_command == "status":
         health = app.model_provider.health()
@@ -608,6 +683,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ValueError,
             ) as exc:
                 print(f"ATHENA claim error: {exc}", file=sys.stderr)
+                return 2
+
+        if args.command == "extract":
+            try:
+                return _run_extract_command(app, args)
+            except (
+                ChatNotFoundError,
+                ModelProviderError,
+                ModelSelectionError,
+                ValueError,
+            ) as exc:
+                print(f"ATHENA extraction error: {exc}", file=sys.stderr)
                 return 2
 
         if args.command == "model":
