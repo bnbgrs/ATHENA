@@ -31,6 +31,9 @@ from athena.retrieval.ranking import RetrievalRankingService
 from athena.retrieval.search import LocalSearchService
 from athena.retrieval.semantic import LocalSemanticSearchService
 from athena.source.blob_store import BlobStore
+from athena.source.chunk_store import SourceChunkStore
+from athena.source.chunking_repository import ChunkingProfileRepository
+from athena.source.chunking_service import SourceChunkingService
 from athena.source.repository import SourceRepository
 from athena.source.representation_repository import SourceRepresentationRepository
 from athena.source.representation_service import SourceTextRepresentationService
@@ -71,6 +74,8 @@ class AthenaApplication:
         self.blob_store = BlobStore(self.paths)
         self.source_repository = SourceRepository(self.database)
         self.source_representation_repository = SourceRepresentationRepository(self.database)
+        self.chunking_profiles = ChunkingProfileRepository(self.database)
+        self.source_chunk_store = SourceChunkStore(self.paths.derived_root)
         self.text_representation_store = TextRepresentationStore(self.paths)
         self.sources = SourceCaptureService(
             repository=self.source_repository,
@@ -97,6 +102,13 @@ class AthenaApplication:
             representations=self.source_representation_repository,
             blob_store=self.blob_store,
             representation_store=self.text_representation_store,
+            runs=self.model_runs,
+            chat=self.chat,
+        )
+        self.source_chunks = SourceChunkingService(
+            source_text=self.source_text,
+            profiles=self.chunking_profiles,
+            store=self.source_chunk_store,
             runs=self.model_runs,
             chat=self.chat,
         )

@@ -88,3 +88,49 @@ def test_text_representation_cli_survives_process_restarts(tmp_path) -> None:
     listing = _run_cli(local_root, "source", "representation-list", source_id)
     assert listing.returncode == 0, listing.stderr
     assert representation_id in listing.stdout
+
+
+
+def test_source_chunk_cli_survives_process_restarts(tmp_path) -> None:
+    original = tmp_path / "chunk-me.md"
+    original.write_text(("Alpha paragraph. " * 80) + "\n\n" + ("Beta paragraph. " * 80), encoding="utf-8")
+    local_root = tmp_path / "runtime"
+
+    imported = _run_cli(local_root, "source", "import", str(original))
+    assert imported.returncode == 0, imported.stderr
+    source_match = _UUID_RE.search(imported.stdout)
+    assert source_match is not None
+    source_id = source_match.group(0)
+
+    represented = _run_cli(local_root, "source", "represent-text", source_id)
+    assert represented.returncode == 0, represented.stderr
+    representation_match = _UUID_RE.search(represented.stdout)
+    assert representation_match is not None
+    representation_id = representation_match.group(0)
+    original.unlink()
+
+    built = _run_cli(local_root, "source", "chunk-text", representation_id)
+    assert built.returncode == 0, built.stderr
+    assert "Run status: succeeded" in built.stdout
+    assert "Profile: paragraph_char_v1@1 target=1200 overlap=0" in built.stdout
+    ids = _UUID_RE.findall(built.stdout)
+    assert len(ids) >= 3
+    chunk_id = ids[2]
+    assert "derived://chunk/" in built.stdout
+
+    shown = _run_cli(local_root, "source", "chunk-show", chunk_id)
+    assert shown.returncode == 0, shown.stderr
+    assert f"Chunk: {chunk_id}" in shown.stdout
+    assert f"Representation: {representation_id}" in shown.stdout
+
+    verified = _run_cli(local_root, "source", "chunk-verify", chunk_id)
+    assert verified.returncode == 0, verified.stderr
+    assert f"Chunk verified: {chunk_id}" in verified.stdout
+
+    read = _run_cli(local_root, "source", "chunk-read", chunk_id)
+    assert read.returncode == 0, read.stderr
+    assert read.stdout
+
+    listing = _run_cli(local_root, "source", "chunk-list", representation_id)
+    assert listing.returncode == 0, listing.stderr
+    assert chunk_id in listing.stdout

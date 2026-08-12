@@ -40,6 +40,11 @@ from athena.retrieval.context import ContextBuilderError
 from athena.retrieval.search import SearchEntityType, SearchError
 from athena.retrieval.semantic import SemanticSearchError
 from athena.source.blob_store import BlobStoreError
+from athena.source.chunk_store import (
+    SourceChunkNotFoundError,
+    SourceChunkStoreError,
+)
+from athena.source.chunking_service import SourceChunkIntegrityError
 from athena.source.models import BlobRecord, SourceRecord, SourceRepresentationRecord
 from athena.source.repository import SourceActorError, SourceNotFoundError
 from athena.source.representation_repository import SourceRepresentationNotFoundError
@@ -467,7 +472,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     source_parser = commands.add_parser(
         "source",
-        help="Raw Archive source capture commands.",
+        help="Source capture, retained representation, and Derived State commands.",
     )
     source_commands = source_parser.add_subparsers(
         dest="source_command",
@@ -528,6 +533,37 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=50,
         help="Maximum number of representations to print (1-500).",
+    )
+    source_chunk_text = source_commands.add_parser(
+        "chunk-text",
+        help="Build a deterministic Derived SourceChunk set from one retained text representation.",
+    )
+    source_chunk_text.add_argument("representation_id", type=_uuid_argument)
+    source_chunk_show = source_commands.add_parser(
+        "chunk-show",
+        help="Show one reconstructible Derived SourceChunk.",
+    )
+    source_chunk_show.add_argument("chunk_id", type=_uuid_argument)
+    source_chunk_verify = source_commands.add_parser(
+        "chunk-verify",
+        help="Verify one SourceChunk against its retained SourceRepresentation.",
+    )
+    source_chunk_verify.add_argument("chunk_id", type=_uuid_argument)
+    source_chunk_read = source_commands.add_parser(
+        "chunk-read",
+        help="Print the exact text slice stored for one SourceChunk.",
+    )
+    source_chunk_read.add_argument("chunk_id", type=_uuid_argument)
+    source_chunk_list = source_commands.add_parser(
+        "chunk-list",
+        help="List Derived SourceChunks for one SourceRepresentation.",
+    )
+    source_chunk_list.add_argument("representation_id", type=_uuid_argument)
+    source_chunk_list.add_argument(
+        "--limit",
+        type=int,
+        default=500,
+        help="Maximum number of chunks to print (1-5000).",
     )
 
     model_parser = commands.add_parser("model", help="Local model provider commands.")
@@ -1444,6 +1480,74 @@ def _run_source_command(app: AthenaApplication, args: argparse.Namespace) -> int
             )
         return 0
 
+    if args.source_command == "chunk-text":
+        chunk_build = app.source_chunks.build_default(args.representation_id)
+        print(
+            f"Chunk build completed: "
+            f"{chunk_build.processing_run.processing_run_id}"
+        )
+        print(f"Run status: {chunk_build.processing_run.status}")
+        print(f"Chunking profile: {chunk_build.profile.chunking_profile_id}")
+        print(
+            f"Profile: {chunk_build.profile.algorithm}@"
+            f"{chunk_build.profile.profile_version} "
+            f"target={chunk_build.profile.target_size} "
+            f"overlap={chunk_build.profile.overlap_size}"
+        )
+        print(f"Build signature: {chunk_build.build_signature.hex()}")
+        print(f"Chunks: {len(chunk_build.chunks)}")
+        for chunk in chunk_build.chunks:
+            print(
+                f"{chunk.chunk_id} index={chunk.chunk_index} "
+                f"range={chunk.start_anchor_value}:{chunk.end_anchor_value} "
+                f"sha256={chunk.content_hash.hex()} uri={chunk.uri}"
+            )
+        return 0
+
+    if args.source_command == "chunk-show":
+        chunk = app.source_chunks.get(args.chunk_id)
+        print(f"Chunk: {chunk.chunk_id}")
+        print(f"URI: {chunk.uri}")
+        print(f"Source: {chunk.source_id}")
+        print(f"Representation: {chunk.representation_id}")
+        print(f"Index: {chunk.chunk_index}")
+        print(f"Profile: {chunk.chunking_profile_id}")
+        print(f"Range: {chunk.start_anchor_value}:{chunk.end_anchor_value}")
+        print(f"SHA-256: {chunk.content_hash.hex()}")
+        print(f"ProcessingRun: {chunk.processing_run_id}")
+        print(f"Build signature: {chunk.build_signature.hex()}")
+        return 0
+
+    if args.source_command == "chunk-verify":
+        chunk = app.source_chunks.verify(args.chunk_id)
+        print(
+            f"Chunk verified: {chunk.chunk_id} index={chunk.chunk_index} "
+            f"range={chunk.start_anchor_value}:{chunk.end_anchor_value} "
+            f"sha256={chunk.content_hash.hex()}"
+        )
+        return 0
+
+    if args.source_command == "chunk-read":
+        chunk = app.source_chunks.verify(args.chunk_id)
+        print(chunk.chunk_text, end="")
+        return 0
+
+    if args.source_command == "chunk-list":
+        chunks = app.source_chunks.list_for_representation(
+            args.representation_id,
+            limit=args.limit,
+        )
+        if not chunks:
+            print("No SourceChunks.")
+            return 0
+        for chunk in chunks:
+            print(
+                f"{chunk.chunk_id} index={chunk.chunk_index} "
+                f"range={chunk.start_anchor_value}:{chunk.end_anchor_value} "
+                f"profile={chunk.chunking_profile_id} run={chunk.processing_run_id}"
+            )
+        return 0
+
     raise RuntimeError(f"Unsupported source command: {args.source_command!r}")
 
 
@@ -1594,6 +1698,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 SourceActorError,
                 SourceNotFoundError,
                 SourceRepresentationNotFoundError,
+                SourceChunkNotFoundError,
+                SourceChunkStoreError,
+                SourceChunkIntegrityError,
                 TextRepresentationError,
                 ValueError,
             ) as exc:

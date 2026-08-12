@@ -15,7 +15,8 @@ from athena.storage.schema import (
     REVIEW_QUEUE_SCHEMA_VERSION,
     SCHEMA_VERSION,
     SOURCE_CAPTURE_SCHEMA_VERSION,
-    SOURCE_REPRESENTATION_MIGRATION_ID,
+    SOURCE_CHUNK_PROFILE_MIGRATION_ID,
+    SOURCE_REPRESENTATION_SCHEMA_VERSION,
     _create_schema_v1,
     _migrate_schema_v1_to_v2,
     _migrate_schema_v2_to_v3,
@@ -40,6 +41,7 @@ EXPECTED_SEMANTIC_TABLES = {
     "blob_records",
     "sources",
     "source_representations",
+    "chunking_profiles",
 }
 
 
@@ -64,7 +66,7 @@ def test_fresh_database_contains_semantic_schema(tmp_path) -> None:
     ).fetchone()
     assert tuple(metadata) == (
         SCHEMA_VERSION,
-        SOURCE_REPRESENTATION_MIGRATION_ID,
+        SOURCE_CHUNK_PROFILE_MIGRATION_ID,
         SCHEMA_VERSION,
     )
 
@@ -454,4 +456,49 @@ def test_v11_database_is_upgraded_additively_to_source_representations(tmp_path)
     assert database.connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert "sources" in _table_names(database.connection)
     assert "source_representations" in _table_names(database.connection)
+    database.stop()
+
+
+
+def test_v12_database_is_upgraded_additively_to_chunking_profiles(tmp_path) -> None:
+    from athena.storage.schema import (
+        _migrate_schema_v3_to_v4,
+        _migrate_schema_v4_to_v5,
+        _migrate_schema_v5_to_v6,
+        _migrate_schema_v6_to_v7,
+        _migrate_schema_v7_to_v8,
+        _migrate_schema_v8_to_v9,
+        _migrate_schema_v9_to_v10,
+        _migrate_schema_v10_to_v11,
+        _migrate_schema_v11_to_v12,
+    )
+
+    path = tmp_path / "athena.db"
+    legacy = sqlite3.connect(path, autocommit=True)
+    legacy.row_factory = sqlite3.Row
+    legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
+    legacy.execute("PRAGMA application_id = 1096042574")
+    _create_schema_v1(legacy, created_at_us=1)
+    _migrate_schema_v1_to_v2(legacy)
+    _migrate_schema_v2_to_v3(legacy)
+    _migrate_schema_v3_to_v4(legacy)
+    _migrate_schema_v4_to_v5(legacy)
+    _migrate_schema_v5_to_v6(legacy)
+    _migrate_schema_v6_to_v7(legacy)
+    _migrate_schema_v7_to_v8(legacy)
+    _migrate_schema_v8_to_v9(legacy)
+    _migrate_schema_v9_to_v10(legacy)
+    _migrate_schema_v10_to_v11(legacy)
+    _migrate_schema_v11_to_v12(legacy)
+    assert legacy.execute("PRAGMA user_version").fetchone()[0] == SOURCE_REPRESENTATION_SCHEMA_VERSION
+    assert "source_representations" in _table_names(legacy)
+    assert "chunking_profiles" not in _table_names(legacy)
+    legacy.close()
+
+    database = SQLiteDatabase(path)
+    database.start()
+    assert database.connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert "source_representations" in _table_names(database.connection)
+    assert "chunking_profiles" in _table_names(database.connection)
+    assert "source_chunks" not in _table_names(database.connection)
     database.stop()

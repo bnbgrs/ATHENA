@@ -17,7 +17,8 @@ LOCAL_FTS_SCHEMA_VERSION = 9
 LOCAL_EMBEDDINGS_SCHEMA_VERSION = 10
 SOURCE_CAPTURE_SCHEMA_VERSION = 11
 SOURCE_REPRESENTATION_SCHEMA_VERSION = 12
-SCHEMA_VERSION = SOURCE_REPRESENTATION_SCHEMA_VERSION
+SOURCE_CHUNK_PROFILE_SCHEMA_VERSION = 13
+SCHEMA_VERSION = SOURCE_CHUNK_PROFILE_SCHEMA_VERSION
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
@@ -31,6 +32,7 @@ LOCAL_FTS_SEARCH_MIGRATION_ID = "0009_local_fts_search"
 LOCAL_EMBEDDINGS_MIGRATION_ID = "0010_local_embeddings"
 SOURCE_CAPTURE_MIGRATION_ID = "0011_source_capture"
 SOURCE_REPRESENTATION_MIGRATION_ID = "0012_source_representations"
+SOURCE_CHUNK_PROFILE_MIGRATION_ID = "0013_source_chunk_profiles"
 
 
 class DatabaseCompatibilityError(RuntimeError):
@@ -107,6 +109,7 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         LOCAL_FTS_SCHEMA_VERSION,
         LOCAL_EMBEDDINGS_SCHEMA_VERSION,
         SOURCE_CAPTURE_SCHEMA_VERSION,
+        SOURCE_REPRESENTATION_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -164,9 +167,13 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
 
     if existing_user_version == SOURCE_CAPTURE_SCHEMA_VERSION:
         _migrate_schema_v11_to_v12(connection)
+        existing_user_version = SOURCE_REPRESENTATION_SCHEMA_VERSION
+
+    if existing_user_version == SOURCE_REPRESENTATION_SCHEMA_VERSION:
+        _migrate_schema_v12_to_v13(connection)
 
     _configure_connection(connection)
-    _verify_schema_v12(connection)
+    _verify_schema_v13(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -972,8 +979,38 @@ def _migrate_schema_v11_to_v12(connection: sqlite3.Connection) -> None:
             ON source_representations(processing_run_id);
 
         UPDATE schema_metadata
-        SET schema_version = {SCHEMA_VERSION},
+        SET schema_version = {SOURCE_REPRESENTATION_SCHEMA_VERSION},
             last_migration_id = '{SOURCE_REPRESENTATION_MIGRATION_ID}',
+            minimum_reader_version = {SOURCE_REPRESENTATION_SCHEMA_VERSION}
+        WHERE singleton_id = 1;
+
+        PRAGMA user_version = {SOURCE_REPRESENTATION_SCHEMA_VERSION};
+        COMMIT;
+        """
+    )
+
+
+def _migrate_schema_v12_to_v13(connection: sqlite3.Connection) -> None:
+    """Add durable versioned chunking profiles; SourceChunks remain Derived State."""
+    connection.executescript(
+        f"""
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE chunking_profiles (
+            chunking_profile_id BLOB(16) PRIMARY KEY CHECK(length(chunking_profile_id) = 16),
+            algorithm TEXT NOT NULL CHECK(length(algorithm) > 0),
+            tokenizer TEXT NULL,
+            target_size INTEGER NULL CHECK(target_size IS NULL OR target_size > 0),
+            overlap_size INTEGER NULL CHECK(overlap_size IS NULL OR overlap_size >= 0),
+            structure_rules_json TEXT NOT NULL CHECK(json_valid(structure_rules_json)),
+            profile_version INTEGER NOT NULL CHECK(profile_version > 0),
+            configuration_hash BLOB(32) NOT NULL UNIQUE CHECK(length(configuration_hash) = 32),
+            created_at_us INTEGER NOT NULL
+        ) WITHOUT ROWID;
+
+        UPDATE schema_metadata
+        SET schema_version = {SCHEMA_VERSION},
+            last_migration_id = '{SOURCE_CHUNK_PROFILE_MIGRATION_ID}',
             minimum_reader_version = {SCHEMA_VERSION}
         WHERE singleton_id = 1;
 
@@ -983,7 +1020,7 @@ def _migrate_schema_v11_to_v12(connection: sqlite3.Connection) -> None:
     )
 
 
-def _verify_schema_v12(connection: sqlite3.Connection) -> None:
+def _verify_schema_v13(connection: sqlite3.Connection) -> None:
     application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
     user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
@@ -1001,7 +1038,7 @@ def _verify_schema_v12(connection: sqlite3.Connection) -> None:
         SCHEMA_VERSION,
         STORAGE_LAYOUT_VERSION,
         BLOB_FORMAT_VERSION,
-        SOURCE_REPRESENTATION_MIGRATION_ID,
+        SOURCE_CHUNK_PROFILE_MIGRATION_ID,
         SCHEMA_VERSION,
     )
     if metadata is None or tuple(metadata) != expected:
@@ -1026,6 +1063,7 @@ def _verify_schema_v12(connection: sqlite3.Connection) -> None:
         "blob_records",
         "sources",
         "source_representations",
+        "chunking_profiles",
     }
     missing_tables = required_tables.difference(_user_tables(connection))
     if missing_tables:
