@@ -1,1 +1,1 @@
-"""Raw Archive source capture primitives."""
+"""Raw Archive source capture and retained representation primitives."""

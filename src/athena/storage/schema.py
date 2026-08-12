@@ -16,7 +16,8 @@ EXTRACTION_SNAPSHOT_SCHEMA_VERSION = 8
 LOCAL_FTS_SCHEMA_VERSION = 9
 LOCAL_EMBEDDINGS_SCHEMA_VERSION = 10
 SOURCE_CAPTURE_SCHEMA_VERSION = 11
-SCHEMA_VERSION = SOURCE_CAPTURE_SCHEMA_VERSION
+SOURCE_REPRESENTATION_SCHEMA_VERSION = 12
+SCHEMA_VERSION = SOURCE_REPRESENTATION_SCHEMA_VERSION
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
@@ -29,6 +30,7 @@ EXTRACTION_SNAPSHOT_MIGRATION_ID = "0008_frozen_extraction_snapshots"
 LOCAL_FTS_SEARCH_MIGRATION_ID = "0009_local_fts_search"
 LOCAL_EMBEDDINGS_MIGRATION_ID = "0010_local_embeddings"
 SOURCE_CAPTURE_MIGRATION_ID = "0011_source_capture"
+SOURCE_REPRESENTATION_MIGRATION_ID = "0012_source_representations"
 
 
 class DatabaseCompatibilityError(RuntimeError):
@@ -104,6 +106,7 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         EXTRACTION_SNAPSHOT_SCHEMA_VERSION,
         LOCAL_FTS_SCHEMA_VERSION,
         LOCAL_EMBEDDINGS_SCHEMA_VERSION,
+        SOURCE_CAPTURE_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -157,9 +160,13 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
 
     if existing_user_version == LOCAL_EMBEDDINGS_SCHEMA_VERSION:
         _migrate_schema_v10_to_v11(connection)
+        existing_user_version = SOURCE_CAPTURE_SCHEMA_VERSION
+
+    if existing_user_version == SOURCE_CAPTURE_SCHEMA_VERSION:
+        _migrate_schema_v11_to_v12(connection)
 
     _configure_connection(connection)
-    _verify_schema_v11(connection)
+    _verify_schema_v12(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -918,8 +925,55 @@ def _migrate_schema_v10_to_v11(connection: sqlite3.Connection) -> None:
             ON sources(blob_id);
 
         UPDATE schema_metadata
-        SET schema_version = {SCHEMA_VERSION},
+        SET schema_version = {SOURCE_CAPTURE_SCHEMA_VERSION},
             last_migration_id = '{SOURCE_CAPTURE_MIGRATION_ID}',
+            minimum_reader_version = {SOURCE_CAPTURE_SCHEMA_VERSION}
+        WHERE singleton_id = 1;
+
+        PRAGMA user_version = {SOURCE_CAPTURE_SCHEMA_VERSION};
+        COMMIT;
+        """
+    )
+
+
+def _migrate_schema_v11_to_v12(connection: sqlite3.Connection) -> None:
+    """Add immutable retained SourceRepresentations backed by concrete runs."""
+    connection.executescript(
+        f"""
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE source_representations (
+            representation_id BLOB(16) PRIMARY KEY CHECK(length(representation_id) = 16),
+            source_id BLOB(16) NOT NULL CHECK(length(source_id) = 16),
+            representation_type TEXT NOT NULL CHECK(representation_type IN (
+                'normalized_text', 'extracted_text', 'ocr_text', 'transcript',
+                'thumbnail', 'page_images'
+            )),
+            blob_id BLOB(16) NOT NULL CHECK(length(blob_id) = 16),
+            processing_run_id BLOB(16) NOT NULL CHECK(length(processing_run_id) = 16),
+            content_hash BLOB(32) NOT NULL CHECK(length(content_hash) = 32),
+            retention_state TEXT NOT NULL CHECK(retention_state IN ('disposable', 'retained')),
+            media_type TEXT NOT NULL CHECK(length(media_type) > 0),
+            parser_id TEXT NOT NULL CHECK(length(parser_id) > 0),
+            parser_version TEXT NOT NULL CHECK(length(parser_version) > 0),
+            options_json TEXT NOT NULL CHECK(json_valid(options_json)),
+            created_at_us INTEGER NOT NULL,
+            provenance_id BLOB(16) NOT NULL CHECK(length(provenance_id) = 16),
+            FOREIGN KEY(representation_id) REFERENCES entity_registry(entity_id),
+            FOREIGN KEY(source_id) REFERENCES sources(source_id),
+            FOREIGN KEY(blob_id) REFERENCES blob_records(blob_id),
+            FOREIGN KEY(processing_run_id) REFERENCES processing_runs(processing_run_id),
+            FOREIGN KEY(provenance_id) REFERENCES provenance_records(provenance_id)
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_source_representations_source_created
+            ON source_representations(source_id, created_at_us DESC, representation_id);
+        CREATE INDEX idx_source_representations_run
+            ON source_representations(processing_run_id);
+
+        UPDATE schema_metadata
+        SET schema_version = {SCHEMA_VERSION},
+            last_migration_id = '{SOURCE_REPRESENTATION_MIGRATION_ID}',
             minimum_reader_version = {SCHEMA_VERSION}
         WHERE singleton_id = 1;
 
@@ -929,7 +983,7 @@ def _migrate_schema_v10_to_v11(connection: sqlite3.Connection) -> None:
     )
 
 
-def _verify_schema_v11(connection: sqlite3.Connection) -> None:
+def _verify_schema_v12(connection: sqlite3.Connection) -> None:
     application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
     user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
@@ -947,7 +1001,7 @@ def _verify_schema_v11(connection: sqlite3.Connection) -> None:
         SCHEMA_VERSION,
         STORAGE_LAYOUT_VERSION,
         BLOB_FORMAT_VERSION,
-        SOURCE_CAPTURE_MIGRATION_ID,
+        SOURCE_REPRESENTATION_MIGRATION_ID,
         SCHEMA_VERSION,
     )
     if metadata is None or tuple(metadata) != expected:
@@ -971,6 +1025,7 @@ def _verify_schema_v11(connection: sqlite3.Connection) -> None:
         "search_embedding_state",
         "blob_records",
         "sources",
+        "source_representations",
     }
     missing_tables = required_tables.difference(_user_tables(connection))
     if missing_tables:

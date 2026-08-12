@@ -32,6 +32,9 @@ from athena.retrieval.search import LocalSearchService
 from athena.retrieval.semantic import LocalSemanticSearchService
 from athena.source.blob_store import BlobStore
 from athena.source.repository import SourceRepository
+from athena.source.representation_repository import SourceRepresentationRepository
+from athena.source.representation_service import SourceTextRepresentationService
+from athena.source.representation_store import TextRepresentationStore
 from athena.source.service import SourceCaptureService
 from athena.storage.database import SQLiteDatabase
 from athena.storage.paths import RuntimePaths
@@ -67,6 +70,8 @@ class AthenaApplication:
         self.chat = ChatService(self.chat_repository)
         self.blob_store = BlobStore(self.paths)
         self.source_repository = SourceRepository(self.database)
+        self.source_representation_repository = SourceRepresentationRepository(self.database)
+        self.text_representation_store = TextRepresentationStore(self.paths)
         self.sources = SourceCaptureService(
             repository=self.source_repository,
             blob_store=self.blob_store,
@@ -87,6 +92,14 @@ class AthenaApplication:
             generation_timeout_seconds=self.settings.model_generation_timeout_seconds,
         )
         self.model_runs = ModelRunRepository(self.database)
+        self.source_text = SourceTextRepresentationService(
+            sources=self.source_repository,
+            representations=self.source_representation_repository,
+            blob_store=self.blob_store,
+            representation_store=self.text_representation_store,
+            runs=self.model_runs,
+            chat=self.chat,
+        )
         self.reviews = ReviewService(self.database)
         self.extraction_snapshots = ExtractionSnapshotRepository(
             self.database, self.model_runs

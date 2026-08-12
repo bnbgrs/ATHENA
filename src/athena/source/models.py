@@ -42,6 +42,19 @@ class BlobStorageArea(str, Enum):
     SPOOL = "spool"
 
 
+class SourceRepresentationType(str, Enum):
+    """Technical representations derived from immutable Source bytes."""
+
+    NORMALIZED_TEXT = "normalized_text"
+
+
+class RepresentationRetentionState(str, Enum):
+    """Whether one immutable representation is retained for durable provenance."""
+
+    RETAINED = "retained"
+    DISPOSABLE = "disposable"
+
+
 @dataclass(frozen=True, slots=True)
 class BlobRecord:
     blob_id: uuid.UUID
@@ -74,5 +87,29 @@ class SourceRecord:
 @dataclass(frozen=True, slots=True)
 class SourceCaptureResult:
     source: SourceRecord
+    blob: BlobRecord
+    reused_blob: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SourceRepresentationRecord:
+    representation_id: uuid.UUID
+    source_id: uuid.UUID
+    representation_type: SourceRepresentationType
+    blob_id: uuid.UUID
+    processing_run_id: uuid.UUID
+    content_hash: bytes
+    retention_state: RepresentationRetentionState
+    media_type: str
+    parser_id: str
+    parser_version: str
+    options_json: str
+    created_at_us: int
+    provenance_id: uuid.UUID
+
+
+@dataclass(frozen=True, slots=True)
+class TextRepresentationResult:
+    representation: SourceRepresentationRecord
     blob: BlobRecord
     reused_blob: bool

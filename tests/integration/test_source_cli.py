@@ -49,3 +49,42 @@ def test_source_import_show_verify_and_list_survive_process_restarts(tmp_path) -
     listing = _run_cli(local_root, "source", "list")
     assert listing.returncode == 0, listing.stderr
     assert source_id in listing.stdout
+
+
+def test_text_representation_cli_survives_process_restarts(tmp_path) -> None:
+    original = tmp_path / "source.md"
+    original.write_bytes(b"\xef\xbb\xbf# Title\r\n\rBody\r\n")
+    local_root = tmp_path / "runtime"
+
+    imported = _run_cli(local_root, "source", "import", str(original))
+    assert imported.returncode == 0, imported.stderr
+    source_match = _UUID_RE.search(imported.stdout)
+    assert source_match is not None
+    source_id = source_match.group(0)
+    original.unlink()
+
+    represented = _run_cli(local_root, "source", "represent-text", source_id)
+    assert represented.returncode == 0, represented.stderr
+    representation_match = _UUID_RE.search(represented.stdout)
+    assert representation_match is not None
+    representation_id = representation_match.group(0)
+    assert "Run status: succeeded" in represented.stdout
+    assert "Retention: retained" in represented.stdout
+
+    shown = _run_cli(local_root, "source", "representation-show", representation_id)
+    assert shown.returncode == 0, shown.stderr
+    assert f"Representation: {representation_id}" in shown.stdout
+    assert f"Source: {source_id}" in shown.stdout
+    assert "Parser: athena.native_text@1" in shown.stdout
+
+    verified = _run_cli(local_root, "source", "representation-verify", representation_id)
+    assert verified.returncode == 0, verified.stderr
+    assert f"Representation verified: {representation_id}" in verified.stdout
+
+    read = _run_cli(local_root, "source", "representation-read", representation_id)
+    assert read.returncode == 0, read.stderr
+    assert read.stdout == "# Title\n\nBody\n"
+
+    listing = _run_cli(local_root, "source", "representation-list", source_id)
+    assert listing.returncode == 0, listing.stderr
+    assert representation_id in listing.stdout

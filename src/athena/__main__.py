@@ -40,8 +40,10 @@ from athena.retrieval.context import ContextBuilderError
 from athena.retrieval.search import SearchEntityType, SearchError
 from athena.retrieval.semantic import SemanticSearchError
 from athena.source.blob_store import BlobStoreError
-from athena.source.models import BlobRecord, SourceRecord
+from athena.source.models import BlobRecord, SourceRecord, SourceRepresentationRecord
 from athena.source.repository import SourceActorError, SourceNotFoundError
+from athena.source.representation_repository import SourceRepresentationNotFoundError
+from athena.source.representation_store import TextRepresentationError
 from athena.version import __version__
 
 
@@ -495,6 +497,37 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=50,
         help="Maximum number of Sources to print (1-500).",
+    )
+    source_represent_text = source_commands.add_parser(
+        "represent-text",
+        help="Build a deterministic retained UTF-8 text representation from one TXT/Markdown Source.",
+    )
+    source_represent_text.add_argument("source_id", type=_uuid_argument)
+    source_representation_show = source_commands.add_parser(
+        "representation-show",
+        help="Show one immutable SourceRepresentation and its BlobRecord.",
+    )
+    source_representation_show.add_argument("representation_id", type=_uuid_argument)
+    source_representation_verify = source_commands.add_parser(
+        "representation-verify",
+        help="Verify the stored bytes of one SourceRepresentation.",
+    )
+    source_representation_verify.add_argument("representation_id", type=_uuid_argument)
+    source_representation_read = source_commands.add_parser(
+        "representation-read",
+        help="Print one verified UTF-8 text SourceRepresentation.",
+    )
+    source_representation_read.add_argument("representation_id", type=_uuid_argument)
+    source_representation_list = source_commands.add_parser(
+        "representation-list",
+        help="List retained representations for one Source.",
+    )
+    source_representation_list.add_argument("source_id", type=_uuid_argument)
+    source_representation_list.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Maximum number of representations to print (1-500).",
     )
 
     model_parser = commands.add_parser("model", help="Local model provider commands.")
@@ -1294,6 +1327,27 @@ def _print_source_record(source: SourceRecord, blob: BlobRecord) -> None:
     print(f"Provenance: {source.provenance_id}")
 
 
+def _print_source_representation_record(
+    representation: SourceRepresentationRecord,
+    blob: BlobRecord,
+) -> None:
+    print(f"Representation: {representation.representation_id}")
+    print(f"Source: {representation.source_id}")
+    print(f"Type: {representation.representation_type.value}")
+    print(f"Retention: {representation.retention_state.value}")
+    print(f"MIME: {representation.media_type}")
+    print(f"Bytes: {blob.byte_length}")
+    print(f"SHA-256: {representation.content_hash.hex()}")
+    print(f"Blob: {blob.blob_id}")
+    print(f"Storage: {blob.storage_area.value}:{blob.storage_locator}")
+    print(
+        f"Parser: {representation.parser_id}@{representation.parser_version}"
+    )
+    print(f"Options: {representation.options_json}")
+    print(f"ProcessingRun: {representation.processing_run_id}")
+    print(f"Provenance: {representation.provenance_id}")
+
+
 def _run_source_command(app: AthenaApplication, args: argparse.Namespace) -> int:
     if args.source_command == "import":
         result = app.sources.capture_file(args.path)
@@ -1334,6 +1388,59 @@ def _run_source_command(app: AthenaApplication, args: argparse.Namespace) -> int
                 f"{source.source_id}  state={source.lifecycle_state.value} "
                 f"type={source.source_type.value} bytes={blob.byte_length} "
                 f"blob={blob.blob_id} name={source.original_name!r}"
+            )
+        return 0
+
+    if args.source_command == "represent-text":
+        build = app.source_text.build(args.source_id)
+        representation = build.result.representation
+        blob = build.result.blob
+        print(f"Representation created: {representation.representation_id}")
+        print(f"Source: {representation.source_id}")
+        print(f"Type: {representation.representation_type.value}")
+        print(f"Retention: {representation.retention_state.value}")
+        print(f"ProcessingRun: {build.processing_run.processing_run_id}")
+        print(f"Run status: {build.processing_run.status}")
+        print(f"Blob: {blob.blob_id} reused={'yes' if build.result.reused_blob else 'no'}")
+        print(f"Bytes: {blob.byte_length}")
+        print(f"SHA-256: {representation.content_hash.hex()}")
+        print(f"Storage: {blob.storage_area.value}:{blob.storage_locator}")
+        return 0
+
+    if args.source_command == "representation-show":
+        representation, blob = app.source_text.get(args.representation_id)
+        _print_source_representation_record(representation, blob)
+        return 0
+
+    if args.source_command == "representation-verify":
+        representation, blob = app.source_text.get(args.representation_id)
+        path = app.source_text.verify(args.representation_id)
+        print(
+            f"Representation verified: {representation.representation_id} "
+            f"bytes={blob.byte_length} sha256={representation.content_hash.hex()}"
+        )
+        print(f"Stored at: {path}")
+        return 0
+
+    if args.source_command == "representation-read":
+        print(app.source_text.read_text(args.representation_id), end="")
+        return 0
+
+    if args.source_command == "representation-list":
+        representations = app.source_text.list_for_source(
+            args.source_id,
+            limit=args.limit,
+        )
+        if not representations:
+            print("No SourceRepresentations.")
+            return 0
+        for representation, blob in representations:
+            print(
+                f"{representation.representation_id}  "
+                f"type={representation.representation_type.value} "
+                f"retention={representation.retention_state.value} "
+                f"bytes={blob.byte_length} blob={blob.blob_id} "
+                f"run={representation.processing_run_id}"
             )
         return 0
 
@@ -1486,6 +1593,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 BlobStoreError,
                 SourceActorError,
                 SourceNotFoundError,
+                SourceRepresentationNotFoundError,
+                TextRepresentationError,
                 ValueError,
             ) as exc:
                 print(f"ATHENA source error: {exc}", file=sys.stderr)
