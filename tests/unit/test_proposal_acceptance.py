@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -202,4 +203,104 @@ def test_accept_all_rolls_back_the_whole_set_on_mid_commit_failure(tmp_path, mon
         assert claim_count == 0
     finally:
         monkeypatch.setattr(ClaimRepository, "_insert_payload", original)
+        database.stop()
+
+
+def test_second_acceptance_reuses_exact_canonical_duplicates(tmp_path) -> None:
+    database, result, knowledge, claims, acceptance = _extracted(tmp_path)
+    try:
+        first = acceptance.accept_all(result)
+        second_result = result
+        plan = acceptance.preflight(second_result)
+
+        assert all(item.action.value == "reuse_canonical" for item in plan.knowledge)
+        assert all(item.action.value == "reuse_canonical" for item in plan.claims)
+
+        second = acceptance.accept_all(second_result, expected_plan=plan)
+        assert second.knowledge_ids == first.knowledge_ids
+        assert second.claim_ids == first.claim_ids
+        assert second.knowledge_created_ids == ()
+        assert second.claim_created_ids == ()
+        assert len(second.knowledge_reused_ids) == 2
+        assert len(second.claim_reused_ids) == 2
+        assert second.contradiction_pairs == ()
+        assert len(second.contradiction_pairs_reused) == 1
+
+        knowledge_count = database.connection.execute(
+            "SELECT COUNT(*) FROM knowledge_units"
+        ).fetchone()[0]
+        claim_count = database.connection.execute("SELECT COUNT(*) FROM claims").fetchone()[0]
+        assert knowledge_count == 2
+        assert claim_count == 2
+
+        reused_provenance = database.connection.execute(
+            "SELECT COUNT(*) FROM provenance_records "
+            "WHERE operation IN ('knowledge.duplicate.reused', 'claim.duplicate.reused')"
+        ).fetchone()[0]
+        assert reused_provenance == 4
+    finally:
+        database.stop()
+
+
+def test_dedup_preflight_surfaces_near_duplicate_and_blocks_acceptance(tmp_path) -> None:
+    database, result, _knowledge, _claims, acceptance = _extracted(tmp_path)
+    try:
+        first = acceptance.accept_all(result)
+        first_knowledge = first.knowledge_ids[0]
+        current = database.connection.execute(
+            """
+            SELECT h.current_revision_id
+            FROM entity_heads AS h
+            WHERE h.entity_id = ?
+            """,
+            (first_knowledge.bytes,),
+        ).fetchone()
+        assert current is not None
+
+        # Modify only canonical text enough to be non-exact but still textually near.
+        database.connection.execute(
+            "UPDATE knowledge_unit_revisions SET body = ? WHERE revision_id = ?",
+            (
+                "Berlin ist die Hauptstadt Deutschlands.",
+                current["current_revision_id"],
+            ),
+        )
+        database.connection.commit()
+
+        plan = acceptance.preflight(result)
+        assert plan.merge_candidates
+        with pytest.raises(ValueError, match="near-duplicates"):
+            acceptance.accept_all(result, expected_plan=plan)
+    finally:
+        database.stop()
+
+
+def test_acceptance_reuses_duplicate_knowledge_proposal_within_same_run(tmp_path) -> None:
+    database, result, _knowledge, _claims, acceptance = _extracted(tmp_path)
+    try:
+        duplicate = result.proposals.knowledge_units[0]
+        proposals = replace(
+            result.proposals,
+            knowledge_units=(duplicate, duplicate),
+            claims=(),
+            relations=(),
+        )
+        duplicate_result = replace(result, proposals=proposals)
+
+        plan = acceptance.preflight(duplicate_result)
+        assert plan.knowledge[0].action.value == "create"
+        assert plan.knowledge[1].action.value == "reuse_proposal"
+
+        accepted = acceptance.accept_all(duplicate_result, expected_plan=plan)
+
+        assert len(accepted.knowledge_ids) == 2
+        assert accepted.knowledge_ids[0] == accepted.knowledge_ids[1]
+        assert len(accepted.knowledge_created_ids) == 1
+        assert len(accepted.knowledge_reused_ids) == 1
+
+        knowledge_count = database.connection.execute(
+            "SELECT COUNT(*) FROM knowledge_units"
+        ).fetchone()[0]
+        assert knowledge_count == 1
+    finally:
         database.stop()

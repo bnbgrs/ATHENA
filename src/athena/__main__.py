@@ -601,20 +601,50 @@ def _run_extract_command(app: AthenaApplication, args: argparse.Namespace) -> in
         if not args.accept:
             return 0
 
-        answer = input("Accept ALL displayed proposals into canonical Knowledge? [y/N] ").strip().lower()
+        plan = app.proposal_acceptance.preflight(result)
+        knowledge_reuse = sum(1 for item in plan.knowledge if item.action.value != "create")
+        claim_reuse = sum(1 for item in plan.claims if item.action.value != "create")
+        print(
+            "Dedup preflight: "
+            f"knowledge_create={len(plan.knowledge) - knowledge_reuse} "
+            f"knowledge_reuse={knowledge_reuse} "
+            f"claim_create={len(plan.claims) - claim_reuse} "
+            f"claim_reuse={claim_reuse}"
+        )
+        if plan.merge_candidates:
+            print(f"Canonical merge candidates: {len(plan.merge_candidates)}")
+            for index, candidate in enumerate(plan.merge_candidates):
+                print(
+                    f"[DM{index}] {candidate.proposal_type.value}[{candidate.proposal_index}] "
+                    f"~ {candidate.existing_entity_id} similarity={candidate.similarity:.3f} "
+                    f"reason={candidate.reason}"
+                )
+            print("Acceptance blocked: resolve canonical merge candidates first.")
+            return 2
+
+        answer = input("Accept ALL displayed proposals after deduplication? [y/N] ").strip().lower()
         if answer not in {"y", "yes"}:
             print("Acceptance cancelled. Canonical writes: 0")
             return 0
 
-        accepted = app.proposal_acceptance.accept_all(result)
+        accepted = app.proposal_acceptance.accept_all(result, expected_plan=plan)
         print(f"Canonical commit: {accepted.commit_id}")
-        print(f"Knowledge created: {len(accepted.knowledge_ids)}")
+        print(
+            f"Knowledge resolved: {len(accepted.knowledge_ids)} "
+            f"(created={len(accepted.knowledge_created_ids)} "
+            f"reused={len(accepted.knowledge_reused_ids)})"
+        )
         for knowledge_id in accepted.knowledge_ids:
             print(f"  K -> {knowledge_id}")
-        print(f"Claims created: {len(accepted.claim_ids)}")
+        print(
+            f"Claims resolved: {len(accepted.claim_ids)} "
+            f"(created={len(accepted.claim_created_ids)} "
+            f"reused={len(accepted.claim_reused_ids)})"
+        )
         for claim_id in accepted.claim_ids:
             print(f"  C -> {claim_id}")
         print(f"Contradictions committed: {len(accepted.contradiction_pairs)}")
+        print(f"Contradictions reused: {len(accepted.contradiction_pairs_reused)}")
         return 0
 
     raise RuntimeError(f"Unsupported extraction command: {args.extract_command!r}")
