@@ -21,7 +21,8 @@ SOURCE_CHUNK_PROFILE_SCHEMA_VERSION = 13
 SOURCE_ANCHOR_SCHEMA_VERSION = 14
 DURABLE_JOBS_SCHEMA_VERSION = 15
 SOURCE_PAGE_MAP_SCHEMA_VERSION = 16
-SCHEMA_VERSION = SOURCE_PAGE_MAP_SCHEMA_VERSION
+SOURCE_DOCUMENT_STRUCTURE_SCHEMA_VERSION = 17
+SCHEMA_VERSION = SOURCE_DOCUMENT_STRUCTURE_SCHEMA_VERSION
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
@@ -39,6 +40,7 @@ SOURCE_CHUNK_PROFILE_MIGRATION_ID = "0013_source_chunk_profiles"
 SOURCE_ANCHOR_MIGRATION_ID = "0014_source_anchors"
 DURABLE_JOBS_MIGRATION_ID = "0015_durable_jobs_checkpoints"
 SOURCE_PAGE_MAP_MIGRATION_ID = "0016_source_representation_page_map"
+SOURCE_DOCUMENT_STRUCTURE_MIGRATION_ID = "0017_source_representation_document_structure"
 
 
 class DatabaseCompatibilityError(RuntimeError):
@@ -119,6 +121,7 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         SOURCE_CHUNK_PROFILE_SCHEMA_VERSION,
         SOURCE_ANCHOR_SCHEMA_VERSION,
         DURABLE_JOBS_SCHEMA_VERSION,
+        SOURCE_PAGE_MAP_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -192,9 +195,13 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
 
     if existing_user_version == DURABLE_JOBS_SCHEMA_VERSION:
         _migrate_schema_v15_to_v16(connection)
+        existing_user_version = SOURCE_PAGE_MAP_SCHEMA_VERSION
+
+    if existing_user_version == SOURCE_PAGE_MAP_SCHEMA_VERSION:
+        _migrate_schema_v16_to_v17(connection)
 
     _configure_connection(connection)
-    _verify_schema_v16(connection)
+    _verify_schema_v17(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -1252,7 +1259,62 @@ def _migrate_schema_v15_to_v16(connection: sqlite3.Connection) -> None:
     )
 
 
-def _verify_schema_v16(connection: sqlite3.Connection) -> None:
+def _migrate_schema_v16_to_v17(connection: sqlite3.Connection) -> None:
+    """Add retained DOCX structure maps and durable structure-anchor links."""
+    connection.executescript(
+        f"""
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE source_representation_structures (
+            structure_id BLOB(16) PRIMARY KEY CHECK(length(structure_id) = 16),
+            representation_id BLOB(16) NOT NULL CHECK(length(representation_id) = 16),
+            structure_index INTEGER NOT NULL CHECK(structure_index >= 0),
+            structure_type TEXT NOT NULL CHECK(structure_type IN (
+                'paragraph', 'heading', 'list_item', 'table', 'table_row', 'table_cell'
+            )),
+            path TEXT NOT NULL CHECK(length(path) > 0),
+            parent_structure_id BLOB(16) NULL CHECK(
+                parent_structure_id IS NULL OR length(parent_structure_id) = 16
+            ),
+            start_offset INTEGER NOT NULL CHECK(start_offset >= 0),
+            end_offset INTEGER NOT NULL CHECK(end_offset >= start_offset),
+            content_hash BLOB(32) NOT NULL CHECK(length(content_hash) = 32),
+            metadata_json TEXT NOT NULL CHECK(json_valid(metadata_json)),
+            UNIQUE(representation_id, structure_index),
+            UNIQUE(representation_id, path),
+            FOREIGN KEY(representation_id) REFERENCES source_representations(representation_id),
+            FOREIGN KEY(parent_structure_id) REFERENCES source_representation_structures(structure_id)
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_source_representation_structures_range
+            ON source_representation_structures(
+                representation_id, start_offset, end_offset, structure_index
+            );
+        CREATE INDEX idx_source_representation_structures_type
+            ON source_representation_structures(
+                representation_id, structure_type, structure_index
+            );
+
+        CREATE TABLE source_anchor_structures (
+            anchor_id BLOB(16) PRIMARY KEY CHECK(length(anchor_id) = 16),
+            structure_id BLOB(16) NOT NULL UNIQUE CHECK(length(structure_id) = 16),
+            FOREIGN KEY(anchor_id) REFERENCES source_anchors(anchor_id),
+            FOREIGN KEY(structure_id) REFERENCES source_representation_structures(structure_id)
+        ) WITHOUT ROWID;
+
+        UPDATE schema_metadata
+        SET schema_version = {SOURCE_DOCUMENT_STRUCTURE_SCHEMA_VERSION},
+            last_migration_id = '{SOURCE_DOCUMENT_STRUCTURE_MIGRATION_ID}',
+            minimum_reader_version = {SOURCE_DOCUMENT_STRUCTURE_SCHEMA_VERSION}
+        WHERE singleton_id = 1;
+
+        PRAGMA user_version = {SOURCE_DOCUMENT_STRUCTURE_SCHEMA_VERSION};
+        COMMIT;
+        """
+    )
+
+
+def _verify_schema_v17(connection: sqlite3.Connection) -> None:
     application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
     user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     if application_id != ATHENA_APPLICATION_ID:
@@ -1269,8 +1331,49 @@ def _verify_schema_v16(connection: sqlite3.Connection) -> None:
         SCHEMA_VERSION,
         STORAGE_LAYOUT_VERSION,
         BLOB_FORMAT_VERSION,
-        SOURCE_PAGE_MAP_MIGRATION_ID,
+        SOURCE_DOCUMENT_STRUCTURE_MIGRATION_ID,
         SCHEMA_VERSION,
+    )
+    if metadata is None or tuple(metadata) != expected:
+        raise DatabaseCompatibilityError("ATHENA schema_metadata verification failed.")
+
+    required_tables = {
+        "knowledge_units", "knowledge_unit_revisions", "claims", "claim_revisions",
+        "claim_evidence", "provenance_inputs", "model_signatures", "processing_runs",
+        "semantic_review_items", "semantic_merge_review_payloads",
+        "extraction_result_snapshots", "search_fts", "search_index_state",
+        "search_embeddings", "search_embedding_state", "blob_records", "sources",
+        "source_representations", "source_representation_pages",
+        "source_representation_structures", "source_anchor_structures",
+        "chunking_profiles", "source_anchors", "jobs", "checkpoints",
+    }
+    missing_tables = required_tables.difference(_user_tables(connection))
+    if missing_tables:
+        missing = ", ".join(sorted(missing_tables))
+        raise DatabaseCompatibilityError(f"ATHENA semantic schema is incomplete: {missing}.")
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise DatabaseCompatibilityError("ATHENA foreign-key verification failed.")
+
+
+def _verify_schema_v16(connection: sqlite3.Connection) -> None:
+    application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
+    user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if application_id != ATHENA_APPLICATION_ID:
+        raise DatabaseCompatibilityError("ATHENA application_id verification failed.")
+    if user_version != SOURCE_PAGE_MAP_SCHEMA_VERSION:
+        raise DatabaseCompatibilityError("ATHENA schema version verification failed.")
+
+    metadata = connection.execute(
+        "SELECT schema_version, storage_layout_version, blob_format_version, "
+        "last_migration_id, minimum_reader_version "
+        "FROM schema_metadata WHERE singleton_id = 1"
+    ).fetchone()
+    expected = (
+        SOURCE_PAGE_MAP_SCHEMA_VERSION,
+        STORAGE_LAYOUT_VERSION,
+        BLOB_FORMAT_VERSION,
+        SOURCE_PAGE_MAP_MIGRATION_ID,
+        SOURCE_PAGE_MAP_SCHEMA_VERSION,
     )
     if metadata is None or tuple(metadata) != expected:
         raise DatabaseCompatibilityError("ATHENA schema_metadata verification failed.")

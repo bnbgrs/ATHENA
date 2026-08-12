@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from bisect import bisect_right
 from dataclasses import dataclass
 
 from athena.chat.service import ChatService
@@ -13,7 +14,10 @@ from athena.common.time import utc_now_us
 from athena.model.provenance import ModelRunRepository, ProcessingRun
 from athena.source.chunk_store import SourceChunkRecord, SourceChunkStore
 from athena.source.chunking_repository import ChunkingProfile, ChunkingProfileRepository
-from athena.source.models import SourceRepresentationType
+from athena.source.models import (
+    SourceRepresentationStructureRecord,
+    SourceRepresentationType,
+)
 from athena.source.representation_service import SourceTextRepresentationService
 
 _PIPELINE_VERSION = "source-chunking-v1"
@@ -59,7 +63,16 @@ class SourceChunkingService:
                 "Source chunking requires a retained normalized_text or extracted_text representation."
             )
         path = self.source_text.verify(representation_id)
-        profile = self.profiles.get_or_create_default()
+        structures = self.source_text.list_structures(representation_id)
+        if representation.parser_id == "athena.native_docx" and not structures:
+            raise SourceChunkIntegrityError(
+                "Native DOCX representation is missing its retained structure map."
+            )
+        profile = (
+            self.profiles.get_or_create_document_default()
+            if structures
+            else self.profiles.get_or_create_default()
+        )
         build_signature = _build_signature(
             representation_id=representation_id,
             representation_hash=representation.content_hash,
@@ -93,7 +106,17 @@ class SourceChunkingService:
 
         try:
             text = path.read_text(encoding="utf-8")
-            spans = _chunk_spans(text, target_size=profile.target_size or 1200)
+            if structures:
+                _verify_structure_spans(text, structures)
+                units, structure_boundaries = _document_structure_units(text, structures)
+                spans = _chunk_spans(
+                    text,
+                    target_size=profile.target_size or 1200,
+                    units=units,
+                    preferred_boundaries=structure_boundaries,
+                )
+            else:
+                spans = _chunk_spans(text, target_size=profile.target_size or 1200)
             created_at_us = utc_now_us()
             chunks = tuple(
                 SourceChunkRecord(
@@ -208,24 +231,38 @@ def _build_signature(
     return hashlib.sha256(canonical.encode("utf-8")).digest()
 
 
-def _chunk_spans(text: str, *, target_size: int) -> tuple[tuple[int, int], ...]:
-    """Return contiguous exact-text spans, preferring paragraph/line/space boundaries."""
+def _chunk_spans(
+    text: str,
+    *,
+    target_size: int,
+    units: tuple[tuple[int, int], ...] | None = None,
+    preferred_boundaries: tuple[int, ...] = (),
+) -> tuple[tuple[int, int], ...]:
+    """Return contiguous exact-text spans, preferring supplied structure boundaries."""
     if target_size <= 0:
         raise ValueError("target_size must be positive.")
     if not text:
         return ()
 
-    units = _paragraph_units(text)
+    active_units = units if units is not None else _paragraph_units(text)
     spans: list[tuple[int, int]] = []
     current_start: int | None = None
     current_end: int | None = None
 
-    for unit_start, unit_end in units:
+    for unit_start, unit_end in active_units:
         if unit_end - unit_start > target_size:
             if current_start is not None and current_end is not None:
                 spans.append((current_start, current_end))
                 current_start = current_end = None
-            spans.extend(_split_long_span(text, unit_start, unit_end, target_size))
+            spans.extend(
+                _split_long_span(
+                    text,
+                    unit_start,
+                    unit_end,
+                    target_size,
+                    preferred_boundaries=preferred_boundaries,
+                )
+            )
             continue
 
         if current_start is None:
@@ -250,6 +287,74 @@ def _chunk_spans(text: str, *, target_size: int) -> tuple[tuple[int, int], ...]:
         if left[1] != right[0]:
             raise RuntimeError("Chunking produced a gap or overlap in exact-text coverage.")
     return tuple(spans)
+
+
+def _verify_structure_spans(
+    text: str,
+    structures: tuple[SourceRepresentationStructureRecord, ...],
+) -> None:
+    if tuple(item.structure_index for item in structures) != tuple(range(len(structures))):
+        raise SourceChunkIntegrityError(
+            "Retained document structure indexes are not contiguous from zero."
+        )
+    known_ids: set[uuid.UUID] = set()
+    for item in structures:
+        if item.parent_structure_id is not None and item.parent_structure_id not in known_ids:
+            raise SourceChunkIntegrityError(
+                "Retained document structure parent does not precede its child."
+            )
+        if not 0 <= item.start_offset <= item.end_offset <= len(text):
+            raise SourceChunkIntegrityError(
+                "Retained document structure range is outside the representation."
+            )
+        actual_hash = hashlib.sha256(
+            text[item.start_offset : item.end_offset].encode("utf-8")
+        ).digest()
+        if actual_hash != item.content_hash:
+            raise SourceChunkIntegrityError(
+                "Retained document structure hash disagrees with its representation."
+            )
+        known_ids.add(item.structure_id)
+
+
+def _document_structure_units(
+    text: str,
+    structures: tuple[SourceRepresentationStructureRecord, ...],
+) -> tuple[tuple[tuple[int, int], ...], tuple[int, ...]]:
+    top_level_starts = tuple(
+        sorted(
+            {
+                item.start_offset
+                for item in structures
+                if item.parent_structure_id is None
+            }
+        )
+    )
+    if not top_level_starts or top_level_starts[0] != 0:
+        raise SourceChunkIntegrityError(
+            "Retained document structure does not cover the representation from offset zero."
+        )
+    unit_boundaries = (*top_level_starts, len(text))
+    units = tuple(
+        (start, end)
+        for start, end in zip(unit_boundaries[:-1], unit_boundaries[1:], strict=True)
+        if start < end
+    )
+    if not units or units[0][0] != 0 or units[-1][1] != len(text):
+        raise SourceChunkIntegrityError(
+            "Retained document structure does not provide contiguous top-level coverage."
+        )
+    structure_boundaries = tuple(
+        sorted(
+            {
+                offset
+                for item in structures
+                for offset in (item.start_offset, item.end_offset)
+                if 0 < offset < len(text)
+            }
+        )
+    )
+    return units, structure_boundaries
 
 
 def _paragraph_units(text: str) -> tuple[tuple[int, int], ...]:
@@ -279,12 +384,19 @@ def _split_long_span(
     start: int,
     end: int,
     target_size: int,
+    *,
+    preferred_boundaries: tuple[int, ...] = (),
 ) -> list[tuple[int, int]]:
     result: list[tuple[int, int]] = []
     cursor = start
     while end - cursor > target_size:
         hard_end = cursor + target_size
-        cut = _preferred_cut(text, cursor, hard_end)
+        cut = _preferred_cut(
+            text,
+            cursor,
+            hard_end,
+            preferred_boundaries=preferred_boundaries,
+        )
         if cut <= cursor:
             cut = hard_end
         result.append((cursor, cut))
@@ -294,7 +406,19 @@ def _split_long_span(
     return result
 
 
-def _preferred_cut(text: str, start: int, hard_end: int) -> int:
+def _preferred_cut(
+    text: str,
+    start: int,
+    hard_end: int,
+    *,
+    preferred_boundaries: tuple[int, ...] = (),
+) -> int:
+    if preferred_boundaries:
+        boundary_index = bisect_right(preferred_boundaries, hard_end) - 1
+        if boundary_index >= 0:
+            boundary = preferred_boundaries[boundary_index]
+            if boundary > start:
+                return boundary
     for needle in ("\n", " ", "\t"):
         position = text.rfind(needle, start + 1, hard_end + 1)
         if position > start:

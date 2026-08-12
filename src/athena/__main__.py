@@ -615,6 +615,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Build retained native PDF text plus a stable page-offset map.",
     )
     source_represent_pdf.add_argument("source_id", type=_uuid_argument)
+    source_represent_docx = source_commands.add_parser(
+        "represent-docx",
+        help="Build retained DOCX text plus a stable technical structure map.",
+    )
+    source_represent_docx.add_argument("source_id", type=_uuid_argument)
     source_representation_show = source_commands.add_parser(
         "representation-show",
         help="Show one immutable SourceRepresentation and its BlobRecord.",
@@ -646,6 +651,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="List retained PDF page-map offsets for one SourceRepresentation.",
     )
     source_representation_pages.add_argument("representation_id", type=_uuid_argument)
+    source_representation_structures = source_commands.add_parser(
+        "representation-structures",
+        help="List retained DOCX paragraph/heading/list/table structure.",
+    )
+    source_representation_structures.add_argument("representation_id", type=_uuid_argument)
     source_chunk_text = source_commands.add_parser(
         "chunk-text",
         help="Build a deterministic Derived SourceChunk set from one retained text representation.",
@@ -682,6 +692,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Materialize a durable text SourceAnchor from one verified Derived SourceChunk.",
     )
     source_anchor_from_chunk.add_argument("chunk_id", type=_uuid_argument)
+    source_anchor_from_structure = source_commands.add_parser(
+        "anchor-from-structure",
+        help="Materialize a durable structured_path/table_cell SourceAnchor.",
+    )
+    source_anchor_from_structure.add_argument("structure_id", type=_uuid_argument)
     source_anchor_create_text = source_commands.add_parser(
         "anchor-create-text",
         help="Materialize a durable text SourceAnchor from a retained representation range.",
@@ -1900,6 +1915,24 @@ def _run_source_command(app: AthenaApplication, args: argparse.Namespace) -> int
         print(f"Storage: {blob.storage_area.value}:{blob.storage_locator}")
         return 0
 
+    if args.source_command == "represent-docx":
+        docx_build = app.source_docx.build(args.source_id)
+        representation = docx_build.result.representation
+        blob = docx_build.result.blob
+        print(f"Representation created: {representation.representation_id}")
+        print(f"Source: {representation.source_id}")
+        print(f"Type: {representation.representation_type.value}")
+        print(f"Retention: {representation.retention_state.value}")
+        print(f"ProcessingRun: {docx_build.processing_run.processing_run_id}")
+        print(f"Run status: {docx_build.processing_run.status}")
+        print(f"Parser: {representation.parser_id}@{representation.parser_version}")
+        print(f"Structures: {len(docx_build.structures)}")
+        print(f"Blob: {blob.blob_id} reused={'yes' if docx_build.result.reused_blob else 'no'}")
+        print(f"Bytes: {blob.byte_length}")
+        print(f"SHA-256: {representation.content_hash.hex()}")
+        print(f"Storage: {blob.storage_area.value}:{blob.storage_locator}")
+        return 0
+
     if args.source_command == "representation-show":
         representation, blob = app.source_text.get(args.representation_id)
         _print_source_representation_record(representation, blob)
@@ -1947,6 +1980,22 @@ def _run_source_command(app: AthenaApplication, args: argparse.Namespace) -> int
             print(
                 f"page={page.page_number} range={page.start_offset}:{page.end_offset} "
                 f"sha256={page.content_hash.hex()}"
+            )
+        return 0
+
+    if args.source_command == "representation-structures":
+        structures = app.source_text.list_structures(args.representation_id)
+        if not structures:
+            print("No retained structure map for this SourceRepresentation.")
+            return 0
+        print(f"Representation structures: {len(structures)}")
+        for item in structures:
+            print(
+                f"structure={item.structure_id} index={item.structure_index} "
+                f"type={item.structure_type.value} path={item.path!r} "
+                f"parent={item.parent_structure_id or '<none>'} "
+                f"range={item.start_offset}:{item.end_offset} "
+                f"sha256={item.content_hash.hex()} metadata={item.metadata_json}"
             )
         return 0
 
@@ -2021,6 +2070,12 @@ def _run_source_command(app: AthenaApplication, args: argparse.Namespace) -> int
     if args.source_command == "anchor-from-chunk":
         anchor = app.source_anchors.materialize_chunk(args.chunk_id)
         _print_source_anchor(anchor)
+        return 0
+
+    if args.source_command == "anchor-from-structure":
+        anchor = app.source_anchors.materialize_structure(args.structure_id)
+        _print_source_anchor(anchor)
+        print(f"Structure: {args.structure_id}")
         return 0
 
     if args.source_command == "anchor-create-text":

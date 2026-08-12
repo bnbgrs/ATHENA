@@ -14,6 +14,8 @@ from athena.source.models import (
     RepresentationRetentionState,
     SourceRepresentationPageRecord,
     SourceRepresentationRecord,
+    SourceRepresentationStructureRecord,
+    SourceRepresentationStructureType,
     SourceRepresentationType,
     TextRepresentationResult,
 )
@@ -50,6 +52,19 @@ class SourceRepresentationRepository:
         representation_type: SourceRepresentationType = SourceRepresentationType.NORMALIZED_TEXT,
         operation: str = "source.representation.text.create",
         page_map: tuple[tuple[int, int, int, bytes], ...] = (),
+        structure_map: tuple[
+            tuple[
+                int,
+                SourceRepresentationStructureType,
+                str,
+                int | None,
+                int,
+                int,
+                bytes,
+                str,
+            ],
+            ...,
+        ] = (),
     ) -> TextRepresentationResult:
         if (stored_blob is None) == (existing_blob is None):
             raise ValueError("Exactly one of stored_blob or existing_blob is required.")
@@ -263,6 +278,76 @@ class SourceRepresentationRepository:
                     ),
                 )
 
+            if structure_map:
+                expected_indexes = tuple(range(len(structure_map)))
+                actual_indexes = tuple(item[0] for item in structure_map)
+                if actual_indexes != expected_indexes:
+                    raise ValueError(
+                        "SourceRepresentation structure indexes must be contiguous from zero."
+                    )
+                paths = tuple(item[2] for item in structure_map)
+                if len(set(paths)) != len(paths):
+                    raise ValueError("SourceRepresentation structure paths must be unique.")
+                structure_ids = tuple(new_uuid7() for _ in structure_map)
+                rows: list[tuple[object, ...]] = []
+                for (
+                    structure_index,
+                    structure_type,
+                    path,
+                    parent_index,
+                    start_offset,
+                    end_offset,
+                    structure_hash,
+                    metadata_json,
+                ) in structure_map:
+                    if not path:
+                        raise ValueError("SourceRepresentation structure path cannot be empty.")
+                    if start_offset < 0 or end_offset < start_offset:
+                        raise ValueError("SourceRepresentation structure offsets are invalid.")
+                    if len(structure_hash) != 32:
+                        raise ValueError("SourceRepresentation structure hash must be SHA-256 bytes.")
+                    try:
+                        metadata = json.loads(metadata_json)
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(
+                            "SourceRepresentation structure metadata must be valid JSON."
+                        ) from exc
+                    if not isinstance(metadata, dict):
+                        raise ValueError(
+                            "SourceRepresentation structure metadata must be a JSON object."
+                        )
+                    parent_id: uuid.UUID | None = None
+                    if parent_index is not None:
+                        if parent_index < 0 or parent_index >= structure_index:
+                            raise ValueError(
+                                "SourceRepresentation structure parent must precede its child."
+                            )
+                        parent_id = structure_ids[parent_index]
+                    rows.append(
+                        (
+                            uuid_to_blob(structure_ids[structure_index]),
+                            uuid_to_blob(representation_id),
+                            structure_index,
+                            structure_type.value,
+                            path,
+                            uuid_to_blob(parent_id) if parent_id is not None else None,
+                            start_offset,
+                            end_offset,
+                            structure_hash,
+                            metadata_json,
+                        )
+                    )
+                connection.executemany(
+                    """
+                    INSERT INTO source_representation_structures (
+                        structure_id, representation_id, structure_index, structure_type,
+                        path, parent_structure_id, start_offset, end_offset,
+                        content_hash, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+
             connection.execute(
                 """
                 UPDATE sources
@@ -418,6 +503,59 @@ class SourceRepresentationRepository:
                 content_hash=bytes(row["content_hash"]),
             )
             for row in rows
+        )
+
+    def get_structure(
+        self, structure_id: uuid.UUID
+    ) -> SourceRepresentationStructureRecord:
+        row = self.database.connection.execute(
+            """
+            SELECT structure_id, representation_id, structure_index, structure_type,
+                   path, parent_structure_id, start_offset, end_offset,
+                   content_hash, metadata_json
+            FROM source_representation_structures
+            WHERE structure_id = ?
+            """,
+            (uuid_to_blob(structure_id),),
+        ).fetchone()
+        if row is None:
+            raise SourceRepresentationNotFoundError(f"Structure {structure_id} not found.")
+        return self._structure_from_row(row)
+
+    def list_structures(
+        self, representation_id: uuid.UUID
+    ) -> tuple[SourceRepresentationStructureRecord, ...]:
+        self.get(representation_id)
+        rows = self.database.connection.execute(
+            """
+            SELECT structure_id, representation_id, structure_index, structure_type,
+                   path, parent_structure_id, start_offset, end_offset,
+                   content_hash, metadata_json
+            FROM source_representation_structures
+            WHERE representation_id = ?
+            ORDER BY structure_index
+            """,
+            (uuid_to_blob(representation_id),),
+        ).fetchall()
+        return tuple(self._structure_from_row(row) for row in rows)
+
+    @staticmethod
+    def _structure_from_row(row: sqlite3.Row) -> SourceRepresentationStructureRecord:
+        return SourceRepresentationStructureRecord(
+            structure_id=uuid_from_blob(bytes(row["structure_id"])),
+            representation_id=uuid_from_blob(bytes(row["representation_id"])),
+            structure_index=int(row["structure_index"]),
+            structure_type=SourceRepresentationStructureType(str(row["structure_type"])),
+            path=str(row["path"]),
+            parent_structure_id=(
+                uuid_from_blob(bytes(row["parent_structure_id"]))
+                if row["parent_structure_id"] is not None
+                else None
+            ),
+            start_offset=int(row["start_offset"]),
+            end_offset=int(row["end_offset"]),
+            content_hash=bytes(row["content_hash"]),
+            metadata_json=str(row["metadata_json"]),
         )
 
     def page_range_for_text_range(

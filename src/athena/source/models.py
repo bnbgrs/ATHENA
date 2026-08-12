@@ -49,6 +49,17 @@ class SourceRepresentationType(str, Enum):
     EXTRACTED_TEXT = "extracted_text"
 
 
+class SourceRepresentationStructureType(str, Enum):
+    """Retained technical structure extracted from a document representation."""
+
+    PARAGRAPH = "paragraph"
+    HEADING = "heading"
+    LIST_ITEM = "list_item"
+    TABLE = "table"
+    TABLE_ROW = "table_row"
+    TABLE_CELL = "table_cell"
+
+
 class SourceAnchorType(str, Enum):
     """Stable source location types from the persistent data model."""
 
@@ -130,6 +141,20 @@ class SourceRepresentationPageRecord:
     start_offset: int
     end_offset: int
     content_hash: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class SourceRepresentationStructureRecord:
+    structure_id: uuid.UUID
+    representation_id: uuid.UUID
+    structure_index: int
+    structure_type: SourceRepresentationStructureType
+    path: str
+    parent_structure_id: uuid.UUID | None
+    start_offset: int
+    end_offset: int
+    content_hash: bytes
+    metadata_json: str
 
 
 @dataclass(frozen=True, slots=True)

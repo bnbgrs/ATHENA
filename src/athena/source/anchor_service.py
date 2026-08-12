@@ -85,15 +85,43 @@ class SourceAnchorService:
             page_end=page_range[1] if page_range is not None else None,
         )
 
+    def materialize_structure(self, structure_id: uuid.UUID) -> SourceAnchorRecord:
+        structure = self.source_text.get_structure(structure_id)
+        text = self.source_text.read_text(structure.representation_id)
+        if not 0 <= structure.start_offset < structure.end_offset <= len(text):
+            raise ValueError("Document structure is empty or outside the retained representation.")
+        actual_hash = hashlib.sha256(
+            text[structure.start_offset : structure.end_offset].encode("utf-8")
+        ).digest()
+        if actual_hash != structure.content_hash:
+            raise SourceAnchorIntegrityError(
+                "Document structure hash disagrees with retained representation."
+            )
+        actor_id = self.chat.ensure_local_user()
+        return self.repository.materialize_structure(
+            actor_id=actor_id,
+            structure_id=structure_id,
+        )
+
+    def structure_id_for_anchor(self, anchor_id: uuid.UUID) -> uuid.UUID | None:
+        return self.repository.structure_id_for_anchor(anchor_id)
+
     def get(self, anchor_id: uuid.UUID) -> SourceAnchorRecord:
         return self.repository.get(anchor_id)
 
     def verify(self, anchor_id: uuid.UUID) -> SourceAnchorRecord:
         anchor = self.repository.get(anchor_id)
-        if anchor.anchor_type is not SourceAnchorType.TEXT_RANGE:
-            raise NotImplementedError("VS4 Step 5 verifies text_range SourceAnchors only.")
+        supported_types = {
+            SourceAnchorType.TEXT_RANGE,
+            SourceAnchorType.STRUCTURED_PATH,
+            SourceAnchorType.TABLE_CELL,
+        }
+        if anchor.anchor_type not in supported_types:
+            raise NotImplementedError(
+                "Current source anchor verification supports text and document-structure anchors."
+            )
         if anchor.representation_id is None or anchor.start_offset is None or anchor.end_offset is None:
-            raise SourceAnchorIntegrityError("Text SourceAnchor is missing its representation/range.")
+            raise SourceAnchorIntegrityError("SourceAnchor is missing its representation/range.")
         text = self.source_text.read_text(anchor.representation_id)
         if not 0 <= anchor.start_offset < anchor.end_offset <= len(text):
             raise SourceAnchorIntegrityError("SourceAnchor range is outside its representation.")
@@ -102,19 +130,51 @@ class SourceAnchorService:
         ).digest()
         if anchor.quoted_hash is None or actual_hash != anchor.quoted_hash:
             raise SourceAnchorIntegrityError("SourceAnchor quoted hash disagrees with representation.")
-        expected_pages = self.source_text.page_range_for_text_range(
-            anchor.representation_id,
-            start_offset=anchor.start_offset,
-            end_offset=anchor.end_offset,
-        )
-        actual_pages = (
-            (anchor.page_start, anchor.page_end)
-            if anchor.page_start is not None and anchor.page_end is not None
-            else None
-        )
-        if expected_pages != actual_pages:
+
+        if anchor.anchor_type is SourceAnchorType.TEXT_RANGE:
+            expected_pages = self.source_text.page_range_for_text_range(
+                anchor.representation_id,
+                start_offset=anchor.start_offset,
+                end_offset=anchor.end_offset,
+            )
+            actual_pages = (
+                (anchor.page_start, anchor.page_end)
+                if anchor.page_start is not None and anchor.page_end is not None
+                else None
+            )
+            if expected_pages != actual_pages:
+                raise SourceAnchorIntegrityError(
+                    "SourceAnchor page range disagrees with retained representation page map."
+                )
+            return anchor
+
+        structure_id = self.repository.structure_id_for_anchor(anchor.anchor_id)
+        if structure_id is None:
+            raise SourceAnchorIntegrityError("Document structure anchor lost its structure link.")
+        structure = self.source_text.get_structure(structure_id)
+        if structure.representation_id != anchor.representation_id:
             raise SourceAnchorIntegrityError(
-                "SourceAnchor page range disagrees with retained representation page map."
+                "Document structure anchor representation disagrees with structure map."
+            )
+        if (structure.start_offset, structure.end_offset) != (
+            anchor.start_offset,
+            anchor.end_offset,
+        ):
+            raise SourceAnchorIntegrityError(
+                "Document structure anchor range disagrees with structure map."
+            )
+        if structure.content_hash != anchor.quoted_hash:
+            raise SourceAnchorIntegrityError(
+                "Document structure anchor hash disagrees with structure map."
+            )
+        expected_type = (
+            SourceAnchorType.TABLE_CELL
+            if structure.structure_type.value == "table_cell"
+            else SourceAnchorType.STRUCTURED_PATH
+        )
+        if anchor.anchor_type is not expected_type:
+            raise SourceAnchorIntegrityError(
+                "Document structure anchor type disagrees with retained structure."
             )
         return anchor
 

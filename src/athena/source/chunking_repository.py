@@ -31,7 +31,20 @@ _DEFAULT_STRUCTURE_RULES = {
     "boundary_priority": ["paragraph", "line", "whitespace", "hard_limit"],
     "preserve_exact_text_slices": True,
 }
+_DOCUMENT_STRUCTURE_RULES = {
+    "anchor_unit": "unicode_codepoint_offset",
+    "boundary_priority": [
+        "document_block",
+        "nested_structure",
+        "line",
+        "whitespace",
+        "hard_limit",
+    ],
+    "preserve_exact_text_slices": True,
+    "structure_map": "retained_v1",
+}
 _DEFAULT_ALGORITHM = "paragraph_char_v1"
+_DOCUMENT_ALGORITHM = "document_structure_char_v1"
 _DEFAULT_TARGET_SIZE = 1200
 _DEFAULT_OVERLAP_SIZE = 0
 _DEFAULT_PROFILE_VERSION = 1
@@ -50,6 +63,16 @@ class ChunkingProfileRepository:
             target_size=_DEFAULT_TARGET_SIZE,
             overlap_size=_DEFAULT_OVERLAP_SIZE,
             structure_rules=dict(_DEFAULT_STRUCTURE_RULES),
+            profile_version=_DEFAULT_PROFILE_VERSION,
+        )
+
+    def get_or_create_document_default(self) -> ChunkingProfile:
+        return self.get_or_create(
+            algorithm=_DOCUMENT_ALGORITHM,
+            tokenizer=None,
+            target_size=_DEFAULT_TARGET_SIZE,
+            overlap_size=_DEFAULT_OVERLAP_SIZE,
+            structure_rules=dict(_DOCUMENT_STRUCTURE_RULES),
             profile_version=_DEFAULT_PROFILE_VERSION,
         )
 

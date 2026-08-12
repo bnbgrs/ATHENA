@@ -11,6 +11,7 @@ from athena.jobs.models import CheckpointRecord, JobPriority, JobRecord, JobStat
 from athena.jobs.repository import JobLeaseError, JobTransitionError
 from athena.jobs.service import DurableJobService
 from athena.source.chunking_service import SourceChunkBuildResult, SourceChunkingService
+from athena.source.docx_representation_service import SourceDocxRepresentationService
 from athena.source.models import (
     RepresentationRetentionState,
     SourceRepresentationRecord,
@@ -23,7 +24,7 @@ from athena.source.service import SourceCaptureService
 _PIPELINE_VERSION = "source-process-v1"
 _TEXT_PARSER_ID = "athena.native_text"
 _TEXT_PARSER_VERSION = "1"
-_TEXT_OPTIONS = {
+_TEXT_OPTIONS: dict[str, object] = {
     "encoding": "utf-8-strict",
     "line_endings": "lf",
     "unicode_normalization": "none",
@@ -74,12 +75,14 @@ class DurableSourceProcessingWorker:
         sources: SourceCaptureService,
         source_text: SourceTextRepresentationService,
         source_pdf: SourcePdfRepresentationService,
+        source_docx: SourceDocxRepresentationService,
         source_chunks: SourceChunkingService,
     ) -> None:
         self.jobs = jobs
         self.sources = sources
         self.source_text = source_text
         self.source_pdf = source_pdf
+        self.source_docx = source_docx
         self.source_chunks = source_chunks
 
     def enqueue(
@@ -98,6 +101,7 @@ class DurableSourceProcessingWorker:
                 "pipeline_version": _PIPELINE_VERSION,
                 "text_parser": f"{_TEXT_PARSER_ID}@{_TEXT_PARSER_VERSION}",
                 "pdf_parser": self.source_pdf.parser_signature,
+                "docx_parser": self.source_docx.parser_signature,
                 "chunking_profile": "default",
                 "embedding_policy": "deferred",
             },
@@ -253,18 +257,28 @@ class DurableSourceProcessingWorker:
     ) -> SourceProcessingStepResult:
         source, _blob = self.sources.get(cursor.source_id)
         is_pdf = self.source_pdf.supports(source)
-        representation = self._compatible_representation(cursor.source_id, is_pdf=is_pdf)
+        is_docx = self.source_docx.supports(source)
+        representation = self._compatible_representation(
+            cursor.source_id,
+            is_pdf=is_pdf,
+            is_docx=is_docx,
+        )
         reused_representation = representation is not None
         if representation is None:
             if is_pdf:
                 built_pdf = self.source_pdf.build(cursor.source_id)
                 representation = built_pdf.result.representation
+            elif is_docx:
+                built_docx = self.source_docx.build(cursor.source_id)
+                representation = built_docx.result.representation
             else:
                 built_text = self.source_text.build(cursor.source_id)
                 representation = built_text.result.representation
         self.source_text.verify(representation.representation_id)
         if is_pdf:
             self.source_pdf.verify_page_map(representation.representation_id)
+        if is_docx:
+            self.source_docx.verify_structure_map(representation.representation_id)
         checkpoint = self.jobs.checkpoint(
             job_id,
             lease_token=lease_token,
@@ -484,11 +498,15 @@ class DurableSourceProcessingWorker:
             "chunking_profile": "default",
             "embedding_policy": "deferred",
         }
-        current_expected = {
+        pdf_expected = {
             **legacy_expected,
             "pdf_parser": self.source_pdf.parser_signature,
         }
-        if config not in (legacy_expected, current_expected):
+        current_expected = {
+            **pdf_expected,
+            "docx_parser": self.source_docx.parser_signature,
+        }
+        if config not in (legacy_expected, pdf_expected, current_expected):
             raise SourceProcessingJobError(
                 "source.process pinned configuration is missing or incompatible."
             )
@@ -497,6 +515,10 @@ class DurableSourceProcessingWorker:
         if self.source_pdf.supports(source) and config == legacy_expected:
             raise SourceProcessingJobError(
                 "Legacy source.process job did not pin a PDF parser and cannot process PDFs."
+            )
+        if self.source_docx.supports(source) and config != current_expected:
+            raise SourceProcessingJobError(
+                "Legacy source.process job did not pin a DOCX parser and cannot process DOCX."
             )
         self._source_id_from_scope(job)
 
@@ -514,20 +536,26 @@ class DurableSourceProcessingWorker:
             ) from exc
 
     def _compatible_representation(
-        self, source_id: uuid.UUID, *, is_pdf: bool
+        self, source_id: uuid.UUID, *, is_pdf: bool, is_docx: bool
     ) -> SourceRepresentationRecord | None:
-        expected_type = (
-            SourceRepresentationType.EXTRACTED_TEXT
-            if is_pdf
-            else SourceRepresentationType.NORMALIZED_TEXT
-        )
-        expected_parser_id = self.source_pdf.parser_id if is_pdf else _TEXT_PARSER_ID
-        expected_parser_version = (
-            self.source_pdf.parser_version if is_pdf else _TEXT_PARSER_VERSION
-        )
-        expected_options = (
-            self.source_pdf.parser_options if is_pdf else _TEXT_OPTIONS
-        )
+        if is_pdf and is_docx:
+            raise SourceProcessingJobError("Source cannot be both PDF and DOCX.")
+        if is_pdf:
+            expected_type = SourceRepresentationType.EXTRACTED_TEXT
+            expected_parser_id = self.source_pdf.parser_id
+            expected_parser_version = self.source_pdf.parser_version
+            expected_options = self.source_pdf.parser_options
+        elif is_docx:
+            expected_type = SourceRepresentationType.NORMALIZED_TEXT
+            expected_parser_id = self.source_docx.parser_id
+            expected_parser_version = self.source_docx.parser_version
+            expected_options = self.source_docx.parser_options
+        else:
+            expected_type = SourceRepresentationType.NORMALIZED_TEXT
+            expected_parser_id = _TEXT_PARSER_ID
+            expected_parser_version = _TEXT_PARSER_VERSION
+            expected_options = _TEXT_OPTIONS
+
         for representation, _blob in self.source_text.list_for_source(source_id, limit=100):
             if representation.representation_type is not expected_type:
                 continue
@@ -548,6 +576,8 @@ class DurableSourceProcessingWorker:
             self.source_text.verify(representation.representation_id)
             if is_pdf:
                 self.source_pdf.verify_page_map(representation.representation_id)
+            if is_docx:
+                self.source_docx.verify_structure_map(representation.representation_id)
             return representation
         return None
 
@@ -565,7 +595,12 @@ class DurableSourceProcessingWorker:
             raise SourceProcessingJobError(
                 "Checkpoint representation is not retained persistent state."
             )
-        return self.source_text.read_text(representation_id)
+        text = self.source_text.read_text(representation_id)
+        if representation.parser_id == self.source_pdf.parser_id:
+            self.source_pdf.verify_page_map(representation_id)
+        if representation.parser_id == self.source_docx.parser_id:
+            self.source_docx.verify_structure_map(representation_id)
+        return text
 
     @staticmethod
     def _require_representation(cursor: _Cursor) -> uuid.UUID:

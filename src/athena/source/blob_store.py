@@ -268,6 +268,8 @@ def _detect_media_type(path: Path) -> str | None:
     )
     for signature, media_type in signatures:
         if prefix.startswith(signature):
+            if signature == b"PK\x03\x04" and path.suffix.lower() == ".docx":
+                return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             return media_type
 
     guessed, _ = mimetypes.guess_type(path.name, strict=False)
