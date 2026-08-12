@@ -24,6 +24,10 @@ from athena.jobs.repository import (
     JobNotFoundError,
     JobTransitionError,
 )
+from athena.jobs.source_processing import (
+    SourceProcessingJobError,
+    SourceProcessingStepResult,
+)
 from athena.knowledge.claim_repository import ClaimNotFoundError, ClaimRelationError
 from athena.knowledge.extraction_models import ChatExtractionResult
 from athena.knowledge.extraction_snapshot import ExtractionSnapshotNotFoundError
@@ -825,6 +829,31 @@ def build_parser() -> argparse.ArgumentParser:
     job_pause.add_argument("job_id", type=_uuid_argument)
     job_resume = job_commands.add_parser("resume", help="Resume a paused job.")
     job_resume.add_argument("job_id", type=_uuid_argument)
+    job_source_process = job_commands.add_parser(
+        "source-process",
+        help="Queue one reproducibly configured durable source.process job.",
+    )
+    job_source_process.add_argument("source_id", type=_uuid_argument)
+    job_source_process.add_argument(
+        "--priority",
+        type=int,
+        choices=range(0, 6),
+        default=int(JobPriority.NORMAL),
+    )
+    job_source_step = job_commands.add_parser(
+        "source-step",
+        help="Execute one durable source-processing stage under an existing lease.",
+    )
+    job_source_step.add_argument("job_id", type=_uuid_argument)
+    job_source_step.add_argument("lease_token", type=_lease_token_argument)
+    job_source_step.add_argument("--extend-seconds", type=int, default=120)
+    job_run_source = job_commands.add_parser(
+        "run-source",
+        help="Acquire and run a queued source.process job to a terminal state.",
+    )
+    job_run_source.add_argument("job_id", type=_uuid_argument)
+    job_run_source.add_argument("--worker", default="athena-cli-source-worker")
+    job_run_source.add_argument("--lease-seconds", type=int, default=120)
     job_commands.add_parser(
         "recover",
         help="Recover only jobs whose worker lease has expired.",
@@ -2027,6 +2056,16 @@ def _print_job(job: JobRecord) -> None:
     print(f"Pinned config: {job.pinned_configuration_json or '<none>'}")
 
 
+def _print_source_processing_result(result: SourceProcessingStepResult) -> None:
+    print(f"Source processing job: {result.job.job_id}")
+    print(f"State: {result.job.state.value}")
+    print(f"Completed stage: {result.completed_stage or '<none>'}")
+    print(f"Checkpoint: {result.checkpoint.checkpoint_id if result.checkpoint else '<none>'}")
+    print(f"Representation: {result.representation_id or '<none>'}")
+    print(f"Chunks: {result.chunk_count if result.chunk_count is not None else '<none>'}")
+    print(f"Done: {result.done}")
+
+
 def _run_job_command(app: AthenaApplication, args: argparse.Namespace) -> int:
     if args.job_command == "create":
         job = app.jobs.create(
@@ -2112,7 +2151,8 @@ def _run_job_command(app: AthenaApplication, args: argparse.Namespace) -> int:
                 f"{checkpoint.checkpoint_id} job={checkpoint.job_id} "
                 f"created_at_us={checkpoint.created_at_us} "
                 f"fence={checkpoint.fencing_sequence} "
-                f"progress={checkpoint.progress_state_json or '<none>'}"
+                f"progress={checkpoint.progress_state_json or '<none>'} "
+                f"resume={checkpoint.resume_metadata_json or '<none>'}"
             )
         return 0
 
@@ -2159,6 +2199,32 @@ def _run_job_command(app: AthenaApplication, args: argparse.Namespace) -> int:
     if args.job_command == "resume":
         job = app.jobs.resume(args.job_id)
         print(f"Job resumed: {job.job_id} state={job.state.value}")
+        return 0
+
+    if args.job_command == "source-process":
+        job = app.source_processing.enqueue(
+            args.source_id,
+            priority=JobPriority(args.priority),
+        )
+        _print_job(job)
+        return 0
+
+    if args.job_command == "source-step":
+        result = app.source_processing.step(
+            args.job_id,
+            lease_token=args.lease_token,
+            extend_seconds=args.extend_seconds,
+        )
+        _print_source_processing_result(result)
+        return 0
+
+    if args.job_command == "run-source":
+        result = app.source_processing.run_to_completion(
+            args.job_id,
+            worker_id=args.worker,
+            lease_seconds=args.lease_seconds,
+        )
+        _print_source_processing_result(result)
         return 0
 
     if args.job_command == "recover":
@@ -2322,6 +2388,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 JobLeaseError,
                 JobNotFoundError,
                 JobTransitionError,
+                SourceProcessingJobError,
                 ValueError,
             ) as exc:
                 print(f"ATHENA job error: {exc}", file=sys.stderr)

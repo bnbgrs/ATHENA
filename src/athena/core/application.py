@@ -14,6 +14,7 @@ from athena.config.settings import AthenaSettings
 from athena.core.services import LifecycleService, ServiceManager
 from athena.jobs.repository import JobRepository
 from athena.jobs.service import DurableJobService
+from athena.jobs.source_processing import DurableSourceProcessingWorker
 from athena.knowledge.acceptance_service import ProposalAcceptanceService
 from athena.knowledge.claim_repository import ClaimRepository
 from athena.knowledge.claim_service import ClaimService
@@ -154,6 +155,12 @@ class AthenaApplication:
             embedding_provider=self.embedding_provider,
             archive_retrieval=self.archive_hybrid_retrieval,
             context_builder=self.source_context_builder,
+        )
+        self.source_processing = DurableSourceProcessingWorker(
+            jobs=self.jobs,
+            sources=self.sources,
+            source_text=self.source_text,
+            source_chunks=self.source_chunks,
         )
         self.reviews = ReviewService(self.database)
         self.extraction_snapshots = ExtractionSnapshotRepository(

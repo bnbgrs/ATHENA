@@ -138,6 +138,24 @@ class DurableJobService:
     def checkpoints(self, job_id: uuid.UUID) -> tuple[CheckpointRecord, ...]:
         return self.repository.list_checkpoints(job_id)
 
+    def get_checkpoint(self, checkpoint_id: uuid.UUID) -> CheckpointRecord:
+        return self.repository.get_checkpoint(checkpoint_id)
+
+    def fail(
+        self,
+        job_id: uuid.UUID,
+        *,
+        lease_token: bytes,
+        blocked_reason: str,
+        now_us: int | None = None,
+    ) -> JobRecord:
+        return self.repository.fail(
+            job_id=job_id,
+            lease_token=lease_token,
+            blocked_reason=blocked_reason,
+            now_us=now_us,
+        )
+
     def wait(
         self,
         job_id: uuid.UUID,
