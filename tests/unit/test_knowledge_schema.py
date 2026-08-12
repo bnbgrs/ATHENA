@@ -5,8 +5,9 @@ from athena.storage.database import SQLiteDatabase
 from athena.storage.schema import (
     KNOWLEDGE_SCHEMA_VERSION,
     LEGACY_SCHEMA_VERSION,
-    MODEL_RUNS_MIGRATION_ID,
+    MODEL_RUNS_SCHEMA_VERSION,
     PROVENANCE_SCHEMA_VERSION,
+    REVIEW_QUEUE_MIGRATION_ID,
     SCHEMA_VERSION,
     _create_schema_v1,
     _migrate_schema_v1_to_v2,
@@ -22,6 +23,7 @@ EXPECTED_SEMANTIC_TABLES = {
     "provenance_inputs",
     "model_signatures",
     "processing_runs",
+    "semantic_review_items",
 }
 
 
@@ -46,7 +48,7 @@ def test_fresh_database_contains_semantic_schema(tmp_path) -> None:
     ).fetchone()
     assert tuple(metadata) == (
         SCHEMA_VERSION,
-        MODEL_RUNS_MIGRATION_ID,
+        REVIEW_QUEUE_MIGRATION_ID,
         SCHEMA_VERSION,
     )
 
@@ -155,4 +157,27 @@ def test_claim_evidence_schema_rejects_reference_free_row(tmp_path) -> None:
         "provenance_id",
     }.issubset(columns)
 
+    database.stop()
+
+
+def test_v4_database_is_upgraded_additively_to_review_queue(tmp_path) -> None:
+    from athena.storage.schema import _migrate_schema_v3_to_v4
+
+    path = tmp_path / "athena.db"
+    legacy = sqlite3.connect(path, autocommit=True)
+    legacy.row_factory = sqlite3.Row
+    legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
+    legacy.execute("PRAGMA application_id = 1096042574")
+    _create_schema_v1(legacy, created_at_us=1)
+    _migrate_schema_v1_to_v2(legacy)
+    _migrate_schema_v2_to_v3(legacy)
+    _migrate_schema_v3_to_v4(legacy)
+    assert legacy.execute("PRAGMA user_version").fetchone()[0] == MODEL_RUNS_SCHEMA_VERSION
+    assert "semantic_review_items" not in _table_names(legacy)
+    legacy.close()
+
+    database = SQLiteDatabase(path)
+    database.start()
+    assert database.connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert "semantic_review_items" in _table_names(database.connection)
     database.stop()

@@ -8,12 +8,14 @@ ATHENA_APPLICATION_ID = 1_096_042_574  # ASCII "ATHN" / 0x4154484E
 LEGACY_SCHEMA_VERSION = 1
 KNOWLEDGE_SCHEMA_VERSION = 2
 PROVENANCE_SCHEMA_VERSION = 3
-SCHEMA_VERSION = 4
+MODEL_RUNS_SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
 PROVENANCE_INPUTS_MIGRATION_ID = "0003_provenance_inputs"
 MODEL_RUNS_MIGRATION_ID = "0004_model_signatures_processing_runs"
+REVIEW_QUEUE_MIGRATION_ID = "0005_semantic_review_queue"
 
 
 class DatabaseCompatibilityError(RuntimeError):
@@ -82,6 +84,7 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         LEGACY_SCHEMA_VERSION,
         KNOWLEDGE_SCHEMA_VERSION,
         PROVENANCE_SCHEMA_VERSION,
+        MODEL_RUNS_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -107,9 +110,13 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
 
     if existing_user_version == PROVENANCE_SCHEMA_VERSION:
         _migrate_schema_v3_to_v4(connection)
+        existing_user_version = MODEL_RUNS_SCHEMA_VERSION
+
+    if existing_user_version == MODEL_RUNS_SCHEMA_VERSION:
+        _migrate_schema_v4_to_v5(connection)
 
     _configure_connection(connection)
-    _verify_schema_v4(connection)
+    _verify_schema_v5(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -521,8 +528,89 @@ def _migrate_schema_v3_to_v4(connection: sqlite3.Connection) -> None:
             WHERE model_signature_id IS NOT NULL;
 
         UPDATE schema_metadata
-        SET schema_version = {SCHEMA_VERSION},
+        SET schema_version = {MODEL_RUNS_SCHEMA_VERSION},
             last_migration_id = '{MODEL_RUNS_MIGRATION_ID}',
+            minimum_reader_version = {MODEL_RUNS_SCHEMA_VERSION}
+        WHERE singleton_id = 1;
+
+        PRAGMA user_version = {MODEL_RUNS_SCHEMA_VERSION};
+        COMMIT;
+        """
+    )
+
+
+def _migrate_schema_v4_to_v5(connection: sqlite3.Connection) -> None:
+    """Add a persistent queue for semantic decisions that require user review."""
+    connection.executescript(
+        f"""
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE semantic_review_items (
+            review_id BLOB(16) PRIMARY KEY CHECK(length(review_id) = 16),
+            review_type TEXT NOT NULL CHECK(review_type IN (
+                'contradiction', 'merge_candidate'
+            )),
+            status TEXT NOT NULL CHECK(status IN (
+                'pending', 'accepted', 'rejected', 'superseded'
+            )),
+            created_at_us INTEGER NOT NULL,
+            resolved_at_us INTEGER NULL,
+            processing_run_id BLOB(16) NOT NULL CHECK(length(processing_run_id) = 16),
+            model_signature_id BLOB(16) NOT NULL CHECK(length(model_signature_id) = 16),
+            left_entity_id BLOB(16) NULL CHECK(
+                left_entity_id IS NULL OR length(left_entity_id) = 16
+            ),
+            left_revision_id BLOB(16) NULL CHECK(
+                left_revision_id IS NULL OR length(left_revision_id) = 16
+            ),
+            right_entity_id BLOB(16) NULL CHECK(
+                right_entity_id IS NULL OR length(right_entity_id) = 16
+            ),
+            right_revision_id BLOB(16) NULL CHECK(
+                right_revision_id IS NULL OR length(right_revision_id) = 16
+            ),
+            confidence REAL NOT NULL CHECK(confidence >= 0.0 AND confidence <= 1.0),
+            reason TEXT NOT NULL,
+            decision_actor_id BLOB(16) NULL CHECK(
+                decision_actor_id IS NULL OR length(decision_actor_id) = 16
+            ),
+            decision_reason TEXT NULL,
+            FOREIGN KEY(processing_run_id) REFERENCES processing_runs(processing_run_id),
+            FOREIGN KEY(model_signature_id) REFERENCES model_signatures(model_signature_id),
+            FOREIGN KEY(left_entity_id) REFERENCES entity_registry(entity_id),
+            FOREIGN KEY(left_revision_id) REFERENCES revisions(revision_id),
+            FOREIGN KEY(right_entity_id) REFERENCES entity_registry(entity_id),
+            FOREIGN KEY(right_revision_id) REFERENCES revisions(revision_id),
+            FOREIGN KEY(decision_actor_id) REFERENCES actors(actor_id),
+            CHECK(
+                (status = 'pending' AND resolved_at_us IS NULL AND decision_actor_id IS NULL)
+                OR
+                (status != 'pending' AND resolved_at_us IS NOT NULL AND decision_actor_id IS NOT NULL)
+            ),
+            CHECK(
+                review_type != 'contradiction'
+                OR (
+                    left_entity_id IS NOT NULL
+                    AND left_revision_id IS NOT NULL
+                    AND right_entity_id IS NOT NULL
+                    AND right_revision_id IS NOT NULL
+                    AND left_entity_id != right_entity_id
+                )
+            )
+        ) WITHOUT ROWID;
+
+        CREATE UNIQUE INDEX uq_pending_contradiction_review
+            ON semantic_review_items(
+                review_type, left_entity_id, right_entity_id
+            )
+            WHERE status = 'pending' AND review_type = 'contradiction';
+
+        CREATE INDEX idx_semantic_review_pending
+            ON semantic_review_items(status, review_type, created_at_us);
+
+        UPDATE schema_metadata
+        SET schema_version = {SCHEMA_VERSION},
+            last_migration_id = '{REVIEW_QUEUE_MIGRATION_ID}',
             minimum_reader_version = {SCHEMA_VERSION}
         WHERE singleton_id = 1;
 
@@ -532,7 +620,7 @@ def _migrate_schema_v3_to_v4(connection: sqlite3.Connection) -> None:
     )
 
 
-def _verify_schema_v4(connection: sqlite3.Connection) -> None:
+def _verify_schema_v5(connection: sqlite3.Connection) -> None:
     application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
     user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
@@ -550,7 +638,7 @@ def _verify_schema_v4(connection: sqlite3.Connection) -> None:
         SCHEMA_VERSION,
         STORAGE_LAYOUT_VERSION,
         BLOB_FORMAT_VERSION,
-        MODEL_RUNS_MIGRATION_ID,
+        REVIEW_QUEUE_MIGRATION_ID,
         SCHEMA_VERSION,
     )
     if metadata is None or tuple(metadata) != expected:
@@ -565,6 +653,7 @@ def _verify_schema_v4(connection: sqlite3.Connection) -> None:
         "provenance_inputs",
         "model_signatures",
         "processing_runs",
+        "semantic_review_items",
     }
     missing_tables = required_tables.difference(_user_tables(connection))
     if missing_tables:

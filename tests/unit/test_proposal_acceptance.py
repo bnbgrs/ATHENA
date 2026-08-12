@@ -17,6 +17,7 @@ from athena.knowledge.extraction_models import (
 )
 from athena.knowledge.extraction_service import ChatKnowledgeExtractionService
 from athena.knowledge.repository import KnowledgeRepository
+from athena.knowledge.review_service import ReviewService
 from athena.model.domain import ModelChatMessage, ModelInfo, ProviderHealth, ProviderHealthStatus
 from athena.model.provenance import ModelRunRepository
 from athena.storage.database import SQLiteDatabase
@@ -111,7 +112,7 @@ class FakeProvider:
                         "left_claim_index": 0,
                         "right_claim_index": 1,
                         "relationship": "contradicts",
-                        "confidence": 0.95,
+                        "confidence": 1.0,
                         "reason": "Both cannot be the capital under the same scope.",
                     }
                 ]
@@ -137,6 +138,7 @@ def _services(tmp_path):
         chat=chat,
         knowledge=knowledge,
         claims=claims,
+        reviews=ReviewService(database),
     )
     return database, chat, extraction, knowledge, claims, acceptance
 
@@ -163,7 +165,8 @@ def test_accept_all_atomically_creates_grounded_canonical_entities(tmp_path) -> 
 
         assert len(accepted.knowledge_ids) == 2
         assert len(accepted.claim_ids) == 2
-        assert len(accepted.contradiction_pairs) == 1
+        assert accepted.contradiction_pairs == ()
+        assert len(accepted.contradiction_review_ids) == 1
 
         first_knowledge = knowledge.load_current(accepted.knowledge_ids[0])
         assert first_knowledge.revision.payload.body == "Berlin ist die Hauptstadt von Deutschland."
@@ -171,7 +174,7 @@ def test_accept_all_atomically_creates_grounded_canonical_entities(tmp_path) -> 
         assert len(inputs) == 1
         first_claim = claims.load_current(accepted.claim_ids[0])
         evidence = claims.list_evidence(first_claim.claim_id)
-        assert {item.evidence_role.value for item in evidence} == {"originates", "contradicts"}
+        assert {item.evidence_role.value for item in evidence} == {"originates"}
 
         provenance = database.connection.execute(
             "SELECT model_signature_id, processing_run_id FROM provenance_records "
@@ -224,7 +227,8 @@ def test_second_acceptance_reuses_exact_canonical_duplicates(tmp_path) -> None:
         assert len(second.knowledge_reused_ids) == 2
         assert len(second.claim_reused_ids) == 2
         assert second.contradiction_pairs == ()
-        assert len(second.contradiction_pairs_reused) == 1
+        assert second.contradiction_pairs_reused == ()
+        assert len(second.contradiction_review_ids) == 1
 
         knowledge_count = database.connection.execute(
             "SELECT COUNT(*) FROM knowledge_units"

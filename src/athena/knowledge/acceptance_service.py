@@ -26,6 +26,7 @@ from athena.knowledge.extraction_models import (
 )
 from athena.knowledge.models import ClaimDraft, EvidenceRole, KnowledgeUnitDraft
 from athena.knowledge.repository import KnowledgeRepository, _knowledge_payload_hash
+from athena.knowledge.review_service import ReviewService
 from athena.storage.database import SQLiteDatabase
 
 
@@ -45,6 +46,7 @@ class ProposalAcceptanceResult:
     claim_reused_ids: tuple[uuid.UUID, ...]
     contradiction_pairs: tuple[tuple[uuid.UUID, uuid.UUID], ...]
     contradiction_pairs_reused: tuple[tuple[uuid.UUID, uuid.UUID], ...]
+    contradiction_review_ids: tuple[uuid.UUID, ...]
 
 
 class ProposalAcceptanceService:
@@ -57,11 +59,13 @@ class ProposalAcceptanceService:
         chat: ChatService,
         knowledge: KnowledgeRepository,
         claims: ClaimRepository,
+        reviews: ReviewService,
     ) -> None:
         self.database = database
         self.chat = chat
         self.knowledge = knowledge
         self.claims = claims
+        self.reviews = reviews
 
     def preflight(self, result: ChatExtractionResult) -> DeduplicationPlan:
         """Return deterministic canonical dedup/merge decisions without writing."""
@@ -105,6 +109,7 @@ class ProposalAcceptanceService:
         claim_reused_ids: list[uuid.UUID] = []
         contradiction_pairs: list[tuple[uuid.UUID, uuid.UUID]] = []
         contradiction_pairs_reused: list[tuple[uuid.UUID, uuid.UUID]] = []
+        contradiction_review_ids: list[uuid.UUID] = []
 
         with self.database.write_transaction() as connection:
             current_plan = CanonicalDeduplicationService.plan(connection, result)
@@ -226,17 +231,22 @@ class ProposalAcceptanceService:
                 ):
                     contradiction_pairs_reused.append((left_claim_id, right_claim_id))
                     continue
-                self._insert_contradiction_pair(
-                    connection=connection,
-                    actor_id=actor_id,
-                    created_at_us=created_at_us,
-                    result=result,
-                    left_claim_id=left_claim_id,
+                review_id = self.reviews.enqueue_contradiction(
+                    connection,
+                    processing_run_id=result.processing_run.processing_run_id,
+                    model_signature_id=result.model_signature.model_signature_id,
+                    left_entity_id=left_claim_id,
                     left_revision_id=left_revision_id,
-                    right_claim_id=right_claim_id,
+                    right_entity_id=right_claim_id,
                     right_revision_id=right_revision_id,
+                    confidence=relation.confidence,
+                    reason=(
+                        "Primary Model contradiction requires review; model-reported "
+                        "confidence is not an authorization signal"
+                    ),
+                    created_at_us=created_at_us,
                 )
-                contradiction_pairs.append((left_claim_id, right_claim_id))
+                contradiction_review_ids.append(review_id)
 
         return ProposalAcceptanceResult(
             processing_run_id=result.processing_run.processing_run_id,
@@ -249,6 +259,7 @@ class ProposalAcceptanceService:
             claim_reused_ids=tuple(claim_reused_ids),
             contradiction_pairs=tuple(contradiction_pairs),
             contradiction_pairs_reused=tuple(contradiction_pairs_reused),
+            contradiction_review_ids=tuple(contradiction_review_ids),
         )
 
     @staticmethod

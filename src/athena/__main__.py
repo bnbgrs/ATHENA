@@ -28,6 +28,7 @@ from athena.knowledge.repository import (
     KnowledgeNotFoundError,
     KnowledgeSourceError,
 )
+from athena.knowledge.review_service import ReviewError
 from athena.knowledge.service import (
     ChatMessageSequenceError,
     UnsupportedKnowledgeSourceError,
@@ -258,6 +259,37 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="After displaying the exact validated proposal set, ask for explicit user acceptance and atomically commit it.",
     )
+
+    review_parser = commands.add_parser(
+        "review",
+        help="Persistent semantic review queue.",
+    )
+    review_commands = review_parser.add_subparsers(dest="review_command", required=True)
+
+    review_list = review_commands.add_parser("list", help="List pending review items.")
+    review_list.add_argument("--type", dest="review_type", choices=("contradiction", "merge_candidate"))
+    review_list.add_argument("--limit", type=int, default=100)
+
+    review_show = review_commands.add_parser("show", help="Show one semantic review item.")
+    review_show.add_argument("review_id", type=_uuid_argument)
+
+    review_accept = review_commands.add_parser("accept", help="Accept one pending review item.")
+    review_accept.add_argument("review_id", type=_uuid_argument)
+
+    review_reject = review_commands.add_parser("reject", help="Reject one pending review item.")
+    review_reject.add_argument("review_id", type=_uuid_argument)
+
+    review_accept_all = review_commands.add_parser(
+        "accept-all",
+        help="Batch-accept pending review items at or above a confidence threshold.",
+    )
+    review_accept_all.add_argument(
+        "--type",
+        dest="review_type",
+        choices=("contradiction",),
+        default="contradiction",
+    )
+    review_accept_all.add_argument("--min-confidence", type=float, default=0.0)
 
     model_parser = commands.add_parser("model", help="Local model provider commands.")
     model_commands = model_parser.add_subparsers(dest="model_command", required=True)
@@ -645,10 +677,81 @@ def _run_extract_command(app: AthenaApplication, args: argparse.Namespace) -> in
             print(f"  C -> {claim_id}")
         print(f"Contradictions committed: {len(accepted.contradiction_pairs)}")
         print(f"Contradictions reused: {len(accepted.contradiction_pairs_reused)}")
+        print(f"Contradictions queued for review: {len(accepted.contradiction_review_ids)}")
+        if accepted.contradiction_review_ids:
+            print("All model-proposed contradictions require review in Step 7.")
+            for review_id in accepted.contradiction_review_ids:
+                print(f"  REVIEW -> {review_id}")
         return 0
 
     raise RuntimeError(f"Unsupported extraction command: {args.extract_command!r}")
 
+
+
+def _print_review_item(item: object) -> None:
+    from athena.knowledge.review_service import ReviewItem
+
+    if not isinstance(item, ReviewItem):
+        raise TypeError("Expected ReviewItem.")
+    print(f"Review: {item.review_id}")
+    print(f"Type: {item.review_type}")
+    print(f"Status: {item.status.value}")
+    print(f"Confidence: {item.confidence:.3f}")
+    print(f"Reason: {item.reason}")
+    print(f"ProcessingRun: {item.processing_run_id}")
+    print(f"ModelSignature: {item.model_signature_id}")
+    print(f"Left: {item.left_entity_id} revision={item.left_revision_id}")
+    print(f"Right: {item.right_entity_id} revision={item.right_revision_id}")
+    if item.decision_actor_id is not None:
+        print(f"Decision actor: {item.decision_actor_id}")
+    if item.decision_reason is not None:
+        print(f"Decision reason: {item.decision_reason}")
+
+
+def _run_review_command(app: AthenaApplication, args: argparse.Namespace) -> int:
+    if args.review_command == "list":
+        items = app.reviews.list_pending(
+            review_type=args.review_type,
+            limit=args.limit,
+        )
+        print(f"Pending reviews: {len(items)}")
+        print("Policy: all model-proposed contradictions require review.")
+        for item in items:
+            print(
+                f"{item.review_id} type={item.review_type} "
+                f"confidence={item.confidence:.3f} "
+                f"left={item.left_entity_id} right={item.right_entity_id}"
+            )
+        return 0
+
+    if args.review_command == "show":
+        _print_review_item(app.reviews.get(args.review_id))
+        return 0
+
+    actor_id = app.chat.ensure_local_user()
+
+    if args.review_command == "accept":
+        item = app.reviews.accept(args.review_id, actor_id=actor_id)
+        print(f"Review accepted: {item.review_id}")
+        return 0
+
+    if args.review_command == "reject":
+        item = app.reviews.reject(args.review_id, actor_id=actor_id)
+        print(f"Review rejected: {item.review_id}")
+        return 0
+
+    if args.review_command == "accept-all":
+        review_ids = app.reviews.accept_all(
+            actor_id=actor_id,
+            review_type=args.review_type,
+            min_confidence=args.min_confidence,
+        )
+        print(f"Reviews accepted: {len(review_ids)}")
+        for review_id in review_ids:
+            print(f"  REVIEW -> {review_id}")
+        return 0
+
+    raise RuntimeError(f"Unsupported review command: {args.review_command!r}")
 
 def _run_model_command(app: AthenaApplication, args: argparse.Namespace) -> int:
     if args.model_command == "status":
@@ -747,6 +850,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ValueError,
             ) as exc:
                 print(f"ATHENA extraction error: {exc}", file=sys.stderr)
+                return 2
+
+        if args.command == "review":
+            try:
+                return _run_review_command(app, args)
+            except (ReviewError, ValueError) as exc:
+                print(f"ATHENA review error: {exc}", file=sys.stderr)
                 return 2
 
         if args.command == "model":

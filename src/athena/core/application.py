@@ -15,6 +15,7 @@ from athena.knowledge.claim_repository import ClaimRepository
 from athena.knowledge.claim_service import ClaimService
 from athena.knowledge.extraction_service import ChatKnowledgeExtractionService
 from athena.knowledge.repository import KnowledgeRepository
+from athena.knowledge.review_service import ReviewService
 from athena.knowledge.service import KnowledgeService
 from athena.model.adapters.lm_studio import LMStudioProvider
 from athena.model.provenance import ModelRunRepository
@@ -63,6 +64,7 @@ class AthenaApplication:
         )
         self.chat_generation = ChatGenerationService(self.chat, self.model_provider)
         self.model_runs = ModelRunRepository(self.database)
+        self.reviews = ReviewService(self.database)
         self.extraction = ChatKnowledgeExtractionService(
             chat=self.chat,
             chat_generation=self.chat_generation,
@@ -74,6 +76,7 @@ class AthenaApplication:
             chat=self.chat,
             knowledge=self.knowledge_repository,
             claims=self.claim_repository,
+            reviews=self.reviews,
         )
 
         bootstrap_services: tuple[LifecycleService, ...] = (
