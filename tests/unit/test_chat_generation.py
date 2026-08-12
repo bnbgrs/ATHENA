@@ -268,3 +268,37 @@ def test_valid_grounded_answer_persists_with_grounding_report(tmp_path) -> None:
         ]
     finally:
         database.stop()
+
+
+def test_persisted_provenance_envelope_is_not_replayed_as_model_history(tmp_path) -> None:
+    database, chat = _chat_service(tmp_path)
+    try:
+        chat_id = chat.create_chat()
+        chat.add_user_message(chat_id=chat_id, content="First question")
+        chat.add_assistant_message(
+            chat_id=chat_id,
+            content=(
+                "First grounded answer. [MODEL-PRIOR]\n\n"
+                'ATHENA_PROVENANCE {"athena_provenance_version":2,"evidence":[],"uses_model_prior":true}'
+            ),
+            provider_id="lm_studio",
+            model_id="example/model",
+        )
+        provider = FakeProvider((_model(),), ("Second answer",))
+        service = ChatGenerationService(chat, provider)
+
+        service.send_message(chat_id=chat_id, content="Second question")
+
+        _, history = provider.requests[-1]
+        assert history == (
+            ModelChatMessage(role="user", content="First question"),
+            ModelChatMessage(
+                role="assistant",
+                content="First grounded answer. [MODEL-PRIOR]",
+            ),
+            ModelChatMessage(role="user", content="Second question"),
+        )
+        persisted = chat.load_chat(chat_id)
+        assert "ATHENA_PROVENANCE" in (persisted.messages[1].content or "")
+    finally:
+        database.stop()

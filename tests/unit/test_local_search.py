@@ -103,3 +103,33 @@ def test_search_type_filter_and_safe_query_validation(tmp_path) -> None:
             raise AssertionError("punctuation-only search must fail")
     finally:
         database.stop()
+
+
+def test_search_projection_excludes_internal_assistant_provenance_manifest(tmp_path) -> None:
+    database, chat, _knowledge, _claims, search = _services(tmp_path)
+    try:
+        chat_id = chat.create_chat()
+        chat.add_assistant_message(
+            chat_id=chat_id,
+            content=(
+                "Berlin ist die Hauptstadt. [MODEL-PRIOR]\n\n"
+                'ATHENA_PROVENANCE {"athena_provenance_version":2,"evidence":[]}'
+            ),
+            provider_id="lm_studio",
+            model_id="primary",
+        )
+
+        results = search.search(
+            "Berlin",
+            entity_type=SearchEntityType.CHAT_MESSAGE,
+        )
+
+        assert len(results) == 1
+        assert results[0].text == "Berlin ist die Hauptstadt. [MODEL-PRIOR]"
+        assert "ATHENA_PROVENANCE" not in results[0].text
+        assert search.search(
+            "athena provenance version",
+            entity_type=SearchEntityType.CHAT_MESSAGE,
+        ) == ()
+    finally:
+        database.stop()

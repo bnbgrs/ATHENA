@@ -157,3 +157,31 @@ def test_nomic_retrieval_uses_required_task_prefixes(tmp_path) -> None:
         assert any(text.startswith("search_query: ") for text in flattened)
     finally:
         database.stop()
+
+
+def test_semantic_documents_exclude_internal_assistant_provenance_manifest(tmp_path) -> None:
+    database = SQLiteDatabase(tmp_path / "athena.db")
+    database.start()
+    try:
+        chat = ChatService(ChatRepository(database))
+        chat_id = chat.create_chat()
+        chat.add_assistant_message(
+            chat_id=chat_id,
+            content=(
+                "Berlin ist die Hauptstadt. [MODEL-PRIOR]\n\n"
+                'ATHENA_PROVENANCE {"athena_provenance_version":2,"evidence":[]}'
+            ),
+            provider_id="lm_studio",
+            model_id="primary",
+        )
+        provider = RecordingEmbeddingProvider(inputs=[])
+        semantic = LocalSemanticSearchService(database, provider)
+
+        semantic.rebuild("fake-embed")
+
+        flattened = [text for batch in provider.inputs for text in batch]
+        document_inputs = [text for text in flattened if "Berlin" in text]
+        assert document_inputs
+        assert all("ATHENA_PROVENANCE" not in text for text in document_inputs)
+    finally:
+        database.stop()

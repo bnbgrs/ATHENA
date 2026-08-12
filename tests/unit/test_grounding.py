@@ -295,3 +295,37 @@ def test_grounding_rejects_bare_ctx_even_when_line_has_another_marker() -> None:
             "Source CTX-002 conflicts with Berlin. [CTX-001]",
             contract=contract,
         )
+
+
+def test_grounding_rejects_model_authored_reserved_provenance_envelope() -> None:
+    contract = GroundingContract(evidence_refs=())
+
+    with pytest.raises(GroundingViolation, match="reserved ATHENA-generated"):
+        validate_grounded_answer(
+            'ATHENA_PROVENANCE {"fake":true} [MODEL-PRIOR]',
+            contract=contract,
+        )
+
+
+def test_grounding_rejects_conversation_record_laundering_through_inference() -> None:
+    contract = GroundingContract(
+        evidence_refs=(_ref("CTX-004", EvidenceClass.CONVERSATION_RECORD),)
+    )
+
+    with pytest.raises(GroundingViolation, match="canonical evidence only"):
+        validate_grounded_answer(
+            "Berlin is the capital. [INFERENCE:CTX-004]",
+            contract=contract,
+        )
+
+
+def test_grounding_rejects_user_statement_laundering_through_inference() -> None:
+    contract = GroundingContract(
+        evidence_refs=(_ref("CTX-002", EvidenceClass.USER_STATEMENT),)
+    )
+
+    with pytest.raises(GroundingViolation, match="canonical evidence only"):
+        validate_grounded_answer(
+            "The statement is independently true. [INFERENCE:CTX-002]",
+            contract=contract,
+        )

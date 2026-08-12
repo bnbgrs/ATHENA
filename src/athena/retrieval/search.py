@@ -8,6 +8,7 @@ import uuid
 from dataclasses import dataclass
 from enum import Enum
 
+from athena.chat.provenance import strip_durable_provenance_manifest
 from athena.common.time import utc_now_us
 from athena.storage.database import SQLiteDatabase
 
@@ -190,18 +191,18 @@ class LocalSearchService:
             """
         )
 
-        # Archived current chat-message revisions are searchable as raw history.
-        connection.execute(
+        # Archived current chat-message revisions remain searchable as raw
+        # conversation history. System-appended ATHENA_PROVENANCE envelopes are
+        # deliberately excluded from this Derived State so internal traceability
+        # metadata cannot become semantic retrieval content or embedding input.
+        chat_rows = connection.execute(
             """
-            INSERT INTO search_fts (
-                entity_id, revision_id, entity_type, title, body
-            )
             SELECT
-                lower(hex(m.message_id)),
-                lower(hex(h.current_revision_id)),
-                'chat_message',
-                'Chat message ' || CAST(m.sequence_no AS TEXT),
-                mr.content
+                lower(hex(m.message_id)) AS entity_id,
+                lower(hex(h.current_revision_id)) AS revision_id,
+                m.message_type,
+                'Chat message ' || CAST(m.sequence_no AS TEXT) AS title,
+                mr.content AS body
             FROM chat_messages AS m
             JOIN chats AS ch
               ON ch.chat_id = m.chat_id
@@ -217,7 +218,28 @@ class LocalSearchService:
               AND mr.protected_payload_id IS NULL
               AND mr.content IS NOT NULL
               AND length(trim(mr.content)) > 0
+            ORDER BY m.message_id
             """
+        ).fetchall()
+        connection.executemany(
+            """
+            INSERT INTO search_fts (
+                entity_id, revision_id, entity_type, title, body
+            ) VALUES (?, ?, 'chat_message', ?, ?)
+            """,
+            (
+                (
+                    str(row["entity_id"]),
+                    str(row["revision_id"]),
+                    str(row["title"]),
+                    (
+                        strip_durable_provenance_manifest(str(row["body"]))
+                        if str(row["message_type"]) == "assistant"
+                        else str(row["body"])
+                    ),
+                )
+                for row in chat_rows
+            ),
         )
 
         indexed_commit_seq = self._current_commit_seq(connection)

@@ -7,6 +7,10 @@ import re
 import uuid
 from dataclasses import dataclass
 
+from athena.chat.provenance import (
+    DURABLE_PROVENANCE_LABEL,
+    contains_reserved_provenance_line,
+)
 from athena.retrieval.evidence import EvidenceClass
 
 _CONTEXT_ID_PATTERN = re.compile(r"CTX-\d{3}")
@@ -116,7 +120,9 @@ Provenance rules for the answer:
 - Use [USER-STATEMENT:CTX-NNN] only for evidence classified as user_statement.
 - Use [CONVERSATION:CTX-NNN] only for evidence classified as conversation_record.
 - An inference that combines supplied evidence may end with a marker such as
-  [INFERENCE:CTX-NNN,CTX-NNN]. The underlying evidence roles remain unchanged.
+  [INFERENCE:CTX-NNN,CTX-NNN]. Only canonical CTX identifiers are allowed in
+  this generic inference marker; user statements and conversation records must
+  not be promoted through inference.
 - If retrieved evidence and allowed model knowledge are insufficient, use
   [UNKNOWN] rather than inventing a fact.
 - Never invent, renumber, or alter CTX identifiers.
@@ -175,6 +181,12 @@ def validate_grounded_answer(
     if not normalized:
         raise GroundingViolation("Grounded answer must not be blank.")
 
+    if contains_reserved_provenance_line(normalized):
+        raise GroundingViolation(
+            f"{DURABLE_PROVENANCE_LABEL} is a reserved ATHENA-generated provenance "
+            "envelope and must not be authored by the model."
+        )
+
     direct_ids = set(_DIRECT_MARKER_PATTERN.findall(normalized))
     user_statement_ids = set(_USER_STATEMENT_MARKER_PATTERN.findall(normalized))
     conversation_ids = set(_CONVERSATION_MARKER_PATTERN.findall(normalized))
@@ -210,6 +222,7 @@ def validate_grounded_answer(
         user_statement_ids=user_statement_ids,
         conversation_ids=conversation_ids,
     )
+    _validate_inference_inputs(contract=contract, inference_ids=inference_ids)
 
     uses_model_prior = _MODEL_PRIOR_MARKER in normalized
     uses_unknown = _UNKNOWN_MARKER in normalized
@@ -351,6 +364,29 @@ def _is_table_separator(line: str) -> bool:
     )
 
 
+def _validate_inference_inputs(
+    *,
+    contract: GroundingContract,
+    inference_ids: set[str],
+) -> None:
+    """Prevent non-canonical raw records from being promoted via inference."""
+
+    invalid = tuple(
+        sorted(
+            context_id
+            for context_id in inference_ids
+            if contract.evidence_for(context_id).evidence_class
+            is not EvidenceClass.CANONICAL
+        )
+    )
+    if invalid:
+        raise GroundingViolation(
+            "Generic [INFERENCE:...] may reference canonical evidence only. "
+            "User statements and conversation records retain their typed roles: "
+            + ", ".join(invalid)
+        )
+
+
 def _validate_typed_markers(
     *,
     contract: GroundingContract,
@@ -410,4 +446,4 @@ def render_durable_provenance_manifest(
         "uses_unknown": report.uses_unknown,
     }
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    return f"\n\nATHENA_PROVENANCE {encoded}"
+    return f"\n\n{DURABLE_PROVENANCE_LABEL} {encoded}"

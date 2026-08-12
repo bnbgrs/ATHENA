@@ -14,6 +14,7 @@ from athena.chat.grounding import (
     validate_grounded_answer,
 )
 from athena.chat.models import ChatMessage, MessageType
+from athena.chat.provenance import strip_durable_provenance_manifest
 from athena.chat.service import ChatService
 from athena.model.domain import ModelChatMessage, ModelInfo
 from athena.model.ports import ChatModelProvider
@@ -172,7 +173,10 @@ class ChatGenerationService:
         if message.message_type is MessageType.USER:
             return ModelChatMessage(role="user", content=message.content)
         if message.message_type is MessageType.ASSISTANT:
-            return ModelChatMessage(role="assistant", content=message.content)
+            return ModelChatMessage(
+                role="assistant",
+                content=strip_durable_provenance_manifest(message.content),
+            )
         raise UnsupportedChatHistoryError(
             f"Message type {message.message_type.value!r} is not yet supported "
             "for model context."
