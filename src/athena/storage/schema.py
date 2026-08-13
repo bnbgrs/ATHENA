@@ -22,7 +22,8 @@ SOURCE_ANCHOR_SCHEMA_VERSION = 14
 DURABLE_JOBS_SCHEMA_VERSION = 15
 SOURCE_PAGE_MAP_SCHEMA_VERSION = 16
 SOURCE_DOCUMENT_STRUCTURE_SCHEMA_VERSION = 17
-SCHEMA_VERSION = SOURCE_DOCUMENT_STRUCTURE_SCHEMA_VERSION
+SOURCE_ANALYSIS_SCHEMA_VERSION = 18
+SCHEMA_VERSION = SOURCE_ANALYSIS_SCHEMA_VERSION
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
@@ -41,6 +42,7 @@ SOURCE_ANCHOR_MIGRATION_ID = "0014_source_anchors"
 DURABLE_JOBS_MIGRATION_ID = "0015_durable_jobs_checkpoints"
 SOURCE_PAGE_MAP_MIGRATION_ID = "0016_source_representation_page_map"
 SOURCE_DOCUMENT_STRUCTURE_MIGRATION_ID = "0017_source_representation_document_structure"
+SOURCE_ANALYSIS_MIGRATION_ID = "0018_hierarchical_source_analysis"
 
 
 class DatabaseCompatibilityError(RuntimeError):
@@ -122,6 +124,7 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         SOURCE_ANCHOR_SCHEMA_VERSION,
         DURABLE_JOBS_SCHEMA_VERSION,
         SOURCE_PAGE_MAP_SCHEMA_VERSION,
+        SOURCE_DOCUMENT_STRUCTURE_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -199,9 +202,13 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
 
     if existing_user_version == SOURCE_PAGE_MAP_SCHEMA_VERSION:
         _migrate_schema_v16_to_v17(connection)
+        existing_user_version = SOURCE_DOCUMENT_STRUCTURE_SCHEMA_VERSION
+
+    if existing_user_version == SOURCE_DOCUMENT_STRUCTURE_SCHEMA_VERSION:
+        _migrate_schema_v17_to_v18(connection)
 
     _configure_connection(connection)
-    _verify_schema_v17(connection)
+    _verify_schema_v18(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -1314,7 +1321,137 @@ def _migrate_schema_v16_to_v17(connection: sqlite3.Connection) -> None:
     )
 
 
-def _verify_schema_v17(connection: sqlite3.Connection) -> None:
+def _migrate_schema_v17_to_v18(connection: sqlite3.Connection) -> None:
+    """Add durable hierarchical large-source analysis state and provenance graph."""
+    connection.executescript(
+        f"""
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE source_analyses (
+            analysis_id BLOB(16) PRIMARY KEY CHECK(length(analysis_id) = 16),
+            job_id BLOB(16) NOT NULL UNIQUE CHECK(length(job_id) = 16),
+            source_id BLOB(16) NOT NULL CHECK(length(source_id) = 16),
+            representation_id BLOB(16) NOT NULL CHECK(length(representation_id) = 16),
+            question TEXT NOT NULL CHECK(length(question) > 0),
+            state TEXT NOT NULL CHECK(state IN (
+                'running', 'partial', 'completed'
+            )),
+            model_signature_id BLOB(16) NOT NULL CHECK(length(model_signature_id) = 16),
+            pipeline_version TEXT NOT NULL CHECK(length(pipeline_version) > 0),
+            effective_context_limit INTEGER NOT NULL CHECK(effective_context_limit > 0),
+            output_reserve INTEGER NOT NULL CHECK(output_reserve > 0),
+            safety_margin INTEGER NOT NULL CHECK(safety_margin >= 0),
+            token_estimator TEXT NOT NULL CHECK(length(token_estimator) > 0),
+            max_hierarchy_depth INTEGER NOT NULL CHECK(max_hierarchy_depth >= 1),
+            total_map_units INTEGER NOT NULL DEFAULT 0 CHECK(total_map_units >= 0),
+            completed_map_units INTEGER NOT NULL DEFAULT 0 CHECK(completed_map_units >= 0),
+            failed_map_units INTEGER NOT NULL DEFAULT 0 CHECK(failed_map_units >= 0),
+            coverage REAL NOT NULL DEFAULT 0.0 CHECK(coverage >= 0.0 AND coverage <= 1.0),
+            final_artifact_id BLOB(16) NULL CHECK(
+                final_artifact_id IS NULL OR length(final_artifact_id) = 16
+            ),
+            created_at_us INTEGER NOT NULL,
+            updated_at_us INTEGER NOT NULL CHECK(updated_at_us >= created_at_us),
+            FOREIGN KEY(job_id) REFERENCES jobs(job_id),
+            FOREIGN KEY(source_id) REFERENCES sources(source_id),
+            FOREIGN KEY(representation_id) REFERENCES source_representations(representation_id),
+            FOREIGN KEY(model_signature_id) REFERENCES model_signatures(model_signature_id),
+            FOREIGN KEY(final_artifact_id) REFERENCES source_analysis_artifacts(artifact_id),
+            CHECK(output_reserve + safety_margin < effective_context_limit),
+            CHECK(completed_map_units + failed_map_units <= total_map_units),
+            CHECK(state != 'completed' OR (
+                total_map_units > 0
+                AND completed_map_units = total_map_units
+                AND failed_map_units = 0
+                AND coverage = 1.0
+                AND final_artifact_id IS NOT NULL
+            ))
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_source_analyses_source
+            ON source_analyses(source_id, created_at_us, analysis_id);
+        CREATE INDEX idx_source_analyses_state
+            ON source_analyses(state, updated_at_us);
+
+        CREATE TABLE source_analysis_work_items (
+            work_item_id BLOB(16) PRIMARY KEY CHECK(length(work_item_id) = 16),
+            analysis_id BLOB(16) NOT NULL CHECK(length(analysis_id) = 16),
+            stage TEXT NOT NULL CHECK(stage IN ('map', 'reduce', 'final')),
+            level INTEGER NOT NULL CHECK(level >= 0),
+            ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+            state TEXT NOT NULL CHECK(state IN ('pending', 'completed', 'failed', 'split')),
+            idempotency_key BLOB(32) NOT NULL UNIQUE CHECK(length(idempotency_key) = 32),
+            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+            created_at_us INTEGER NOT NULL,
+            updated_at_us INTEGER NOT NULL CHECK(updated_at_us >= created_at_us),
+            UNIQUE(analysis_id, stage, level, ordinal),
+            FOREIGN KEY(analysis_id) REFERENCES source_analyses(analysis_id)
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_source_analysis_work_pending
+            ON source_analysis_work_items(analysis_id, stage, state, level, ordinal);
+
+        CREATE TABLE source_analysis_artifacts (
+            artifact_id BLOB(16) PRIMARY KEY CHECK(length(artifact_id) = 16),
+            analysis_id BLOB(16) NOT NULL CHECK(length(analysis_id) = 16),
+            work_item_id BLOB(16) NOT NULL UNIQUE CHECK(length(work_item_id) = 16),
+            artifact_kind TEXT NOT NULL CHECK(artifact_kind IN ('map', 'reduce', 'final')),
+            level INTEGER NOT NULL CHECK(level >= 0),
+            ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+            content_json TEXT NOT NULL CHECK(json_valid(content_json)),
+            content_hash BLOB(32) NOT NULL CHECK(length(content_hash) = 32),
+            processing_run_id BLOB(16) NOT NULL UNIQUE CHECK(length(processing_run_id) = 16),
+            created_at_us INTEGER NOT NULL,
+            UNIQUE(analysis_id, artifact_kind, level, ordinal),
+            FOREIGN KEY(analysis_id) REFERENCES source_analyses(analysis_id),
+            FOREIGN KEY(work_item_id) REFERENCES source_analysis_work_items(work_item_id),
+            FOREIGN KEY(processing_run_id) REFERENCES processing_runs(processing_run_id)
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_source_analysis_artifacts_level
+            ON source_analysis_artifacts(analysis_id, artifact_kind, level, ordinal);
+
+        CREATE TABLE source_analysis_work_inputs (
+            work_item_id BLOB(16) NOT NULL CHECK(length(work_item_id) = 16),
+            ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+            input_kind TEXT NOT NULL CHECK(input_kind IN ('source_anchor', 'artifact')),
+            source_anchor_id BLOB(16) NULL CHECK(
+                source_anchor_id IS NULL OR length(source_anchor_id) = 16
+            ),
+            artifact_id BLOB(16) NULL CHECK(
+                artifact_id IS NULL OR length(artifact_id) = 16
+            ),
+            PRIMARY KEY(work_item_id, ordinal),
+            FOREIGN KEY(work_item_id) REFERENCES source_analysis_work_items(work_item_id),
+            FOREIGN KEY(source_anchor_id) REFERENCES source_anchors(anchor_id),
+            FOREIGN KEY(artifact_id) REFERENCES source_analysis_artifacts(artifact_id),
+            CHECK(
+                (input_kind = 'source_anchor' AND source_anchor_id IS NOT NULL AND artifact_id IS NULL)
+                OR
+                (input_kind = 'artifact' AND artifact_id IS NOT NULL AND source_anchor_id IS NULL)
+            )
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_source_analysis_inputs_anchor
+            ON source_analysis_work_inputs(source_anchor_id)
+            WHERE source_anchor_id IS NOT NULL;
+        CREATE INDEX idx_source_analysis_inputs_artifact
+            ON source_analysis_work_inputs(artifact_id)
+            WHERE artifact_id IS NOT NULL;
+
+        UPDATE schema_metadata
+        SET schema_version = {SOURCE_ANALYSIS_SCHEMA_VERSION},
+            last_migration_id = '{SOURCE_ANALYSIS_MIGRATION_ID}',
+            minimum_reader_version = {SOURCE_ANALYSIS_SCHEMA_VERSION}
+        WHERE singleton_id = 1;
+
+        PRAGMA user_version = {SOURCE_ANALYSIS_SCHEMA_VERSION};
+        COMMIT;
+        """
+    )
+
+
+def _verify_schema_v18(connection: sqlite3.Connection) -> None:
     application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
     user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     if application_id != ATHENA_APPLICATION_ID:
@@ -1331,8 +1468,51 @@ def _verify_schema_v17(connection: sqlite3.Connection) -> None:
         SCHEMA_VERSION,
         STORAGE_LAYOUT_VERSION,
         BLOB_FORMAT_VERSION,
-        SOURCE_DOCUMENT_STRUCTURE_MIGRATION_ID,
+        SOURCE_ANALYSIS_MIGRATION_ID,
         SCHEMA_VERSION,
+    )
+    if metadata is None or tuple(metadata) != expected:
+        raise DatabaseCompatibilityError("ATHENA schema_metadata verification failed.")
+
+    required_tables = {
+        "knowledge_units", "knowledge_unit_revisions", "claims", "claim_revisions",
+        "claim_evidence", "provenance_inputs", "model_signatures", "processing_runs",
+        "semantic_review_items", "semantic_merge_review_payloads",
+        "extraction_result_snapshots", "search_fts", "search_index_state",
+        "search_embeddings", "search_embedding_state", "blob_records", "sources",
+        "source_representations", "source_representation_pages",
+        "source_representation_structures", "source_anchor_structures",
+        "chunking_profiles", "source_anchors", "jobs", "checkpoints",
+        "source_analyses", "source_analysis_work_items", "source_analysis_artifacts",
+        "source_analysis_work_inputs",
+    }
+    missing_tables = required_tables.difference(_user_tables(connection))
+    if missing_tables:
+        missing = ", ".join(sorted(missing_tables))
+        raise DatabaseCompatibilityError(f"ATHENA semantic schema is incomplete: {missing}.")
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise DatabaseCompatibilityError("ATHENA foreign-key verification failed.")
+
+
+def _verify_schema_v17(connection: sqlite3.Connection) -> None:
+    application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
+    user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if application_id != ATHENA_APPLICATION_ID:
+        raise DatabaseCompatibilityError("ATHENA application_id verification failed.")
+    if user_version != SOURCE_DOCUMENT_STRUCTURE_SCHEMA_VERSION:
+        raise DatabaseCompatibilityError("ATHENA schema version verification failed.")
+
+    metadata = connection.execute(
+        "SELECT schema_version, storage_layout_version, blob_format_version, "
+        "last_migration_id, minimum_reader_version "
+        "FROM schema_metadata WHERE singleton_id = 1"
+    ).fetchone()
+    expected = (
+        SOURCE_DOCUMENT_STRUCTURE_SCHEMA_VERSION,
+        STORAGE_LAYOUT_VERSION,
+        BLOB_FORMAT_VERSION,
+        SOURCE_DOCUMENT_STRUCTURE_MIGRATION_ID,
+        SOURCE_DOCUMENT_STRUCTURE_SCHEMA_VERSION,
     )
     if metadata is None or tuple(metadata) != expected:
         raise DatabaseCompatibilityError("ATHENA schema_metadata verification failed.")

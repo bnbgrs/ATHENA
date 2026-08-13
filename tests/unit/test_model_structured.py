@@ -1,9 +1,15 @@
+import io
 import json
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 import pytest
 
-from athena.model.adapters.lm_studio import LMStudioProvider, ProviderProtocolError
+from athena.model.adapters.lm_studio import (
+    LMStudioProvider,
+    ProviderContextLimitError,
+    ProviderProtocolError,
+)
 from athena.model.domain import ModelChatMessage
 
 
@@ -79,3 +85,57 @@ def test_lm_studio_rejects_non_json_structured_content() -> None:
                 schema_id="example_schema_v1",
                 json_schema={"type": "object"},
             )
+
+
+def test_lm_studio_classifies_backend_context_overflow() -> None:
+    provider = LMStudioProvider("http://127.0.0.1:1234")
+    body = io.BytesIO(
+        json.dumps(
+            {"error": {"message": "maximum context length exceeded: too many tokens"}}
+        ).encode("utf-8")
+    )
+    error = HTTPError(
+        provider.chat_completions_url,
+        400,
+        "Bad Request",
+        hdrs=None,
+        fp=body,
+    )
+
+    with patch("athena.model.adapters.lm_studio.urlopen", side_effect=error):
+        with pytest.raises(ProviderContextLimitError, match="context capacity"):
+            provider.generate_structured(
+                model_id="example/model",
+                messages=(ModelChatMessage(role="user", content="Analyze."),),
+                schema_id="example_schema_v1",
+                json_schema={"type": "object"},
+            )
+
+
+def test_lm_studio_structured_generation_honors_max_output_tokens() -> None:
+    response = FakeResponse(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps({"items": []}),
+                    }
+                }
+            ]
+        }
+    )
+    provider = LMStudioProvider("http://127.0.0.1:1234")
+
+    with patch("athena.model.adapters.lm_studio.urlopen", return_value=response) as mocked:
+        provider.generate_structured(
+            model_id="example/model",
+            messages=(ModelChatMessage(role="user", content="Extract."),),
+            schema_id="example_schema_v1",
+            json_schema={"type": "object"},
+            max_output_tokens=900,
+        )
+
+    request = mocked.call_args.args[0]
+    payload = json.loads(request.data.decode("utf-8"))
+    assert payload["max_tokens"] == 900

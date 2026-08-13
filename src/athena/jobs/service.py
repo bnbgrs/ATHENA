@@ -32,6 +32,7 @@ class DurableJobService:
     BUILTIN_JOB_TYPES = frozenset(
         {
             "source.process",
+            "source.analyze",
             "source.represent",
             "source.chunk",
             "search.rebuild",

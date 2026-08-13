@@ -24,6 +24,10 @@ class ProviderProtocolError(ModelProviderError):
     """Raised when a backend response violates the expected contract."""
 
 
+class ProviderContextLimitError(ModelProviderError):
+    """Raised when the backend rejects a request for exceeding context capacity."""
+
+
 @dataclass(frozen=True, slots=True)
 class LMStudioProvider:
     """LM Studio adapter.
@@ -135,6 +139,10 @@ class LMStudioProvider:
                     )
         except HTTPError as exc:
             detail = self._http_error_detail(exc)
+            if self._is_context_limit_error(exc.code, detail):
+                raise ProviderContextLimitError(
+                    f"LM Studio rejected chat generation for context capacity{detail}."
+                ) from exc
             raise ModelProviderError(
                 f"LM Studio returned HTTP {exc.code} during chat generation{detail}."
             ) from exc
@@ -150,6 +158,7 @@ class LMStudioProvider:
         messages: Sequence[ModelChatMessage],
         schema_id: str,
         json_schema: Mapping[str, Any],
+        max_output_tokens: int | None = None,
     ) -> Mapping[str, Any]:
         """Generate one JSON object constrained by LM Studio structured output."""
         if not model_id:
@@ -159,6 +168,8 @@ class LMStudioProvider:
         normalized_schema_id = schema_id.strip()
         if not normalized_schema_id:
             raise ValueError("schema_id must not be empty.")
+        if max_output_tokens is not None and max_output_tokens < 1:
+            raise ValueError("max_output_tokens must be positive when provided.")
 
         request_payload = {
             "model": model_id,
@@ -177,6 +188,8 @@ class LMStudioProvider:
             "temperature": 0.0,
             "stream": False,
         }
+        if max_output_tokens is not None:
+            request_payload["max_tokens"] = max_output_tokens
         raw_body = json.dumps(request_payload, ensure_ascii=False).encode("utf-8")
         request = Request(
             self.chat_completions_url,
@@ -193,6 +206,10 @@ class LMStudioProvider:
                 raw = response.read()
         except HTTPError as exc:
             detail = self._http_error_detail(exc)
+            if self._is_context_limit_error(exc.code, detail):
+                raise ProviderContextLimitError(
+                    f"LM Studio rejected structured generation for context capacity{detail}."
+                ) from exc
             raise ModelProviderError(
                 f"LM Studio returned HTTP {exc.code} during structured generation{detail}."
             ) from exc
@@ -293,6 +310,22 @@ class LMStudioProvider:
         if not isinstance(content, str):
             raise ProviderProtocolError("LM Studio returned non-text chat content.")
         return content
+
+    @staticmethod
+    def _is_context_limit_error(status_code: int, detail: str) -> bool:
+        if status_code not in {400, 413, 422}:
+            return False
+        normalized = detail.casefold()
+        markers = (
+            "maximum context length",
+            "context length exceeded",
+            "context window",
+            "context capacity",
+            "too many tokens",
+            "token limit",
+            "exceeds the context",
+        )
+        return any(marker in normalized for marker in markers)
 
     @staticmethod
     def _http_error_detail(exc: HTTPError) -> str:

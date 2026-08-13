@@ -33,6 +33,7 @@ from athena.jobs.scheduler import (
     SchedulerRunResult,
     SchedulerTickResult,
 )
+from athena.jobs.source_analysis import SourceAnalysisJobError, SourceAnalysisStepResult
 from athena.jobs.source_processing import (
     SourceProcessingJobError,
     SourceProcessingStepResult,
@@ -63,6 +64,7 @@ from athena.retrieval.archive import ArchiveSearchError
 from athena.retrieval.context import ContextBuilderError
 from athena.retrieval.search import SearchEntityType, SearchError
 from athena.retrieval.semantic import SemanticSearchError
+from athena.source.analysis_repository import SourceAnalysisNotFoundError
 from athena.source.anchor_repository import SourceAnchorNotFoundError
 from athena.source.anchor_service import SourceAnchorIntegrityError
 from athena.source.blob_store import BlobStoreError
@@ -893,6 +895,45 @@ def build_parser() -> argparse.ArgumentParser:
     job_run_source.add_argument("job_id", type=_uuid_argument)
     job_run_source.add_argument("--worker", default="athena-cli-source-worker")
     job_run_source.add_argument("--lease-seconds", type=int, default=120)
+    job_source_analyze = job_commands.add_parser(
+        "source-analyze",
+        help="Queue hierarchical durable analysis of one processed source.",
+    )
+    job_source_analyze.add_argument("source_id", type=_uuid_argument)
+    job_source_analyze.add_argument("question")
+    job_source_analyze.add_argument("--model", dest="model_id")
+    job_source_analyze.add_argument("--context-limit", type=int)
+    job_source_analyze.add_argument("--output-reserve", type=int)
+    job_source_analyze.add_argument("--safety-margin", type=int)
+    job_source_analyze.add_argument("--max-depth", type=int, default=12)
+    job_source_analyze.add_argument(
+        "--priority",
+        type=int,
+        choices=range(0, 6),
+        default=int(JobPriority.NORMAL),
+    )
+    job_analysis_step = job_commands.add_parser(
+        "analysis-step",
+        help="Execute one durable source-analysis boundary under an existing lease.",
+    )
+    job_analysis_step.add_argument("job_id", type=_uuid_argument)
+    job_analysis_step.add_argument("lease_token", type=_lease_token_argument)
+    job_analysis_step.add_argument("--extend-seconds", type=int, default=120)
+    job_run_analysis = job_commands.add_parser(
+        "run-analysis",
+        help="Acquire and run a queued source.analyze job until completed or waiting.",
+    )
+    job_run_analysis.add_argument("job_id", type=_uuid_argument)
+    job_run_analysis.add_argument("--worker", default="athena-cli-analysis-worker")
+    job_run_analysis.add_argument("--lease-seconds", type=int, default=120)
+    job_analysis_show = job_commands.add_parser(
+        "analysis-show", help="Show one persistent source analysis."
+    )
+    job_analysis_show.add_argument("analysis_id", type=_uuid_argument)
+    job_analysis_artifacts = job_commands.add_parser(
+        "analysis-artifacts", help="List persistent artifacts for one source analysis."
+    )
+    job_analysis_artifacts.add_argument("analysis_id", type=_uuid_argument)
     job_embedding_rebuild = job_commands.add_parser(
         "embedding-rebuild",
         help="Queue a durable SourceChunk embedding rebuild pinned to current generation.",
@@ -2252,6 +2293,25 @@ def _print_source_processing_result(result: SourceProcessingStepResult) -> None:
     print(f"Done: {result.done}")
 
 
+def _print_source_analysis_result(result: SourceAnalysisStepResult) -> None:
+    print(f"Source analysis job: {result.job.job_id}")
+    print(f"State: {result.job.state.value}")
+    print(f"Completed stage: {result.completed_stage or '<none>'}")
+    print(f"Checkpoint: {result.checkpoint.checkpoint_id if result.checkpoint else '<none>'}")
+    print(f"Analysis: {result.analysis.analysis_id if result.analysis else '<none>'}")
+    if result.analysis is not None:
+        print(f"Coverage: {result.analysis.coverage:.6f}")
+        print(
+            "Map units: "
+            f"{result.analysis.completed_map_units}/{result.analysis.total_map_units} "
+            f"failed={result.analysis.failed_map_units}"
+        )
+        print(f"Final artifact: {result.analysis.final_artifact_id or '<none>'}")
+    print(f"Artifact: {result.artifact_id or '<none>'}")
+    print(f"Waiting: {result.waiting}")
+    print(f"Done: {result.done}")
+
+
 def _print_embedding_rebuild_result(result: EmbeddingRebuildStepResult) -> None:
     print(f"Embedding rebuild job: {result.job.job_id}")
     print(f"State: {result.job.state.value}")
@@ -2434,21 +2494,92 @@ def _run_job_command(app: AthenaApplication, args: argparse.Namespace) -> int:
         return 0
 
     if args.job_command == "source-step":
-        result = app.source_processing.step(
+        source_result = app.source_processing.step(
             args.job_id,
             lease_token=args.lease_token,
             extend_seconds=args.extend_seconds,
         )
-        _print_source_processing_result(result)
+        _print_source_processing_result(source_result)
         return 0
 
     if args.job_command == "run-source":
-        result = app.source_processing.run_to_completion(
+        source_result = app.source_processing.run_to_completion(
             args.job_id,
             worker_id=args.worker,
             lease_seconds=args.lease_seconds,
         )
-        _print_source_processing_result(result)
+        _print_source_processing_result(source_result)
+        return 0
+
+    if args.job_command == "source-analyze":
+        job = app.source_analysis.enqueue(
+            args.source_id,
+            question=args.question,
+            requested_model_id=args.model_id,
+            priority=JobPriority(args.priority),
+            context_limit=args.context_limit,
+            output_reserve=args.output_reserve,
+            safety_margin=args.safety_margin,
+            max_hierarchy_depth=args.max_depth,
+        )
+        _print_job(job)
+        return 0
+
+    if args.job_command == "analysis-step":
+        analysis_result = app.source_analysis.step(
+            args.job_id,
+            lease_token=args.lease_token,
+            extend_seconds=args.extend_seconds,
+        )
+        _print_source_analysis_result(analysis_result)
+        return 0
+
+    if args.job_command == "run-analysis":
+        analysis_result = app.source_analysis.run_to_completion(
+            args.job_id,
+            worker_id=args.worker,
+            lease_seconds=args.lease_seconds,
+        )
+        _print_source_analysis_result(analysis_result)
+        return 0
+
+    if args.job_command == "analysis-show":
+        analysis = app.source_analysis_repository.get_analysis(args.analysis_id)
+        print(f"Analysis: {analysis.analysis_id}")
+        print(f"Job: {analysis.job_id}")
+        print(f"Source: {analysis.source_id}")
+        print(f"Representation: {analysis.representation_id}")
+        print(f"State: {analysis.state.value}")
+        print(f"Coverage: {analysis.coverage:.6f}")
+        print(
+            "Map units: "
+            f"{analysis.completed_map_units}/{analysis.total_map_units} "
+            f"failed={analysis.failed_map_units}"
+        )
+        print(f"Model signature: {analysis.model_signature_id}")
+        print(f"Context limit: {analysis.effective_context_limit}")
+        print(f"Output reserve: {analysis.output_reserve}")
+        print(f"Safety margin: {analysis.safety_margin}")
+        print(f"Token estimator: {analysis.token_estimator}")
+        print(f"Final artifact: {analysis.final_artifact_id or '<none>'}")
+        return 0
+
+    if args.job_command == "analysis-artifacts":
+        artifacts = app.source_analysis_repository.list_artifacts(args.analysis_id)
+        if not artifacts:
+            print("No source-analysis artifacts.")
+            return 0
+        for artifact in artifacts:
+            anchor_ids = app.source_analysis_repository.source_anchor_ids_for_artifact(
+                artifact.artifact_id
+            )
+            print(
+                f"{artifact.artifact_id} kind={artifact.artifact_kind.value} "
+                f"level={artifact.level} ordinal={artifact.ordinal} "
+                f"run={artifact.processing_run_id} anchors="
+                + ",".join(str(anchor_id) for anchor_id in anchor_ids)
+            )
+            print(artifact.content_json)
         return 0
 
     if args.job_command == "embedding-rebuild":
@@ -2667,6 +2798,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 JobSchedulerError,
                 EmbeddingRebuildJobError,
                 SourceProcessingJobError,
+                SourceAnalysisJobError,
+                SourceAnalysisNotFoundError,
+                ModelProviderError,
+                ModelSelectionError,
                 ValueError,
             ) as exc:
                 print(f"ATHENA job error: {exc}", file=sys.stderr)

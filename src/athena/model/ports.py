@@ -44,6 +44,7 @@ class ChatModelProvider(ModelDiscoveryProvider, Protocol):
         messages: Sequence[ModelChatMessage],
         schema_id: str,
         json_schema: Mapping[str, Any],
+        max_output_tokens: int | None = None,
     ) -> Mapping[str, Any]:
-        """Return one JSON object constrained by the supplied schema."""
+        """Return one JSON object constrained by the supplied schema and output cap."""
         ...

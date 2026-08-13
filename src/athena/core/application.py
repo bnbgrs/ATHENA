@@ -16,6 +16,7 @@ from athena.jobs.embedding_processing import DurableEmbeddingRebuildWorker
 from athena.jobs.repository import JobRepository
 from athena.jobs.scheduler import DurableJobScheduler
 from athena.jobs.service import DurableJobService
+from athena.jobs.source_analysis import DurableSourceAnalysisWorker
 from athena.jobs.source_processing import DurableSourceProcessingWorker
 from athena.knowledge.acceptance_service import ProposalAcceptanceService
 from athena.knowledge.claim_repository import ClaimRepository
@@ -42,6 +43,8 @@ from athena.retrieval.ranking import RetrievalRankingService
 from athena.retrieval.search import LocalSearchService
 from athena.retrieval.semantic import LocalSemanticSearchService
 from athena.retrieval.source_context import SourceContextBuilderService
+from athena.source.analysis_repository import SourceAnalysisRepository
+from athena.source.analysis_service import SourceAnalysisService
 from athena.source.anchor_repository import SourceAnchorRepository
 from athena.source.anchor_service import SourceAnchorService
 from athena.source.blob_store import BlobStore
@@ -191,6 +194,21 @@ class AthenaApplication:
             archive_retrieval=self.archive_hybrid_retrieval,
             context_builder=self.source_context_builder,
         )
+        self.source_analysis_repository = SourceAnalysisRepository(self.database)
+        self.source_analysis_service = SourceAnalysisService(
+            jobs=self.jobs,
+            repository=self.source_analysis_repository,
+            source_text=self.source_text,
+            source_chunks=self.source_chunks,
+            source_anchors=self.source_anchors,
+            provider=self.model_provider,
+            runs=self.model_runs,
+            chat=self.chat,
+        )
+        self.source_analysis = DurableSourceAnalysisWorker(
+            jobs=self.jobs,
+            service=self.source_analysis_service,
+        )
         self.source_processing = DurableSourceProcessingWorker(
             jobs=self.jobs,
             sources=self.sources,
@@ -208,6 +226,7 @@ class AthenaApplication:
             jobs=self.jobs,
             source_worker=self.source_processing,
             embedding_worker=self.embedding_rebuild,
+            analysis_worker=self.source_analysis,
         )
         self.reviews = ReviewService(self.database)
         self.extraction_snapshots = ExtractionSnapshotRepository(
