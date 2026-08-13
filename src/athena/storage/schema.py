@@ -25,7 +25,8 @@ SOURCE_DOCUMENT_STRUCTURE_SCHEMA_VERSION = 17
 SOURCE_ANALYSIS_SCHEMA_VERSION = 18
 SOURCE_KNOWLEDGE_SCHEMA_VERSION = 19
 HIERARCHICAL_SOURCE_EXTRACTION_SCHEMA_VERSION = 20
-SCHEMA_VERSION = HIERARCHICAL_SOURCE_EXTRACTION_SCHEMA_VERSION
+PERSONAL_MEMORY_SCHEMA_VERSION = 21
+SCHEMA_VERSION = PERSONAL_MEMORY_SCHEMA_VERSION
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
@@ -47,6 +48,7 @@ SOURCE_DOCUMENT_STRUCTURE_MIGRATION_ID = "0017_source_representation_document_st
 SOURCE_ANALYSIS_MIGRATION_ID = "0018_hierarchical_source_analysis"
 SOURCE_KNOWLEDGE_MIGRATION_ID = "0019_source_analysis_knowledge_promotion"
 HIERARCHICAL_SOURCE_EXTRACTION_MIGRATION_ID = "0020_hierarchical_source_knowledge_extraction"
+PERSONAL_MEMORY_MIGRATION_ID = "0021_personal_memory_core"
 
 
 class DatabaseCompatibilityError(RuntimeError):
@@ -131,6 +133,7 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         SOURCE_DOCUMENT_STRUCTURE_SCHEMA_VERSION,
         SOURCE_ANALYSIS_SCHEMA_VERSION,
         SOURCE_KNOWLEDGE_SCHEMA_VERSION,
+        HIERARCHICAL_SOURCE_EXTRACTION_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -220,9 +223,13 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
 
     if existing_user_version == SOURCE_KNOWLEDGE_SCHEMA_VERSION:
         _migrate_schema_v19_to_v20(connection)
+        existing_user_version = HIERARCHICAL_SOURCE_EXTRACTION_SCHEMA_VERSION
+
+    if existing_user_version == HIERARCHICAL_SOURCE_EXTRACTION_SCHEMA_VERSION:
+        _migrate_schema_v20_to_v21(connection)
 
     _configure_connection(connection)
-    _verify_schema_v20(connection)
+    _verify_schema_v21(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -1653,6 +1660,126 @@ def _migrate_schema_v19_to_v20(connection: sqlite3.Connection) -> None:
         COMMIT;
         """
     )
+
+
+def _migrate_schema_v20_to_v21(connection: sqlite3.Connection) -> None:
+    """Add canonical Personal Memory identities and immutable revisions."""
+    connection.executescript(
+        f"""
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE personal_memory_entries (
+            memory_id BLOB(16) PRIMARY KEY CHECK(length(memory_id) = 16),
+            FOREIGN KEY(memory_id) REFERENCES entity_registry(entity_id)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE personal_memory_revisions (
+            revision_id BLOB(16) PRIMARY KEY CHECK(length(revision_id) = 16),
+            memory_kind TEXT NOT NULL CHECK(memory_kind IN (
+                'response_style',
+                'language_preference',
+                'detail_preference',
+                'workflow_preference',
+                'model_preference',
+                'tool_preference',
+                'recurring_setting',
+                'interaction_preference',
+                'other'
+            )),
+            content TEXT NOT NULL CHECK(length(trim(content)) > 0),
+            scope_entity_id BLOB(16) NULL CHECK(
+                scope_entity_id IS NULL OR length(scope_entity_id) = 16
+            ),
+            scope_kind TEXT NOT NULL CHECK(scope_kind IN (
+                'global', 'project', 'workflow', 'client'
+            )),
+            learning_mode TEXT NOT NULL CHECK(learning_mode IN (
+                'explicit_user', 'model_inferred', 'imported'
+            )),
+            sensitivity TEXT NOT NULL CHECK(sensitivity IN (
+                'normal', 'sensitive', 'protected'
+            )),
+            confidence REAL NULL CHECK(
+                confidence IS NULL OR (confidence >= 0.0 AND confidence <= 1.0)
+            ),
+            last_confirmed_at_us INTEGER NULL CHECK(
+                last_confirmed_at_us IS NULL OR last_confirmed_at_us >= 0
+            ),
+            protected_payload_id BLOB(16) NULL CHECK(
+                protected_payload_id IS NULL OR length(protected_payload_id) = 16
+            ),
+            FOREIGN KEY(revision_id) REFERENCES revisions(revision_id),
+            CHECK(
+                (scope_kind = 'global' AND scope_entity_id IS NULL)
+                OR
+                (scope_kind != 'global' AND scope_entity_id IS NOT NULL)
+            ),
+            CHECK(learning_mode != 'explicit_user' OR confidence IS NULL),
+            CHECK(sensitivity != 'protected' OR protected_payload_id IS NOT NULL)
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_personal_memory_scope
+            ON personal_memory_revisions(scope_kind, scope_entity_id);
+        CREATE INDEX idx_personal_memory_kind
+            ON personal_memory_revisions(memory_kind);
+
+        UPDATE schema_metadata
+        SET schema_version = {PERSONAL_MEMORY_SCHEMA_VERSION},
+            last_migration_id = '{PERSONAL_MEMORY_MIGRATION_ID}',
+            minimum_reader_version = {PERSONAL_MEMORY_SCHEMA_VERSION}
+        WHERE singleton_id = 1;
+
+        PRAGMA user_version = {PERSONAL_MEMORY_SCHEMA_VERSION};
+        COMMIT;
+        """
+    )
+
+
+def _verify_schema_v21(connection: sqlite3.Connection) -> None:
+    application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
+    user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if application_id != ATHENA_APPLICATION_ID:
+        raise DatabaseCompatibilityError("ATHENA application_id verification failed.")
+    if user_version != PERSONAL_MEMORY_SCHEMA_VERSION:
+        raise DatabaseCompatibilityError("ATHENA schema version verification failed.")
+
+    metadata = connection.execute(
+        "SELECT schema_version, storage_layout_version, blob_format_version, "
+        "last_migration_id, minimum_reader_version "
+        "FROM schema_metadata WHERE singleton_id = 1"
+    ).fetchone()
+    expected = (
+        PERSONAL_MEMORY_SCHEMA_VERSION,
+        STORAGE_LAYOUT_VERSION,
+        BLOB_FORMAT_VERSION,
+        PERSONAL_MEMORY_MIGRATION_ID,
+        PERSONAL_MEMORY_SCHEMA_VERSION,
+    )
+    if metadata is None or tuple(metadata) != expected:
+        raise DatabaseCompatibilityError("ATHENA schema_metadata verification failed.")
+
+    required_tables = {
+        "knowledge_units", "knowledge_unit_revisions", "claims", "claim_revisions",
+        "claim_evidence", "provenance_inputs", "model_signatures", "processing_runs",
+        "semantic_review_items", "semantic_merge_review_payloads",
+        "extraction_result_snapshots", "search_fts", "search_index_state",
+        "search_embeddings", "search_embedding_state", "blob_records", "sources",
+        "source_representations", "source_representation_pages",
+        "source_representation_structures", "source_anchor_structures",
+        "chunking_profiles", "source_anchors", "jobs", "checkpoints",
+        "source_analyses", "source_analysis_work_items", "source_analysis_artifacts",
+        "source_analysis_work_inputs", "source_extraction_result_snapshots",
+        "source_analysis_knowledge_origins", "source_extractions",
+        "source_extraction_evidence", "source_extraction_work_items",
+        "source_extraction_artifacts", "source_extraction_work_inputs",
+        "personal_memory_entries", "personal_memory_revisions",
+    }
+    missing_tables = required_tables.difference(_user_tables(connection))
+    if missing_tables:
+        missing = ", ".join(sorted(missing_tables))
+        raise DatabaseCompatibilityError(f"ATHENA semantic schema is incomplete: {missing}.")
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise DatabaseCompatibilityError("ATHENA foreign-key verification failed.")
 
 
 def _verify_schema_v20(connection: sqlite3.Connection) -> None:

@@ -36,6 +36,8 @@ from athena.knowledge.source_hierarchical_repository import (
     SourceHierarchicalExtractionRepository,
 )
 from athena.knowledge.source_hierarchical_service import SourceHierarchicalExtractionService
+from athena.memory.repository import PersonalMemoryRepository
+from athena.memory.service import PersonalMemoryService
 from athena.model.adapters.lm_studio import LMStudioProvider
 from athena.model.adapters.lm_studio_embeddings import LMStudioEmbeddingProvider
 from athena.model.provenance import ModelRunRepository
@@ -104,6 +106,8 @@ class AthenaApplication:
         self.database = SQLiteDatabase(self.paths.database_path)
         self.chat_repository = ChatRepository(self.database)
         self.chat = ChatService(self.chat_repository)
+        self.personal_memory_repository = PersonalMemoryRepository(self.database)
+        self.personal_memory = PersonalMemoryService(self.personal_memory_repository, self.chat)
         self.job_repository = JobRepository(self.database)
         self.jobs = DurableJobService(self.job_repository, self.chat)
         self.blob_store = BlobStore(self.paths)

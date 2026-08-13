@@ -67,3 +67,36 @@ def test_job_run_extraction_parser_defaults_worker() -> None:
     assert args.job_command == "run-extraction"
     assert args.worker == "athena-cli-extraction-worker"
     assert args.lease_seconds == 120
+
+
+def test_memory_remember_parser_defaults_to_explicit_global_other() -> None:
+    args = build_parser().parse_args(["memory", "remember", "Prefer German answers."])
+
+    assert args.command == "memory"
+    assert args.memory_command == "remember"
+    assert args.content == "Prefer German answers."
+    assert args.kind.value == "other"
+    assert args.scope_kind.value == "global"
+    assert args.scope_id is None
+    assert args.sensitivity.value == "normal"
+
+
+def test_memory_scoped_remember_parser() -> None:
+    args = build_parser().parse_args(
+        [
+            "memory",
+            "remember",
+            "Use detailed technical answers.",
+            "--kind",
+            "detail_preference",
+            "--scope-kind",
+            "project",
+            "--scope-id",
+            "11111111-1111-1111-1111-111111111111",
+        ]
+    )
+
+    assert args.memory_command == "remember"
+    assert args.kind.value == "detail_preference"
+    assert args.scope_kind.value == "project"
+    assert str(args.scope_id) == "11111111-1111-1111-1111-111111111111"

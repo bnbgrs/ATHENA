@@ -67,6 +67,19 @@ from athena.knowledge.source_extraction import (
     SourceAnalysisExtractionResult,
     SourceExtractionSnapshotNotFoundError,
 )
+from athena.memory.models import (
+    MemoryKind,
+    MemoryScopeKind,
+    MemorySensitivity,
+    PersonalMemorySnapshot,
+)
+from athena.memory.repository import (
+    PersonalMemoryActorError,
+    PersonalMemoryConflictError,
+    PersonalMemoryLifecycleError,
+    PersonalMemoryNotFoundError,
+    PersonalMemoryProtectionError,
+)
 from athena.model.adapters.lm_studio import ModelProviderError
 from athena.retrieval.archive import ArchiveSearchError
 from athena.retrieval.context import ContextBuilderError
@@ -140,6 +153,36 @@ def _knowledge_kind_argument(value: str) -> KnowledgeKind:
             f"invalid knowledge kind {value!r}; choose one of: {allowed}"
         ) from exc
 
+
+
+def _memory_kind_argument(value: str) -> MemoryKind:
+    try:
+        return MemoryKind(value)
+    except ValueError as exc:
+        allowed = ", ".join(item.value for item in MemoryKind)
+        raise argparse.ArgumentTypeError(
+            f"invalid memory kind {value!r}; choose one of: {allowed}"
+        ) from exc
+
+
+def _memory_scope_kind_argument(value: str) -> MemoryScopeKind:
+    try:
+        return MemoryScopeKind(value)
+    except ValueError as exc:
+        allowed = ", ".join(item.value for item in MemoryScopeKind)
+        raise argparse.ArgumentTypeError(
+            f"invalid memory scope {value!r}; choose one of: {allowed}"
+        ) from exc
+
+
+def _memory_sensitivity_argument(value: str) -> MemorySensitivity:
+    try:
+        return MemorySensitivity(value)
+    except ValueError as exc:
+        allowed = ", ".join(item.value for item in MemorySensitivity)
+        raise argparse.ArgumentTypeError(
+            f"invalid memory sensitivity {value!r}; choose one of: {allowed}"
+        ) from exc
 
 def _claim_kind_argument(value: str) -> ClaimKind:
     try:
@@ -346,6 +389,75 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=50,
         help="Maximum number of KnowledgeUnits to print (1-500).",
+    )
+
+    memory_parser = commands.add_parser(
+        "memory",
+        help="Explicit-user Personal Memory commands.",
+    )
+    memory_commands = memory_parser.add_subparsers(
+        dest="memory_command",
+        required=True,
+    )
+
+    memory_remember = memory_commands.add_parser(
+        "remember",
+        help="Persist one explicit user preference without calling a model.",
+    )
+    memory_remember.add_argument("content")
+    memory_remember.add_argument(
+        "--kind", type=_memory_kind_argument, default=MemoryKind.OTHER
+    )
+    memory_remember.add_argument(
+        "--scope-kind", type=_memory_scope_kind_argument, default=MemoryScopeKind.GLOBAL
+    )
+    memory_remember.add_argument("--scope-id", type=_uuid_argument)
+    memory_remember.add_argument(
+        "--sensitivity",
+        type=_memory_sensitivity_argument,
+        default=MemorySensitivity.NORMAL,
+    )
+
+    memory_show = memory_commands.add_parser("show", help="Show one Personal Memory head.")
+    memory_show.add_argument("memory_id", type=_uuid_argument)
+
+    memory_history = memory_commands.add_parser(
+        "history", help="Show immutable revisions of one Personal Memory entry."
+    )
+    memory_history.add_argument("memory_id", type=_uuid_argument)
+
+    memory_list = memory_commands.add_parser("list", help="List active Personal Memory.")
+    memory_list.add_argument("--limit", type=int, default=50)
+    memory_list.add_argument(
+        "--include-inactive", action="store_true", help="Also show disabled entries."
+    )
+
+    memory_revise = memory_commands.add_parser(
+        "revise", help="Create a new explicit-user revision of Personal Memory."
+    )
+    memory_revise.add_argument("memory_id", type=_uuid_argument)
+    memory_revise.add_argument("content")
+    memory_revise.add_argument("--kind", type=_memory_kind_argument)
+    memory_revise.add_argument("--scope-kind", type=_memory_scope_kind_argument)
+    memory_revise.add_argument("--scope-id", type=_uuid_argument)
+    memory_revise.add_argument("--sensitivity", type=_memory_sensitivity_argument)
+
+    for command_name, help_text in (
+        ("confirm", "Confirm the current Personal Memory entry."),
+        ("disable", "Disable one Personal Memory entry."),
+        ("enable", "Re-enable one disabled Personal Memory entry."),
+        ("delete", "Logically delete one Personal Memory entry."),
+    ):
+        command = memory_commands.add_parser(command_name, help=help_text)
+        command.add_argument("memory_id", type=_uuid_argument)
+
+    memory_reset = memory_commands.add_parser(
+        "reset", help="Logically delete all Personal Memory without touching Knowledge/Archive."
+    )
+    memory_reset.add_argument(
+        "--yes",
+        action="store_true",
+        help="Required confirmation for the destructive bulk reset.",
     )
 
     claim_parser = commands.add_parser(
@@ -1402,6 +1514,118 @@ def _run_knowledge_command(app: AthenaApplication, args: argparse.Namespace) -> 
 
     raise RuntimeError(f"Unsupported knowledge command: {args.knowledge_command!r}")
 
+
+def _print_personal_memory(snapshot: PersonalMemorySnapshot) -> None:
+    revision = snapshot.revision
+    payload = revision.payload
+    scope = payload.scope_kind.value
+    if payload.scope_entity_id is not None:
+        scope = f"{scope}:{payload.scope_entity_id}"
+    print(f"Memory: {snapshot.memory_id}")
+    print(f"Lifecycle: {snapshot.lifecycle_state}")
+    print(f"Revision: {revision.revision_no} ({revision.revision_id})")
+    print(f"Kind: {payload.memory_kind.value}")
+    print(f"Scope: {scope}")
+    print(f"Learning mode: {payload.learning_mode.value}")
+    print(f"Sensitivity: {payload.sensitivity.value}")
+    print(f"Last confirmed us: {payload.last_confirmed_at_us}")
+    print(f"Provenance: {revision.provenance_id}")
+    print(f"Content: {payload.content}")
+
+
+def _run_memory_command(app: AthenaApplication, args: argparse.Namespace) -> int:
+    if args.memory_command == "remember":
+        revision = app.personal_memory.remember(
+            content=args.content,
+            memory_kind=args.kind,
+            scope_kind=args.scope_kind,
+            scope_entity_id=args.scope_id,
+            sensitivity=args.sensitivity,
+        )
+        print(f"Personal Memory created: {revision.memory_id}")
+        print(f"Revision: {revision.revision_no} ({revision.revision_id})")
+        print(f"Provenance: {revision.provenance_id}")
+        print("Actor: user")
+        print("Model signature: <none>")
+        return 0
+
+    if args.memory_command == "show":
+        _print_personal_memory(app.personal_memory.load(args.memory_id))
+        return 0
+
+    if args.memory_command == "history":
+        revisions = app.personal_memory.history(args.memory_id)
+        print(f"Memory: {args.memory_id}")
+        print(f"Revisions: {len(revisions)}")
+        for revision in revisions:
+            payload = revision.payload
+            scope = payload.scope_kind.value
+            if payload.scope_entity_id is not None:
+                scope = f"{scope}:{payload.scope_entity_id}"
+            print(
+                f"[{revision.revision_no}] revision={revision.revision_id} "
+                f"kind={payload.memory_kind.value} scope={scope} "
+                f"sensitivity={payload.sensitivity.value} content={payload.content}"
+            )
+        return 0
+
+    if args.memory_command == "list":
+        snapshots = app.personal_memory.list(
+            limit=args.limit, include_inactive=args.include_inactive
+        )
+        if not snapshots:
+            print("No active Personal Memory.")
+            return 0
+        for snapshot in snapshots:
+            payload = snapshot.revision.payload
+            scope = payload.scope_kind.value
+            if payload.scope_entity_id is not None:
+                scope = f"{scope}:{payload.scope_entity_id}"
+            print(
+                f"{snapshot.memory_id}  state={snapshot.lifecycle_state} "
+                f"rev={snapshot.revision.revision_no} kind={payload.memory_kind.value} "
+                f"scope={scope} content={payload.content}"
+            )
+        return 0
+
+    if args.memory_command == "revise":
+        revision = app.personal_memory.revise(
+            memory_id=args.memory_id,
+            content=args.content,
+            memory_kind=args.kind,
+            scope_kind=args.scope_kind,
+            scope_entity_id=args.scope_id,
+            sensitivity=args.sensitivity,
+        )
+        print(f"Personal Memory revised: {revision.memory_id}")
+        print(f"Revision: {revision.revision_no} ({revision.revision_id})")
+        print(f"Provenance: {revision.provenance_id}")
+        return 0
+
+    if args.memory_command == "confirm":
+        revision = app.personal_memory.confirm(args.memory_id)
+        print(f"Personal Memory confirmed: {revision.memory_id}")
+        print(f"Revision: {revision.revision_no} ({revision.revision_id})")
+        return 0
+
+    if args.memory_command in {"disable", "enable", "delete"}:
+        operation = getattr(app.personal_memory, args.memory_command)
+        commit_id = operation(args.memory_id)
+        print(f"Personal Memory {args.memory_command}: {args.memory_id}")
+        print(f"Commit: {commit_id if commit_id is not None else '<no-op>'}")
+        return 0
+
+    if args.memory_command == "reset":
+        if not args.yes:
+            print("Personal Memory reset requires --yes. Canonical writes: 0")
+            return 2
+        result = app.personal_memory.reset()
+        print(f"Personal Memory reset: {result.deleted_count} entries")
+        print(f"Commit: {result.commit_id if result.commit_id is not None else '<none>'}")
+        print("Knowledge/Raw Archive writes: 0")
+        return 0
+
+    raise RuntimeError(f"Unsupported memory command: {args.memory_command!r}")
 
 def _run_claim_command(app: AthenaApplication, args: argparse.Namespace) -> int:
     if args.claim_command == "promote":
@@ -3000,6 +3224,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ValueError,
             ) as exc:
                 print(f"ATHENA knowledge error: {exc}", file=sys.stderr)
+                return 2
+
+        if args.command == "memory":
+            try:
+                return _run_memory_command(app, args)
+            except (
+                PersonalMemoryActorError,
+                PersonalMemoryConflictError,
+                PersonalMemoryLifecycleError,
+                PersonalMemoryNotFoundError,
+                PersonalMemoryProtectionError,
+                ValueError,
+            ) as exc:
+                print(f"ATHENA Personal Memory error: {exc}", file=sys.stderr)
                 return 2
 
         if args.command == "claim":
