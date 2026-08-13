@@ -31,3 +31,39 @@ def test_chat_send_parser() -> None:
     assert args.chat_command == "send"
     assert args.content == "Hello"
     assert args.model_id == "example/model"
+
+
+def test_job_source_extract_parser_accepts_hierarchical_budget_options() -> None:
+    args = build_parser().parse_args(
+        [
+            "job",
+            "source-extract",
+            "11111111-1111-1111-1111-111111111111",
+            "--model",
+            "local-primary",
+            "--context-limit",
+            "4096",
+            "--output-reserve",
+            "768",
+            "--safety-margin",
+            "256",
+            "--max-depth",
+            "9",
+        ]
+    )
+    assert args.job_command == "source-extract"
+    assert str(args.analysis_id) == "11111111-1111-1111-1111-111111111111"
+    assert args.model_id == "local-primary"
+    assert args.context_limit == 4096
+    assert args.output_reserve == 768
+    assert args.safety_margin == 256
+    assert args.max_depth == 9
+
+
+def test_job_run_extraction_parser_defaults_worker() -> None:
+    args = build_parser().parse_args(
+        ["job", "run-extraction", "22222222-2222-2222-2222-222222222222"]
+    )
+    assert args.job_command == "run-extraction"
+    assert args.worker == "athena-cli-extraction-worker"
+    assert args.lease_seconds == 120

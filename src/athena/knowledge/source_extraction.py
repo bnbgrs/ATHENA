@@ -46,6 +46,10 @@ SOURCE_EXTRACTION_SCHEMA_ID = "athena_source_analysis_knowledge_extraction_v1"
 PIPELINE_VERSION = "source-analysis-knowledge-extraction/2"
 PROMPT_TEMPLATE_ID = "athena.source_analysis_knowledge_extraction"
 PROMPT_TEMPLATE_VERSION = "2"
+HIERARCHICAL_PIPELINE_VERSION = "source-analysis-knowledge-extraction/3"
+HIERARCHICAL_PROMPT_TEMPLATE_ID = "athena.source_analysis_knowledge_extraction_hierarchical"
+HIERARCHICAL_PROMPT_TEMPLATE_VERSION = "6"
+HIERARCHICAL_LEGACY_PROMPT_TEMPLATE_VERSIONS = frozenset({"1", "2", "3", "4", "5"})
 TOKEN_ESTIMATOR = "utf8-bytes-div3-v1"
 
 
@@ -446,6 +450,34 @@ class SourceExtractionSnapshotRepository:
         )
         proposals_json = _canonical_json(_proposal_payload(result.proposals))
         with self.database.write_transaction() as connection:
+            existing = connection.execute(
+                """
+                SELECT analysis_id, final_artifact_id, model_json, evidence_json, proposals_json
+                FROM source_extraction_result_snapshots
+                WHERE processing_run_id = ?
+                """,
+                (uuid_to_blob(result.processing_run.processing_run_id),),
+            ).fetchone()
+            if existing is not None:
+                expected = (
+                    uuid_to_blob(result.analysis_id),
+                    uuid_to_blob(result.final_artifact_id),
+                    model_json,
+                    evidence_json,
+                    proposals_json,
+                )
+                actual = (
+                    bytes(existing["analysis_id"]),
+                    bytes(existing["final_artifact_id"]),
+                    str(existing["model_json"]),
+                    str(existing["evidence_json"]),
+                    str(existing["proposals_json"]),
+                )
+                if actual != expected:
+                    raise SourceExtractionError(
+                        "Frozen source extraction snapshot cannot be overwritten with different content."
+                    )
+                return
             connection.execute(
                 """
                 INSERT INTO source_extraction_result_snapshots (

@@ -8,7 +8,7 @@ from athena.model.adapters.lm_studio import (
     LMStudioProvider,
     ProviderProtocolError,
 )
-from athena.model.domain import ProviderHealthStatus
+from athena.model.domain import ModelChatMessage, ProviderHealthStatus
 
 
 class FakeResponse:
@@ -93,3 +93,150 @@ def test_lm_studio_rejects_malformed_model_payload() -> None:
     ):
         with pytest.raises(ProviderProtocolError, match="models"):
             provider.discover_models()
+
+
+def test_lm_studio_controlled_structured_uses_native_reasoning_off() -> None:
+    provider = LMStudioProvider("http://127.0.0.1:1234")
+    captured: dict[str, object] = {}
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["timeout"] = timeout
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse(
+            {
+                "model_instance_id": "example/model-q4",
+                "output": [{"type": "message", "content": '{"answer":42}'}],
+                "stats": {
+                    "input_tokens": 20,
+                    "total_output_tokens": 5,
+                    "reasoning_output_tokens": 0,
+                },
+            }
+        )
+
+    with patch("athena.model.adapters.lm_studio.urlopen", side_effect=fake_urlopen):
+        result = provider.generate_controlled_structured(
+            model_id="example/model-q4",
+            messages=(
+                ModelChatMessage(role="system", content="Return structured output."),
+                ModelChatMessage(role="user", content="Give the answer."),
+            ),
+            schema_id="answer_v1",
+            json_schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {"answer": {"type": "integer"}},
+                "required": ["answer"],
+            },
+            reasoning_mode="off",
+            context_length=5300,
+            max_output_tokens=2000,
+            temperature=0.0,
+            top_p=0.95,
+            top_k=40,
+            min_p=0.05,
+            repeat_penalty=1.1,
+        )
+
+    assert result == {"answer": 42}
+    assert provider.controlled_structured_transport_id == "lmstudio_native_chat_instance_reuse_v2"
+    assert captured["url"] == "http://127.0.0.1:1234/api/v1/chat"
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    assert payload["reasoning"] == "off"
+    assert payload["context_length"] == 5300
+    assert payload["max_output_tokens"] == 2000
+    assert payload["temperature"] == 0.0
+    assert payload["top_p"] == 0.95
+    assert payload["top_k"] == 40
+    assert payload["min_p"] == 0.05
+    assert payload["repeat_penalty"] == 1.1
+    assert payload["stream"] is False
+    assert payload["store"] is False
+    assert "ATHENA_SCHEMA_ID: answer_v1" in payload["system_prompt"]
+    assert "athena.controlled_structured_json/1" in payload["system_prompt"]
+
+
+def test_lm_studio_controlled_structured_rejects_reasoning_tokens_when_off() -> None:
+    provider = LMStudioProvider("http://127.0.0.1:1234")
+    response = FakeResponse(
+        {
+            "model_instance_id": "example/model-q4",
+            "output": [{"type": "message", "content": '{"answer":42}'}],
+            "stats": {
+                "input_tokens": 20,
+                "total_output_tokens": 6,
+                "reasoning_output_tokens": 1,
+            },
+        }
+    )
+
+    with patch("athena.model.adapters.lm_studio.urlopen", return_value=response):
+        with pytest.raises(ProviderProtocolError, match="reasoning tokens"):
+            provider.generate_controlled_structured(
+                model_id="example/model-q4",
+                messages=(
+                    ModelChatMessage(role="system", content="Return structured output."),
+                    ModelChatMessage(role="user", content="Give the answer."),
+                ),
+                schema_id="answer_v1",
+                json_schema={"type": "object"},
+                reasoning_mode="off",
+                context_length=5300,
+                max_output_tokens=2000,
+                temperature=0.0,
+                top_p=0.95,
+                top_k=40,
+                min_p=0.05,
+                repeat_penalty=1.1,
+            )
+
+
+def test_lm_studio_controlled_structured_reuses_returned_runtime_instance() -> None:
+    provider = LMStudioProvider("http://127.0.0.1:1234")
+    payloads: list[dict[str, object]] = []
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        payload = json.loads(request.data.decode("utf-8"))
+        payloads.append(payload)
+        return FakeResponse(
+            {
+                "model_instance_id": "example/model-q4:runtime-1",
+                "output": [{"type": "message", "content": '{"answer":42}'}],
+                "stats": {
+                    "input_tokens": 20,
+                    "total_output_tokens": 5,
+                    "reasoning_output_tokens": 0,
+                },
+            }
+        )
+
+    kwargs = {
+        "model_id": "example/model-q4",
+        "messages": (
+            ModelChatMessage(role="system", content="Return structured output."),
+            ModelChatMessage(role="user", content="Give the answer."),
+        ),
+        "schema_id": "answer_v1",
+        "json_schema": {"type": "object"},
+        "reasoning_mode": "off",
+        "context_length": 5300,
+        "max_output_tokens": 2000,
+        "temperature": 0.0,
+        "top_p": 0.95,
+        "top_k": 40,
+        "min_p": 0.05,
+        "repeat_penalty": 1.1,
+    }
+
+    with patch("athena.model.adapters.lm_studio.urlopen", side_effect=fake_urlopen):
+        assert provider.generate_controlled_structured(**kwargs) == {"answer": 42}
+        assert provider.generate_controlled_structured(**kwargs) == {"answer": 42}
+
+    assert len(payloads) == 2
+    assert payloads[0]["model"] == "example/model-q4"
+    assert payloads[0]["context_length"] == 5300
+    assert payloads[1]["model"] == "example/model-q4:runtime-1"
+    assert "context_length" not in payloads[1]

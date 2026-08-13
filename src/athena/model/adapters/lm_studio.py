@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from athena.model.domain import ModelChatMessage, ModelInfo, ProviderHealth, ProviderHealthStatus
+from athena.model.ports import controlled_structured_contract_prefix
 
 
 class ModelProviderError(RuntimeError):
@@ -40,6 +41,9 @@ class LMStudioProvider:
     base_url: str
     timeout_seconds: float = 2.0
     generation_timeout_seconds: float = 300.0
+    _controlled_instance_ids: dict[tuple[str, int], str] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     @property
     def provider_id(self) -> str:
@@ -52,6 +56,14 @@ class LMStudioProvider:
     @property
     def chat_completions_url(self) -> str:
         return f"{self.base_url}/v1/chat/completions"
+
+    @property
+    def native_chat_url(self) -> str:
+        return f"{self.base_url}/api/v1/chat"
+
+    @property
+    def controlled_structured_transport_id(self) -> str:
+        return "lmstudio_native_chat_instance_reuse_v2"
 
     def health(self) -> ProviderHealth:
         try:
@@ -258,6 +270,175 @@ class LMStudioProvider:
         if not isinstance(structured, Mapping):
             raise ProviderProtocolError(
                 "LM Studio structured content must be a JSON object."
+            )
+        return cast(Mapping[str, Any], structured)
+
+
+    def generate_controlled_structured(
+        self,
+        *,
+        model_id: str,
+        messages: Sequence[ModelChatMessage],
+        schema_id: str,
+        json_schema: Mapping[str, Any],
+        reasoning_mode: str,
+        context_length: int,
+        max_output_tokens: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        min_p: float,
+        repeat_penalty: float,
+    ) -> Mapping[str, Any]:
+        """Generate JSON through native chat with explicit reasoning and sampling controls.
+
+        LM Studio's native chat endpoint does not enforce JSON Schema. ATHENA therefore
+        supplies the schema as an explicit model contract, parses exactly one JSON object,
+        and leaves strict stage-specific validation to the Core before any artifact commit.
+        """
+        if not model_id:
+            raise ValueError("model_id must not be empty.")
+        if len(messages) != 2 or messages[0].role != "system" or messages[1].role != "user":
+            raise ValueError(
+                "Controlled structured generation requires exactly one system and one user message."
+            )
+        normalized_schema_id = schema_id.strip()
+        if not normalized_schema_id:
+            raise ValueError("schema_id must not be empty.")
+        if reasoning_mode not in {"off", "low", "medium", "high", "on"}:
+            raise ValueError("reasoning_mode is invalid.")
+        if context_length < 1:
+            raise ValueError("context_length must be positive.")
+        if max_output_tokens < 1:
+            raise ValueError("max_output_tokens must be positive.")
+
+        schema_text = json.dumps(
+            dict(json_schema),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        system_prompt = (
+            f"{messages[0].content}"
+            f"{controlled_structured_contract_prefix(normalized_schema_id)}"
+            f"{schema_text}"
+        )
+        instance_key = (model_id, context_length)
+        pinned_instance_id = self._controlled_instance_ids.get(instance_key)
+        request_payload = {
+            "model": pinned_instance_id or model_id,
+            "system_prompt": system_prompt,
+            "input": messages[1].content,
+            "reasoning": reasoning_mode,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "min_p": min_p,
+            "repeat_penalty": repeat_penalty,
+            "max_output_tokens": max_output_tokens,
+            "stream": False,
+            "store": False,
+        }
+        if pinned_instance_id is None:
+            # Apply the pinned physical context only when acquiring the runtime instance.
+            # Subsequent calls address that exact instance without asking LM Studio to JIT-load
+            # another copy for the same model/configuration.
+            request_payload["context_length"] = context_length
+        raw_body = json.dumps(request_payload, ensure_ascii=False).encode("utf-8")
+        request = Request(
+            self.native_chat_url,
+            data=raw_body,
+            method="POST",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+        )
+
+        try:
+            with urlopen(request, timeout=self.generation_timeout_seconds) as response:
+                raw = response.read()
+        except HTTPError as exc:
+            detail = self._http_error_detail(exc)
+            if self._is_context_limit_error(exc.code, detail):
+                raise ProviderContextLimitError(
+                    f"LM Studio rejected controlled structured generation for context capacity{detail}."
+                ) from exc
+            raise ModelProviderError(
+                f"LM Studio returned HTTP {exc.code} during controlled structured generation{detail}."
+            ) from exc
+        except (URLError, TimeoutError, OSError) as exc:
+            raise ProviderUnavailableError(
+                f"LM Studio controlled structured generation failed at {self.base_url}."
+            ) from exc
+
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ProviderProtocolError(
+                "LM Studio returned invalid JSON for controlled structured generation."
+            ) from exc
+        if not isinstance(payload, Mapping):
+            raise ProviderProtocolError(
+                "LM Studio returned a non-object controlled structured response."
+            )
+
+        model_instance_id = payload.get("model_instance_id")
+        if not isinstance(model_instance_id, str) or not model_instance_id.strip():
+            raise ProviderProtocolError(
+                "LM Studio controlled structured response is missing model_instance_id."
+            )
+        normalized_instance_id = model_instance_id.strip()
+        if pinned_instance_id is None:
+            self._controlled_instance_ids[instance_key] = normalized_instance_id
+        elif normalized_instance_id != pinned_instance_id:
+            raise ProviderProtocolError(
+                "LM Studio switched model instances during one controlled extraction runtime."
+            )
+
+        stats = payload.get("stats")
+        if not isinstance(stats, Mapping):
+            raise ProviderProtocolError(
+                "LM Studio controlled structured response is missing stats."
+            )
+        reasoning_tokens = stats.get("reasoning_output_tokens")
+        if (
+            isinstance(reasoning_tokens, bool)
+            or not isinstance(reasoning_tokens, (int, float))
+            or reasoning_tokens < 0
+        ):
+            raise ProviderProtocolError(
+                "LM Studio controlled structured response has invalid reasoning token usage."
+            )
+        if reasoning_mode == "off" and reasoning_tokens != 0:
+            raise ProviderProtocolError(
+                "LM Studio used reasoning tokens despite ATHENA pinning reasoning_mode='off'."
+            )
+
+        output = payload.get("output")
+        if not isinstance(output, list) or len(output) != 1:
+            raise ProviderProtocolError(
+                "LM Studio controlled structured response must contain exactly one output item."
+            )
+        message = output[0]
+        if not isinstance(message, Mapping) or message.get("type") != "message":
+            raise ProviderProtocolError(
+                "LM Studio controlled structured response did not return one message item."
+            )
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise ProviderProtocolError(
+                "LM Studio controlled structured response is missing JSON content."
+            )
+        try:
+            structured = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ProviderProtocolError(
+                "LM Studio controlled structured content is not valid JSON."
+            ) from exc
+        if not isinstance(structured, Mapping):
+            raise ProviderProtocolError(
+                "LM Studio controlled structured content must be a JSON object."
             )
         return cast(Mapping[str, Any], structured)
 

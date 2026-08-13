@@ -33,6 +33,7 @@ class DurableJobService:
         {
             "source.process",
             "source.analyze",
+            "source.extract",
             "source.represent",
             "source.chunk",
             "search.rebuild",

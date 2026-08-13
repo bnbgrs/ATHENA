@@ -17,6 +17,7 @@ from athena.jobs.repository import JobRepository
 from athena.jobs.scheduler import DurableJobScheduler
 from athena.jobs.service import DurableJobService
 from athena.jobs.source_analysis import DurableSourceAnalysisWorker
+from athena.jobs.source_extraction import DurableSourceHierarchicalExtractionWorker
 from athena.jobs.source_processing import DurableSourceProcessingWorker
 from athena.knowledge.acceptance_service import ProposalAcceptanceService
 from athena.knowledge.claim_repository import ClaimRepository
@@ -31,6 +32,10 @@ from athena.knowledge.source_extraction import (
     SourceAnalysisKnowledgeExtractionService,
     SourceExtractionSnapshotRepository,
 )
+from athena.knowledge.source_hierarchical_repository import (
+    SourceHierarchicalExtractionRepository,
+)
+from athena.knowledge.source_hierarchical_service import SourceHierarchicalExtractionService
 from athena.model.adapters.lm_studio import LMStudioProvider
 from athena.model.adapters.lm_studio_embeddings import LMStudioEmbeddingProvider
 from athena.model.provenance import ModelRunRepository
@@ -227,12 +232,6 @@ class AthenaApplication:
             jobs=self.jobs,
             semantic=self.archive_semantic_search,
         )
-        self.job_scheduler = DurableJobScheduler(
-            jobs=self.jobs,
-            source_worker=self.source_processing,
-            embedding_worker=self.embedding_rebuild,
-            analysis_worker=self.source_analysis,
-        )
         self.reviews = ReviewService(self.database)
         self.source_extraction_snapshots = SourceExtractionSnapshotRepository(
             self.database, self.model_runs
@@ -245,6 +244,30 @@ class AthenaApplication:
             provider=self.model_provider,
             runs=self.model_runs,
             snapshots=self.source_extraction_snapshots,
+        )
+        self.source_hierarchical_extraction_repository = SourceHierarchicalExtractionRepository(
+            self.database
+        )
+        self.source_hierarchical_extraction_service = SourceHierarchicalExtractionService(
+            jobs=self.jobs,
+            repository=self.source_hierarchical_extraction_repository,
+            analyses=self.source_analysis_repository,
+            anchors=self.source_anchors,
+            base_extraction=self.source_extraction,
+            provider=self.model_provider,
+            runs=self.model_runs,
+            snapshots=self.source_extraction_snapshots,
+        )
+        self.source_hierarchical_extraction = DurableSourceHierarchicalExtractionWorker(
+            jobs=self.jobs,
+            service=self.source_hierarchical_extraction_service,
+        )
+        self.job_scheduler = DurableJobScheduler(
+            jobs=self.jobs,
+            source_worker=self.source_processing,
+            embedding_worker=self.embedding_rebuild,
+            analysis_worker=self.source_analysis,
+            extraction_worker=self.source_hierarchical_extraction,
         )
         self.source_proposal_acceptance = SourceProposalAcceptanceService(
             database=self.database,

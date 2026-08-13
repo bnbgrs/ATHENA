@@ -34,6 +34,10 @@ from athena.jobs.scheduler import (
     SchedulerTickResult,
 )
 from athena.jobs.source_analysis import SourceAnalysisJobError, SourceAnalysisStepResult
+from athena.jobs.source_extraction import (
+    SourceHierarchicalExtractionJobError,
+    SourceHierarchicalExtractionStepResult,
+)
 from athena.jobs.source_processing import (
     SourceProcessingJobError,
     SourceProcessingStepResult,
@@ -959,6 +963,45 @@ def build_parser() -> argparse.ArgumentParser:
         "analysis-artifacts", help="List persistent artifacts for one source analysis."
     )
     job_analysis_artifacts.add_argument("analysis_id", type=_uuid_argument)
+    job_source_extract = job_commands.add_parser(
+        "source-extract",
+        help="Queue durable hierarchical Knowledge extraction for one completed source analysis.",
+    )
+    job_source_extract.add_argument("analysis_id", type=_uuid_argument)
+    job_source_extract.add_argument("--model", dest="model_id")
+    job_source_extract.add_argument("--context-limit", type=int)
+    job_source_extract.add_argument("--output-reserve", type=int)
+    job_source_extract.add_argument("--safety-margin", type=int)
+    job_source_extract.add_argument("--max-depth", type=int, default=16)
+    job_source_extract.add_argument(
+        "--priority",
+        type=int,
+        choices=range(0, 6),
+        default=int(JobPriority.NORMAL),
+    )
+    job_extraction_step = job_commands.add_parser(
+        "extraction-step",
+        help="Execute one durable hierarchical source-extraction boundary under an existing lease.",
+    )
+    job_extraction_step.add_argument("job_id", type=_uuid_argument)
+    job_extraction_step.add_argument("lease_token", type=_lease_token_argument)
+    job_extraction_step.add_argument("--extend-seconds", type=int, default=120)
+    job_run_extraction = job_commands.add_parser(
+        "run-extraction",
+        help="Acquire and run a queued source.extract job until completed or waiting.",
+    )
+    job_run_extraction.add_argument("job_id", type=_uuid_argument)
+    job_run_extraction.add_argument("--worker", default="athena-cli-extraction-worker")
+    job_run_extraction.add_argument("--lease-seconds", type=int, default=120)
+    job_extraction_show = job_commands.add_parser(
+        "extraction-show", help="Show one persistent hierarchical source extraction."
+    )
+    job_extraction_show.add_argument("extraction_id", type=_uuid_argument)
+    job_extraction_artifacts = job_commands.add_parser(
+        "extraction-artifacts",
+        help="List persistent artifacts for one hierarchical source extraction.",
+    )
+    job_extraction_artifacts.add_argument("extraction_id", type=_uuid_argument)
     job_embedding_rebuild = job_commands.add_parser(
         "embedding-rebuild",
         help="Queue a durable SourceChunk embedding rebuild pinned to current generation.",
@@ -2462,6 +2505,26 @@ def _print_source_analysis_result(result: SourceAnalysisStepResult) -> None:
     print(f"Done: {result.done}")
 
 
+def _print_source_extraction_job_result(
+    result: SourceHierarchicalExtractionStepResult,
+) -> None:
+    print(f"Source extraction job: {result.job.job_id}")
+    print(f"State: {result.job.state.value}")
+    print(f"Completed stage: {result.completed_stage or '<none>'}")
+    print(f"Checkpoint: {result.checkpoint.checkpoint_id if result.checkpoint else '<none>'}")
+    print(f"Extraction: {result.extraction.extraction_id if result.extraction else '<none>'}")
+    if result.extraction is not None:
+        print(
+            "Batches: "
+            f"{result.extraction.completed_batches}/{result.extraction.total_batches} "
+            f"failed={result.extraction.failed_batches}"
+        )
+        print(f"Final artifact: {result.extraction.final_work_artifact_id or '<none>'}")
+    print(f"Artifact: {result.artifact_id or '<none>'}")
+    print(f"Waiting: {result.waiting}")
+    print(f"Done: {result.done}")
+
+
 def _print_embedding_rebuild_result(result: EmbeddingRebuildStepResult) -> None:
     print(f"Embedding rebuild job: {result.job.job_id}")
     print(f"State: {result.job.state.value}")
@@ -2732,6 +2795,76 @@ def _run_job_command(app: AthenaApplication, args: argparse.Namespace) -> int:
             print(artifact.content_json)
         return 0
 
+    if args.job_command == "source-extract":
+        job = app.source_hierarchical_extraction.enqueue(
+            args.analysis_id,
+            requested_model_id=args.model_id,
+            priority=JobPriority(args.priority),
+            context_limit=args.context_limit,
+            output_reserve=args.output_reserve,
+            safety_margin=args.safety_margin,
+            max_hierarchy_depth=args.max_depth,
+        )
+        _print_job(job)
+        return 0
+
+    if args.job_command == "extraction-step":
+        extraction_result = app.source_hierarchical_extraction.step(
+            args.job_id,
+            lease_token=args.lease_token,
+            extend_seconds=args.extend_seconds,
+        )
+        _print_source_extraction_job_result(extraction_result)
+        return 0
+
+    if args.job_command == "run-extraction":
+        extraction_result = app.source_hierarchical_extraction.run_to_completion(
+            args.job_id,
+            worker_id=args.worker,
+            lease_seconds=args.lease_seconds,
+        )
+        _print_source_extraction_job_result(extraction_result)
+        return 0
+
+    if args.job_command == "extraction-show":
+        extraction = app.source_hierarchical_extraction_repository.get_extraction(
+            args.extraction_id
+        )
+        print(f"Extraction: {extraction.extraction_id}")
+        print(f"Job: {extraction.job_id}")
+        print(f"Analysis: {extraction.analysis_id}")
+        print(f"Analysis Final artifact: {extraction.final_artifact_id}")
+        print(f"State: {extraction.state.value}")
+        print(
+            "Batches: "
+            f"{extraction.completed_batches}/{extraction.total_batches} "
+            f"failed={extraction.failed_batches}"
+        )
+        print(f"Model signature: {extraction.model_signature_id}")
+        print(f"Context limit: {extraction.effective_context_limit}")
+        print(f"Output reserve: {extraction.output_reserve}")
+        print(f"Safety margin: {extraction.safety_margin}")
+        print(f"Token estimator: {extraction.token_estimator}")
+        print(f"Final work artifact: {extraction.final_work_artifact_id or '<none>'}")
+        return 0
+
+    if args.job_command == "extraction-artifacts":
+        extraction_artifacts = app.source_hierarchical_extraction_repository.list_artifacts(
+            args.extraction_id
+        )
+        if not extraction_artifacts:
+            print("No hierarchical source-extraction artifacts.")
+            return 0
+        for extraction_artifact in extraction_artifacts:
+            print(
+                f"{extraction_artifact.artifact_id} "
+                f"kind={extraction_artifact.artifact_kind.value} "
+                f"level={extraction_artifact.level} ordinal={extraction_artifact.ordinal} "
+                f"run={extraction_artifact.processing_run_id}"
+            )
+            print(extraction_artifact.content_json)
+        return 0
+
     if args.job_command == "embedding-rebuild":
         job = app.embedding_rebuild.enqueue(
             args.model,
@@ -2949,6 +3082,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 EmbeddingRebuildJobError,
                 SourceProcessingJobError,
                 SourceAnalysisJobError,
+                SourceHierarchicalExtractionJobError,
                 SourceAnalysisNotFoundError,
                 ModelProviderError,
                 ModelSelectionError,

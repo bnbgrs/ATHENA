@@ -5,6 +5,8 @@ from athena.storage.database import SQLiteDatabase
 from athena.storage.schema import (
     DURABLE_JOBS_SCHEMA_VERSION,
     EXTRACTION_SNAPSHOT_SCHEMA_VERSION,
+    HIERARCHICAL_SOURCE_EXTRACTION_MIGRATION_ID,
+    HIERARCHICAL_SOURCE_EXTRACTION_SCHEMA_VERSION,
     KNOWLEDGE_SCHEMA_VERSION,
     LEGACY_SCHEMA_VERSION,
     LOCAL_EMBEDDINGS_SCHEMA_VERSION,
@@ -19,7 +21,6 @@ from athena.storage.schema import (
     SOURCE_ANCHOR_SCHEMA_VERSION,
     SOURCE_CAPTURE_SCHEMA_VERSION,
     SOURCE_DOCUMENT_STRUCTURE_SCHEMA_VERSION,
-    SOURCE_KNOWLEDGE_MIGRATION_ID,
     SOURCE_KNOWLEDGE_SCHEMA_VERSION,
     SOURCE_PAGE_MAP_SCHEMA_VERSION,
     SOURCE_REPRESENTATION_SCHEMA_VERSION,
@@ -60,6 +61,11 @@ EXPECTED_SEMANTIC_TABLES = {
     "source_analysis_work_inputs",
     "source_extraction_result_snapshots",
     "source_analysis_knowledge_origins",
+    "source_extractions",
+    "source_extraction_evidence",
+    "source_extraction_work_items",
+    "source_extraction_artifacts",
+    "source_extraction_work_inputs",
 }
 
 
@@ -84,7 +90,7 @@ def test_fresh_database_contains_semantic_schema(tmp_path) -> None:
     ).fetchone()
     assert tuple(metadata) == (
         SCHEMA_VERSION,
-        SOURCE_KNOWLEDGE_MIGRATION_ID,
+        HIERARCHICAL_SOURCE_EXTRACTION_MIGRATION_ID,
         SCHEMA_VERSION,
     )
 
@@ -617,7 +623,7 @@ def test_v14_database_is_upgraded_additively_to_durable_jobs(tmp_path) -> None:
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == SOURCE_KNOWLEDGE_MIGRATION_ID
+    assert metadata["last_migration_id"] == HIERARCHICAL_SOURCE_EXTRACTION_MIGRATION_ID
     database.stop()
 
 
@@ -769,7 +775,7 @@ def test_v17_database_is_upgraded_additively_to_hierarchical_source_analysis(tmp
     database = SQLiteDatabase(path)
     database.start()
     assert database.connection.execute("PRAGMA user_version").fetchone()[0] == (
-        SOURCE_KNOWLEDGE_SCHEMA_VERSION
+        SCHEMA_VERSION
     )
     tables = _table_names(database.connection)
     assert {
@@ -782,7 +788,7 @@ def test_v17_database_is_upgraded_additively_to_hierarchical_source_analysis(tmp
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == SOURCE_KNOWLEDGE_MIGRATION_ID
+    assert metadata["last_migration_id"] == HIERARCHICAL_SOURCE_EXTRACTION_MIGRATION_ID
     database.stop()
 
 
@@ -841,5 +847,73 @@ def test_v18_database_is_upgraded_additively_to_source_knowledge_promotion(tmp_p
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == SOURCE_KNOWLEDGE_MIGRATION_ID
+    assert metadata["last_migration_id"] == HIERARCHICAL_SOURCE_EXTRACTION_MIGRATION_ID
+    database.stop()
+
+
+def test_v19_database_is_upgraded_additively_to_hierarchical_source_extraction(tmp_path) -> None:
+    from athena.storage.schema import (
+        _migrate_schema_v3_to_v4,
+        _migrate_schema_v4_to_v5,
+        _migrate_schema_v5_to_v6,
+        _migrate_schema_v6_to_v7,
+        _migrate_schema_v7_to_v8,
+        _migrate_schema_v8_to_v9,
+        _migrate_schema_v9_to_v10,
+        _migrate_schema_v10_to_v11,
+        _migrate_schema_v11_to_v12,
+        _migrate_schema_v12_to_v13,
+        _migrate_schema_v13_to_v14,
+        _migrate_schema_v14_to_v15,
+        _migrate_schema_v15_to_v16,
+        _migrate_schema_v16_to_v17,
+        _migrate_schema_v17_to_v18,
+        _migrate_schema_v18_to_v19,
+    )
+
+    path = tmp_path / "athena.db"
+    legacy = sqlite3.connect(path, autocommit=True)
+    legacy.row_factory = sqlite3.Row
+    legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
+    legacy.execute("PRAGMA application_id = 1096042574")
+    _create_schema_v1(legacy, created_at_us=1)
+    _migrate_schema_v1_to_v2(legacy)
+    _migrate_schema_v2_to_v3(legacy)
+    _migrate_schema_v3_to_v4(legacy)
+    _migrate_schema_v4_to_v5(legacy)
+    _migrate_schema_v5_to_v6(legacy)
+    _migrate_schema_v6_to_v7(legacy)
+    _migrate_schema_v7_to_v8(legacy)
+    _migrate_schema_v8_to_v9(legacy)
+    _migrate_schema_v9_to_v10(legacy)
+    _migrate_schema_v10_to_v11(legacy)
+    _migrate_schema_v11_to_v12(legacy)
+    _migrate_schema_v12_to_v13(legacy)
+    _migrate_schema_v13_to_v14(legacy)
+    _migrate_schema_v14_to_v15(legacy)
+    _migrate_schema_v15_to_v16(legacy)
+    _migrate_schema_v16_to_v17(legacy)
+    _migrate_schema_v17_to_v18(legacy)
+    _migrate_schema_v18_to_v19(legacy)
+    assert legacy.execute("PRAGMA user_version").fetchone()[0] == SOURCE_KNOWLEDGE_SCHEMA_VERSION
+    assert "source_extractions" not in _table_names(legacy)
+    legacy.close()
+
+    database = SQLiteDatabase(path)
+    database.start()
+    assert database.connection.execute("PRAGMA user_version").fetchone()[0] == (
+        HIERARCHICAL_SOURCE_EXTRACTION_SCHEMA_VERSION
+    )
+    assert {
+        "source_extractions",
+        "source_extraction_evidence",
+        "source_extraction_work_items",
+        "source_extraction_artifacts",
+        "source_extraction_work_inputs",
+    }.issubset(_table_names(database.connection))
+    metadata = database.connection.execute(
+        "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
+    ).fetchone()
+    assert metadata is not None
+    assert metadata["last_migration_id"] == HIERARCHICAL_SOURCE_EXTRACTION_MIGRATION_ID
     database.stop()

@@ -26,6 +26,10 @@ from athena.knowledge.models import ClaimDraft, EvidenceRole, KnowledgeUnitDraft
 from athena.knowledge.repository import KnowledgeRepository, _knowledge_payload_hash
 from athena.knowledge.review_service import ReviewService
 from athena.knowledge.source_extraction import (
+    HIERARCHICAL_LEGACY_PROMPT_TEMPLATE_VERSIONS,
+    HIERARCHICAL_PIPELINE_VERSION,
+    HIERARCHICAL_PROMPT_TEMPLATE_ID,
+    HIERARCHICAL_PROMPT_TEMPLATE_VERSION,
     PIPELINE_VERSION,
     PROMPT_TEMPLATE_ID,
     PROMPT_TEMPLATE_VERSION,
@@ -257,13 +261,33 @@ class SourceProposalAcceptanceService:
             )
         if result.processing_run.run_type != "source_knowledge_extraction":
             raise SourceProposalAcceptanceError("ProcessingRun is not a source extraction run.")
-        if result.processing_run.pipeline_version != PIPELINE_VERSION:
+        valid_identities = {
+            (
+                PIPELINE_VERSION,
+                PROMPT_TEMPLATE_ID,
+                PROMPT_TEMPLATE_VERSION,
+            ),
+            (
+                HIERARCHICAL_PIPELINE_VERSION,
+                HIERARCHICAL_PROMPT_TEMPLATE_ID,
+                HIERARCHICAL_PROMPT_TEMPLATE_VERSION,
+            ),
+            *(
+                (
+                    HIERARCHICAL_PIPELINE_VERSION,
+                    HIERARCHICAL_PROMPT_TEMPLATE_ID,
+                    version,
+                )
+                for version in HIERARCHICAL_LEGACY_PROMPT_TEMPLATE_VERSIONS
+            ),
+        }
+        identity = (
+            result.processing_run.pipeline_version,
+            result.processing_run.prompt_template_id,
+            result.processing_run.prompt_template_version,
+        )
+        if identity not in valid_identities:
             raise SourceProposalAcceptanceError("Source extraction pipeline version changed.")
-        if (
-            result.processing_run.prompt_template_id != PROMPT_TEMPLATE_ID
-            or result.processing_run.prompt_template_version != PROMPT_TEMPLATE_VERSION
-        ):
-            raise SourceProposalAcceptanceError("Source extraction prompt identity changed.")
         if result.processing_run.model_signature_id != result.model_signature.model_signature_id:
             raise SourceProposalAcceptanceError("Source extraction run/model signature mismatch.")
         self._validate_run_snapshot(result)

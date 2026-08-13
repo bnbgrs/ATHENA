@@ -17,6 +17,10 @@ from athena.jobs.models import JobRecord, JobState, WaitingReason
 from athena.jobs.repository import JobLeaseError, JobTransitionError
 from athena.jobs.service import DurableJobService
 from athena.jobs.source_analysis import DurableSourceAnalysisWorker, SourceAnalysisJobError
+from athena.jobs.source_extraction import (
+    DurableSourceHierarchicalExtractionWorker,
+    SourceHierarchicalExtractionJobError,
+)
 from athena.jobs.source_processing import (
     DurableSourceProcessingWorker,
     SourceProcessingJobError,
@@ -24,7 +28,9 @@ from athena.jobs.source_processing import (
 
 logger = logging.getLogger(__name__)
 
-_SUPPORTED_JOB_TYPES = frozenset({"source.process", "embedding.rebuild", "source.analyze"})
+_SUPPORTED_JOB_TYPES = frozenset(
+    {"source.process", "embedding.rebuild", "source.analyze", "source.extract"}
+)
 _AUTO_RETRY_REASONS = frozenset(
     {
         WaitingReason.NETWORK.value,
@@ -120,12 +126,14 @@ class DurableJobScheduler:
         source_worker: DurableSourceProcessingWorker,
         embedding_worker: DurableEmbeddingRebuildWorker,
         analysis_worker: DurableSourceAnalysisWorker | None = None,
+        extraction_worker: DurableSourceHierarchicalExtractionWorker | None = None,
         policy: SchedulerPolicy | None = None,
     ) -> None:
         self.jobs = jobs
         self.source_worker = source_worker
         self.embedding_worker = embedding_worker
         self.analysis_worker = analysis_worker
+        self.extraction_worker = extraction_worker
         self.policy = policy or SchedulerPolicy()
 
     @property
@@ -331,6 +339,10 @@ class DurableJobScheduler:
                 if self.analysis_worker is None:
                     raise JobSchedulerError("No source.analyze worker is configured.")
                 return self._dispatch_analysis(leased.job_id, lease_token)
+            if leased.job_type == "source.extract":
+                if self.extraction_worker is None:
+                    raise JobSchedulerError("No source.extract worker is configured.")
+                return self._dispatch_extraction(leased.job_id, lease_token)
             raise JobSchedulerError(
                 f"No scheduler dispatcher registered for {leased.job_type!r}."
             )
@@ -340,6 +352,7 @@ class DurableJobScheduler:
             SourceProcessingJobError,
             EmbeddingRebuildJobError,
             SourceAnalysisJobError,
+            SourceHierarchicalExtractionJobError,
         ) as exc:
             return "failed", self._fail_if_still_leased(
                 leased.job_id,
@@ -404,6 +417,25 @@ class DurableJobScheduler:
                 return "waiting", result.job
         return self._yield_at_boundary(job_id, lease_token)
 
+    def _dispatch_extraction(
+        self,
+        job_id: uuid.UUID,
+        lease_token: bytes,
+    ) -> tuple[str, JobRecord]:
+        if self.extraction_worker is None:
+            raise JobSchedulerError("No source.extract worker is configured.")
+        for _ in range(self.policy.max_boundaries_per_dispatch):
+            result = self.extraction_worker.step(
+                job_id,
+                lease_token=lease_token,
+                extend_seconds=self.policy.lease_seconds,
+            )
+            if result.done:
+                return "completed", result.job
+            if result.waiting:
+                return "waiting", result.job
+        return self._yield_at_boundary(job_id, lease_token)
+
     def _yield_at_boundary(
         self,
         job_id: uuid.UUID,
@@ -434,6 +466,15 @@ class DurableJobScheduler:
                     extend_seconds=self.policy.lease_seconds,
                 )
                 return "cancelled", analysis_result.job
+            if current.job_type == "source.extract":
+                if self.extraction_worker is None:
+                    raise JobSchedulerError("No source.extract worker is configured.")
+                extraction_result = self.extraction_worker.step(
+                    job_id,
+                    lease_token=lease_token,
+                    extend_seconds=self.policy.lease_seconds,
+                )
+                return "cancelled", extraction_result.job
         yielded = self.jobs.yield_job(job_id, lease_token=lease_token)
         return "yielded", yielded
 
