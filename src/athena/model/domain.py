@@ -36,6 +36,7 @@ class ModelInfo:
     loaded: bool
     vision: bool | None
     trained_for_tool_use: bool | None
+    loaded_context_length: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

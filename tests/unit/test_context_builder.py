@@ -92,3 +92,94 @@ def test_context_prefers_rank_order_and_omits_later_items_when_budget_full() -> 
     assert bundle.items
     assert bundle.items[0].entity_id == first.entity_id
     assert bundle.omitted_count >= 1
+
+
+def _memory(
+    content: str,
+    *,
+    kind: str = "response_style",
+    scope_kind: str = "global",
+    scope_entity_id: uuid.UUID | None = None,
+):
+    from athena.memory.models import (
+        MemoryKind,
+        MemoryLearningMode,
+        MemoryScopeKind,
+        MemorySensitivity,
+        PersonalMemoryDraft,
+        PersonalMemoryRevision,
+        PersonalMemorySnapshot,
+    )
+
+    memory_id = uuid.uuid4()
+    revision_id = uuid.uuid4()
+    return PersonalMemorySnapshot(
+        memory_id=memory_id,
+        lifecycle_state="active",
+        revision=PersonalMemoryRevision(
+            memory_id=memory_id,
+            revision_id=revision_id,
+            revision_no=1,
+            created_at_us=1,
+            created_by_actor_id=uuid.uuid4(),
+            provenance_id=uuid.uuid4(),
+            payload=PersonalMemoryDraft(
+                memory_kind=MemoryKind(kind),
+                content=content,
+                scope_kind=MemoryScopeKind(scope_kind),
+                scope_entity_id=scope_entity_id,
+                learning_mode=MemoryLearningMode.EXPLICIT_USER,
+                sensitivity=MemorySensitivity.NORMAL,
+                last_confirmed_at_us=1,
+            ),
+        ),
+    )
+
+
+def test_context_renders_personal_memory_as_separate_user_preference_data() -> None:
+    source = _ranked("Berlin ist die Hauptstadt von Deutschland.")
+    memory = _memory("Antworte knapp.")
+    bundle = ContextBuilderService().build_from_ranked(
+        query="Erkläre es ausführlich.",
+        results=(source,),
+        personal_memory=(memory,),
+        max_estimated_tokens=900,
+    )
+
+    payload = json.loads(bundle.rendered_text)
+    assert payload["athena_context_version"] == 2
+    assert payload["user_preferences"][0]["label"] == "USER PREFERENCE"
+    assert payload["user_preferences"][0]["content"] == "Antworte knapp."
+    assert "overrides USER PREFERENCE" in payload["policy"]
+    assert "not world fact" in payload["policy"]
+    assert payload["query"] == "Erkläre es ausführlich."
+
+
+def test_context_omits_over_budget_memory_instead_of_truncating_preference() -> None:
+    memory = _memory("Sehr lange Präferenz. " * 500)
+    bundle = ContextBuilderService().build_from_ranked(
+        query="test",
+        results=(),
+        personal_memory=(memory,),
+        max_estimated_tokens=180,
+    )
+    assert bundle.memory_items == ()
+    assert bundle.omitted_memory_count == 1
+
+
+def test_context_evidence_truncation_prefers_sentence_boundary() -> None:
+    source = _ranked(
+        "Erster vollständiger Satz. Zweiter vollständiger Satz. "
+        + "Dritter sehr langer Satz mit vielen Worten " * 80
+    )
+    bundle = ContextBuilderService().build_from_ranked(
+        query="test",
+        results=(source,),
+        max_estimated_tokens=300,
+    )
+    assert bundle.items
+    item = bundle.items[0]
+    assert item.truncated
+    assert item.text.endswith("…[TRUNCATED]")
+    prefix = item.text.removesuffix(" …[TRUNCATED]")
+    assert prefix.endswith((".", "!", "?"))

@@ -25,6 +25,78 @@ class FakeResponse:
         return self._bytes
 
 
+class FakeStreamResponse:
+    def __init__(self, lines: tuple[bytes, ...]) -> None:
+        self.lines = lines
+
+    def __enter__(self) -> "FakeStreamResponse":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    def __iter__(self):
+        return iter(self.lines)
+
+
+def test_lm_studio_stream_chat_enforces_max_output_tokens() -> None:
+    provider = LMStudioProvider("http://127.0.0.1:1234")
+    captured: dict[str, object] = {}
+
+    def fake_urlopen(request, timeout):
+        captured["timeout"] = timeout
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        return FakeStreamResponse(
+            (
+                b'data: {"choices":[{"delta":{"content":"ok"}}]}\n',
+                b'data: [DONE]\n',
+            )
+        )
+
+    with patch("athena.model.adapters.lm_studio.urlopen", side_effect=fake_urlopen):
+        chunks = tuple(
+            provider.stream_chat(
+                model_id="example/model-q4",
+                messages=(ModelChatMessage(role="user", content="test"),),
+                max_output_tokens=1000,
+                reasoning_mode="off",
+            )
+        )
+
+    assert chunks == ("ok",)
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    assert payload["max_tokens"] == 1000
+    assert payload["reasoning_effort"] == "none"
+    assert payload["stream"] is True
+
+
+def test_lm_studio_stream_chat_rejects_non_positive_output_cap() -> None:
+    provider = LMStudioProvider("http://127.0.0.1:1234")
+
+    with pytest.raises(ValueError, match="max_output_tokens"):
+        tuple(
+            provider.stream_chat(
+                model_id="example/model-q4",
+                messages=(ModelChatMessage(role="user", content="test"),),
+                max_output_tokens=0,
+            )
+        )
+
+
+def test_lm_studio_stream_chat_rejects_unsupported_reasoning_mode() -> None:
+    provider = LMStudioProvider("http://127.0.0.1:1234")
+
+    with pytest.raises(ValueError, match="reasoning_mode"):
+        tuple(
+            provider.stream_chat(
+                model_id="example/model-q4",
+                messages=(ModelChatMessage(role="user", content="test"),),
+                reasoning_mode="on",
+            )
+        )
+
+
 def test_lm_studio_discovers_and_normalizes_models() -> None:
     provider = LMStudioProvider("http://127.0.0.1:1234")
     payload = {
@@ -64,6 +136,7 @@ def test_lm_studio_discovers_and_normalizes_models() -> None:
     assert model.display_name == "Example Model"
     assert model.model_type == "llm"
     assert model.context_capacity == 32768
+    assert model.loaded_context_length == 8192
     assert model.quantization == "Q4_K_M"
     assert model.loaded is True
     assert model.vision is False

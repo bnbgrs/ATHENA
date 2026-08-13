@@ -26,6 +26,7 @@ class FakeProvider:
         self.models = models
         self.chunks = chunks
         self.requests: list[tuple[str, tuple[ModelChatMessage, ...]]] = []
+        self.controls: list[tuple[int | None, str | None]] = []
 
     def health(self) -> ProviderHealth:
         return ProviderHealth(ProviderHealthStatus.READY)
@@ -38,8 +39,11 @@ class FakeProvider:
         *,
         model_id: str,
         messages: Sequence[ModelChatMessage],
+        max_output_tokens: int | None = None,
+        reasoning_mode: str | None = None,
     ) -> Iterator[str]:
         self.requests.append((model_id, tuple(messages)))
+        self.controls.append((max_output_tokens, reasoning_mode))
         yield from self.chunks
 
 
@@ -94,6 +98,25 @@ def test_streamed_reply_is_persisted_only_after_completion(tmp_path) -> None:
                 (ModelChatMessage(role="user", content="Say hello"),),
             )
         ]
+    finally:
+        database.stop()
+
+
+def test_generation_forwards_explicit_reasoning_off_with_output_cap(tmp_path) -> None:
+    database, chat = _chat_service(tmp_path)
+    try:
+        chat_id = chat.create_chat()
+        provider = FakeProvider((_model(),), ("bounded answer",))
+        service = ChatGenerationService(chat, provider)
+
+        service.send_message(
+            chat_id=chat_id,
+            content="Answer without hidden reasoning",
+            max_output_tokens=1000,
+            reasoning_mode="off",
+        )
+
+        assert provider.controls == [(1000, "off")]
     finally:
         database.stop()
 

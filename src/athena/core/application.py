@@ -309,6 +309,7 @@ class AthenaApplication:
             hybrid_retrieval=self.hybrid_retrieval,
             context_builder=self.context_builder,
             evidence_policy=self.memory_evidence_policy,
+            personal_memory=self.personal_memory,
         )
         self.proposal_acceptance = ProposalAcceptanceService(
             database=self.database,

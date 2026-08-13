@@ -92,14 +92,20 @@ class LMStudioProvider:
         *,
         model_id: str,
         messages: Sequence[ModelChatMessage],
+        max_output_tokens: int | None = None,
+        reasoning_mode: str | None = None,
     ) -> Iterator[str]:
         """Stream assistant text from LM Studio using SSE chat completions."""
         if not model_id:
             raise ValueError("model_id must not be empty.")
         if not messages:
             raise ValueError("At least one chat message is required.")
+        if max_output_tokens is not None and max_output_tokens < 1:
+            raise ValueError("max_output_tokens must be positive when provided.")
+        if reasoning_mode not in {None, "off"}:
+            raise ValueError("reasoning_mode must be None or 'off'.")
 
-        request_payload = {
+        request_payload: dict[str, Any] = {
             "model": model_id,
             "messages": [
                 {"role": message.role, "content": message.content}
@@ -107,6 +113,12 @@ class LMStudioProvider:
             ],
             "stream": True,
         }
+        if max_output_tokens is not None:
+            request_payload["max_tokens"] = max_output_tokens
+        if reasoning_mode == "off":
+            # LM Studio's OpenAI-compatible chat-completions endpoint maps
+            # ATHENA's provider-independent reasoning mode to reasoning_effort.
+            request_payload["reasoning_effort"] = "none"
         raw_body = json.dumps(request_payload, ensure_ascii=False).encode("utf-8")
         request = Request(
             self.chat_completions_url,
@@ -538,6 +550,7 @@ class LMStudioProvider:
             raise ProviderProtocolError(
                 f"LM Studio model {key!r} has invalid 'loaded_instances'."
             )
+        loaded_context_length = self._loaded_context_length(key, loaded_instances)
 
         vision: bool | None = None
         trained_for_tool_use: bool | None = None
@@ -562,7 +575,37 @@ class LMStudioProvider:
             loaded=bool(loaded_instances),
             vision=vision,
             trained_for_tool_use=trained_for_tool_use,
+            loaded_context_length=loaded_context_length,
         )
+
+    def _loaded_context_length(
+        self,
+        model_key: str,
+        loaded_instances: list[object],
+    ) -> int | None:
+        lengths: list[int] = []
+        for instance in loaded_instances:
+            if not isinstance(instance, Mapping):
+                raise ProviderProtocolError(
+                    f"LM Studio model {model_key!r} has invalid loaded instance metadata."
+                )
+            config = instance.get("config")
+            if config is None:
+                continue
+            if not isinstance(config, Mapping):
+                raise ProviderProtocolError(
+                    f"LM Studio model {model_key!r} has invalid loaded instance config."
+                )
+            value = config.get("context_length")
+            if value is None:
+                continue
+            lengths.append(self._optional_positive_int(value) or 0)
+        if not lengths:
+            return None
+        # Multiple runtime instances may have different limits. Normal chat does
+        # not target a specific instance, so use the smallest reported limit as
+        # the fail-closed effective capacity.
+        return min(lengths)
 
     @staticmethod
     def _required_string(raw: Mapping[str, Any], field: str) -> str:

@@ -47,6 +47,8 @@ class ChatModelProvider(ModelDiscoveryProvider, Protocol):
         *,
         model_id: str,
         messages: Sequence[ModelChatMessage],
+        max_output_tokens: int | None = None,
+        reasoning_mode: str | None = None,
     ) -> Iterator[str]:
         """Yield assistant text deltas for a complete local chat history."""
         ...

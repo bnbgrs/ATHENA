@@ -272,6 +272,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum retrieved memory items (1-100).",
     )
     send_parser.add_argument(
+        "--memory-max-preferences",
+        type=int,
+        default=8,
+        help="Maximum Personal Memory USER PREFERENCE items (0-100).",
+    )
+    send_parser.add_argument(
+        "--memory-scope-kind",
+        type=_memory_scope_kind_argument,
+        help="Optional current Personal Memory scope kind for scoped preferences.",
+    )
+    send_parser.add_argument(
+        "--memory-scope-id",
+        type=_uuid_argument,
+        help="Exact current scope entity ID for project/workflow/client Memory.",
+    )
+    send_parser.add_argument(
+        "--memory-context-limit",
+        type=int,
+        help=(
+            "Fail-closed effective Primary Model context limit. Defaults to the "
+            "loaded LM Studio context when reported."
+        ),
+    )
+    send_parser.add_argument(
+        "--memory-output-reserve",
+        type=int,
+        default=2048,
+        help="Reserved output tokens kept free before the model call.",
+    )
+    send_parser.add_argument(
+        "--memory-safety-margin",
+        type=int,
+        default=256,
+        help="Additional estimated-token safety margin for provider overhead.",
+    )
+    send_parser.add_argument(
         "--source-max-tokens",
         type=int,
         default=1200,
@@ -1324,6 +1360,12 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
                     requested_embedding_model_id=args.embedding_model_id,
                     max_context_tokens=args.memory_max_tokens,
                     max_context_items=args.memory_max_items,
+                    max_memory_items=args.memory_max_preferences,
+                    memory_scope_kind=args.memory_scope_kind,
+                    memory_scope_entity_id=args.memory_scope_id,
+                    effective_context_limit=args.memory_context_limit,
+                    output_reserve=args.memory_output_reserve,
+                    safety_margin=args.memory_safety_margin,
                     allow_model_prior=(
                         True
                         if args.memory_allow_model_prior is None
@@ -1368,11 +1410,21 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
         if memory_result is not None:
             print(
                 "Memory context: "
+                f"preferences={len(memory_result.context.memory_items)} "
+                f"preferences_omitted={memory_result.context.omitted_memory_count} "
                 f"items={len(memory_result.context.items)} "
                 f"omitted={memory_result.context.omitted_count} "
                 f"estimated_tokens={memory_result.context.estimated_tokens}/"
                 f"{memory_result.context.max_estimated_tokens} "
                 f"embedding_model={memory_result.embedding_model.backend_model_id}"
+            )
+            print(
+                "Context budget: "
+                f"input={memory_result.budget.estimated_input_tokens} "
+                f"output_reserve={memory_result.budget.output_reserve} "
+                f"safety_margin={memory_result.budget.safety_margin} "
+                f"total={memory_result.budget.estimated_total_tokens}/"
+                f"{memory_result.budget.effective_context_limit}"
             )
             if memory_result.context.items:
                 ids = ", ".join(

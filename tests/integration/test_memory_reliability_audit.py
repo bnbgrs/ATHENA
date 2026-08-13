@@ -12,6 +12,8 @@ from athena.chat.memory import MemoryAugmentedChatService
 from athena.chat.models import MessageType
 from athena.chat.repository import ChatRepository
 from athena.chat.service import ChatService
+from athena.memory.repository import PersonalMemoryRepository
+from athena.memory.service import PersonalMemoryService
 from athena.model.domain import ModelChatMessage, ModelInfo, ProviderHealth, ProviderHealthStatus
 from athena.retrieval.context import ContextBuilderService
 from athena.retrieval.evidence import MemoryEvidencePolicy
@@ -82,6 +84,8 @@ class ScriptedProvider:
         *,
         model_id: str,
         messages: Sequence[ModelChatMessage],
+        max_output_tokens: int | None = None,
+        reasoning_mode: str | None = None,
     ) -> Iterator[str]:
         self.requests.append((model_id, tuple(messages)))
         yield from self.chunks
@@ -98,6 +102,7 @@ def _llm(model_id: str) -> ModelInfo:
         loaded=True,
         vision=False,
         trained_for_tool_use=False,
+        loaded_context_length=32768,
     )
 
 
@@ -130,12 +135,14 @@ def _runtime(
     chat = ChatService(ChatRepository(database))
     provider = ScriptedProvider(chunks, models=models)
     generation = ChatGenerationService(chat, provider)
+    personal_memory = PersonalMemoryService(PersonalMemoryRepository(database), chat)
     memory = MemoryAugmentedChatService(
         chat_generation=generation,
         embedding_provider=embedding or StaticEmbeddingProvider(),  # type: ignore[arg-type]
         hybrid_retrieval=hybrid or StaticHybrid(),  # type: ignore[arg-type]
         context_builder=ContextBuilderService(),
         evidence_policy=MemoryEvidencePolicy(database),
+        personal_memory=personal_memory,
     )
     return database, chat, provider, memory
 

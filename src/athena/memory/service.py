@@ -160,3 +160,68 @@ class PersonalMemoryService:
 
     def history(self, memory_id: uuid.UUID) -> tuple[PersonalMemoryRevision, ...]:
         return self.repository.list_revisions(memory_id)
+
+    def context_candidates(
+        self,
+        *,
+        scope_kind: MemoryScopeKind | None = None,
+        scope_entity_id: uuid.UUID | None = None,
+        limit: int = 32,
+    ) -> tuple[PersonalMemorySnapshot, ...]:
+        """Return deterministic active Memory candidates for one model call.
+
+        Global core collaboration preferences are eligible everywhere. Scoped
+        entries are eligible only for an exact current scope match. Protected
+        entries cannot exist in the v1 plaintext repository, so this method never
+        silently unlocks protected content.
+        """
+        if not 1 <= limit <= 100:
+            raise ValueError("Personal Memory context limit must be between 1 and 100.")
+        if scope_kind is None and scope_entity_id is not None:
+            raise ValueError("scope_entity_id requires scope_kind.")
+        if scope_kind is MemoryScopeKind.GLOBAL and scope_entity_id is not None:
+            raise ValueError("Global context scope must not have scope_entity_id.")
+        if scope_kind is not None and scope_kind is not MemoryScopeKind.GLOBAL:
+            if scope_entity_id is None:
+                raise ValueError("Scoped context requires scope_entity_id.")
+
+        snapshots = self.repository.list_current(limit=500, include_inactive=False)
+        core_kinds = {
+            MemoryKind.RESPONSE_STYLE,
+            MemoryKind.LANGUAGE_PREFERENCE,
+            MemoryKind.DETAIL_PREFERENCE,
+            MemoryKind.INTERACTION_PREFERENCE,
+        }
+
+        def priority(snapshot: PersonalMemorySnapshot) -> tuple[int, int, str]:
+            payload = snapshot.revision.payload
+            if payload.scope_kind is MemoryScopeKind.GLOBAL and payload.memory_kind in core_kinds:
+                tier = 0
+            elif (
+                scope_kind is not None
+                and scope_kind is not MemoryScopeKind.GLOBAL
+                and payload.scope_kind is scope_kind
+                and payload.scope_entity_id == scope_entity_id
+            ):
+                tier = 1
+            elif payload.scope_kind is MemoryScopeKind.GLOBAL:
+                tier = 2
+            else:
+                tier = 3
+            return (tier, -snapshot.revision.created_at_us, str(snapshot.memory_id))
+
+        eligible = []
+        for snapshot in snapshots:
+            payload = snapshot.revision.payload
+            if payload.scope_kind is MemoryScopeKind.GLOBAL:
+                eligible.append(snapshot)
+                continue
+            if (
+                scope_kind is not None
+                and scope_kind is not MemoryScopeKind.GLOBAL
+                and payload.scope_kind is scope_kind
+                and payload.scope_entity_id == scope_entity_id
+            ):
+                eligible.append(snapshot)
+
+        return tuple(sorted(eligible, key=priority)[:limit])

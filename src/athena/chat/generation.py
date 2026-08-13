@@ -71,6 +71,8 @@ class ChatGenerationService:
         on_delta: Callable[[str], None] | None = None,
         retrieved_context: str | None = None,
         grounding_contract: GroundingContract | None = None,
+        max_output_tokens: int | None = None,
+        reasoning_mode: str | None = None,
     ) -> ChatGenerationResult:
         model = self.select_model(requested_model_id)
         user_message = self.chat.add_user_message(chat_id=chat_id, content=content)
@@ -94,11 +96,31 @@ class ChatGenerationService:
                 *history,
             )
 
+        if max_output_tokens is not None and max_output_tokens < 1:
+            raise ValueError("max_output_tokens must be positive when provided.")
+        if reasoning_mode not in {None, "off"}:
+            raise ValueError("reasoning_mode must be None or 'off'.")
+
         chunks: list[str] = []
-        for chunk in self.provider.stream_chat(
-            model_id=model.backend_model_id,
-            messages=history,
-        ):
+        if reasoning_mode is not None:
+            stream = self.provider.stream_chat(
+                model_id=model.backend_model_id,
+                messages=history,
+                max_output_tokens=max_output_tokens,
+                reasoning_mode=reasoning_mode,
+            )
+        elif max_output_tokens is not None:
+            stream = self.provider.stream_chat(
+                model_id=model.backend_model_id,
+                messages=history,
+                max_output_tokens=max_output_tokens,
+            )
+        else:
+            stream = self.provider.stream_chat(
+                model_id=model.backend_model_id,
+                messages=history,
+            )
+        for chunk in stream:
             chunks.append(chunk)
             if on_delta is not None:
                 on_delta(chunk)
