@@ -23,7 +23,8 @@ DURABLE_JOBS_SCHEMA_VERSION = 15
 SOURCE_PAGE_MAP_SCHEMA_VERSION = 16
 SOURCE_DOCUMENT_STRUCTURE_SCHEMA_VERSION = 17
 SOURCE_ANALYSIS_SCHEMA_VERSION = 18
-SCHEMA_VERSION = SOURCE_ANALYSIS_SCHEMA_VERSION
+SOURCE_KNOWLEDGE_SCHEMA_VERSION = 19
+SCHEMA_VERSION = SOURCE_KNOWLEDGE_SCHEMA_VERSION
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
@@ -43,6 +44,7 @@ DURABLE_JOBS_MIGRATION_ID = "0015_durable_jobs_checkpoints"
 SOURCE_PAGE_MAP_MIGRATION_ID = "0016_source_representation_page_map"
 SOURCE_DOCUMENT_STRUCTURE_MIGRATION_ID = "0017_source_representation_document_structure"
 SOURCE_ANALYSIS_MIGRATION_ID = "0018_hierarchical_source_analysis"
+SOURCE_KNOWLEDGE_MIGRATION_ID = "0019_source_analysis_knowledge_promotion"
 
 
 class DatabaseCompatibilityError(RuntimeError):
@@ -125,6 +127,7 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         DURABLE_JOBS_SCHEMA_VERSION,
         SOURCE_PAGE_MAP_SCHEMA_VERSION,
         SOURCE_DOCUMENT_STRUCTURE_SCHEMA_VERSION,
+        SOURCE_ANALYSIS_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -206,9 +209,13 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
 
     if existing_user_version == SOURCE_DOCUMENT_STRUCTURE_SCHEMA_VERSION:
         _migrate_schema_v17_to_v18(connection)
+        existing_user_version = SOURCE_ANALYSIS_SCHEMA_VERSION
+
+    if existing_user_version == SOURCE_ANALYSIS_SCHEMA_VERSION:
+        _migrate_schema_v18_to_v19(connection)
 
     _configure_connection(connection)
-    _verify_schema_v18(connection)
+    _verify_schema_v19(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -1451,7 +1458,56 @@ def _migrate_schema_v17_to_v18(connection: sqlite3.Connection) -> None:
     )
 
 
-def _verify_schema_v18(connection: sqlite3.Connection) -> None:
+def _migrate_schema_v18_to_v19(connection: sqlite3.Connection) -> None:
+    """Add frozen source-analysis extraction snapshots and canonical promotion backlinks."""
+    connection.executescript(
+        f"""
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE source_extraction_result_snapshots (
+            processing_run_id BLOB(16) PRIMARY KEY CHECK(length(processing_run_id) = 16),
+            analysis_id BLOB(16) NOT NULL CHECK(length(analysis_id) = 16),
+            final_artifact_id BLOB(16) NOT NULL CHECK(length(final_artifact_id) = 16),
+            model_json TEXT NOT NULL CHECK(json_valid(model_json)),
+            evidence_json TEXT NOT NULL CHECK(json_valid(evidence_json)),
+            proposals_json TEXT NOT NULL CHECK(json_valid(proposals_json)),
+            created_at_us INTEGER NOT NULL,
+            FOREIGN KEY(processing_run_id) REFERENCES processing_runs(processing_run_id),
+            FOREIGN KEY(analysis_id) REFERENCES source_analyses(analysis_id),
+            FOREIGN KEY(final_artifact_id) REFERENCES source_analysis_artifacts(artifact_id)
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_source_extraction_snapshots_analysis
+            ON source_extraction_result_snapshots(analysis_id, created_at_us);
+
+        CREATE TABLE source_analysis_knowledge_origins (
+            provenance_id BLOB(16) PRIMARY KEY CHECK(length(provenance_id) = 16),
+            analysis_id BLOB(16) NOT NULL CHECK(length(analysis_id) = 16),
+            final_artifact_id BLOB(16) NOT NULL CHECK(length(final_artifact_id) = 16),
+            extraction_run_id BLOB(16) NOT NULL CHECK(length(extraction_run_id) = 16),
+            created_at_us INTEGER NOT NULL,
+            FOREIGN KEY(provenance_id) REFERENCES provenance_records(provenance_id),
+            FOREIGN KEY(analysis_id) REFERENCES source_analyses(analysis_id),
+            FOREIGN KEY(final_artifact_id) REFERENCES source_analysis_artifacts(artifact_id),
+            FOREIGN KEY(extraction_run_id) REFERENCES processing_runs(processing_run_id)
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_source_analysis_knowledge_origins_analysis
+            ON source_analysis_knowledge_origins(analysis_id, final_artifact_id);
+
+        UPDATE schema_metadata
+        SET schema_version = {SOURCE_KNOWLEDGE_SCHEMA_VERSION},
+            last_migration_id = '{SOURCE_KNOWLEDGE_MIGRATION_ID}',
+            minimum_reader_version = {SOURCE_KNOWLEDGE_SCHEMA_VERSION}
+        WHERE singleton_id = 1;
+
+        PRAGMA user_version = {SOURCE_KNOWLEDGE_SCHEMA_VERSION};
+        COMMIT;
+        """
+    )
+
+
+def _verify_schema_v19(connection: sqlite3.Connection) -> None:
     application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
     user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     if application_id != ATHENA_APPLICATION_ID:
@@ -1468,8 +1524,52 @@ def _verify_schema_v18(connection: sqlite3.Connection) -> None:
         SCHEMA_VERSION,
         STORAGE_LAYOUT_VERSION,
         BLOB_FORMAT_VERSION,
-        SOURCE_ANALYSIS_MIGRATION_ID,
+        SOURCE_KNOWLEDGE_MIGRATION_ID,
         SCHEMA_VERSION,
+    )
+    if metadata is None or tuple(metadata) != expected:
+        raise DatabaseCompatibilityError("ATHENA schema_metadata verification failed.")
+
+    required_tables = {
+        "knowledge_units", "knowledge_unit_revisions", "claims", "claim_revisions",
+        "claim_evidence", "provenance_inputs", "model_signatures", "processing_runs",
+        "semantic_review_items", "semantic_merge_review_payloads",
+        "extraction_result_snapshots", "search_fts", "search_index_state",
+        "search_embeddings", "search_embedding_state", "blob_records", "sources",
+        "source_representations", "source_representation_pages",
+        "source_representation_structures", "source_anchor_structures",
+        "chunking_profiles", "source_anchors", "jobs", "checkpoints",
+        "source_analyses", "source_analysis_work_items", "source_analysis_artifacts",
+        "source_analysis_work_inputs", "source_extraction_result_snapshots",
+        "source_analysis_knowledge_origins",
+    }
+    missing_tables = required_tables.difference(_user_tables(connection))
+    if missing_tables:
+        missing = ", ".join(sorted(missing_tables))
+        raise DatabaseCompatibilityError(f"ATHENA semantic schema is incomplete: {missing}.")
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise DatabaseCompatibilityError("ATHENA foreign-key verification failed.")
+
+
+def _verify_schema_v18(connection: sqlite3.Connection) -> None:
+    application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
+    user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if application_id != ATHENA_APPLICATION_ID:
+        raise DatabaseCompatibilityError("ATHENA application_id verification failed.")
+    if user_version != SOURCE_ANALYSIS_SCHEMA_VERSION:
+        raise DatabaseCompatibilityError("ATHENA schema version verification failed.")
+
+    metadata = connection.execute(
+        "SELECT schema_version, storage_layout_version, blob_format_version, "
+        "last_migration_id, minimum_reader_version "
+        "FROM schema_metadata WHERE singleton_id = 1"
+    ).fetchone()
+    expected = (
+        SOURCE_ANALYSIS_SCHEMA_VERSION,
+        STORAGE_LAYOUT_VERSION,
+        BLOB_FORMAT_VERSION,
+        SOURCE_ANALYSIS_MIGRATION_ID,
+        SOURCE_ANALYSIS_SCHEMA_VERSION,
     )
     if metadata is None or tuple(metadata) != expected:
         raise DatabaseCompatibilityError("ATHENA schema_metadata verification failed.")

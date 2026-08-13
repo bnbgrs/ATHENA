@@ -9,9 +9,19 @@ import uuid
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from enum import Enum
+from typing import Protocol
 
 from athena.common.ids import uuid_from_blob
-from athena.knowledge.extraction_models import ChatExtractionResult, ProposalEntityType
+from athena.knowledge.extraction_models import ExtractionProposalSet, ProposalEntityType
+
+
+class ExtractionProposalCarrier(Protocol):
+    """Minimal result contract required by canonical deduplication."""
+
+    @property
+    def proposals(self) -> ExtractionProposalSet:
+        """Return the immutable proposal set exposed by an extraction result."""
+        ...
 
 
 class DedupAction(str, Enum):
@@ -88,7 +98,7 @@ class CanonicalDeduplicationService:
     def plan(
         cls,
         connection: sqlite3.Connection,
-        result: ChatExtractionResult,
+        result: ExtractionProposalCarrier,
     ) -> DeduplicationPlan:
         knowledge_rows = cls._knowledge_rows(connection)
         claim_rows = cls._claim_rows(connection)

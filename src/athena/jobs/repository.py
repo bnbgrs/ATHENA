@@ -388,6 +388,26 @@ class JobRepository:
                         "Checkpoint commit_id must reference an existing durable commit."
                     )
             fencing_sequence = int(row["fencing_sequence"])
+            # Windows can expose the same microsecond timestamp to consecutive
+            # checkpoint commits. Keep the persisted per-job ordering strict so
+            # list_checkpoints() never falls back to random UUIDv7 tie bits.
+            previous = connection.execute(
+                """
+                SELECT MAX(created_at_us) AS created_at_us
+                FROM checkpoints
+                WHERE job_id = ?
+                """,
+                (uuid_to_blob(job_id),),
+            ).fetchone()
+            previous_created_at_us = (
+                None if previous is None or previous["created_at_us"] is None
+                else int(previous["created_at_us"])
+            )
+            checkpoint_created_at_us = (
+                now
+                if previous_created_at_us is None
+                else max(now, previous_created_at_us + 1)
+            )
             connection.execute(
                 """
                 INSERT INTO checkpoints (
@@ -401,7 +421,7 @@ class JobRepository:
                     uuid_to_blob(checkpoint_id),
                     uuid_to_blob(job_id),
                     _maybe_uuid_blob(processing_stage_id),
-                    now,
+                    checkpoint_created_at_us,
                     progress_state_json,
                     last_confirmed_input_json,
                     last_confirmed_output_json,
@@ -416,7 +436,12 @@ class JobRepository:
                 SET last_checkpoint_id = ?, current_stage = ?, updated_at_us = ?
                 WHERE job_id = ?
                 """,
-                (uuid_to_blob(checkpoint_id), current_stage, now, uuid_to_blob(job_id)),
+                (
+                    uuid_to_blob(checkpoint_id),
+                    current_stage,
+                    checkpoint_created_at_us,
+                    uuid_to_blob(job_id),
+                ),
             )
         return self.get_checkpoint(checkpoint_id)
 

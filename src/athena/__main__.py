@@ -59,6 +59,10 @@ from athena.knowledge.service import (
     ChatMessageSequenceError,
     UnsupportedKnowledgeSourceError,
 )
+from athena.knowledge.source_extraction import (
+    SourceAnalysisExtractionResult,
+    SourceExtractionSnapshotNotFoundError,
+)
 from athena.model.adapters.lm_studio import ModelProviderError
 from athena.retrieval.archive import ArchiveSearchError
 from athena.retrieval.context import ContextBuilderError
@@ -426,6 +430,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Load and accept one frozen successful extraction run without calling the model again.",
     )
     extract_accept_run.add_argument("processing_run_id", type=_uuid_argument)
+
+    extract_source_analysis = extract_commands.add_parser(
+        "source-analysis",
+        help="Generate grounded Knowledge/Claim proposals from one completed source analysis.",
+    )
+    extract_source_analysis.add_argument("analysis_id", type=_uuid_argument)
+    extract_source_analysis.add_argument("--model", dest="model_id")
+    extract_source_analysis.add_argument("--context-limit", type=int)
+    extract_source_analysis.add_argument("--output-reserve", type=int)
+    extract_source_analysis.add_argument("--safety-margin", type=int)
+    extract_source_analysis.add_argument(
+        "--accept",
+        action="store_true",
+        help="After displaying the grounded proposal set, ask for explicit user acceptance.",
+    )
+
+    extract_accept_source_run = extract_commands.add_parser(
+        "accept-source-run",
+        help="Load and accept one frozen successful source-analysis extraction run without calling the model again.",
+    )
+    extract_accept_source_run.add_argument("processing_run_id", type=_uuid_argument)
 
     review_parser = commands.add_parser(
         "review",
@@ -1514,27 +1539,152 @@ def _accept_extraction_result(
     return 0
 
 
+def _print_source_extraction(result: SourceAnalysisExtractionResult) -> None:
+    proposals = result.proposals
+    evidence = {item.sequence_no: item for item in result.evidence}
+    print(f"Source extraction run: {result.processing_run.processing_run_id}")
+    print(f"Analysis: {result.analysis_id}")
+    print(f"Final artifact: {result.final_artifact_id}")
+    print(f"Model: {result.model.backend_model_id}")
+    print(f"Model signature: {result.model_signature.model_signature_id}")
+    print(f"Evidence anchors: {len(result.evidence)}")
+    print(f"Knowledge proposals: {len(proposals.knowledge_units)}")
+    for index, knowledge_proposal in enumerate(proposals.knowledge_units):
+        title = knowledge_proposal.title if knowledge_proposal.title is not None else "<none>"
+        anchor_id = evidence[knowledge_proposal.source_sequence_no].anchor_id
+        print(
+            f"[K{index}] evidence=[{knowledge_proposal.source_sequence_no}] anchor={anchor_id} "
+            f"kind={knowledge_proposal.knowledge_kind.value} "
+            f"status={knowledge_proposal.epistemic_status.value} "
+            f"confidence={knowledge_proposal.confidence:.3f} title={title} "
+            f"quote={knowledge_proposal.source_quote!r} body={knowledge_proposal.body}"
+        )
+    print(f"Claim proposals: {len(proposals.claims)}")
+    for index, claim_proposal in enumerate(proposals.claims):
+        anchor_id = evidence[claim_proposal.source_sequence_no].anchor_id
+        print(
+            f"[C{index}] evidence=[{claim_proposal.source_sequence_no}] anchor={anchor_id} "
+            f"kind={claim_proposal.claim_kind.value} "
+            f"status={claim_proposal.epistemic_status.value} "
+            f"confidence={claim_proposal.confidence:.3f} quote={claim_proposal.source_quote!r} "
+            f"statement={claim_proposal.statement}"
+        )
+    print(f"Relation proposals: {len(proposals.relations)}")
+    for index, relation in enumerate(proposals.relations):
+        print(
+            f"[R{index}] {relation.left_type.value}[{relation.left_index}] "
+            f"--{relation.relation_type}--> "
+            f"{relation.right_type.value}[{relation.right_index}] "
+            f"confidence={relation.confidence:.3f}"
+        )
+    print("Canonical writes: 0 (proposal-only)")
+
+
+def _accept_source_extraction_result(
+    app: AthenaApplication,
+    result: SourceAnalysisExtractionResult,
+) -> int:
+    plan = app.source_proposal_acceptance.preflight(result)
+    knowledge_reuse = sum(1 for item in plan.knowledge if item.action.value != "create")
+    claim_reuse = sum(1 for item in plan.claims if item.action.value != "create")
+    print(
+        "Dedup preflight: "
+        f"knowledge_create={len(plan.knowledge) - knowledge_reuse} "
+        f"knowledge_reuse={knowledge_reuse} "
+        f"claim_create={len(plan.claims) - claim_reuse} "
+        f"claim_reuse={claim_reuse}"
+    )
+    keep_separate = False
+    if plan.merge_candidates:
+        print(f"Canonical near-duplicate candidates: {len(plan.merge_candidates)}")
+        for index, candidate in enumerate(plan.merge_candidates):
+            print(
+                f"[DM{index}] {candidate.proposal_type.value}[{candidate.proposal_index}] "
+                f"~ {candidate.existing_entity_id} similarity={candidate.similarity:.3f} "
+                f"reason={candidate.reason}"
+            )
+        answer = input(
+            "Keep ALL displayed near-duplicate proposals separate and continue? [y/N] "
+        ).strip().lower()
+        if answer not in {"y", "yes"}:
+            print("Acceptance blocked. Canonical writes: 0")
+            return 2
+        keep_separate = True
+
+    answer = input("Accept ALL displayed grounded source proposals? [y/N] ").strip().lower()
+    if answer not in {"y", "yes"}:
+        print("Acceptance cancelled. Canonical writes: 0")
+        return 0
+
+    accepted = app.source_proposal_acceptance.accept_all(
+        result,
+        expected_plan=plan,
+        keep_separate_near_duplicates=keep_separate,
+    )
+    print(f"Canonical commit: {accepted.commit_id}")
+    print(
+        f"Knowledge resolved: {len(accepted.knowledge_ids)} "
+        f"(created={len(accepted.knowledge_created_ids)} reused={len(accepted.knowledge_reused_ids)})"
+    )
+    for knowledge_id in accepted.knowledge_ids:
+        print(f"  K -> {knowledge_id}")
+    print(
+        f"Claims resolved: {len(accepted.claim_ids)} "
+        f"(created={len(accepted.claim_created_ids)} reused={len(accepted.claim_reused_ids)})"
+    )
+    for claim_id in accepted.claim_ids:
+        print(f"  C -> {claim_id}")
+    print(f"Contradictions queued for review: {len(accepted.contradiction_review_ids)}")
+    for review_id in accepted.contradiction_review_ids:
+        print(f"  REVIEW -> {review_id}")
+    return 0
+
+
 def _run_extract_command(app: AthenaApplication, args: argparse.Namespace) -> int:
     if args.extract_command == "chat":
-        result = app.extraction.extract_chat(
+        chat_result = app.extraction.extract_chat(
             chat_id=args.chat_id,
             requested_model_id=args.model_id,
         )
-        _print_extraction(result)
-        print(f"Frozen extraction run: {result.processing_run.processing_run_id}")
+        _print_extraction(chat_result)
+        print(f"Frozen extraction run: {chat_result.processing_run.processing_run_id}")
         if not args.accept:
             return 0
-        return _accept_extraction_result(app, result)
+        return _accept_extraction_result(app, chat_result)
 
     if args.extract_command == "accept-run":
         try:
-            result = app.extraction_snapshots.load(args.processing_run_id)
+            frozen_chat_result = app.extraction_snapshots.load(args.processing_run_id)
         except ExtractionSnapshotNotFoundError as exc:
             print(f"ATHENA extraction snapshot error: {exc}", file=sys.stderr)
             return 2
         print("Loaded frozen extraction proposal snapshot; Primary Model was not called.")
-        _print_extraction(result)
-        return _accept_extraction_result(app, result)
+        _print_extraction(frozen_chat_result)
+        return _accept_extraction_result(app, frozen_chat_result)
+
+    if args.extract_command == "source-analysis":
+        source_result = app.source_extraction.extract_analysis(
+            analysis_id=args.analysis_id,
+            requested_model_id=args.model_id,
+            context_limit=args.context_limit,
+            output_reserve=args.output_reserve,
+            safety_margin=args.safety_margin,
+        )
+        _print_source_extraction(source_result)
+        print(f"Frozen source extraction run: {source_result.processing_run.processing_run_id}")
+        if not args.accept:
+            return 0
+        return _accept_source_extraction_result(app, source_result)
+
+    if args.extract_command == "accept-source-run":
+        try:
+            frozen_source_result = app.source_extraction_snapshots.load(args.processing_run_id)
+        except SourceExtractionSnapshotNotFoundError as exc:
+            print(f"ATHENA source extraction snapshot error: {exc}", file=sys.stderr)
+            return 2
+        print("Loaded frozen source extraction proposal snapshot; Primary Model was not called.")
+        _print_source_extraction(frozen_source_result)
+        return _accept_source_extraction_result(app, frozen_source_result)
 
     raise RuntimeError(f"Unsupported extraction command: {args.extract_command!r}")
 

@@ -26,6 +26,11 @@ from athena.knowledge.extraction_snapshot import ExtractionSnapshotRepository
 from athena.knowledge.repository import KnowledgeRepository
 from athena.knowledge.review_service import ReviewService
 from athena.knowledge.service import KnowledgeService
+from athena.knowledge.source_acceptance import SourceProposalAcceptanceService
+from athena.knowledge.source_extraction import (
+    SourceAnalysisKnowledgeExtractionService,
+    SourceExtractionSnapshotRepository,
+)
 from athena.model.adapters.lm_studio import LMStudioProvider
 from athena.model.adapters.lm_studio_embeddings import LMStudioEmbeddingProvider
 from athena.model.provenance import ModelRunRepository
@@ -229,6 +234,26 @@ class AthenaApplication:
             analysis_worker=self.source_analysis,
         )
         self.reviews = ReviewService(self.database)
+        self.source_extraction_snapshots = SourceExtractionSnapshotRepository(
+            self.database, self.model_runs
+        )
+        self.source_extraction = SourceAnalysisKnowledgeExtractionService(
+            repository=self.source_analysis_repository,
+            anchors=self.source_anchors,
+            chat=self.chat,
+            chat_generation=self.chat_generation,
+            provider=self.model_provider,
+            runs=self.model_runs,
+            snapshots=self.source_extraction_snapshots,
+        )
+        self.source_proposal_acceptance = SourceProposalAcceptanceService(
+            database=self.database,
+            chat=self.chat,
+            analyses=self.source_analysis_repository,
+            anchors=self.source_anchors,
+            reviews=self.reviews,
+            snapshots=self.source_extraction_snapshots,
+        )
         self.extraction_snapshots = ExtractionSnapshotRepository(
             self.database, self.model_runs
         )

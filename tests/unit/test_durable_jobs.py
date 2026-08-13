@@ -91,6 +91,41 @@ def test_lease_checkpoint_and_completion_are_durable_and_fenced(tmp_path) -> Non
     app.stop()
 
 
+def test_checkpoint_listing_preserves_commit_order_when_timestamps_tie(tmp_path) -> None:
+    app = _app(tmp_path)
+    job = app.jobs.create(job_type="source.process")
+    leased = app.jobs.acquire(
+        job.job_id,
+        worker_id="worker-a",
+        lease_seconds=60,
+        now_us=1_000_000,
+    )
+    assert leased.lease_token is not None
+
+    first = app.jobs.checkpoint(
+        job.job_id,
+        lease_token=leased.lease_token,
+        current_stage="first",
+        resume_metadata={"next_stage": "first"},
+        now_us=1_000_001,
+    )
+    second = app.jobs.checkpoint(
+        job.job_id,
+        lease_token=leased.lease_token,
+        current_stage="second",
+        resume_metadata={"next_stage": "second"},
+        now_us=1_000_001,
+    )
+
+    checkpoints = app.jobs.checkpoints(job.job_id)
+    assert [item.checkpoint_id for item in checkpoints] == [
+        first.checkpoint_id,
+        second.checkpoint_id,
+    ]
+    assert [item.created_at_us for item in checkpoints] == [1_000_001, 1_000_002]
+    app.stop()
+
+
 def test_expired_lease_recovery_requeues_and_rejects_zombie_worker(tmp_path) -> None:
     app = _app(tmp_path)
     job = app.jobs.create(job_type="source.process")
