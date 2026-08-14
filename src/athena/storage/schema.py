@@ -27,7 +27,8 @@ SOURCE_KNOWLEDGE_SCHEMA_VERSION = 19
 HIERARCHICAL_SOURCE_EXTRACTION_SCHEMA_VERSION = 20
 PERSONAL_MEMORY_SCHEMA_VERSION = 21
 EXHAUSTIVE_RESEARCH_SCHEMA_VERSION = 22
-SCHEMA_VERSION = EXHAUSTIVE_RESEARCH_SCHEMA_VERSION
+RESEARCH_ORCHESTRATION_SCHEMA_VERSION = 23
+SCHEMA_VERSION = RESEARCH_ORCHESTRATION_SCHEMA_VERSION
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
@@ -51,6 +52,7 @@ SOURCE_KNOWLEDGE_MIGRATION_ID = "0019_source_analysis_knowledge_promotion"
 HIERARCHICAL_SOURCE_EXTRACTION_MIGRATION_ID = "0020_hierarchical_source_knowledge_extraction"
 PERSONAL_MEMORY_MIGRATION_ID = "0021_personal_memory_core"
 EXHAUSTIVE_RESEARCH_MIGRATION_ID = "0022_exhaustive_research_foundation"
+RESEARCH_ORCHESTRATION_MIGRATION_ID = "0023_exhaustive_research_orchestration"
 
 
 class DatabaseCompatibilityError(RuntimeError):
@@ -137,6 +139,7 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         SOURCE_KNOWLEDGE_SCHEMA_VERSION,
         HIERARCHICAL_SOURCE_EXTRACTION_SCHEMA_VERSION,
         PERSONAL_MEMORY_SCHEMA_VERSION,
+        EXHAUSTIVE_RESEARCH_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -234,9 +237,13 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
 
     if existing_user_version == PERSONAL_MEMORY_SCHEMA_VERSION:
         _migrate_schema_v21_to_v22(connection)
+        existing_user_version = EXHAUSTIVE_RESEARCH_SCHEMA_VERSION
+
+    if existing_user_version == EXHAUSTIVE_RESEARCH_SCHEMA_VERSION:
+        _migrate_schema_v22_to_v23(connection)
 
     _configure_connection(connection)
-    _verify_schema_v22(connection)
+    _verify_schema_v23(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -1892,6 +1899,165 @@ def _migrate_schema_v21_to_v22(connection: sqlite3.Connection) -> None:
         COMMIT;
         """
     )
+
+
+
+def _migrate_schema_v22_to_v23(connection: sqlite3.Connection) -> None:
+    """Add durable Research child orchestration and pinned model-contract state."""
+    connection.executescript(
+        f"""
+        BEGIN IMMEDIATE;
+
+        ALTER TABLE research_work_items
+            ADD COLUMN source_processing_job_id BLOB(16) NULL
+            REFERENCES jobs(job_id)
+            CHECK(
+                source_processing_job_id IS NULL
+                OR length(source_processing_job_id) = 16
+            );
+
+        ALTER TABLE research_scopes ADD COLUMN model_id TEXT NULL;
+        ALTER TABLE research_scopes
+            ADD COLUMN model_signature_id BLOB(16) NULL
+            REFERENCES model_signatures(model_signature_id)
+            CHECK(
+                model_signature_id IS NULL OR length(model_signature_id) = 16
+            );
+        ALTER TABLE research_scopes
+            ADD COLUMN model_signature_sha256 BLOB(32) NULL
+            CHECK(
+                model_signature_sha256 IS NULL
+                OR length(model_signature_sha256) = 32
+            );
+        ALTER TABLE research_scopes
+            ADD COLUMN effective_context_limit INTEGER NULL
+            CHECK(
+                effective_context_limit IS NULL OR effective_context_limit > 0
+            );
+        ALTER TABLE research_scopes
+            ADD COLUMN output_reserve INTEGER NULL
+            CHECK(output_reserve IS NULL OR output_reserve > 0);
+        ALTER TABLE research_scopes
+            ADD COLUMN safety_margin INTEGER NULL
+            CHECK(safety_margin IS NULL OR safety_margin >= 0);
+        ALTER TABLE research_scopes ADD COLUMN token_estimator TEXT NULL;
+        ALTER TABLE research_scopes
+            ADD COLUMN max_hierarchy_depth INTEGER NULL
+            CHECK(
+                max_hierarchy_depth IS NULL OR max_hierarchy_depth >= 1
+            );
+
+        CREATE UNIQUE INDEX uq_jobs_research_child_identity
+            ON jobs(
+                job_type,
+                json_extract(requested_scope_json, '$.research_work_item_id')
+            )
+            WHERE job_type IN ('source.process', 'source.analyze')
+              AND json_extract(
+                    requested_scope_json,
+                    '$.research_work_item_id'
+                  ) IS NOT NULL;
+
+        CREATE UNIQUE INDEX uq_research_work_source_processing_job
+            ON research_work_items(source_processing_job_id)
+            WHERE source_processing_job_id IS NOT NULL;
+
+        CREATE UNIQUE INDEX uq_research_work_source_analysis_job
+            ON research_work_items(source_analysis_job_id)
+            WHERE source_analysis_job_id IS NOT NULL;
+
+        CREATE INDEX idx_research_scope_model_signature
+            ON research_scopes(model_signature_id)
+            WHERE model_signature_id IS NOT NULL;
+
+        UPDATE schema_metadata
+        SET schema_version = {RESEARCH_ORCHESTRATION_SCHEMA_VERSION},
+            last_migration_id = '{RESEARCH_ORCHESTRATION_MIGRATION_ID}',
+            minimum_reader_version = {RESEARCH_ORCHESTRATION_SCHEMA_VERSION}
+        WHERE singleton_id = 1;
+
+        PRAGMA user_version = {RESEARCH_ORCHESTRATION_SCHEMA_VERSION};
+        COMMIT;
+        """
+    )
+
+
+def _verify_schema_v23(connection: sqlite3.Connection) -> None:
+    application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
+    user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if application_id != ATHENA_APPLICATION_ID:
+        raise DatabaseCompatibilityError("ATHENA application_id verification failed.")
+    if user_version != RESEARCH_ORCHESTRATION_SCHEMA_VERSION:
+        raise DatabaseCompatibilityError("ATHENA schema version verification failed.")
+
+    metadata = connection.execute(
+        "SELECT schema_version, storage_layout_version, blob_format_version, "
+        "last_migration_id, minimum_reader_version "
+        "FROM schema_metadata WHERE singleton_id = 1"
+    ).fetchone()
+    expected = (
+        RESEARCH_ORCHESTRATION_SCHEMA_VERSION,
+        STORAGE_LAYOUT_VERSION,
+        BLOB_FORMAT_VERSION,
+        RESEARCH_ORCHESTRATION_MIGRATION_ID,
+        RESEARCH_ORCHESTRATION_SCHEMA_VERSION,
+    )
+    if metadata is None or tuple(metadata) != expected:
+        raise DatabaseCompatibilityError("ATHENA schema_metadata verification failed.")
+
+    required_tables = {
+        "knowledge_units", "knowledge_unit_revisions", "claims", "claim_revisions",
+        "claim_evidence", "provenance_inputs", "model_signatures", "processing_runs",
+        "semantic_review_items", "semantic_merge_review_payloads",
+        "extraction_result_snapshots", "search_fts", "search_index_state",
+        "search_embeddings", "search_embedding_state", "blob_records", "sources",
+        "source_representations", "source_representation_pages",
+        "source_representation_structures", "source_anchor_structures",
+        "chunking_profiles", "source_anchors", "jobs", "checkpoints",
+        "source_analyses", "source_analysis_work_items", "source_analysis_artifacts",
+        "source_analysis_work_inputs", "source_extraction_result_snapshots",
+        "source_analysis_knowledge_origins", "source_extractions",
+        "source_extraction_evidence", "source_extraction_work_items",
+        "source_extraction_artifacts", "source_extraction_work_inputs",
+        "personal_memory_entries", "personal_memory_revisions",
+        "research_scopes", "research_candidate_sets", "research_candidates",
+        "research_work_items",
+    }
+    missing_tables = required_tables.difference(_user_tables(connection))
+    if missing_tables:
+        missing = ", ".join(sorted(missing_tables))
+        raise DatabaseCompatibilityError(
+            f"ATHENA semantic schema is incomplete: {missing}."
+        )
+
+    scope_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(research_scopes)")
+    }
+    if not {
+        "model_id",
+        "model_signature_id",
+        "model_signature_sha256",
+        "effective_context_limit",
+        "output_reserve",
+        "safety_margin",
+        "token_estimator",
+        "max_hierarchy_depth",
+    }.issubset(scope_columns):
+        raise DatabaseCompatibilityError(
+            "ATHENA research_scopes orchestration columns are incomplete."
+        )
+
+    work_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(research_work_items)")
+    }
+    if "source_processing_job_id" not in work_columns:
+        raise DatabaseCompatibilityError(
+            "ATHENA research_work_items child orchestration is incomplete."
+        )
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise DatabaseCompatibilityError("ATHENA foreign-key verification failed.")
 
 
 def _verify_schema_v22(connection: sqlite3.Connection) -> None:

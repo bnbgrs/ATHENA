@@ -61,6 +61,14 @@ class ResearchScopeRecord:
     internet_scope_json: str | None
     coverage_target: float
     snapshot_commit_seq: int
+    model_id: str | None
+    model_signature_id: uuid.UUID | None
+    model_signature_sha256: bytes | None
+    effective_context_limit: int | None
+    output_reserve: int | None
+    safety_margin: int | None
+    token_estimator: str | None
+    max_hierarchy_depth: int | None
     state: ResearchScopeState
     candidate_total: int
     processed_count: int
@@ -106,6 +114,7 @@ class ResearchWorkItemRecord:
     candidate_id: uuid.UUID
     state: ResearchWorkState
     idempotency_key: bytes
+    source_processing_job_id: uuid.UUID | None
     source_analysis_job_id: uuid.UUID | None
     attempt_count: int
     created_at_us: int

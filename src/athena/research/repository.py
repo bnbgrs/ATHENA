@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import sqlite3
 import uuid
@@ -10,6 +11,7 @@ from collections.abc import Sequence
 
 from athena.common.ids import new_uuid7, uuid_from_blob, uuid_to_blob
 from athena.common.time import utc_now_us
+from athena.jobs.repository import JobLeaseError
 from athena.research.models import (
     ResearchCandidateEligibility,
     ResearchCandidateRecord,
@@ -39,6 +41,10 @@ class ResearchScopeUnsupportedError(ValueError):
 
 class ResearchSnapshotError(RuntimeError):
     """Raised when an explicit candidate cannot exist inside the pinned snapshot."""
+
+
+class ResearchFenceError(JobLeaseError):
+    """Raised when a stale Research parent tries to commit orchestration state."""
 
 
 class ResearchRepository:
@@ -357,6 +363,374 @@ class ResearchRepository:
 
         return self.get_candidate_set(scope_id)
 
+    def pin_model_contract_fenced(
+        self,
+        scope_id: uuid.UUID,
+        *,
+        parent_job_id: uuid.UUID,
+        lease_token: bytes,
+        model_id: str,
+        model_signature_id: uuid.UUID,
+        model_signature_sha256: bytes,
+        effective_context_limit: int,
+        output_reserve: int,
+        safety_margin: int,
+        token_estimator: str,
+        max_hierarchy_depth: int,
+    ) -> ResearchScopeRecord:
+        if len(model_signature_sha256) != 32:
+            raise ResearchStateError("Research ModelSignature hash must be SHA-256.")
+        expected = (
+            model_id,
+            model_signature_id,
+            model_signature_sha256,
+            effective_context_limit,
+            output_reserve,
+            safety_margin,
+            token_estimator,
+            max_hierarchy_depth,
+        )
+        with self.database.write_transaction() as connection:
+            self._require_live_fence(connection, parent_job_id, lease_token)
+            row = connection.execute(
+                "SELECT * FROM research_scopes WHERE scope_id = ?",
+                (uuid_to_blob(scope_id),),
+            ).fetchone()
+            if row is None:
+                raise ResearchNotFoundError(str(scope_id))
+            current = _scope_from_row(row)
+            actual = (
+                current.model_id,
+                current.model_signature_id,
+                current.model_signature_sha256,
+                current.effective_context_limit,
+                current.output_reserve,
+                current.safety_margin,
+                current.token_estimator,
+                current.max_hierarchy_depth,
+            )
+            if any(item is not None for item in actual):
+                if actual != expected:
+                    raise ResearchStateError(
+                        "ResearchScope already pins a different model contract."
+                    )
+                return current
+            if output_reserve + safety_margin >= effective_context_limit:
+                raise ResearchStateError(
+                    "Research model contract leaves no effective input budget."
+                )
+            connection.execute(
+                """
+                UPDATE research_scopes
+                SET model_id = ?,
+                    model_signature_id = ?,
+                    model_signature_sha256 = ?,
+                    effective_context_limit = ?,
+                    output_reserve = ?,
+                    safety_margin = ?,
+                    token_estimator = ?,
+                    max_hierarchy_depth = ?,
+                    updated_at_us = ?
+                WHERE scope_id = ?
+                """,
+                (
+                    model_id,
+                    uuid_to_blob(model_signature_id),
+                    model_signature_sha256,
+                    effective_context_limit,
+                    output_reserve,
+                    safety_margin,
+                    token_estimator,
+                    max_hierarchy_depth,
+                    utc_now_us(),
+                    uuid_to_blob(scope_id),
+                ),
+            )
+        return self.get_scope(scope_id)
+
+    def mark_scope_state_fenced(
+        self,
+        scope_id: uuid.UUID,
+        *,
+        parent_job_id: uuid.UUID,
+        lease_token: bytes,
+        state: ResearchScopeState,
+    ) -> ResearchScopeRecord:
+        if state not in {ResearchScopeState.RUNNING, ResearchScopeState.PARTIAL}:
+            raise ResearchStateError(
+                f"Fenced orchestration cannot set ResearchScope to {state.value!r}."
+            )
+        with self.database.write_transaction() as connection:
+            self._require_live_fence(connection, parent_job_id, lease_token)
+            row = connection.execute(
+                "SELECT state FROM research_scopes WHERE scope_id = ?",
+                (uuid_to_blob(scope_id),),
+            ).fetchone()
+            if row is None:
+                raise ResearchNotFoundError(str(scope_id))
+            current = ResearchScopeState(str(row["state"]))
+            if current is state:
+                return self.get_scope(scope_id)
+            allowed = (
+                state is ResearchScopeState.RUNNING
+                and current is ResearchScopeState.FROZEN
+            ) or (
+                state is ResearchScopeState.PARTIAL
+                and current in {ResearchScopeState.FROZEN, ResearchScopeState.RUNNING}
+            )
+            if not allowed:
+                raise ResearchStateError(
+                    f"ResearchScope cannot transition {current.value!r} -> {state.value!r}."
+                )
+            connection.execute(
+                "UPDATE research_scopes SET state = ?, updated_at_us = ? WHERE scope_id = ?",
+                (state.value, utc_now_us(), uuid_to_blob(scope_id)),
+            )
+        return self.get_scope(scope_id)
+
+    def mark_scope_partial_unleased(
+        self,
+        scope_id: uuid.UUID,
+    ) -> ResearchScopeRecord:
+        with self.database.write_transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT rs.state AS scope_state, j.state AS job_state
+                FROM research_scopes AS rs
+                JOIN jobs AS j ON j.job_id = rs.job_id
+                WHERE rs.scope_id = ?
+                """,
+                (uuid_to_blob(scope_id),),
+            ).fetchone()
+            if row is None:
+                raise ResearchNotFoundError(str(scope_id))
+            if str(row["job_state"]) in {"running", "cancel_requested"}:
+                raise ResearchStateError(
+                    "Running ResearchScope must be made partial by its fenced worker."
+                )
+            current = ResearchScopeState(str(row["scope_state"]))
+            if current is ResearchScopeState.PARTIAL:
+                return self.get_scope(scope_id)
+            if current not in {ResearchScopeState.FROZEN, ResearchScopeState.RUNNING}:
+                raise ResearchStateError(
+                    f"ResearchScope cannot become partial from {current.value!r}."
+                )
+            connection.execute(
+                "UPDATE research_scopes SET state = 'partial', updated_at_us = ? "
+                "WHERE scope_id = ?",
+                (utc_now_us(), uuid_to_blob(scope_id)),
+            )
+        return self.get_scope(scope_id)
+
+    def next_pending_work(
+        self,
+        scope_id: uuid.UUID,
+    ) -> ResearchWorkItemRecord | None:
+        row = self.database.connection.execute(
+            """
+            SELECT rw.*
+            FROM research_work_items AS rw
+            JOIN research_candidates AS rc ON rc.candidate_id = rw.candidate_id
+            WHERE rw.scope_id = ? AND rw.state = 'pending'
+            ORDER BY rc.ordinal ASC, rw.work_item_id ASC
+            LIMIT 1
+            """,
+            (uuid_to_blob(scope_id),),
+        ).fetchone()
+        return None if row is None else _work_item_from_row(row)
+
+    def get_candidate(
+        self,
+        candidate_id: uuid.UUID,
+    ) -> ResearchCandidateRecord:
+        row = self.database.connection.execute(
+            "SELECT * FROM research_candidates WHERE candidate_id = ?",
+            (uuid_to_blob(candidate_id),),
+        ).fetchone()
+        if row is None:
+            raise ResearchNotFoundError(str(candidate_id))
+        return _candidate_from_row(row)
+
+    def find_child_job_for_work_item(
+        self,
+        work_item_id: uuid.UUID,
+        *,
+        job_type: str,
+    ) -> uuid.UUID | None:
+        if job_type not in {"source.process", "source.analyze"}:
+            raise ResearchStateError(f"Unsupported Research child type {job_type!r}.")
+        rows = self.database.connection.execute(
+            """
+            SELECT job_id
+            FROM jobs
+            WHERE job_type = ?
+              AND json_extract(
+                    requested_scope_json,
+                    '$.research_work_item_id'
+                  ) = ?
+            ORDER BY created_at_us ASC, job_id ASC
+            """,
+            (job_type, str(work_item_id)),
+        ).fetchall()
+        if len(rows) > 1:
+            raise ResearchStateError(
+                f"Research work {work_item_id} has duplicate {job_type} children."
+            )
+        if not rows:
+            return None
+        return uuid_from_blob(bytes(rows[0]["job_id"]))
+
+    def link_source_processing_job_fenced(
+        self,
+        work_item_id: uuid.UUID,
+        *,
+        parent_job_id: uuid.UUID,
+        lease_token: bytes,
+        child_job_id: uuid.UUID,
+    ) -> ResearchWorkItemRecord:
+        return self._link_child_job_fenced(
+            work_item_id,
+            parent_job_id=parent_job_id,
+            lease_token=lease_token,
+            child_job_id=child_job_id,
+            column="source_processing_job_id",
+            expected_job_type="source.process",
+        )
+
+    def link_source_analysis_job_fenced(
+        self,
+        work_item_id: uuid.UUID,
+        *,
+        parent_job_id: uuid.UUID,
+        lease_token: bytes,
+        child_job_id: uuid.UUID,
+    ) -> ResearchWorkItemRecord:
+        return self._link_child_job_fenced(
+            work_item_id,
+            parent_job_id=parent_job_id,
+            lease_token=lease_token,
+            child_job_id=child_job_id,
+            column="source_analysis_job_id",
+            expected_job_type="source.analyze",
+        )
+
+    def _link_child_job_fenced(
+        self,
+        work_item_id: uuid.UUID,
+        *,
+        parent_job_id: uuid.UUID,
+        lease_token: bytes,
+        child_job_id: uuid.UUID,
+        column: str,
+        expected_job_type: str,
+    ) -> ResearchWorkItemRecord:
+        if column not in {"source_processing_job_id", "source_analysis_job_id"}:
+            raise ResearchStateError("Invalid Research child-link column.")
+        with self.database.write_transaction() as connection:
+            self._require_live_fence(connection, parent_job_id, lease_token)
+            row = connection.execute(
+                """
+                SELECT rw.*, rc.source_id, rs.job_id AS parent_job_id
+                FROM research_work_items AS rw
+                JOIN research_candidates AS rc ON rc.candidate_id = rw.candidate_id
+                JOIN research_scopes AS rs ON rs.scope_id = rw.scope_id
+                WHERE rw.work_item_id = ?
+                """,
+                (uuid_to_blob(work_item_id),),
+            ).fetchone()
+            if row is None:
+                raise ResearchNotFoundError(str(work_item_id))
+            if bytes(row["parent_job_id"]) != parent_job_id.bytes:
+                raise ResearchStateError("Research work belongs to another parent job.")
+            existing = row[column]
+            if existing is not None:
+                existing_id = uuid_from_blob(bytes(existing))
+                if existing_id != child_job_id:
+                    raise ResearchStateError(
+                        "Research work is already linked to a different child."
+                    )
+                return self.get_work_item(work_item_id)
+
+            child = connection.execute(
+                "SELECT job_type, requested_scope_json FROM jobs WHERE job_id = ?",
+                (uuid_to_blob(child_job_id),),
+            ).fetchone()
+            if child is None or str(child["job_type"]) != expected_job_type:
+                raise ResearchStateError(
+                    f"Research child {child_job_id} is not {expected_job_type!r}."
+                )
+            try:
+                child_scope = json.loads(str(child["requested_scope_json"]))
+            except json.JSONDecodeError as exc:
+                raise ResearchStateError("Research child scope is invalid JSON.") from exc
+            if not isinstance(child_scope, dict):
+                raise ResearchStateError("Research child scope must be an object.")
+            if child_scope.get("research_work_item_id") != str(work_item_id):
+                raise ResearchStateError("Research child lost its work identity.")
+            source_id = uuid_from_blob(bytes(row["source_id"]))
+            if child_scope.get("source_id") != str(source_id):
+                raise ResearchStateError("Research child points at the wrong Source.")
+
+            connection.execute(
+                f"UPDATE research_work_items SET {column} = ?, updated_at_us = ? "
+                "WHERE work_item_id = ?",
+                (
+                    uuid_to_blob(child_job_id),
+                    utc_now_us(),
+                    uuid_to_blob(work_item_id),
+                ),
+            )
+        return self.get_work_item(work_item_id)
+
+    def mark_work_state_fenced(
+        self,
+        work_item_id: uuid.UUID,
+        *,
+        parent_job_id: uuid.UUID,
+        lease_token: bytes,
+        state: ResearchWorkState,
+    ) -> ResearchWorkItemRecord:
+        if state is ResearchWorkState.PENDING:
+            raise ResearchStateError("Fenced work commit requires a terminal state.")
+        with self.database.write_transaction() as connection:
+            self._require_live_fence(connection, parent_job_id, lease_token)
+            row = connection.execute(
+                """
+                SELECT rw.*, rs.job_id AS parent_job_id
+                FROM research_work_items AS rw
+                JOIN research_scopes AS rs ON rs.scope_id = rw.scope_id
+                WHERE rw.work_item_id = ?
+                """,
+                (uuid_to_blob(work_item_id),),
+            ).fetchone()
+            if row is None:
+                raise ResearchNotFoundError(str(work_item_id))
+            if bytes(row["parent_job_id"]) != parent_job_id.bytes:
+                raise ResearchStateError("Research work belongs to another parent job.")
+            current = _work_item_from_row(row)
+            if current.state is state:
+                return current
+            if current.state is not ResearchWorkState.PENDING:
+                raise ResearchStateError(
+                    f"Research work {work_item_id} is already terminal "
+                    f"({current.state.value!r})."
+                )
+            now_us = utc_now_us()
+            connection.execute(
+                """
+                UPDATE research_work_items
+                SET state = ?, attempt_count = attempt_count + 1, updated_at_us = ?
+                WHERE work_item_id = ? AND state = 'pending'
+                """,
+                (state.value, now_us, uuid_to_blob(work_item_id)),
+            )
+            self._recompute_scope_counters(
+                connection,
+                scope_id=current.scope_id,
+                now_us=now_us,
+            )
+        return self.get_work_item(work_item_id)
+
     def list_candidates(
         self,
         scope_id: uuid.UUID,
@@ -453,6 +827,38 @@ class ResearchRepository:
             eligible_count=eligible_count,
             coverage_ratio=scope.coverage_ratio,
         )
+
+    @staticmethod
+    def _require_live_fence(
+        connection: sqlite3.Connection,
+        job_id: uuid.UUID,
+        lease_token: bytes,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT state, lease_token, lease_expires_at_us
+            FROM jobs
+            WHERE job_id = ?
+            """,
+            (uuid_to_blob(job_id),),
+        ).fetchone()
+        if row is None:
+            raise ResearchFenceError(f"Research parent job {job_id} does not exist.")
+        if str(row["state"]) not in {"running", "cancel_requested"}:
+            raise ResearchFenceError(
+                "Research parent does not own a live running fence."
+            )
+        persisted = row["lease_token"]
+        expires = row["lease_expires_at_us"]
+        if (
+            persisted is None
+            or not hmac.compare_digest(bytes(persisted), lease_token)
+            or expires is None
+            or int(expires) <= utc_now_us()
+        ):
+            raise ResearchFenceError(
+                "Research parent lease is stale or mismatched."
+            )
 
     @staticmethod
     def _select_sources_as_of(
@@ -597,6 +1003,36 @@ def _scope_from_row(row: sqlite3.Row) -> ResearchScopeRecord:
         ),
         coverage_target=float(row["coverage_target"]),
         snapshot_commit_seq=int(row["snapshot_commit_seq"]),
+        model_id=str(row["model_id"]) if row["model_id"] is not None else None,
+        model_signature_id=(
+            uuid_from_blob(bytes(row["model_signature_id"]))
+            if row["model_signature_id"] is not None
+            else None
+        ),
+        model_signature_sha256=(
+            bytes(row["model_signature_sha256"])
+            if row["model_signature_sha256"] is not None
+            else None
+        ),
+        effective_context_limit=(
+            int(row["effective_context_limit"])
+            if row["effective_context_limit"] is not None
+            else None
+        ),
+        output_reserve=(
+            int(row["output_reserve"]) if row["output_reserve"] is not None else None
+        ),
+        safety_margin=(
+            int(row["safety_margin"]) if row["safety_margin"] is not None else None
+        ),
+        token_estimator=(
+            str(row["token_estimator"]) if row["token_estimator"] is not None else None
+        ),
+        max_hierarchy_depth=(
+            int(row["max_hierarchy_depth"])
+            if row["max_hierarchy_depth"] is not None
+            else None
+        ),
         state=ResearchScopeState(str(row["state"])),
         candidate_total=int(row["candidate_total"]),
         processed_count=int(row["processed_count"]),
@@ -651,6 +1087,11 @@ def _work_item_from_row(row: sqlite3.Row) -> ResearchWorkItemRecord:
         candidate_id=uuid_from_blob(bytes(row["candidate_id"])),
         state=ResearchWorkState(str(row["state"])),
         idempotency_key=bytes(row["idempotency_key"]),
+        source_processing_job_id=(
+            uuid_from_blob(bytes(row["source_processing_job_id"]))
+            if row["source_processing_job_id"] is not None
+            else None
+        ),
         source_analysis_job_id=(
             uuid_from_blob(bytes(row["source_analysis_job_id"]))
             if row["source_analysis_job_id"] is not None

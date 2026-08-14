@@ -4,7 +4,6 @@ from athena.common.ids import new_uuid7, uuid_to_blob
 from athena.storage.database import SQLiteDatabase
 from athena.storage.schema import (
     DURABLE_JOBS_SCHEMA_VERSION,
-    EXHAUSTIVE_RESEARCH_MIGRATION_ID,
     EXHAUSTIVE_RESEARCH_SCHEMA_VERSION,
     EXTRACTION_SNAPSHOT_SCHEMA_VERSION,
     HIERARCHICAL_SOURCE_EXTRACTION_SCHEMA_VERSION,
@@ -18,6 +17,8 @@ from athena.storage.schema import (
     PERSONAL_MEMORY_MIGRATION_ID,
     PERSONAL_MEMORY_SCHEMA_VERSION,
     PROVENANCE_SCHEMA_VERSION,
+    RESEARCH_ORCHESTRATION_MIGRATION_ID,
+    RESEARCH_ORCHESTRATION_SCHEMA_VERSION,
     REVIEW_QUEUE_SCHEMA_VERSION,
     SCHEMA_VERSION,
     SOURCE_ANALYSIS_SCHEMA_VERSION,
@@ -99,7 +100,7 @@ def test_fresh_database_contains_semantic_schema(tmp_path) -> None:
     ).fetchone()
     assert tuple(metadata) == (
         SCHEMA_VERSION,
-        EXHAUSTIVE_RESEARCH_MIGRATION_ID,
+        RESEARCH_ORCHESTRATION_MIGRATION_ID,
         SCHEMA_VERSION,
     )
 
@@ -632,7 +633,7 @@ def test_v14_database_is_upgraded_additively_to_durable_jobs(tmp_path) -> None:
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == EXHAUSTIVE_RESEARCH_MIGRATION_ID
+    assert metadata["last_migration_id"] == RESEARCH_ORCHESTRATION_MIGRATION_ID
     database.stop()
 
 
@@ -797,7 +798,7 @@ def test_v17_database_is_upgraded_additively_to_hierarchical_source_analysis(tmp
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == EXHAUSTIVE_RESEARCH_MIGRATION_ID
+    assert metadata["last_migration_id"] == RESEARCH_ORCHESTRATION_MIGRATION_ID
     database.stop()
 
 
@@ -856,7 +857,7 @@ def test_v18_database_is_upgraded_additively_to_source_knowledge_promotion(tmp_p
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == EXHAUSTIVE_RESEARCH_MIGRATION_ID
+    assert metadata["last_migration_id"] == RESEARCH_ORCHESTRATION_MIGRATION_ID
     database.stop()
 
 
@@ -922,7 +923,7 @@ def test_v19_database_is_upgraded_additively_to_hierarchical_source_extraction(t
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == EXHAUSTIVE_RESEARCH_MIGRATION_ID
+    assert metadata["last_migration_id"] == RESEARCH_ORCHESTRATION_MIGRATION_ID
     database.stop()
 
 
@@ -991,7 +992,7 @@ def test_v20_database_is_upgraded_additively_to_personal_memory(tmp_path) -> Non
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == EXHAUSTIVE_RESEARCH_MIGRATION_ID
+    assert metadata["last_migration_id"] == RESEARCH_ORCHESTRATION_MIGRATION_ID
     database.stop()
 
 
@@ -1057,7 +1058,7 @@ def test_v21_database_is_upgraded_additively_to_exhaustive_research(tmp_path) ->
     database = SQLiteDatabase(path)
     database.start()
     assert database.connection.execute("PRAGMA user_version").fetchone()[0] == (
-        EXHAUSTIVE_RESEARCH_SCHEMA_VERSION
+        RESEARCH_ORCHESTRATION_SCHEMA_VERSION
     )
     assert {
         "research_scopes",
@@ -1069,5 +1070,99 @@ def test_v21_database_is_upgraded_additively_to_exhaustive_research(tmp_path) ->
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == EXHAUSTIVE_RESEARCH_MIGRATION_ID
+    assert metadata["last_migration_id"] == RESEARCH_ORCHESTRATION_MIGRATION_ID
+    database.stop()
+
+
+def test_v22_database_is_upgraded_additively_to_research_orchestration(
+    tmp_path,
+) -> None:
+    from athena.storage.schema import (
+        _migrate_schema_v3_to_v4,
+        _migrate_schema_v4_to_v5,
+        _migrate_schema_v5_to_v6,
+        _migrate_schema_v6_to_v7,
+        _migrate_schema_v7_to_v8,
+        _migrate_schema_v8_to_v9,
+        _migrate_schema_v9_to_v10,
+        _migrate_schema_v10_to_v11,
+        _migrate_schema_v11_to_v12,
+        _migrate_schema_v12_to_v13,
+        _migrate_schema_v13_to_v14,
+        _migrate_schema_v14_to_v15,
+        _migrate_schema_v15_to_v16,
+        _migrate_schema_v16_to_v17,
+        _migrate_schema_v17_to_v18,
+        _migrate_schema_v18_to_v19,
+        _migrate_schema_v19_to_v20,
+        _migrate_schema_v20_to_v21,
+        _migrate_schema_v21_to_v22,
+    )
+
+    path = tmp_path / "athena.db"
+    legacy = sqlite3.connect(path, autocommit=True)
+    legacy.row_factory = sqlite3.Row
+    legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
+    legacy.execute("PRAGMA application_id = 1096042574")
+    _create_schema_v1(legacy, created_at_us=1)
+    _migrate_schema_v1_to_v2(legacy)
+    _migrate_schema_v2_to_v3(legacy)
+    _migrate_schema_v3_to_v4(legacy)
+    _migrate_schema_v4_to_v5(legacy)
+    _migrate_schema_v5_to_v6(legacy)
+    _migrate_schema_v6_to_v7(legacy)
+    _migrate_schema_v7_to_v8(legacy)
+    _migrate_schema_v8_to_v9(legacy)
+    _migrate_schema_v9_to_v10(legacy)
+    _migrate_schema_v10_to_v11(legacy)
+    _migrate_schema_v11_to_v12(legacy)
+    _migrate_schema_v12_to_v13(legacy)
+    _migrate_schema_v13_to_v14(legacy)
+    _migrate_schema_v14_to_v15(legacy)
+    _migrate_schema_v15_to_v16(legacy)
+    _migrate_schema_v16_to_v17(legacy)
+    _migrate_schema_v17_to_v18(legacy)
+    _migrate_schema_v18_to_v19(legacy)
+    _migrate_schema_v19_to_v20(legacy)
+    _migrate_schema_v20_to_v21(legacy)
+    _migrate_schema_v21_to_v22(legacy)
+    assert legacy.execute("PRAGMA user_version").fetchone()[0] == (
+        EXHAUSTIVE_RESEARCH_SCHEMA_VERSION
+    )
+    assert "source_processing_job_id" not in {
+        str(row[1])
+        for row in legacy.execute("PRAGMA table_info(research_work_items)")
+    }
+    legacy.close()
+
+    database = SQLiteDatabase(path)
+    database.start()
+    assert database.connection.execute("PRAGMA user_version").fetchone()[0] == (
+        RESEARCH_ORCHESTRATION_SCHEMA_VERSION
+    )
+    assert "source_processing_job_id" in {
+        str(row[1])
+        for row in database.connection.execute(
+            "PRAGMA table_info(research_work_items)"
+        )
+    }
+    scope_columns = {
+        str(row[1])
+        for row in database.connection.execute("PRAGMA table_info(research_scopes)")
+    }
+    assert {
+        "model_id",
+        "model_signature_id",
+        "model_signature_sha256",
+        "effective_context_limit",
+        "output_reserve",
+        "safety_margin",
+        "token_estimator",
+        "max_hierarchy_depth",
+    }.issubset(scope_columns)
+    metadata = database.connection.execute(
+        "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
+    ).fetchone()
+    assert metadata is not None
+    assert metadata["last_migration_id"] == RESEARCH_ORCHESTRATION_MIGRATION_ID
     database.stop()

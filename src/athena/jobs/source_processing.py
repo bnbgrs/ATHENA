@@ -114,13 +114,17 @@ class DurableSourceProcessingWorker:
         source_id: uuid.UUID,
         *,
         priority: JobPriority = JobPriority.NORMAL,
+        research_work_item_id: uuid.UUID | None = None,
     ) -> JobRecord:
         """Queue one reproducibly configured source-processing job."""
         self.sources.get(source_id)
+        requested_scope: dict[str, object] = {"source_id": str(source_id)}
+        if research_work_item_id is not None:
+            requested_scope["research_work_item_id"] = str(research_work_item_id)
         return self.jobs.create(
             job_type="source.process",
             priority=priority,
-            requested_scope={"source_id": str(source_id)},
+            requested_scope=requested_scope,
             pinned_configuration={
                 "pipeline_version": _PIPELINE_VERSION,
                 "text_parser": f"{_TEXT_PARSER_ID}@{_TEXT_PARSER_VERSION}",

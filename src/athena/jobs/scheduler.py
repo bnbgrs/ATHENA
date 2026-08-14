@@ -15,6 +15,7 @@ from athena.jobs.embedding_processing import (
 )
 from athena.jobs.models import JobRecord, JobState, WaitingReason
 from athena.jobs.repository import JobLeaseError, JobTransitionError
+from athena.jobs.research import DurableResearchWorker, ResearchJobError
 from athena.jobs.service import DurableJobService
 from athena.jobs.source_analysis import DurableSourceAnalysisWorker, SourceAnalysisJobError
 from athena.jobs.source_extraction import (
@@ -29,7 +30,13 @@ from athena.jobs.source_processing import (
 logger = logging.getLogger(__name__)
 
 _SUPPORTED_JOB_TYPES = frozenset(
-    {"source.process", "embedding.rebuild", "source.analyze", "source.extract"}
+    {
+        "source.process",
+        "embedding.rebuild",
+        "source.analyze",
+        "source.extract",
+        "research.exhaustive",
+    }
 )
 _AUTO_RETRY_REASONS = frozenset(
     {
@@ -127,6 +134,7 @@ class DurableJobScheduler:
         embedding_worker: DurableEmbeddingRebuildWorker,
         analysis_worker: DurableSourceAnalysisWorker | None = None,
         extraction_worker: DurableSourceHierarchicalExtractionWorker | None = None,
+        research_worker: DurableResearchWorker | None = None,
         policy: SchedulerPolicy | None = None,
     ) -> None:
         self.jobs = jobs
@@ -134,6 +142,7 @@ class DurableJobScheduler:
         self.embedding_worker = embedding_worker
         self.analysis_worker = analysis_worker
         self.extraction_worker = extraction_worker
+        self.research_worker = research_worker
         self.policy = policy or SchedulerPolicy()
 
     @property
@@ -343,6 +352,10 @@ class DurableJobScheduler:
                 if self.extraction_worker is None:
                     raise JobSchedulerError("No source.extract worker is configured.")
                 return self._dispatch_extraction(leased.job_id, lease_token)
+            if leased.job_type == "research.exhaustive":
+                if self.research_worker is None:
+                    raise JobSchedulerError("No research.exhaustive worker is configured.")
+                return self._dispatch_research(leased.job_id, lease_token)
             raise JobSchedulerError(
                 f"No scheduler dispatcher registered for {leased.job_type!r}."
             )
@@ -353,6 +366,7 @@ class DurableJobScheduler:
             EmbeddingRebuildJobError,
             SourceAnalysisJobError,
             SourceHierarchicalExtractionJobError,
+            ResearchJobError,
         ) as exc:
             return "failed", self._fail_if_still_leased(
                 leased.job_id,
@@ -436,6 +450,30 @@ class DurableJobScheduler:
                 return "waiting", result.job
         return self._yield_at_boundary(job_id, lease_token)
 
+    def _dispatch_research(
+        self,
+        job_id: uuid.UUID,
+        lease_token: bytes,
+    ) -> tuple[str, JobRecord]:
+        if self.research_worker is None:
+            raise JobSchedulerError("No research.exhaustive worker is configured.")
+        for _ in range(self.policy.max_boundaries_per_dispatch):
+            result = self.research_worker.step(
+                job_id,
+                lease_token=lease_token,
+                extend_seconds=self.policy.lease_seconds,
+            )
+            if result.done:
+                action = (
+                    "cancelled"
+                    if result.job.state is JobState.CANCELLED
+                    else "completed"
+                )
+                return action, result.job
+            if result.waiting:
+                return "waiting", result.job
+        return self._yield_at_boundary(job_id, lease_token)
+
     def _yield_at_boundary(
         self,
         job_id: uuid.UUID,
@@ -475,6 +513,15 @@ class DurableJobScheduler:
                     extend_seconds=self.policy.lease_seconds,
                 )
                 return "cancelled", extraction_result.job
+            if current.job_type == "research.exhaustive":
+                if self.research_worker is None:
+                    raise JobSchedulerError("No research.exhaustive worker is configured.")
+                research_result = self.research_worker.step(
+                    job_id,
+                    lease_token=lease_token,
+                    extend_seconds=self.policy.lease_seconds,
+                )
+                return "cancelled", research_result.job
         yielded = self.jobs.yield_job(job_id, lease_token=lease_token)
         return "yielded", yielded
 

@@ -171,7 +171,29 @@ class SourceAnalysisService:
         normalized_question = question.strip()
         if not normalized_question:
             raise SourceAnalysisConfigurationError("Analysis question must not be empty.")
-        representation_id = self._select_processed_representation(source_id)
+        config = self.pin_configuration(
+            requested_model_id=requested_model_id,
+            context_limit=context_limit,
+            output_reserve=output_reserve,
+            safety_margin=safety_margin,
+            max_hierarchy_depth=max_hierarchy_depth,
+        )
+        return self.enqueue_pinned(
+            source_id,
+            question=normalized_question,
+            config=config,
+            priority=priority,
+        )
+
+    def pin_configuration(
+        self,
+        *,
+        requested_model_id: str | None = None,
+        context_limit: int | None = None,
+        output_reserve: int | None = None,
+        safety_margin: int | None = None,
+        max_hierarchy_depth: int = DEFAULT_MAX_HIERARCHY_DEPTH,
+    ) -> AnalysisPinnedConfiguration:
         model = self.select_model(requested_model_id)
         config, _signature = self._pin_configuration(
             model,
@@ -180,14 +202,62 @@ class SourceAnalysisService:
             safety_margin=safety_margin,
             max_hierarchy_depth=max_hierarchy_depth,
         )
+        return config
+
+    def assert_pinned_configuration_unchanged(
+        self,
+        config: AnalysisPinnedConfiguration,
+    ) -> ModelInfo:
+        model = self.select_model(config.model_id)
+        if (
+            model.context_capacity is not None
+            and config.effective_context_limit > model.context_capacity
+        ):
+            raise SourceAnalysisModelDriftError(
+                "Current model context capacity is smaller than the pinned effective context limit."
+            )
+        if (
+            model.loaded_context_length is not None
+            and config.effective_context_limit > model.loaded_context_length
+        ):
+            raise SourceAnalysisModelDriftError(
+                "Current loaded runtime context is smaller than the pinned effective context limit."
+            )
+        signature = self._signature_for_model(model, config)
+        if (
+            signature.model_signature_id != config.model_signature_id
+            or signature.signature_hash != config.model_signature_hash
+        ):
+            raise SourceAnalysisModelDriftError(
+                "Current Primary Model signature differs from the pinned source analysis model."
+            )
+        return model
+
+    def enqueue_pinned(
+        self,
+        source_id: uuid.UUID,
+        *,
+        question: str,
+        config: AnalysisPinnedConfiguration,
+        priority: JobPriority = JobPriority.NORMAL,
+        research_work_item_id: uuid.UUID | None = None,
+    ) -> JobRecord:
+        normalized_question = question.strip()
+        if not normalized_question:
+            raise SourceAnalysisConfigurationError("Analysis question must not be empty.")
+        self.assert_pinned_configuration_unchanged(config)
+        representation_id = self._select_processed_representation(source_id)
+        requested_scope: dict[str, object] = {
+            "source_id": str(source_id),
+            "representation_id": str(representation_id),
+            "question": normalized_question,
+        }
+        if research_work_item_id is not None:
+            requested_scope["research_work_item_id"] = str(research_work_item_id)
         return self.jobs.create(
             job_type="source.analyze",
             priority=priority,
-            requested_scope={
-                "source_id": str(source_id),
-                "representation_id": str(representation_id),
-                "question": normalized_question,
-            },
+            requested_scope=requested_scope,
             pinned_configuration={
                 "pipeline_version": PIPELINE_VERSION,
                 "model_id": config.model_id,
@@ -202,6 +272,9 @@ class SourceAnalysisService:
                 "prompt_template_version": PROMPT_TEMPLATE_VERSION,
             },
         )
+
+    def processed_representation_id(self, source_id: uuid.UUID) -> uuid.UUID:
+        return self._select_processed_representation(source_id)
 
     def select_model(self, requested_model_id: str | None = None) -> ModelInfo:
         models = self.provider.discover_models()
@@ -303,20 +376,7 @@ class SourceAnalysisService:
         config = self.pinned_configuration(job)
         if analysis.model_signature_id != config.model_signature_id:
             raise SourceAnalysisModelDriftError("Analysis row lost its pinned ModelSignature.")
-        model = self.select_model(config.model_id)
-        if model.context_capacity is not None and config.effective_context_limit > model.context_capacity:
-            raise SourceAnalysisModelDriftError(
-                "Current model context capacity is smaller than the pinned effective context limit."
-            )
-        signature = self._signature_for_model(model, config)
-        if (
-            signature.model_signature_id != config.model_signature_id
-            or signature.signature_hash != config.model_signature_hash
-        ):
-            raise SourceAnalysisModelDriftError(
-                "Current Primary Model signature differs from the pinned source analysis model."
-            )
-        return model
+        return self.assert_pinned_configuration_unchanged(config)
 
     def plan_map(self, analysis: SourceAnalysisRecord) -> tuple[SourceAnalysisWorkItem, ...]:
         """Materialize stable SourceAnchors for every current chunk and idempotently plan map work."""

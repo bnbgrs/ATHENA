@@ -15,6 +15,7 @@ from athena.config.settings import AthenaSettings
 from athena.core.services import LifecycleService, ServiceManager
 from athena.jobs.embedding_processing import DurableEmbeddingRebuildWorker
 from athena.jobs.repository import JobRepository
+from athena.jobs.research import DurableResearchWorker
 from athena.jobs.scheduler import DurableJobScheduler
 from athena.jobs.service import DurableJobService
 from athena.jobs.source_analysis import DurableSourceAnalysisWorker
@@ -115,10 +116,6 @@ class AthenaApplication:
         self.job_repository = JobRepository(self.database)
         self.jobs = DurableJobService(self.job_repository, self.chat)
         self.research_repository = ResearchRepository(self.database)
-        self.research = ResearchService(
-            repository=self.research_repository,
-            jobs=self.jobs,
-        )
         self.blob_store = BlobStore(self.paths)
         self.source_repository = SourceRepository(self.database)
         self.source_representation_repository = SourceRepresentationRepository(self.database)
@@ -241,6 +238,11 @@ class AthenaApplication:
             jobs=self.jobs,
             service=self.source_analysis_service,
         )
+        self.research = ResearchService(
+            repository=self.research_repository,
+            jobs=self.jobs,
+            source_analysis=self.source_analysis_service,
+        )
         self.source_processing = DurableSourceProcessingWorker(
             jobs=self.jobs,
             sources=self.sources,
@@ -249,6 +251,11 @@ class AthenaApplication:
             source_docx=self.source_docx,
             source_html=self.source_html,
             source_chunks=self.source_chunks,
+        )
+        self.research_worker = DurableResearchWorker(
+            jobs=self.jobs,
+            service=self.research,
+            source_processing=self.source_processing,
         )
         self.embedding_rebuild = DurableEmbeddingRebuildWorker(
             jobs=self.jobs,
@@ -291,6 +298,7 @@ class AthenaApplication:
             embedding_worker=self.embedding_rebuild,
             analysis_worker=self.source_analysis,
             extraction_worker=self.source_hierarchical_extraction,
+            research_worker=self.research_worker,
         )
         self.source_proposal_acceptance = SourceProposalAcceptanceService(
             database=self.database,
