@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 
+from athena.chat.models import ChatMessage
 from athena.chat.service import ChatService
 from athena.common.time import utc_now_us
+from athena.memory.explicit_command import (
+    ExplicitMemoryIntent,
+    parse_explicit_personal_memory_command,
+)
 from athena.memory.models import (
     MemoryKind,
     MemoryLearningMode,
@@ -17,6 +23,15 @@ from athena.memory.models import (
     PersonalMemorySnapshot,
 )
 from athena.memory.repository import PersonalMemoryRepository
+
+
+@dataclass(frozen=True, slots=True)
+class ExplicitMemoryCommandWrite:
+    """One locally handled explicit Memory command from persistent chat."""
+
+    intent: ExplicitMemoryIntent
+    user_message: ChatMessage
+    memory_revision: PersonalMemoryRevision
 
 
 class PersonalMemoryService:
@@ -49,6 +64,39 @@ class PersonalMemoryService:
                 last_confirmed_at_us=utc_now_us(),
             ),
             reason="explicit user Personal Memory write",
+        )
+
+    def remember_explicit_chat_command(
+        self,
+        *,
+        chat_id: uuid.UUID,
+        content: str,
+        scope_kind: MemoryScopeKind | None = None,
+        scope_entity_id: uuid.UUID | None = None,
+    ) -> ExplicitMemoryCommandWrite | None:
+        """Handle one unambiguous Personal Memory command without a model call."""
+        intent = parse_explicit_personal_memory_command(
+            content,
+            scope_kind=scope_kind,
+            scope_entity_id=scope_entity_id,
+        )
+        if intent is None:
+            return None
+
+        # Validate the target chat before creating durable Memory.
+        self.chat.load_chat(chat_id)
+        user_message = self.chat.add_user_message(chat_id=chat_id, content=content)
+        revision = self.remember(
+            content=intent.memory_content,
+            memory_kind=intent.memory_kind,
+            scope_kind=intent.scope_kind,
+            scope_entity_id=intent.scope_entity_id,
+            sensitivity=MemorySensitivity.NORMAL,
+        )
+        return ExplicitMemoryCommandWrite(
+            intent=intent,
+            user_message=user_message,
+            memory_revision=revision,
         )
 
     def revise(

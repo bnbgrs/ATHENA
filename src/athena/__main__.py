@@ -67,6 +67,7 @@ from athena.knowledge.source_extraction import (
     SourceAnalysisExtractionResult,
     SourceExtractionSnapshotNotFoundError,
 )
+from athena.memory.explicit_command import is_explicit_persistence_command
 from athena.memory.models import (
     MemoryKind,
     MemoryScopeKind,
@@ -232,7 +233,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     send_parser = chat_commands.add_parser(
         "send",
-        help="Persist a user message, stream a local model reply, then save it.",
+        help=(
+            "Persist a user message and normally stream a local model reply. "
+            "Unambiguous explicit Personal Memory commands are handled locally."
+        ),
     )
     send_parser.add_argument("chat_id", type=_uuid_argument)
     send_parser.add_argument("content", help="Message text. Quote text containing spaces.")
@@ -1347,6 +1351,64 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
+
+        if not args.sources:
+            explicit_memory = app.personal_memory.remember_explicit_chat_command(
+                chat_id=args.chat_id,
+                content=args.content,
+                scope_kind=args.memory_scope_kind,
+                scope_entity_id=args.memory_scope_id,
+            )
+            if explicit_memory is not None:
+                revision = explicit_memory.memory_revision
+                intent = explicit_memory.intent
+                scope = intent.scope_kind.value
+                if intent.scope_entity_id is not None:
+                    scope = f"{scope}:{intent.scope_entity_id}"
+                print(
+                    "Personal Memory created from explicit chat command: "
+                    f"{revision.memory_id}"
+                )
+                print(
+                    f"User message saved: {explicit_memory.user_message.message_id}"
+                )
+                print(f"Revision: {revision.revision_no} ({revision.revision_id})")
+                print(f"Kind: {intent.memory_kind.value}")
+                print(f"Scope: {scope}")
+                print(f"Content: {intent.memory_content}")
+                print("Actor: user")
+                print("Model signature: <none>")
+                print("Primary Model calls: 0")
+                print("Canonical Knowledge writes: 0")
+                print("Canonical Claim writes: 0")
+                return 0
+
+            if is_explicit_persistence_command(args.content):
+                user_message = app.chat.add_user_message(
+                    chat_id=args.chat_id,
+                    content=args.content,
+                )
+                print(
+                    "ATHENA persistence routing: explicit save request is not "
+                    "a clear Personal Memory collaboration preference.",
+                    file=sys.stderr,
+                )
+                print(
+                    "No Personal Memory or canonical Knowledge/Claim write was "
+                    "performed.",
+                    file=sys.stderr,
+                )
+                print(
+                    "Natural-language Knowledge save routing is not implemented "
+                    "in this slice.",
+                    file=sys.stderr,
+                )
+                print(f"User message saved: {user_message.message_id}")
+                print("Primary Model calls: 0")
+                print("Personal Memory writes: 0")
+                print("Canonical Knowledge writes: 0")
+                print("Canonical Claim writes: 0")
+                return 2
 
         print("Assistant: ", end="", flush=True)
         memory_result: MemoryChatGenerationResult | None = None
