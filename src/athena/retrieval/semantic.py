@@ -8,10 +8,12 @@ import sqlite3
 import struct
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 
 from athena.common.ids import uuid_to_blob
 from athena.common.time import utc_now_us
 from athena.model.adapters.lm_studio_embeddings import LMStudioEmbeddingProvider
+from athena.retrieval.hnsw import HnswIndexError, HnswIndexStore
 from athena.retrieval.search import SearchEntityType
 from athena.storage.database import SQLiteDatabase
 
@@ -33,10 +35,11 @@ class EmbeddingIndexStatus:
     dimensions: int
     document_count: int
     rebuilt_at_us: int
+    hnsw_ready: bool
 
     @property
     def current(self) -> bool:
-        return self.indexed_commit_seq >= self.current_commit_seq
+        return self.indexed_commit_seq >= self.current_commit_seq and self.hnsw_ready
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,12 +62,18 @@ class LocalSemanticSearchService:
         provider: LMStudioEmbeddingProvider,
         *,
         batch_size: int = 32,
+        hnsw_root: Path | None = None,
     ) -> None:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive.")
         self.database = database
         self.provider = provider
         self.batch_size = batch_size
+        self.hnsw = HnswIndexStore(
+            hnsw_root or (self.database.path.parent / "hnsw"),
+            namespace="knowledge",
+            reference_size=33,
+        )
 
     def status(self, model_id: str) -> EmbeddingIndexStatus | None:
         normalized_model_id = model_id.strip()
@@ -85,13 +94,22 @@ class LocalSemanticSearchService:
         ).fetchone()
         if row is None:
             return None
+        indexed_commit_seq = int(row["indexed_commit_seq"])
+        dimensions = int(row["dimensions"])
+        document_count = int(row["document_count"])
         return EmbeddingIndexStatus(
             model_id=normalized_model_id,
-            indexed_commit_seq=int(row["indexed_commit_seq"]),
+            indexed_commit_seq=indexed_commit_seq,
             current_commit_seq=self._current_commit_seq(self.database.connection),
-            dimensions=int(row["dimensions"]),
-            document_count=int(row["document_count"]),
+            dimensions=dimensions,
+            document_count=document_count,
             rebuilt_at_us=int(row["rebuilt_at_us"]),
+            hnsw_ready=self.hnsw.ready(
+                model_id=storage_model_id,
+                snapshot=indexed_commit_seq,
+                dimensions=dimensions,
+                document_count=document_count,
+            ),
         )
 
     def rebuild(self, model_id: str) -> EmbeddingIndexStatus:
@@ -214,17 +232,41 @@ class LocalSemanticSearchService:
                 ),
             )
 
+        try:
+            self._rebuild_hnsw_from_persisted(
+                normalized_model_id,
+                snapshot=current_commit_seq,
+                dimensions=dimensions,
+                document_count=len(documents),
+            )
+        except HnswIndexError as exc:
+            raise SemanticSearchError(str(exc)) from exc
+
         status = self.status(normalized_model_id)
-        if status is None:
-            raise SemanticSearchError("Embedding index state was not persisted.")
+        if status is None or not status.current:
+            raise SemanticSearchError("Embedding/HNSW index state was not published.")
         return status
 
     def ensure_current(self, model_id: str) -> EmbeddingIndexStatus:
-        status = self.status(model_id)
+        normalized_model_id = model_id.strip()
+        status = self.status(normalized_model_id)
         current_commit_seq = self._current_commit_seq(self.database.connection)
-        if status is not None and status.indexed_commit_seq >= current_commit_seq:
-            return status
-        return self.rebuild(model_id)
+        if status is None or status.indexed_commit_seq < current_commit_seq:
+            return self.rebuild(normalized_model_id)
+        if not status.hnsw_ready:
+            try:
+                self._rebuild_hnsw_from_persisted(
+                    normalized_model_id,
+                    snapshot=status.indexed_commit_seq,
+                    dimensions=status.dimensions,
+                    document_count=status.document_count,
+                )
+            except HnswIndexError as exc:
+                raise SemanticSearchError(str(exc)) from exc
+            status = self.status(normalized_model_id)
+            if status is None or not status.current:
+                raise SemanticSearchError("HNSW sidecar rebuild did not become current.")
+        return status
 
     def search(
         self,
@@ -256,45 +298,67 @@ class LocalSemanticSearchService:
                 "Query embedding dimensions differ from the persisted index."
             )
 
-        rows = self.database.connection.execute(
-            """
-            SELECT
-                e.entity_type,
-                e.entity_id,
-                e.revision_id,
-                e.vector_blob,
-                NULLIF(f.title, '') AS title,
-                f.body,
-                CASE
-                    WHEN e.entity_type = 'claim' THEN (
-                        SELECT count(*)
-                        FROM claim_evidence AS ce
-                        WHERE ce.claim_id = e.entity_id
-                          AND ce.evidence_role = 'contradicts'
-                    )
-                    ELSE 0
-                END AS contradiction_count
-            FROM search_embeddings AS e
-            JOIN search_fts AS f
-              ON lower(hex(e.entity_id)) = f.entity_id
-             AND lower(hex(e.revision_id)) = f.revision_id
-             AND e.entity_type = f.entity_type
-            WHERE e.model_id = ?
-            """,
-            (storage_model_id,),
-        ).fetchall()
+        candidate_limit = min(status.document_count, max(limit, min(500, limit * 4)))
+        try:
+            matches = self.hnsw.search(
+                query_vector,
+                model_id=storage_model_id,
+                snapshot=status.indexed_commit_seq,
+                dimensions=status.dimensions,
+                document_count=status.document_count,
+                limit=candidate_limit,
+            )
+        except HnswIndexError as exc:
+            raise SemanticSearchError(str(exc)) from exc
 
         results: list[SemanticSearchResult] = []
-        for row in rows:
+        for match in matches:
+            entity_type, entity_id, revision_id = _decode_reference(match.reference)
+            row = self.database.connection.execute(
+                """
+                SELECT
+                    e.vector_blob,
+                    NULLIF(f.title, '') AS title,
+                    f.body,
+                    CASE
+                        WHEN e.entity_type = 'claim' THEN (
+                            SELECT count(*)
+                            FROM claim_evidence AS ce
+                            WHERE ce.claim_id = e.entity_id
+                              AND ce.evidence_role = 'contradicts'
+                        )
+                        ELSE 0
+                    END AS contradiction_count
+                FROM search_embeddings AS e
+                JOIN search_fts AS f
+                  ON lower(hex(e.entity_id)) = f.entity_id
+                 AND lower(hex(e.revision_id)) = f.revision_id
+                 AND e.entity_type = f.entity_type
+                WHERE e.model_id = ?
+                  AND e.entity_type = ?
+                  AND e.entity_id = ?
+                  AND e.revision_id = ?
+                """,
+                (
+                    storage_model_id,
+                    entity_type.value,
+                    uuid_to_blob(entity_id),
+                    uuid_to_blob(revision_id),
+                ),
+            ).fetchone()
+            if row is None:
+                raise SemanticSearchError(
+                    "HNSW candidate references missing persisted embedding state."
+                )
             vector = _unpack_vector(bytes(row["vector_blob"]), status.dimensions)
             similarity = math.fsum(
                 left * right for left, right in zip(query_vector, vector, strict=True)
             )
             results.append(
                 SemanticSearchResult(
-                    entity_id=uuid.UUID(bytes=bytes(row["entity_id"])),
-                    revision_id=uuid.UUID(bytes=bytes(row["revision_id"])),
-                    entity_type=SearchEntityType(str(row["entity_type"])),
+                    entity_id=entity_id,
+                    revision_id=revision_id,
+                    entity_type=entity_type,
                     title=None if row["title"] is None else str(row["title"]),
                     text=str(row["body"]),
                     similarity=max(-1.0, min(1.0, similarity)),
@@ -310,6 +374,46 @@ class LocalSemanticSearchService:
             )
         )
         return tuple(results[:limit])
+
+    def _rebuild_hnsw_from_persisted(
+        self,
+        model_id: str,
+        *,
+        snapshot: int,
+        dimensions: int,
+        document_count: int,
+    ) -> None:
+        storage_model_id = _storage_model_id(model_id)
+        rows = self.database.connection.execute(
+            """
+            SELECT entity_type, entity_id, revision_id, vector_blob
+            FROM search_embeddings
+            WHERE model_id = ?
+            ORDER BY entity_type, entity_id, revision_id
+            """,
+            (storage_model_id,),
+        ).fetchall()
+        if len(rows) != document_count:
+            raise SemanticSearchError(
+                "Persisted embedding count disagrees with semantic index state."
+            )
+        entries = tuple(
+            (
+                _encode_reference(
+                    SearchEntityType(str(row["entity_type"])),
+                    uuid.UUID(bytes=bytes(row["entity_id"])),
+                    uuid.UUID(bytes=bytes(row["revision_id"])),
+                ),
+                _unpack_vector(bytes(row["vector_blob"]), dimensions),
+            )
+            for row in rows
+        )
+        self.hnsw.build(
+            model_id=storage_model_id,
+            snapshot=snapshot,
+            dimensions=dimensions,
+            entries=entries,
+        )
 
     def _ensure_fts_current(self) -> None:
         # Reuse the same commit watermark contract without duplicating the FTS
@@ -327,6 +431,32 @@ class LocalSemanticSearchService:
             return 0
         return int(row["commit_seq"])
 
+
+
+_REFERENCE_TYPE_CODE = {
+    SearchEntityType.KNOWLEDGE: 1,
+    SearchEntityType.CLAIM: 2,
+    SearchEntityType.CHAT_MESSAGE: 3,
+}
+_REFERENCE_CODE_TYPE = {value: key for key, value in _REFERENCE_TYPE_CODE.items()}
+
+
+def _encode_reference(
+    entity_type: SearchEntityType,
+    entity_id: uuid.UUID,
+    revision_id: uuid.UUID,
+) -> bytes:
+    return bytes((_REFERENCE_TYPE_CODE[entity_type],)) + entity_id.bytes + revision_id.bytes
+
+
+def _decode_reference(value: bytes) -> tuple[SearchEntityType, uuid.UUID, uuid.UUID]:
+    if len(value) != 33:
+        raise SemanticSearchError("HNSW semantic reference has an invalid length.")
+    try:
+        entity_type = _REFERENCE_CODE_TYPE[value[0]]
+    except KeyError as exc:
+        raise SemanticSearchError("HNSW semantic reference has an invalid entity type.") from exc
+    return entity_type, uuid.UUID(bytes=value[1:17]), uuid.UUID(bytes=value[17:33])
 
 
 def _embedding_profile(model_id: str) -> str:

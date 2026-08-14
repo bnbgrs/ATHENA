@@ -7,6 +7,7 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 
+from athena.retrieval.fusion import DEFAULT_RRF_K, reciprocal_rank_contribution
 from athena.retrieval.ranking import RetrievalRankingService
 from athena.retrieval.search import SearchEntityType
 from athena.retrieval.semantic import LocalSemanticSearchService
@@ -17,12 +18,8 @@ _TYPE_AUTHORITY = {
     SearchEntityType.CHAT_MESSAGE: 0.68,
 }
 
-_LEXICAL_WEIGHT = 0.42
-_SEMANTIC_WEIGHT = 0.38
-_AUTHORITY_WEIGHT = 0.14
-_CONTRADICTION_WEIGHT = 0.06
 _DIVERSITY_THRESHOLD = 0.82
-_DIVERSITY_PENALTY = 0.14
+_DIVERSITY_PENALTY_FRACTION = 0.14
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,9 +57,14 @@ class HybridRetrievalService:
         self,
         lexical: RetrievalRankingService,
         semantic: LocalSemanticSearchService,
+        *,
+        rrf_k: int = DEFAULT_RRF_K,
     ) -> None:
+        if rrf_k <= 0:
+            raise ValueError("RRF k must be positive.")
         self.lexical = lexical
         self.semantic = semantic
+        self.rrf_k = rrf_k
 
     def search(
         self,
@@ -89,14 +91,14 @@ class HybridRetrievalService:
         )
 
         by_entity: dict[tuple[SearchEntityType, uuid.UUID], _Candidate] = {}
-        for lexical_result in lexical_results:
+        for rank, lexical_result in enumerate(lexical_results, start=1):
             by_entity[(lexical_result.entity_type, lexical_result.entity_id)] = _Candidate(
                 entity_id=lexical_result.entity_id,
                 revision_id=lexical_result.revision_id,
                 entity_type=lexical_result.entity_type,
                 title=lexical_result.title,
                 text=lexical_result.text,
-                lexical_score=lexical_result.lexical_score,
+                lexical_score=reciprocal_rank_contribution(rank, k=self.rrf_k),
                 semantic_score=0.0,
                 contradiction_count=lexical_result.contradiction_count,
                 member_entity_ids=frozenset(
@@ -104,25 +106,13 @@ class HybridRetrievalService:
                 ),
             )
 
-        semantic_values = [
-            semantic_result.similarity
+        filtered_semantic_results = tuple(
+            semantic_result
             for semantic_result in semantic_results
             if entity_type is None or semantic_result.entity_type is entity_type
-        ]
-        sem_min = min(semantic_values, default=0.0)
-        sem_max = max(semantic_values, default=0.0)
-
-        for semantic_result in semantic_results:
-            if (
-                entity_type is not None
-                and semantic_result.entity_type is not entity_type
-            ):
-                continue
-            semantic_score = _normalize_similarity(
-                semantic_result.similarity,
-                minimum=sem_min,
-                maximum=sem_max,
-            )
+        )
+        for rank, semantic_result in enumerate(filtered_semantic_results, start=1):
+            semantic_score = reciprocal_rank_contribution(rank, k=self.rrf_k)
             key = (semantic_result.entity_type, semantic_result.entity_id)
             current = by_entity.get(key)
             if current is None:
@@ -157,13 +147,7 @@ class HybridRetrievalService:
 
 def _score(candidate: _Candidate) -> HybridSearchResult:
     authority = _TYPE_AUTHORITY[candidate.entity_type]
-    contradiction = min(1.0, candidate.contradiction_count / 2.0)
-    score = (
-        candidate.lexical_score * _LEXICAL_WEIGHT
-        + candidate.semantic_score * _SEMANTIC_WEIGHT
-        + authority * _AUTHORITY_WEIGHT
-        + contradiction * _CONTRADICTION_WEIGHT
-    )
+    score = candidate.lexical_score + candidate.semantic_score
     return HybridSearchResult(
         entity_id=candidate.entity_id,
         revision_id=candidate.revision_id,
@@ -277,18 +261,7 @@ def _diversity_penalty(
         maximum = max(maximum, similarity)
     if maximum < _DIVERSITY_THRESHOLD:
         return 0.0
-    return _DIVERSITY_PENALTY * maximum
-
-
-def _normalize_similarity(
-    value: float,
-    *,
-    minimum: float,
-    maximum: float,
-) -> float:
-    if maximum <= minimum:
-        return 1.0
-    return min(1.0, max(0.0, (value - minimum) / (maximum - minimum)))
+    return candidate.score * _DIVERSITY_PENALTY_FRACTION * maximum
 
 
 def _normalize_text(value: str) -> str:

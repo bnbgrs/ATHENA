@@ -2140,7 +2140,8 @@ def _run_embedding_command(app: AthenaApplication, args: argparse.Namespace) -> 
             f"Embedding index: model={model_id} current={status.current} "
             f"documents={status.document_count} dimensions={status.dimensions} "
             f"indexed_commit_seq={status.indexed_commit_seq} "
-            f"current_commit_seq={status.current_commit_seq}"
+            f"current_commit_seq={status.current_commit_seq} "
+            f"hnsw_ready={status.hnsw_ready}"
         )
         return 0
 
@@ -2149,7 +2150,7 @@ def _run_embedding_command(app: AthenaApplication, args: argparse.Namespace) -> 
         print(
             f"Embedding index rebuilt: model={model_id} "
             f"documents={status.document_count} dimensions={status.dimensions} "
-            f"commit_seq={status.indexed_commit_seq}"
+            f"commit_seq={status.indexed_commit_seq} hnsw_ready={status.hnsw_ready}"
         )
         return 0
 
@@ -2247,8 +2248,8 @@ def _run_search_command(app: AthenaApplication, args: argparse.Namespace) -> int
                 f"entity={hybrid_result.entity_id} "
                 f"revision={hybrid_result.revision_id} "
                 f"score={hybrid_result.score:.4f} "
-                f"lexical={hybrid_result.lexical_score:.4f} "
-                f"semantic={hybrid_result.semantic_score:.4f} "
+                f"lexical_rrf={hybrid_result.lexical_score:.4f} "
+                f"semantic_rrf={hybrid_result.semantic_score:.4f} "
                 f"authority={hybrid_result.authority_score:.2f} "
                 f"contradictions={hybrid_result.contradiction_count} "
                 f"duplicates={hybrid_result.duplicate_count}{title}"
@@ -2678,8 +2679,8 @@ def _run_source_command(app: AthenaApplication, args: argparse.Namespace) -> int
                     f"range={hybrid_result.start_anchor_value}:"
                     f"{hybrid_result.end_anchor_value} "
                     f"score={hybrid_result.score:.4f} "
-                    f"lexical={hybrid_result.lexical_score:.4f} "
-                    f"semantic={hybrid_result.semantic_score:.4f} "
+                    f"lexical_rrf={hybrid_result.lexical_score:.4f} "
+                    f"semantic_rrf={hybrid_result.semantic_score:.4f} "
                     f"sha256={hybrid_result.content_hash.hex()}"
                 )
                 print(f"    source_name={hybrid_result.source_name!r}")
@@ -2718,7 +2719,8 @@ def _run_source_command(app: AthenaApplication, args: argparse.Namespace) -> int
             f"Archive embedding index: model={model_id} current={status.current} "
             f"documents={status.document_count} dimensions={status.dimensions} "
             f"indexed_chunk_generation={status.indexed_chunk_generation} "
-            f"current_chunk_generation={status.current_chunk_generation}"
+            f"current_chunk_generation={status.current_chunk_generation} "
+            f"hnsw_ready={status.hnsw_ready}"
         )
         return 0
 
@@ -2728,7 +2730,8 @@ def _run_source_command(app: AthenaApplication, args: argparse.Namespace) -> int
         print(
             f"Archive embedding index rebuilt: model={model_id} "
             f"documents={status.document_count} dimensions={status.dimensions} "
-            f"chunk_generation={status.indexed_chunk_generation}"
+            f"chunk_generation={status.indexed_chunk_generation} "
+            f"hnsw_ready={status.hnsw_ready}"
         )
         return 0
 

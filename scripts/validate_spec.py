@@ -12,6 +12,17 @@ ROOT = Path(__file__).resolve().parents[1]
 ALPHA = ROOT / "docs" / "alpha"
 BETA = ROOT / "docs" / "beta"
 UTF8 = "utf-8"
+IGNORED_SCAN_ROOTS = frozenset(
+    {
+        ".git",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".venv",
+        "build",
+        "dist",
+    }
+)
 
 CheckResult = tuple[str, bool, str]
 checks: list[CheckResult] = []
@@ -30,8 +41,19 @@ def contains_all(text: str, values: Iterable[str]) -> bool:
     return all(value in text for value in values)
 
 
-all_files = [path for path in ROOT.rglob("*") if path.is_file()]
-markdown_files = list(ROOT.rglob("*.md"))
+def included_in_repository_scan(path: Path) -> bool:
+    relative = path.relative_to(ROOT)
+    return not relative.parts or relative.parts[0] not in IGNORED_SCAN_ROOTS
+
+
+all_files = [
+    path
+    for path in ROOT.rglob("*")
+    if path.is_file() and included_in_repository_scan(path)
+]
+markdown_files = [
+    path for path in ROOT.rglob("*.md") if included_in_repository_scan(path)
+]
 
 non_ascii_files = [
     str(path.relative_to(ROOT))

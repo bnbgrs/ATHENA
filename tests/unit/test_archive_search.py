@@ -352,3 +352,36 @@ def test_derived_v1_store_migrates_and_backfills_archive_fts(tmp_path) -> None:
             "SELECT chunk_generation, fts_generation FROM archive_search_state"
         ).fetchone()
         assert tuple(state) == (1, 1)
+
+
+def test_archive_hnsw_sidecar_rebuilds_without_reembedding(tmp_path) -> None:
+    app = _started_app(tmp_path)
+    try:
+        _build_chunks(
+            app,
+            tmp_path,
+            "archive-hnsw.txt",
+            "Berlin ist der Regierungssitz Deutschlands.\n",
+        )
+        provider = FakeEmbeddingProvider()
+        semantic = ArchiveSemanticSearchService(
+            lexical=app.archive_search,
+            provider=provider,
+        )
+        semantic.rebuild("fake-embed")
+        calls_after_embedding_rebuild = provider.calls
+
+        for path in semantic.hnsw.root.glob("*"):
+            path.unlink()
+
+        missing = semantic.status("fake-embed")
+        assert missing is not None
+        assert not missing.hnsw_ready
+        assert not missing.current
+
+        restored = semantic.ensure_current("fake-embed")
+        assert restored.current
+        assert restored.hnsw_ready
+        assert provider.calls == calls_after_embedding_rebuild
+    finally:
+        app.stop()

@@ -14,6 +14,8 @@ from dataclasses import dataclass
 
 from athena.common.time import utc_now_us
 from athena.model.adapters.lm_studio_embeddings import LMStudioEmbeddingProvider
+from athena.retrieval.fusion import DEFAULT_RRF_K, reciprocal_rank_contribution
+from athena.retrieval.hnsw import HnswIndexError, HnswIndexStore
 from athena.source.chunk_store import SourceChunkRecord, SourceChunkStore
 from athena.source.chunking_service import SourceChunkingService
 from athena.storage.database import SQLiteDatabase
@@ -99,10 +101,14 @@ class ArchiveEmbeddingIndexStatus:
     dimensions: int
     document_count: int
     rebuilt_at_us: int
+    hnsw_ready: bool
 
     @property
     def current(self) -> bool:
-        return self.indexed_chunk_generation == self.current_chunk_generation
+        return (
+            self.indexed_chunk_generation == self.current_chunk_generation
+            and self.hnsw_ready
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,6 +317,11 @@ class ArchiveSemanticSearchService:
         self.chunk_store = lexical.chunk_store
         self.provider = provider
         self.batch_size = batch_size
+        self.hnsw = HnswIndexStore(
+            self.chunk_store.path.parent / "hnsw",
+            namespace="archive",
+            reference_size=16,
+        )
 
     def status(self, model_id: str) -> ArchiveEmbeddingIndexStatus | None:
         normalized_model_id = _require_model_id(model_id)
@@ -327,13 +338,22 @@ class ArchiveSemanticSearchService:
             ).fetchone()
         if row is None:
             return None
+        indexed_generation = int(row["indexed_chunk_generation"])
+        dimensions = int(row["dimensions"])
+        document_count = int(row["document_count"])
         return ArchiveEmbeddingIndexStatus(
             model_id=normalized_model_id,
-            indexed_chunk_generation=int(row["indexed_chunk_generation"]),
+            indexed_chunk_generation=indexed_generation,
             current_chunk_generation=current_generation,
-            dimensions=int(row["dimensions"]),
-            document_count=int(row["document_count"]),
+            dimensions=dimensions,
+            document_count=document_count,
             rebuilt_at_us=int(row["rebuilt_at_us"]),
+            hnsw_ready=self.hnsw.ready(
+                model_id=storage_model_id,
+                snapshot=indexed_generation,
+                dimensions=dimensions,
+                document_count=document_count,
+            ),
         )
 
     def prepare_rebuild_batch(
@@ -559,10 +579,19 @@ class ArchiveSemanticSearchService:
                 if connection.in_transaction:
                     connection.execute("ROLLBACK")
                 raise
+        try:
+            self._rebuild_hnsw_from_persisted(
+                normalized_model_id,
+                snapshot=target_chunk_generation,
+                dimensions=persisted_dimensions,
+                document_count=plan.total_document_count,
+            )
+        except HnswIndexError as exc:
+            raise ArchiveSearchError(str(exc)) from exc
         status = self.status(normalized_model_id)
         if status is None or not status.current:
             raise ArchiveSearchError(
-                "Archive embedding index publication did not become current."
+                "Archive embedding/HNSW publication did not become current."
             )
         return status
 
@@ -742,16 +771,81 @@ class ArchiveSemanticSearchService:
                     connection.execute("ROLLBACK")
                 raise
 
+        try:
+            self._rebuild_hnsw_from_persisted(
+                normalized_model_id,
+                snapshot=generation,
+                dimensions=persisted_dimensions,
+                document_count=document_count,
+            )
+        except HnswIndexError as exc:
+            raise ArchiveSearchError(str(exc)) from exc
         status = self.status(normalized_model_id)
-        if status is None:
-            raise ArchiveSearchError("Archive embedding index state was not persisted.")
+        if status is None or not status.current:
+            raise ArchiveSearchError("Archive embedding/HNSW index was not published.")
         return status
 
+    def _rebuild_hnsw_from_persisted(
+        self,
+        model_id: str,
+        *,
+        snapshot: int,
+        dimensions: int,
+        document_count: int,
+    ) -> None:
+        storage_model_id = _storage_model_id(model_id)
+        with self.chunk_store.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT chunk_id, vector_blob, dimensions
+                FROM archive_embeddings
+                WHERE model_id = ? AND indexed_chunk_generation = ?
+                ORDER BY chunk_id
+                """,
+                (storage_model_id, snapshot),
+            ).fetchall()
+        if len(rows) != document_count:
+            raise ArchiveSearchError(
+                "Persisted archive embedding count disagrees with index state."
+            )
+        entries: list[tuple[bytes, tuple[float, ...]]] = []
+        for row in rows:
+            if int(row["dimensions"]) != dimensions:
+                raise ArchiveSearchError(
+                    "Persisted archive embedding dimensions disagree with index state."
+                )
+            entries.append(
+                (
+                    bytes(row["chunk_id"]),
+                    _unpack_vector(bytes(row["vector_blob"]), dimensions),
+                )
+            )
+        self.hnsw.build(
+            model_id=storage_model_id,
+            snapshot=snapshot,
+            dimensions=dimensions,
+            entries=entries,
+        )
+
     def ensure_current(self, model_id: str) -> ArchiveEmbeddingIndexStatus:
-        status = self.status(model_id)
-        if status is not None and status.current:
-            return status
-        return self.rebuild(model_id)
+        normalized_model_id = _require_model_id(model_id)
+        status = self.status(normalized_model_id)
+        if status is None or status.indexed_chunk_generation != status.current_chunk_generation:
+            return self.rebuild(normalized_model_id)
+        if not status.hnsw_ready:
+            try:
+                self._rebuild_hnsw_from_persisted(
+                    normalized_model_id,
+                    snapshot=status.indexed_chunk_generation,
+                    dimensions=status.dimensions,
+                    document_count=status.document_count,
+                )
+            except HnswIndexError as exc:
+                raise ArchiveSearchError(str(exc)) from exc
+            status = self.status(normalized_model_id)
+            if status is None or not status.current:
+                raise ArchiveSearchError("Archive HNSW sidecar rebuild did not become current.")
+        return status
 
     def search(
         self,
@@ -784,30 +878,78 @@ class ArchiveSemanticSearchService:
                 "Archive query embedding dimensions differ from persisted index."
             )
         storage_model_id = _storage_model_id(normalized_model_id)
+        rows: Sequence[sqlite3.Row]
 
-        clauses = [
-            "e.model_id = ?",
-            "e.indexed_chunk_generation = ?",
-        ]
-        parameters: list[object] = [storage_model_id, status.indexed_chunk_generation]
-        if source_id is not None:
-            clauses.append("c.source_id = ?")
-            parameters.append(source_id.bytes)
-        if representation_id is not None:
-            clauses.append("c.representation_id = ?")
-            parameters.append(representation_id.bytes)
+        if source_id is None and representation_id is None:
+            candidate_limit = min(
+                status.document_count,
+                max(limit, min(500, limit * 4)),
+            )
+            try:
+                matches = self.hnsw.search(
+                    query_vector,
+                    model_id=storage_model_id,
+                    snapshot=status.indexed_chunk_generation,
+                    dimensions=status.dimensions,
+                    document_count=status.document_count,
+                    limit=candidate_limit,
+                )
+            except HnswIndexError as exc:
+                raise ArchiveSearchError(str(exc)) from exc
+            candidate_ids = tuple(uuid.UUID(bytes=match.reference) for match in matches)
+            candidate_rows: list[sqlite3.Row] = []
+            with self.chunk_store.connect() as connection:
+                for chunk_id in candidate_ids:
+                    row = connection.execute(
+                        """
+                        SELECT e.chunk_id, e.vector_blob, e.text_sha256, e.dimensions
+                        FROM archive_embeddings AS e
+                        WHERE e.model_id = ?
+                          AND e.indexed_chunk_generation = ?
+                          AND e.chunk_id = ?
+                        """,
+                        (
+                            storage_model_id,
+                            status.indexed_chunk_generation,
+                            chunk_id.bytes,
+                        ),
+                    ).fetchone()
+                    if row is None:
+                        raise ArchiveSearchError(
+                            "Archive HNSW candidate references missing persisted "
+                            "embedding state."
+                        )
+                    candidate_rows.append(row)
+            rows = candidate_rows
+        else:
+            # USearch's Python binding has no graph predicate API. Preserve hard
+            # source/representation filters with the exact persisted-vector fallback.
+            clauses = [
+                "e.model_id = ?",
+                "e.indexed_chunk_generation = ?",
+            ]
+            parameters: list[object] = [
+                storage_model_id,
+                status.indexed_chunk_generation,
+            ]
+            if source_id is not None:
+                clauses.append("c.source_id = ?")
+                parameters.append(source_id.bytes)
+            if representation_id is not None:
+                clauses.append("c.representation_id = ?")
+                parameters.append(representation_id.bytes)
 
-        with self.chunk_store.connect() as connection:
-            rows = connection.execute(
-                f"""
-                SELECT e.chunk_id, e.vector_blob, e.text_sha256, e.dimensions
-                FROM archive_embeddings AS e
-                JOIN source_chunks AS c ON c.chunk_id = e.chunk_id
-                WHERE {' AND '.join(clauses)}
-                ORDER BY c.representation_id, c.chunk_index, c.chunk_id
-                """,
-                tuple(parameters),
-            ).fetchall()
+            with self.chunk_store.connect() as connection:
+                rows = connection.execute(
+                    f"""
+                    SELECT e.chunk_id, e.vector_blob, e.text_sha256, e.dimensions
+                    FROM archive_embeddings AS e
+                    JOIN source_chunks AS c ON c.chunk_id = e.chunk_id
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY c.representation_id, c.chunk_index, c.chunk_id
+                    """,
+                    tuple(parameters),
+                ).fetchall()
 
         results: list[ArchiveSemanticSearchResult] = []
         for row in rows:
@@ -863,9 +1005,14 @@ class ArchiveHybridRetrievalService:
         self,
         lexical: ArchiveSearchService,
         semantic: ArchiveSemanticSearchService,
+        *,
+        rrf_k: int = DEFAULT_RRF_K,
     ) -> None:
+        if rrf_k <= 0:
+            raise ArchiveSearchError("RRF k must be positive.")
         self.lexical = lexical
         self.semantic = semantic
+        self.rrf_k = rrf_k
 
     def search(
         self,
@@ -893,23 +1040,14 @@ class ArchiveHybridRetrievalService:
             representation_id=representation_id,
         )
 
-        lexical_scores = [item.score for item in lexical]
-        lex_min = min(lexical_scores, default=0.0)
-        lex_max = max(lexical_scores, default=0.0)
-        semantic_scores = [item.similarity for item in semantic]
-        sem_min = min(semantic_scores, default=0.0)
-        sem_max = max(semantic_scores, default=0.0)
-
         candidates: dict[uuid.UUID, _ArchiveCandidate] = {}
-        for lexical_item in lexical:
+        for rank, lexical_item in enumerate(lexical, start=1):
             candidates[lexical_item.chunk_id] = _ArchiveCandidate.from_lexical(
                 lexical_item,
-                lexical_score=_normalize_range(lexical_item.score, lex_min, lex_max),
+                lexical_score=reciprocal_rank_contribution(rank, k=self.rrf_k),
             )
-        for semantic_item in semantic:
-            semantic_score = _normalize_range(
-                semantic_item.similarity, sem_min, sem_max
-            )
+        for rank, semantic_item in enumerate(semantic, start=1):
+            semantic_score = reciprocal_rank_contribution(rank, k=self.rrf_k)
             existing = candidates.get(semantic_item.chunk_id)
             if existing is None:
                 candidates[semantic_item.chunk_id] = _ArchiveCandidate.from_semantic(
@@ -990,7 +1128,7 @@ class _ArchiveCandidate:
 
 
 def _candidate_to_result(candidate: _ArchiveCandidate) -> ArchiveHybridSearchResult:
-    score = candidate.lexical_score * 0.52 + candidate.semantic_score * 0.48
+    score = candidate.lexical_score + candidate.semantic_score
     return ArchiveHybridSearchResult(
         chunk_id=candidate.chunk_id,
         source_id=candidate.source_id,
@@ -1058,14 +1196,14 @@ def _archive_diversity_penalty(
     selected: list[ArchiveHybridSearchResult],
 ) -> float:
     same_source = sum(1 for prior in selected if prior.source_id == candidate.source_id)
-    source_penalty = min(0.16, same_source * 0.06)
+    source_penalty_fraction = min(0.30, same_source * 0.10)
     candidate_tokens = _tokens(candidate.text)
     similarity = max(
         (_jaccard(candidate_tokens, _tokens(prior.text)) for prior in selected),
         default=0.0,
     )
-    similarity_penalty = 0.08 * similarity if similarity >= 0.88 else 0.0
-    return source_penalty + similarity_penalty
+    similarity_penalty_fraction = 0.08 * similarity if similarity >= 0.88 else 0.0
+    return candidate.score * (source_penalty_fraction + similarity_penalty_fraction)
 
 
 
@@ -1157,11 +1295,6 @@ def _uuid_from_hex(value: str) -> uuid.UUID:
     except ValueError as exc:
         raise ArchiveSearchError("Archive FTS contains an invalid UUID.") from exc
 
-
-def _normalize_range(value: float, minimum: float, maximum: float) -> float:
-    if maximum <= minimum:
-        return 1.0
-    return min(1.0, max(0.0, (value - minimum) / (maximum - minimum)))
 
 
 def _tokens(text: str) -> frozenset[str]:

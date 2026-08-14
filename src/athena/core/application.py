@@ -296,6 +296,7 @@ class AthenaApplication:
         self.semantic_search = LocalSemanticSearchService(
             self.database,
             self.embedding_provider,
+            hnsw_root=self.paths.derived_root / "hnsw",
         )
         self.hybrid_retrieval = HybridRetrievalService(
             self.retrieval,

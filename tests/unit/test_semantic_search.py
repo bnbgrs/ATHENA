@@ -185,3 +185,40 @@ def test_semantic_documents_exclude_internal_assistant_provenance_manifest(tmp_p
         assert all("ATHENA_PROVENANCE" not in text for text in document_inputs)
     finally:
         database.stop()
+
+
+def test_hnsw_sidecar_rebuilds_from_persisted_vectors_without_reembedding(tmp_path) -> None:
+    database = SQLiteDatabase(tmp_path / "athena.db")
+    database.start()
+    try:
+        chat = ChatService(ChatRepository(database))
+        knowledge = KnowledgeService(KnowledgeRepository(database), chat)
+        chat_id = chat.create_chat()
+        message = chat.add_user_message(
+            chat_id=chat_id,
+            content="Berlin ist der Regierungssitz Deutschlands.",
+        )
+        knowledge.promote_chat_message(
+            chat_id=chat_id,
+            sequence_no=message.sequence_no,
+            knowledge_kind=KnowledgeKind.FACT,
+        )
+        provider = FakeEmbeddingProvider()
+        semantic = LocalSemanticSearchService(database, provider)
+        semantic.rebuild("fake-embed")
+        calls_after_embedding_rebuild = provider.calls
+
+        for path in semantic.hnsw.root.glob("*"):
+            path.unlink()
+
+        missing = semantic.status("fake-embed")
+        assert missing is not None
+        assert not missing.hnsw_ready
+        assert not missing.current
+
+        restored = semantic.ensure_current("fake-embed")
+        assert restored.current
+        assert restored.hnsw_ready
+        assert provider.calls == calls_after_embedding_rebuild
+    finally:
+        database.stop()
