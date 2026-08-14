@@ -91,6 +91,31 @@ def test_lease_checkpoint_and_completion_are_durable_and_fenced(tmp_path) -> Non
     app.stop()
 
 
+def test_heartbeat_clamps_backward_clock_and_never_shortens_lease(tmp_path) -> None:
+    app = _app(tmp_path)
+    job = app.jobs.create(job_type="source.process")
+    leased = app.jobs.acquire(
+        job.job_id,
+        worker_id="worker-a",
+        lease_seconds=60,
+        now_us=2_000_000,
+    )
+    assert leased.lease_token is not None
+    assert leased.lease_acquired_at_us == 2_000_000
+    assert leased.lease_expires_at_us == 62_000_000
+
+    heartbeat = app.jobs.heartbeat(
+        job.job_id,
+        lease_token=leased.lease_token,
+        extend_seconds=10,
+        now_us=1_000_000,
+    )
+
+    assert heartbeat.heartbeat_at_us == 2_000_000
+    assert heartbeat.lease_expires_at_us == 62_000_000
+    app.stop()
+
+
 def test_checkpoint_listing_preserves_commit_order_when_timestamps_tie(tmp_path) -> None:
     app = _app(tmp_path)
     job = app.jobs.create(job_type="source.process")

@@ -345,13 +345,38 @@ class JobRepository:
                 raise JobLeaseError(
                     f"Job {job_id} is not heartbeat-eligible in state {state.value!r}."
                 )
+
+            lease_acquired_at = row["lease_acquired_at_us"]
+            lease_expires_at = row["lease_expires_at_us"]
+            heartbeat_at = row["heartbeat_at_us"]
+            if lease_acquired_at is None or lease_expires_at is None:
+                raise JobLeaseError(f"Job {job_id} has incomplete lease timestamps.")
+
+            effective_now = max(
+                now,
+                int(lease_acquired_at),
+                (
+                    int(heartbeat_at)
+                    if heartbeat_at is not None
+                    else int(lease_acquired_at)
+                ),
+            )
+            next_expires_at = max(
+                int(lease_expires_at),
+                effective_now + extend_by_us,
+            )
             connection.execute(
                 """
                 UPDATE jobs
                 SET heartbeat_at_us = ?, lease_expires_at_us = ?, updated_at_us = ?
                 WHERE job_id = ?
                 """,
-                (now, now + extend_by_us, now, uuid_to_blob(job_id)),
+                (
+                    effective_now,
+                    next_expires_at,
+                    effective_now,
+                    uuid_to_blob(job_id),
+                ),
             )
         return self.get(job_id)
 
