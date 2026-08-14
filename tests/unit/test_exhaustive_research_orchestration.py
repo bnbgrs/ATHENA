@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from athena.common.time import utc_now_us
 from athena.config.settings import AthenaSettings
 from athena.core.application import AthenaApplication
 from athena.jobs.models import JobState, WaitingReason
@@ -453,29 +454,66 @@ def test_cancel_preserves_confirmed_work_and_never_claims_complete(
     app.stop()
 
 
-def test_scheduler_dispatches_research_and_auto_retries_dependency(
+def test_scheduler_drives_research_dependency_polling_to_synthesis_without_retry_budget(
     tmp_path: Path,
 ) -> None:
     app, _provider = _app(tmp_path / "runtime")
-    source = _capture(app, tmp_path / "source.txt", "scheduler research evidence")
-    _preprocess(app, source.source_id)
-    job = app.research.enqueue_local(query="Scheduler research.")
+    first = _capture(app, tmp_path / "a.txt", "scheduler alpha evidence")
+    second = _capture(app, tmp_path / "b.txt", "scheduler beta evidence")
+    job = app.research.enqueue_local(
+        query="Scheduler research.",
+        explicit_source_ids=(first.source_id, second.source_id),
+    )
+    now_us = utc_now_us()
 
-    tick = app.job_scheduler.tick(worker_id="research-scheduler")
+    for ordinal in range(100):
+        tick = app.job_scheduler.tick(
+            worker_id=f"research-scheduler-{ordinal % 2}",
+            now_us=now_us,
+        )
+        parent = app.jobs.get(job.job_id)
+        if (
+            parent.state is JobState.WAITING
+            and parent.blocked_reason == WaitingReason.DEPENDENCY.value
+            and parent.current_stage == "research_awaiting_synthesis"
+            and parent.next_run_at_us is None
+        ):
+            break
 
-    assert tick.selected_job_id == job.job_id
-    assert tick.selected_job_type == "research.exhaustive"
-    assert tick.action == "waiting"
-    assert tick.final_state is JobState.WAITING
-    assert tick.retry_at_us is not None
+        if tick.idle:
+            due = [
+                waiting.next_run_at_us
+                for waiting in app.jobs.waiting(limit=200)
+                if waiting.next_run_at_us is not None
+            ]
+            if due:
+                now_us = max(now_us + 1, min(due) + 1)
+            else:
+                now_us += 1_000_000
+        else:
+            # A dispatched job may have created immediately eligible child work.
+            # Keep simulated time before the parent's dependency poll deadline so
+            # the scheduler gets the same immediate next tick as production.
+            now_us += 1
+    else:
+        raise AssertionError("Scheduler did not drive Research to awaiting_synthesis.")
+
     parent = app.jobs.get(job.job_id)
-    assert parent.blocked_reason == WaitingReason.DEPENDENCY.value
+    assert parent.retry_count == 0
     scope = app.research.initialize(job.job_id)
     work = app.research_repository.list_work_items(scope.scope_id)
-    assert len(work) == 1
-    assert work[0].source_analysis_job_id is not None
-    child = app.jobs.get(work[0].source_analysis_job_id)
-    assert child.state is JobState.QUEUED
+    coverage = app.research.coverage(job.job_id)
+
+    assert scope.state is ResearchScopeState.RUNNING
+    assert len(work) == 2
+    assert all(item.state is ResearchWorkState.SUCCESSFUL for item in work)
+    assert all(item.source_processing_job_id is not None for item in work)
+    assert all(item.source_analysis_job_id is not None for item in work)
+    assert coverage.processed_count == 2
+    assert coverage.successful_count == 2
+    assert coverage.failed_count == 0
+    assert coverage.unavailable_count == 0
+    assert coverage.coverage_ratio == 1.0
     app.stop()
 
 

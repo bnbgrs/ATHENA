@@ -183,7 +183,7 @@ class JobRepository:
         *,
         now_us: int | None = None,
     ) -> tuple[JobRecord, ...]:
-        """Wake only timer/backoff/resource waiters whose retry time is due."""
+        """Wake timed retry/dependency waiters whose next run is due."""
         now = utc_now_us() if now_us is None else now_us
         woken_ids: list[uuid.UUID] = []
         with self.database.write_transaction() as connection:
@@ -194,7 +194,7 @@ class JobRepository:
                 WHERE state = 'waiting'
                   AND blocked_reason IN (
                       'waiting_resource', 'waiting_storage', 'waiting_network',
-                      'waiting_schedule', 'waiting_backoff'
+                      'waiting_schedule', 'waiting_dependency', 'waiting_backoff'
                   )
                   AND next_run_at_us IS NOT NULL
                   AND next_run_at_us <= ?

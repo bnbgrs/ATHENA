@@ -282,6 +282,47 @@ def test_waiting_state_requires_reason_and_can_wake(tmp_path) -> None:
     app.stop()
 
 
+
+def test_dependency_wait_wakes_when_due_without_consuming_retry_budget(tmp_path) -> None:
+    app = _app(tmp_path)
+    job = app.jobs.create(job_type="research.exhaustive")
+    leased = app.jobs.acquire(
+        job.job_id,
+        worker_id="research-parent",
+        lease_seconds=60,
+        now_us=100,
+    )
+    assert leased.lease_token is not None
+
+    waiting = app.jobs.wait(
+        job.job_id,
+        lease_token=leased.lease_token,
+        reason=WaitingReason.DEPENDENCY,
+        next_run_at_us=500,
+        now_us=101,
+    )
+    assert waiting.state is JobState.WAITING
+    assert waiting.blocked_reason == WaitingReason.DEPENDENCY.value
+    assert waiting.next_run_at_us == 500
+    assert waiting.retry_count == 0
+
+    assert app.jobs.wake_due_waiting(now_us=499) == ()
+    still_waiting = app.jobs.get(job.job_id)
+    assert still_waiting.state is JobState.WAITING
+    assert still_waiting.retry_count == 0
+
+    woken = app.jobs.wake_due_waiting(now_us=500)
+    assert [item.job_id for item in woken] == [job.job_id]
+
+    queued = app.jobs.get(job.job_id)
+    assert queued.state is JobState.QUEUED
+    assert queued.blocked_reason is None
+    assert queued.next_run_at_us is None
+    assert queued.retry_count == 0
+    app.stop()
+
+
+
 def test_one_hundred_queued_jobs_survive_restart(tmp_path) -> None:
     first = _app(tmp_path)
     created_ids = {
