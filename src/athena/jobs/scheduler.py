@@ -164,6 +164,9 @@ class DurableJobScheduler:
         recovered = self.jobs.recover_startup(now_us=now)
         scheduled_retries = self._schedule_orphaned_retry_waiters(now)
         woken = self.jobs.wake_due_waiting(now_us=now)
+        legacy_research_woken = (
+            self._wake_legacy_research_synthesis_waiters()
+        )
 
         candidates = self.jobs.eligible_queued(
             now_us=now,
@@ -190,7 +193,7 @@ class DurableJobScheduler:
             return SchedulerTickResult(
                 recovered_jobs=len(recovered),
                 scheduled_retries=scheduled_retries,
-                woken_jobs=len(woken),
+                woken_jobs=len(woken) + legacy_research_woken,
                 selected_job_id=None,
                 selected_job_type=None,
                 action="idle",
@@ -239,7 +242,7 @@ class DurableJobScheduler:
         return SchedulerTickResult(
             recovered_jobs=len(recovered),
             scheduled_retries=scheduled_retries,
-            woken_jobs=len(woken),
+            woken_jobs=len(woken) + legacy_research_woken,
             selected_job_id=current.job_id,
             selected_job_type=current.job_type,
             action=action,
@@ -540,6 +543,24 @@ class DurableJobScheduler:
             )
         except JobLeaseError:
             return self.jobs.get(job_id)
+
+    def _wake_legacy_research_synthesis_waiters(self) -> int:
+        """Wake pre-Run-3 Research parents stranded at the old synthesis boundary."""
+        woken = 0
+        for job in self.jobs.waiting(limit=self.policy.candidate_limit):
+            if (
+                job.job_type != "research.exhaustive"
+                or job.blocked_reason != WaitingReason.DEPENDENCY.value
+                or job.current_stage != "research_awaiting_synthesis"
+                or job.next_run_at_us is not None
+            ):
+                continue
+            try:
+                self.jobs.wake(job.job_id)
+            except JobTransitionError:
+                continue
+            woken += 1
+        return woken
 
     def _schedule_orphaned_retry_waiters(self, now_us: int) -> int:
         scheduled = 0

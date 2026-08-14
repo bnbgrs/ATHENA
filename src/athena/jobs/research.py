@@ -15,12 +15,17 @@ from athena.jobs.service import DurableJobService
 from athena.jobs.source_processing import DurableSourceProcessingWorker
 from athena.model.adapters.lm_studio import (
     ModelProviderError,
+    ProviderContextLimitError,
     ProviderUnavailableError,
 )
 from athena.research.models import (
     ResearchCandidateRecord,
+    ResearchCoverage,
     ResearchScopeRecord,
     ResearchScopeState,
+    ResearchSynthesisStage,
+    ResearchSynthesisWorkItemRecord,
+    ResearchSynthesisWorkState,
     ResearchWorkItemRecord,
     ResearchWorkState,
 )
@@ -29,6 +34,15 @@ from athena.research.repository import (
     ResearchRepository,
 )
 from athena.research.service import PIPELINE_VERSION, ResearchService
+from athena.research.synthesis_service import (
+    PIPELINE_VERSION as SYNTHESIS_PIPELINE_VERSION,
+)
+from athena.research.synthesis_service import (
+    ResearchSynthesisConfigurationError,
+    ResearchSynthesisInputTooLargeError,
+    ResearchSynthesisOutputError,
+    ResearchSynthesisService,
+)
 from athena.source.analysis_models import AnalysisStage, SourceAnalysisState
 from athena.source.analysis_service import (
     AnalysisPinnedConfiguration,
@@ -63,12 +77,14 @@ class DurableResearchWorker:
         jobs: DurableJobService,
         service: ResearchService,
         source_processing: DurableSourceProcessingWorker,
+        synthesis: ResearchSynthesisService,
     ) -> None:
         self.jobs = jobs
         self.service = service
         self.repository: ResearchRepository = service.repository
         self.source_processing = source_processing
         self.source_analysis = service.source_analysis
+        self.synthesis = synthesis
 
     def step(
         self,
@@ -137,6 +153,14 @@ class DurableResearchWorker:
                 child_job_id=None,
             )
 
+        if scope.state is ResearchScopeState.COMPLETED:
+            return self._complete_persisted_result(
+                job,
+                lease_token,
+                scope,
+                stage="result_recovered",
+            )
+
         if scope.state is ResearchScopeState.FROZEN:
             scope = self.repository.mark_scope_state_fenced(
                 scope.scope_id,
@@ -163,32 +187,11 @@ class DurableResearchWorker:
 
         work_item = self.repository.next_pending_work(scope.scope_id)
         if work_item is None:
-            checkpoint = self._checkpoint(
+            return self._advance_synthesis(
                 job,
                 lease_token,
                 scope,
-                current_stage="research_awaiting_synthesis",
-                work_item=None,
-                child_job_id=None,
-                detail={
-                    "reason": "all_eligible_source_work_terminal",
-                    "final_synthesis": "not_started",
-                },
-            )
-            waiting = self.jobs.wait(
-                job_id,
-                lease_token=lease_token,
-                reason=WaitingReason.DEPENDENCY,
-            )
-            return ResearchStepResult(
-                job=waiting,
-                scope=self.repository.get_scope(scope.scope_id),
-                work_item=None,
-                completed_stage="awaiting_synthesis",
-                checkpoint=checkpoint,
-                child_job_id=None,
-                done=False,
-                waiting=True,
+                extend_seconds=extend_seconds,
             )
 
         candidate = self.repository.get_candidate(work_item.candidate_id)
@@ -339,6 +342,351 @@ class DurableResearchWorker:
             scope,
             refreshed,
             child=analysis_child,
+        )
+
+
+    def _advance_synthesis(
+        self,
+        job: JobRecord,
+        lease_token: bytes,
+        scope: ResearchScopeRecord,
+        *,
+        extend_seconds: int,
+    ) -> ResearchStepResult:
+        refreshed_scope = self.repository.get_scope(scope.scope_id)
+        persisted_result = self.repository.get_result_for_scope(scope.scope_id)
+        if persisted_result is not None:
+            if refreshed_scope.state is not ResearchScopeState.COMPLETED:
+                raise ResearchJobError(
+                    "ResearchResult exists without a completed ResearchScope."
+                )
+            return self._complete_persisted_result(
+                job,
+                lease_token,
+                refreshed_scope,
+                stage="result_recovered",
+            )
+
+        synthesis_work = self.repository.list_synthesis_work_items(scope.scope_id)
+        if (
+            job.current_stage != "research_awaiting_synthesis"
+            and not synthesis_work
+        ):
+            checkpoint = self._checkpoint(
+                job,
+                lease_token,
+                refreshed_scope,
+                current_stage="research_awaiting_synthesis",
+                work_item=None,
+                child_job_id=None,
+                detail={
+                    "reason": "all_eligible_source_work_terminal",
+                    "final_synthesis": "not_started",
+                },
+            )
+            waiting = self.jobs.wait(
+                job.job_id,
+                lease_token=lease_token,
+                reason=WaitingReason.DEPENDENCY,
+                next_run_at_us=utc_now_us(),
+            )
+            return ResearchStepResult(
+                job=waiting,
+                scope=self.repository.get_scope(scope.scope_id),
+                work_item=None,
+                completed_stage="awaiting_synthesis",
+                checkpoint=checkpoint,
+                child_job_id=None,
+                done=False,
+                waiting=True,
+            )
+
+        coverage = self.repository.coverage(scope.scope_id)
+        if coverage.successful_count == 0:
+            semantic_content = _deterministic_no_success_content(coverage)
+            self.repository.finalize_result_fenced(
+                scope.scope_id,
+                parent_job_id=job.job_id,
+                lease_token=lease_token,
+                semantic_content=semantic_content,
+                final_artifact_id=None,
+                synthesis_pipeline_version=SYNTHESIS_PIPELINE_VERSION,
+            )
+            completed_scope = self.repository.get_scope(scope.scope_id)
+            return self._complete_persisted_result(
+                job,
+                lease_token,
+                completed_scope,
+                stage="result_finalized",
+            )
+
+        completed_finals = tuple(
+            item
+            for item in self.repository.list_synthesis_work_items(scope.scope_id)
+            if item.stage is ResearchSynthesisStage.FINAL
+            and item.state is ResearchSynthesisWorkState.COMPLETED
+        )
+        if len(completed_finals) > 1:
+            raise ResearchJobError(
+                "Research synthesis has more than one completed FINAL work item."
+            )
+        if completed_finals:
+            final_work = completed_finals[0]
+            final_artifact = self.repository.synthesis_artifact_for_work_item(
+                final_work.work_item_id
+            )
+            if final_artifact is None:
+                raise ResearchJobError(
+                    "Completed Research FINAL work lost its immutable artifact."
+                )
+            semantic_content = _semantic_content_from_final_artifact(
+                final_artifact.content_json
+            )
+            self.repository.finalize_result_fenced(
+                scope.scope_id,
+                parent_job_id=job.job_id,
+                lease_token=lease_token,
+                semantic_content=semantic_content,
+                final_artifact_id=final_artifact.artifact_id,
+                synthesis_pipeline_version=SYNTHESIS_PIPELINE_VERSION,
+            )
+            completed_scope = self.repository.get_scope(scope.scope_id)
+            return self._complete_persisted_result(
+                job,
+                lease_token,
+                completed_scope,
+                stage="result_finalized",
+            )
+
+        try:
+            self.service.ensure_model_contract(
+                job.job_id,
+                parent_job_id=job.job_id,
+                lease_token=lease_token,
+            )
+        except ProviderUnavailableError as exc:
+            return self._wait_reason(
+                job,
+                lease_token,
+                refreshed_scope,
+                None,
+                WaitingReason.NETWORK,
+                stage="research_synthesis_model_unavailable",
+                detail=str(exc),
+            )
+        except (ModelSelectionError, SourceAnalysisModelDriftError) as exc:
+            return self._wait_reason(
+                job,
+                lease_token,
+                refreshed_scope,
+                None,
+                WaitingReason.USER,
+                stage="research_synthesis_model_drift",
+                detail=str(exc),
+            )
+        except ModelProviderError as exc:
+            return self._wait_reason(
+                job,
+                lease_token,
+                refreshed_scope,
+                None,
+                WaitingReason.USER,
+                stage="research_synthesis_model_error",
+                detail=str(exc),
+            )
+
+        work = self.synthesis.plan_next_synthesis(
+            refreshed_scope,
+            parent_job_id=job.job_id,
+            lease_token=lease_token,
+        )
+        try:
+            prepared = self.synthesis.prepare_call(refreshed_scope, work)
+        except ResearchSynthesisInputTooLargeError:
+            return self._split_synthesis_boundary(
+                job,
+                lease_token,
+                refreshed_scope,
+                work,
+                reason="estimated_context_overflow",
+            )
+        except ResearchSynthesisConfigurationError as exc:
+            raise ResearchJobError(str(exc)) from exc
+
+        try:
+            artifact = self.synthesis.execute_call(
+                scope=refreshed_scope,
+                parent_job_id=job.job_id,
+                lease_token=lease_token,
+                prepared=prepared,
+                extend_seconds=extend_seconds,
+            )
+        except ProviderContextLimitError:
+            return self._split_synthesis_boundary(
+                job,
+                lease_token,
+                refreshed_scope,
+                work,
+                reason="provider_context_overflow",
+            )
+        except ProviderUnavailableError as exc:
+            return self._wait_reason(
+                job,
+                lease_token,
+                refreshed_scope,
+                None,
+                WaitingReason.NETWORK,
+                stage="research_synthesis_provider_unavailable",
+                detail=str(exc),
+            )
+        except SourceAnalysisModelDriftError as exc:
+            return self._wait_reason(
+                job,
+                lease_token,
+                refreshed_scope,
+                None,
+                WaitingReason.USER,
+                stage="research_synthesis_model_drift",
+                detail=str(exc),
+            )
+        except ResearchSynthesisOutputError as exc:
+            return self._wait_reason(
+                job,
+                lease_token,
+                refreshed_scope,
+                None,
+                WaitingReason.USER,
+                stage="research_synthesis_output_invalid",
+                detail=str(exc),
+            )
+        except ModelProviderError as exc:
+            return self._wait_reason(
+                job,
+                lease_token,
+                refreshed_scope,
+                None,
+                WaitingReason.USER,
+                stage="research_synthesis_model_error",
+                detail=str(exc),
+            )
+
+        refreshed_scope = self.repository.get_scope(scope.scope_id)
+        checkpoint = self._checkpoint(
+            job,
+            lease_token,
+            refreshed_scope,
+            current_stage="research_synthesis_artifact_committed",
+            work_item=None,
+            child_job_id=None,
+            detail={
+                "synthesis_work_item_id": str(work.work_item_id),
+                "artifact_id": str(artifact.artifact_id),
+                "synthesis_stage": artifact.artifact_kind.value,
+                "level": artifact.level,
+                "ordinal": artifact.ordinal,
+            },
+        )
+        return self._result(
+            job.job_id,
+            refreshed_scope,
+            None,
+            "synthesis_artifact",
+            checkpoint,
+            child_job_id=None,
+        )
+
+    def _split_synthesis_boundary(
+        self,
+        job: JobRecord,
+        lease_token: bytes,
+        scope: ResearchScopeRecord,
+        work: ResearchSynthesisWorkItemRecord,
+        *,
+        reason: str,
+    ) -> ResearchStepResult:
+        try:
+            children = self.synthesis.split_synthesis_work(
+                scope,
+                work,
+                parent_job_id=job.job_id,
+                lease_token=lease_token,
+            )
+        except ResearchSynthesisConfigurationError as exc:
+            return self._wait_reason(
+                job,
+                lease_token,
+                scope,
+                None,
+                WaitingReason.USER,
+                stage="research_synthesis_budget_blocked",
+                detail=str(exc),
+            )
+        checkpoint = self._checkpoint(
+            job,
+            lease_token,
+            self.repository.get_scope(scope.scope_id),
+            current_stage="research_synthesis_split",
+            work_item=None,
+            child_job_id=None,
+            detail={
+                "reason": reason,
+                "synthesis_work_item_id": str(work.work_item_id),
+                "child_work_item_ids": [
+                    str(child.work_item_id) for child in children
+                ],
+            },
+        )
+        return self._result(
+            job.job_id,
+            self.repository.get_scope(scope.scope_id),
+            None,
+            "synthesis_split",
+            checkpoint,
+            child_job_id=None,
+        )
+
+    def _complete_persisted_result(
+        self,
+        job: JobRecord,
+        lease_token: bytes,
+        scope: ResearchScopeRecord,
+        *,
+        stage: str,
+    ) -> ResearchStepResult:
+        result = self.repository.get_result_for_scope(scope.scope_id)
+        if result is None:
+            raise ResearchJobError(
+                "Completed ResearchScope has no durable ResearchResult."
+            )
+        checkpoint = self._checkpoint(
+            job,
+            lease_token,
+            scope,
+            current_stage=f"research_{stage}",
+            work_item=None,
+            child_job_id=None,
+            detail={
+                "result_id": str(result.result_id),
+                "final_artifact_id": (
+                    str(result.final_artifact_id)
+                    if result.final_artifact_id is not None
+                    else None
+                ),
+            },
+        )
+        completed = self.jobs.complete(
+            job.job_id,
+            lease_token=lease_token,
+        )
+        return ResearchStepResult(
+            job=completed,
+            scope=self.repository.get_scope(scope.scope_id),
+            work_item=None,
+            completed_stage=stage,
+            checkpoint=checkpoint,
+            child_job_id=None,
+            done=True,
+            waiting=False,
         )
 
     def _ensure_processing_child(
@@ -740,6 +1088,73 @@ class DurableResearchWorker:
             waiting=False,
         )
 
+
+
+def _deterministic_no_success_content(
+    coverage: ResearchCoverage,
+) -> dict[str, object]:
+    fully_irrelevant = (
+        coverage.eligible_count > 0
+        and coverage.irrelevant_count == coverage.eligible_count
+        and coverage.failed_count == 0
+        and coverage.unavailable_count == 0
+    )
+    if fully_irrelevant:
+        return {
+            "summary": (
+                "All eligible sources were processed successfully but no relevant "
+                "evidence was found for the frozen ResearchScope."
+            ),
+            "findings": [],
+            "contradictions": [],
+            "uncertainty": "",
+        }
+    uncertainty = (
+        "Semantic synthesis has no successful source evidence. Coverage remains "
+        "explicitly bounded by failed or unavailable eligible sources."
+        if coverage.failed_count > 0 or coverage.unavailable_count > 0
+        else "Semantic synthesis has no successful source evidence."
+    )
+    return {
+        "summary": "No successful source evidence was available for semantic synthesis.",
+        "findings": [],
+        "contradictions": [],
+        "uncertainty": uncertainty,
+    }
+
+
+def _semantic_content_from_final_artifact(raw: str) -> dict[str, object]:
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ResearchJobError(
+            "Research FINAL synthesis artifact contains invalid JSON."
+        ) from exc
+    expected = {"summary", "findings", "contradictions", "uncertainty"}
+    if not isinstance(payload, dict) or set(payload) != expected:
+        raise ResearchJobError(
+            "Research FINAL synthesis artifact has an invalid semantic shape."
+        )
+    if not isinstance(payload["summary"], str) or not isinstance(
+        payload["uncertainty"], str
+    ):
+        raise ResearchJobError(
+            "Research FINAL synthesis artifact text fields are invalid."
+        )
+    for field in ("findings", "contradictions"):
+        values = payload[field]
+        if not isinstance(values, list) or any(
+            not isinstance(item, str) for item in values
+        ):
+            raise ResearchJobError(
+                f"Research FINAL synthesis artifact field {field!r} is invalid."
+            )
+    return {
+        "summary": payload["summary"],
+        "findings": list(payload["findings"]),
+        "contradictions": list(payload["contradictions"]),
+        "uncertainty": payload["uncertainty"],
+    }
 
 def _child_wait_reason(child: JobRecord) -> WaitingReason:
     if child.state is not JobState.WAITING or child.blocked_reason is None:

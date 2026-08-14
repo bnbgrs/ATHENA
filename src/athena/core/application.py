@@ -47,6 +47,7 @@ from athena.observability.health import HealthService
 from athena.observability.logging import configure_logging
 from athena.research.repository import ResearchRepository
 from athena.research.service import ResearchService
+from athena.research.synthesis_service import ResearchSynthesisService
 from athena.retrieval.archive import (
     ArchiveHybridRetrievalService,
     ArchiveSearchService,
@@ -243,6 +244,10 @@ class AthenaApplication:
             jobs=self.jobs,
             source_analysis=self.source_analysis_service,
         )
+        self.research_synthesis = ResearchSynthesisService(
+            repository=self.research_repository,
+            source_analysis=self.source_analysis_service,
+        )
         self.source_processing = DurableSourceProcessingWorker(
             jobs=self.jobs,
             sources=self.sources,
@@ -256,6 +261,7 @@ class AthenaApplication:
             jobs=self.jobs,
             service=self.research,
             source_processing=self.source_processing,
+            synthesis=self.research_synthesis,
         )
         self.embedding_rebuild = DurableEmbeddingRebuildWorker(
             jobs=self.jobs,

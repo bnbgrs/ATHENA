@@ -7,7 +7,8 @@ import hmac
 import json
 import sqlite3
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 from athena.common.ids import new_uuid7, uuid_from_blob, uuid_to_blob
 from athena.common.time import utc_now_us
@@ -19,8 +20,16 @@ from athena.research.models import (
     ResearchCandidateSetState,
     ResearchCoverage,
     ResearchMode,
+    ResearchResultRecord,
     ResearchScopeRecord,
     ResearchScopeState,
+    ResearchSynthesisArtifactRecord,
+    ResearchSynthesisEvidenceRecord,
+    ResearchSynthesisInputKind,
+    ResearchSynthesisStage,
+    ResearchSynthesisWorkInputRecord,
+    ResearchSynthesisWorkItemRecord,
+    ResearchSynthesisWorkState,
     ResearchWorkItemRecord,
     ResearchWorkState,
 )
@@ -813,6 +822,1359 @@ class ResearchRepository:
             raise ResearchNotFoundError(str(work_item_id))
         return _work_item_from_row(row)
 
+
+    def successful_source_analysis_final_artifact_ids(
+        self,
+        scope_id: uuid.UUID,
+    ) -> tuple[uuid.UUID, ...]:
+        """Return successful SourceAnalysis FINAL artifacts in frozen candidate order."""
+        return self._successful_source_analysis_final_artifact_ids(
+            self.database.connection,
+            scope_id,
+        )
+
+    @staticmethod
+    def _successful_source_analysis_final_artifact_ids(
+        connection: sqlite3.Connection,
+        scope_id: uuid.UUID,
+    ) -> tuple[uuid.UUID, ...]:
+        scope = connection.execute(
+            "SELECT successful_count FROM research_scopes WHERE scope_id = ?",
+            (uuid_to_blob(scope_id),),
+        ).fetchone()
+        if scope is None:
+            raise ResearchNotFoundError(str(scope_id))
+        rows = connection.execute(
+            """
+            SELECT sa.final_artifact_id
+            FROM research_work_items AS rw
+            JOIN research_candidates AS rc ON rc.candidate_id = rw.candidate_id
+            JOIN source_analyses AS sa ON sa.job_id = rw.source_analysis_job_id
+            JOIN source_analysis_artifacts AS artifact
+              ON artifact.artifact_id = sa.final_artifact_id
+             AND artifact.analysis_id = sa.analysis_id
+             AND artifact.artifact_kind = 'final'
+            WHERE rw.scope_id = ?
+              AND rw.state = 'successful'
+              AND sa.state = 'completed'
+              AND sa.coverage = 1.0
+              AND sa.final_artifact_id IS NOT NULL
+            ORDER BY rc.ordinal ASC, artifact.artifact_id ASC
+            """,
+            (uuid_to_blob(scope_id),),
+        ).fetchall()
+        result = tuple(uuid_from_blob(bytes(row[0])) for row in rows)
+        if len(result) != int(scope["successful_count"]):
+            raise ResearchStateError(
+                "Successful Research work does not resolve to exactly one completed "
+                "SourceAnalysis FINAL artifact per source."
+            )
+        return result
+
+    def create_synthesis_work_item_fenced(
+        self,
+        scope_id: uuid.UUID,
+        *,
+        parent_job_id: uuid.UUID,
+        lease_token: bytes,
+        stage: ResearchSynthesisStage,
+        level: int,
+        ordinal: int,
+        inputs: Sequence[tuple[ResearchSynthesisInputKind, uuid.UUID]],
+        descriptor: Mapping[str, Any],
+        pipeline_version: str,
+        prompt_template_id: str,
+        prompt_template_version: str,
+    ) -> ResearchSynthesisWorkItemRecord:
+        if level < 0 or ordinal < 0:
+            raise ResearchStateError(
+                "Research synthesis level and ordinal must not be negative."
+            )
+        if not inputs:
+            raise ResearchStateError(
+                "Research synthesis work requires at least one immutable input."
+            )
+        normalized_pipeline = _required_text(
+            pipeline_version,
+            "Research synthesis pipeline_version",
+        )
+        normalized_prompt = _required_text(
+            prompt_template_id,
+            "Research synthesis prompt_template_id",
+        )
+        normalized_prompt_version = _required_text(
+            prompt_template_version,
+            "Research synthesis prompt_template_version",
+        )
+        key = _synthesis_work_idempotency_key(
+            scope_id=scope_id,
+            stage=stage,
+            level=level,
+            ordinal=ordinal,
+            inputs=inputs,
+            descriptor=descriptor,
+            pipeline_version=normalized_pipeline,
+            prompt_template_id=normalized_prompt,
+            prompt_template_version=normalized_prompt_version,
+        )
+        with self.database.write_transaction() as connection:
+            self._require_running_fence(
+                connection,
+                parent_job_id,
+                lease_token,
+            )
+            scope_row = connection.execute(
+                "SELECT job_id, state FROM research_scopes WHERE scope_id = ?",
+                (uuid_to_blob(scope_id),),
+            ).fetchone()
+            if scope_row is None:
+                raise ResearchNotFoundError(str(scope_id))
+            if bytes(scope_row["job_id"]) != parent_job_id.bytes:
+                raise ResearchStateError(
+                    "Research synthesis scope belongs to another parent job."
+                )
+            if ResearchScopeState(str(scope_row["state"])) is not ResearchScopeState.RUNNING:
+                raise ResearchStateError(
+                    "Research synthesis can only be planned for a running scope."
+                )
+            pending = connection.execute(
+                "SELECT COUNT(*) FROM research_work_items "
+                "WHERE scope_id = ? AND state = 'pending'",
+                (uuid_to_blob(scope_id),),
+            ).fetchone()
+            if pending is None or int(pending[0]) != 0:
+                raise ResearchStateError(
+                    "Research synthesis cannot start before all source work is terminal."
+                )
+
+            existing = connection.execute(
+                "SELECT * FROM research_synthesis_work_items "
+                "WHERE idempotency_key = ?",
+                (key,),
+            ).fetchone()
+            if existing is not None:
+                item = _synthesis_work_item_from_row(existing)
+                expected = (
+                    scope_id,
+                    stage,
+                    level,
+                    ordinal,
+                    normalized_pipeline,
+                    normalized_prompt,
+                    normalized_prompt_version,
+                )
+                actual = (
+                    item.scope_id,
+                    item.stage,
+                    item.level,
+                    item.ordinal,
+                    item.pipeline_version,
+                    item.prompt_template_id,
+                    item.prompt_template_version,
+                )
+                if actual != expected:
+                    raise ResearchStateError(
+                        "Research synthesis idempotency key collided with different work."
+                    )
+                persisted_inputs = self._synthesis_inputs_for_work_item(
+                    connection,
+                    item.work_item_id,
+                )
+                expected_inputs = tuple(inputs)
+                actual_inputs = tuple(
+                    (
+                        persisted.input_kind,
+                        persisted.source_analysis_artifact_id
+                        if persisted.input_kind
+                        is ResearchSynthesisInputKind.SOURCE_ANALYSIS_ARTIFACT
+                        else persisted.research_synthesis_artifact_id,
+                    )
+                    for persisted in persisted_inputs
+                )
+                if actual_inputs != expected_inputs:
+                    raise ResearchStateError(
+                        "Idempotent Research synthesis work disagrees on immutable inputs."
+                    )
+                return item
+
+            self._validate_synthesis_inputs(
+                connection,
+                scope_id=scope_id,
+                inputs=inputs,
+            )
+            now_us = utc_now_us()
+            work_item_id = new_uuid7()
+            connection.execute(
+                """
+                INSERT INTO research_synthesis_work_items (
+                    work_item_id, scope_id, stage, level, ordinal, state,
+                    idempotency_key, pipeline_version, prompt_template_id,
+                    prompt_template_version, attempt_count, created_at_us, updated_at_us
+                ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, 0, ?, ?)
+                """,
+                (
+                    uuid_to_blob(work_item_id),
+                    uuid_to_blob(scope_id),
+                    stage.value,
+                    level,
+                    ordinal,
+                    key,
+                    normalized_pipeline,
+                    normalized_prompt,
+                    normalized_prompt_version,
+                    now_us,
+                    now_us,
+                ),
+            )
+            for input_ordinal, (kind, ref_id) in enumerate(inputs):
+                connection.execute(
+                    """
+                    INSERT INTO research_synthesis_work_inputs (
+                        work_item_id, ordinal, input_kind,
+                        source_analysis_artifact_id,
+                        research_synthesis_artifact_id
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        uuid_to_blob(work_item_id),
+                        input_ordinal,
+                        kind.value,
+                        (
+                            uuid_to_blob(ref_id)
+                            if kind
+                            is ResearchSynthesisInputKind.SOURCE_ANALYSIS_ARTIFACT
+                            else None
+                        ),
+                        (
+                            uuid_to_blob(ref_id)
+                            if kind
+                            is ResearchSynthesisInputKind.RESEARCH_SYNTHESIS_ARTIFACT
+                            else None
+                        ),
+                    ),
+                )
+            row = connection.execute(
+                "SELECT * FROM research_synthesis_work_items WHERE work_item_id = ?",
+                (uuid_to_blob(work_item_id),),
+            ).fetchone()
+            assert row is not None
+            return _synthesis_work_item_from_row(row)
+
+    @staticmethod
+    def _validate_synthesis_inputs(
+        connection: sqlite3.Connection,
+        *,
+        scope_id: uuid.UUID,
+        inputs: Sequence[tuple[ResearchSynthesisInputKind, uuid.UUID]],
+    ) -> None:
+        seen: set[tuple[ResearchSynthesisInputKind, uuid.UUID]] = set()
+        successful_final_ids = set(
+            ResearchRepository._successful_source_analysis_final_artifact_ids(
+                connection,
+                scope_id,
+            )
+        )
+        for kind, ref_id in inputs:
+            identity = (kind, ref_id)
+            if identity in seen:
+                raise ResearchStateError(
+                    "Research synthesis work cannot repeat the same immutable input."
+                )
+            seen.add(identity)
+            if kind is ResearchSynthesisInputKind.SOURCE_ANALYSIS_ARTIFACT:
+                if ref_id not in successful_final_ids:
+                    raise ResearchStateError(
+                        "Research synthesis SourceAnalysis input is not the completed "
+                        "FINAL artifact of SUCCESSFUL source work in this scope."
+                    )
+                continue
+            if kind is ResearchSynthesisInputKind.RESEARCH_SYNTHESIS_ARTIFACT:
+                row = connection.execute(
+                    """
+                    SELECT work.state
+                    FROM research_synthesis_artifacts AS artifact
+                    JOIN research_synthesis_work_items AS work
+                      ON work.work_item_id = artifact.work_item_id
+                    WHERE artifact.artifact_id = ?
+                      AND artifact.scope_id = ?
+                    """,
+                    (uuid_to_blob(ref_id), uuid_to_blob(scope_id)),
+                ).fetchone()
+                if row is None or str(row["state"]) != "completed":
+                    raise ResearchStateError(
+                        "Research synthesis artifact input is absent, cross-scope, "
+                        "or not durably completed."
+                    )
+                continue
+            raise ResearchStateError(
+                f"Unsupported Research synthesis input kind {kind!r}."
+            )
+
+    def get_synthesis_work_item(
+        self,
+        work_item_id: uuid.UUID,
+    ) -> ResearchSynthesisWorkItemRecord:
+        row = self.database.connection.execute(
+            "SELECT * FROM research_synthesis_work_items WHERE work_item_id = ?",
+            (uuid_to_blob(work_item_id),),
+        ).fetchone()
+        if row is None:
+            raise ResearchNotFoundError(
+                f"Research synthesis work {work_item_id} does not exist."
+            )
+        return _synthesis_work_item_from_row(row)
+
+    def list_synthesis_work_items(
+        self,
+        scope_id: uuid.UUID,
+        *,
+        stage: ResearchSynthesisStage | None = None,
+        state: ResearchSynthesisWorkState | None = None,
+    ) -> tuple[ResearchSynthesisWorkItemRecord, ...]:
+        clauses = ["scope_id = ?"]
+        params: list[object] = [uuid_to_blob(scope_id)]
+        if stage is not None:
+            clauses.append("stage = ?")
+            params.append(stage.value)
+        if state is not None:
+            clauses.append("state = ?")
+            params.append(state.value)
+        rows = self.database.connection.execute(
+            "SELECT * FROM research_synthesis_work_items WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY level, ordinal, work_item_id",
+            tuple(params),
+        ).fetchall()
+        return tuple(_synthesis_work_item_from_row(row) for row in rows)
+
+    def next_pending_synthesis(
+        self,
+        scope_id: uuid.UUID,
+    ) -> ResearchSynthesisWorkItemRecord | None:
+        row = self.database.connection.execute(
+            """
+            SELECT * FROM research_synthesis_work_items
+            WHERE scope_id = ? AND state = 'pending'
+            ORDER BY level, ordinal, work_item_id
+            LIMIT 1
+            """,
+            (uuid_to_blob(scope_id),),
+        ).fetchone()
+        return None if row is None else _synthesis_work_item_from_row(row)
+
+    def synthesis_inputs_for_work_item(
+        self,
+        work_item_id: uuid.UUID,
+    ) -> tuple[ResearchSynthesisWorkInputRecord, ...]:
+        return self._synthesis_inputs_for_work_item(
+            self.database.connection,
+            work_item_id,
+        )
+
+    @staticmethod
+    def _synthesis_inputs_for_work_item(
+        connection: sqlite3.Connection,
+        work_item_id: uuid.UUID,
+    ) -> tuple[ResearchSynthesisWorkInputRecord, ...]:
+        rows = connection.execute(
+            """
+            SELECT * FROM research_synthesis_work_inputs
+            WHERE work_item_id = ?
+            ORDER BY ordinal
+            """,
+            (uuid_to_blob(work_item_id),),
+        ).fetchall()
+        return tuple(_synthesis_work_input_from_row(row) for row in rows)
+
+
+    def split_synthesis_work_item_fenced(
+        self,
+        work_item_id: uuid.UUID,
+        *,
+        parent_job_id: uuid.UUID,
+        lease_token: bytes,
+        children: Sequence[
+            tuple[
+                int,
+                int,
+                Sequence[tuple[ResearchSynthesisInputKind, uuid.UUID]],
+                Mapping[str, Any],
+            ]
+        ],
+    ) -> tuple[ResearchSynthesisWorkItemRecord, ...]:
+        """Atomically supersede pending synthesis work with convergent REDUCE children."""
+        if not children:
+            raise ResearchStateError(
+                "Research synthesis split requires at least one convergent child."
+            )
+
+        with self.database.write_transaction() as connection:
+            self._require_running_fence(
+                connection,
+                parent_job_id,
+                lease_token,
+            )
+            parent_row = connection.execute(
+                """
+                SELECT work.*, scope.job_id AS parent_job_id,
+                       scope.state AS scope_state
+                FROM research_synthesis_work_items AS work
+                JOIN research_scopes AS scope ON scope.scope_id = work.scope_id
+                WHERE work.work_item_id = ?
+                """,
+                (uuid_to_blob(work_item_id),),
+            ).fetchone()
+            if parent_row is None:
+                raise ResearchNotFoundError(
+                    f"Research synthesis work {work_item_id} does not exist."
+                )
+            if bytes(parent_row["parent_job_id"]) != parent_job_id.bytes:
+                raise ResearchStateError(
+                    "Research synthesis work belongs to another parent job."
+                )
+            if str(parent_row["scope_state"]) != ResearchScopeState.RUNNING.value:
+                raise ResearchStateError(
+                    "Research synthesis split requires a running scope."
+                )
+
+            parent = _synthesis_work_item_from_row(parent_row)
+            if parent.stage not in {
+                ResearchSynthesisStage.REDUCE,
+                ResearchSynthesisStage.FINAL,
+            }:
+                raise ResearchStateError(
+                    "Only reduce/final Research synthesis work can be split."
+                )
+
+            parent_inputs = self._synthesis_inputs_for_work_item(
+                connection,
+                work_item_id,
+            )
+            parent_refs = tuple(
+                (
+                    item.input_kind,
+                    item.source_analysis_artifact_id
+                    if item.input_kind
+                    is ResearchSynthesisInputKind.SOURCE_ANALYSIS_ARTIFACT
+                    else item.research_synthesis_artifact_id,
+                )
+                for item in parent_inputs
+            )
+            if any(ref_id is None for _kind, ref_id in parent_refs):
+                raise ResearchStateError(
+                    "Research synthesis parent has an incomplete immutable input."
+                )
+            if len(set(parent_refs)) != len(parent_refs):
+                raise ResearchStateError(
+                    "Research synthesis split cannot disambiguate duplicate parent inputs."
+                )
+            allowed_refs = set(parent_refs)
+            used_refs: set[tuple[ResearchSynthesisInputKind, uuid.UUID | None]] = set()
+
+            normalized_children: list[
+                tuple[
+                    bytes,
+                    int,
+                    int,
+                    tuple[tuple[ResearchSynthesisInputKind, uuid.UUID], ...],
+                ]
+            ] = []
+            for child_level, child_ordinal, child_inputs_raw, descriptor in children:
+                child_inputs = tuple(child_inputs_raw)
+                if child_level != parent.level + 1:
+                    raise ResearchStateError(
+                        "Research synthesis split child level must be parent level + 1."
+                    )
+                if child_ordinal < 0:
+                    raise ResearchStateError(
+                        "Research synthesis split child ordinal must not be negative."
+                    )
+                if len(child_inputs) < 2:
+                    raise ResearchStateError(
+                        "Research synthesis REDUCE child must merge at least two inputs."
+                    )
+                if len(set(child_inputs)) != len(child_inputs):
+                    raise ResearchStateError(
+                        "Research synthesis REDUCE child contains duplicate inputs."
+                    )
+                for child_ref in child_inputs:
+                    if child_ref not in allowed_refs:
+                        raise ResearchStateError(
+                            "Research synthesis split child references an input "
+                            "outside its parent."
+                        )
+                    if child_ref in used_refs:
+                        raise ResearchStateError(
+                            "Research synthesis split children must not overlap inputs."
+                        )
+                    used_refs.add(child_ref)
+
+                key = _synthesis_work_idempotency_key(
+                    scope_id=parent.scope_id,
+                    stage=ResearchSynthesisStage.REDUCE,
+                    level=child_level,
+                    ordinal=child_ordinal,
+                    inputs=child_inputs,
+                    descriptor={
+                        "split_parent_work_item_id": str(work_item_id),
+                        "child": descriptor,
+                    },
+                    pipeline_version=parent.pipeline_version,
+                    prompt_template_id=parent.prompt_template_id,
+                    prompt_template_version=parent.prompt_template_version,
+                )
+                normalized_children.append(
+                    (
+                        key,
+                        child_level,
+                        child_ordinal,
+                        child_inputs,
+                    )
+                )
+
+            def persisted_child(
+                key: bytes,
+                child_level: int,
+                child_ordinal: int,
+                child_inputs: tuple[
+                    tuple[ResearchSynthesisInputKind, uuid.UUID], ...
+                ],
+            ) -> ResearchSynthesisWorkItemRecord:
+                row = connection.execute(
+                    """
+                    SELECT *
+                    FROM research_synthesis_work_items
+                    WHERE idempotency_key = ?
+                    """,
+                    (key,),
+                ).fetchone()
+                if row is None:
+                    raise ResearchStateError(
+                        "Previously split Research synthesis work lost a "
+                        "deterministic child."
+                    )
+                item = _synthesis_work_item_from_row(row)
+                identity = (
+                    item.scope_id,
+                    item.stage,
+                    item.level,
+                    item.ordinal,
+                    item.pipeline_version,
+                    item.prompt_template_id,
+                    item.prompt_template_version,
+                )
+                expected_identity = (
+                    parent.scope_id,
+                    ResearchSynthesisStage.REDUCE,
+                    child_level,
+                    child_ordinal,
+                    parent.pipeline_version,
+                    parent.prompt_template_id,
+                    parent.prompt_template_version,
+                )
+                if identity != expected_identity:
+                    raise ResearchStateError(
+                        "Research synthesis split child identity drifted."
+                    )
+                persisted_inputs = self._synthesis_inputs_for_work_item(
+                    connection,
+                    item.work_item_id,
+                )
+                actual_inputs = tuple(
+                    (
+                        persisted.input_kind,
+                        persisted.source_analysis_artifact_id
+                        if persisted.input_kind
+                        is ResearchSynthesisInputKind.SOURCE_ANALYSIS_ARTIFACT
+                        else persisted.research_synthesis_artifact_id,
+                    )
+                    for persisted in persisted_inputs
+                )
+                if actual_inputs != child_inputs:
+                    raise ResearchStateError(
+                        "Research synthesis split child immutable inputs drifted."
+                    )
+                return item
+
+            if parent.state is ResearchSynthesisWorkState.SPLIT:
+                return tuple(
+                    persisted_child(
+                        key,
+                        child_level,
+                        child_ordinal,
+                        child_inputs,
+                    )
+                    for key, child_level, child_ordinal, child_inputs
+                    in normalized_children
+                )
+            if parent.state is not ResearchSynthesisWorkState.PENDING:
+                raise ResearchStateError(
+                    "Only pending Research synthesis work can be split."
+                )
+
+            now_us = utc_now_us()
+            created: list[ResearchSynthesisWorkItemRecord] = []
+            for key, child_level, child_ordinal, child_inputs in normalized_children:
+                existing = connection.execute(
+                    """
+                    SELECT *
+                    FROM research_synthesis_work_items
+                    WHERE idempotency_key = ?
+                    """,
+                    (key,),
+                ).fetchone()
+                if existing is not None:
+                    created.append(
+                        persisted_child(
+                            key,
+                            child_level,
+                            child_ordinal,
+                            child_inputs,
+                        )
+                    )
+                    continue
+
+                self._validate_synthesis_inputs(
+                    connection,
+                    scope_id=parent.scope_id,
+                    inputs=child_inputs,
+                )
+                child_id = new_uuid7()
+                connection.execute(
+                    """
+                    INSERT INTO research_synthesis_work_items (
+                        work_item_id, scope_id, stage, level, ordinal, state,
+                        idempotency_key, pipeline_version, prompt_template_id,
+                        prompt_template_version, attempt_count,
+                        created_at_us, updated_at_us
+                    ) VALUES (
+                        ?, ?, 'reduce', ?, ?, 'pending',
+                        ?, ?, ?, ?, 0, ?, ?
+                    )
+                    """,
+                    (
+                        uuid_to_blob(child_id),
+                        uuid_to_blob(parent.scope_id),
+                        child_level,
+                        child_ordinal,
+                        key,
+                        parent.pipeline_version,
+                        parent.prompt_template_id,
+                        parent.prompt_template_version,
+                        now_us,
+                        now_us,
+                    ),
+                )
+                for input_ordinal, (kind, ref_id) in enumerate(child_inputs):
+                    connection.execute(
+                        """
+                        INSERT INTO research_synthesis_work_inputs (
+                            work_item_id, ordinal, input_kind,
+                            source_analysis_artifact_id,
+                            research_synthesis_artifact_id
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            uuid_to_blob(child_id),
+                            input_ordinal,
+                            kind.value,
+                            (
+                                uuid_to_blob(ref_id)
+                                if kind
+                                is ResearchSynthesisInputKind.SOURCE_ANALYSIS_ARTIFACT
+                                else None
+                            ),
+                            (
+                                uuid_to_blob(ref_id)
+                                if kind
+                                is ResearchSynthesisInputKind.RESEARCH_SYNTHESIS_ARTIFACT
+                                else None
+                            ),
+                        ),
+                    )
+                row = connection.execute(
+                    """
+                    SELECT *
+                    FROM research_synthesis_work_items
+                    WHERE work_item_id = ?
+                    """,
+                    (uuid_to_blob(child_id),),
+                ).fetchone()
+                assert row is not None
+                created.append(_synthesis_work_item_from_row(row))
+
+            cursor = connection.execute(
+                """
+                UPDATE research_synthesis_work_items
+                SET state = 'split', updated_at_us = ?
+                WHERE work_item_id = ? AND state = 'pending'
+                """,
+                (now_us, uuid_to_blob(work_item_id)),
+            )
+            if cursor.rowcount != 1:
+                raise ResearchStateError(
+                    "Research synthesis parent lost its pending state during split."
+                )
+            return tuple(created)
+
+
+    def begin_synthesis_attempt_fenced(
+        self,
+        work_item_id: uuid.UUID,
+        *,
+        parent_job_id: uuid.UUID,
+        lease_token: bytes,
+    ) -> ResearchSynthesisWorkItemRecord:
+        with self.database.write_transaction() as connection:
+            self._require_running_fence(
+                connection,
+                parent_job_id,
+                lease_token,
+            )
+            row = connection.execute(
+                """
+                SELECT work.*, scope.job_id AS parent_job_id, scope.state AS scope_state
+                FROM research_synthesis_work_items AS work
+                JOIN research_scopes AS scope ON scope.scope_id = work.scope_id
+                WHERE work.work_item_id = ?
+                """,
+                (uuid_to_blob(work_item_id),),
+            ).fetchone()
+            if row is None:
+                raise ResearchNotFoundError(
+                    f"Research synthesis work {work_item_id} does not exist."
+                )
+            if bytes(row["parent_job_id"]) != parent_job_id.bytes:
+                raise ResearchStateError(
+                    "Research synthesis work belongs to another parent job."
+                )
+            if str(row["scope_state"]) != ResearchScopeState.RUNNING.value:
+                raise ResearchStateError(
+                    "Research synthesis attempt requires a running scope."
+                )
+            item = _synthesis_work_item_from_row(row)
+            if item.state is not ResearchSynthesisWorkState.PENDING:
+                raise ResearchStateError(
+                    "Only pending Research synthesis work can begin an attempt."
+                )
+            cursor = connection.execute(
+                """
+                UPDATE research_synthesis_work_items
+                SET attempt_count = attempt_count + 1, updated_at_us = ?
+                WHERE work_item_id = ? AND state = 'pending'
+                """,
+                (utc_now_us(), uuid_to_blob(work_item_id)),
+            )
+            if cursor.rowcount != 1:
+                raise ResearchStateError(
+                    "Research synthesis work lost its pending state at attempt start."
+                )
+            updated = connection.execute(
+                "SELECT * FROM research_synthesis_work_items WHERE work_item_id = ?",
+                (uuid_to_blob(work_item_id),),
+            ).fetchone()
+            assert updated is not None
+            return _synthesis_work_item_from_row(updated)
+
+    def commit_synthesis_artifact_fenced(
+        self,
+        *,
+        work_item_id: uuid.UUID,
+        parent_job_id: uuid.UUID,
+        lease_token: bytes,
+        content: Mapping[str, Any],
+        processing_run_id: uuid.UUID,
+        evidence: Sequence[tuple[str, int, int]],
+    ) -> ResearchSynthesisArtifactRecord:
+        content_json = _canonical_json_object(content)
+        content_hash = hashlib.sha256(content_json.encode("utf-8")).digest()
+        evidence_rows = _validated_synthesis_evidence(content, evidence)
+
+        with self.database.write_transaction() as connection:
+            self._require_running_fence(
+                connection,
+                parent_job_id,
+                lease_token,
+            )
+            row = connection.execute(
+                """
+                SELECT work.*, scope.job_id AS parent_job_id,
+                       scope.state AS scope_state,
+                       scope.model_signature_id
+                FROM research_synthesis_work_items AS work
+                JOIN research_scopes AS scope ON scope.scope_id = work.scope_id
+                WHERE work.work_item_id = ?
+                """,
+                (uuid_to_blob(work_item_id),),
+            ).fetchone()
+            if row is None:
+                raise ResearchNotFoundError(
+                    f"Research synthesis work {work_item_id} does not exist."
+                )
+            if bytes(row["parent_job_id"]) != parent_job_id.bytes:
+                raise ResearchStateError(
+                    "Research synthesis work belongs to another parent job."
+                )
+            if str(row["scope_state"]) != ResearchScopeState.RUNNING.value:
+                raise ResearchStateError(
+                    "Research synthesis artifact commit requires a running scope."
+                )
+            item = _synthesis_work_item_from_row(row)
+
+            existing = connection.execute(
+                "SELECT * FROM research_synthesis_artifacts WHERE work_item_id = ?",
+                (uuid_to_blob(work_item_id),),
+            ).fetchone()
+            if existing is not None:
+                artifact = _synthesis_artifact_from_row(existing)
+                if artifact.content_hash != content_hash:
+                    raise ResearchStateError(
+                        "Completed Research synthesis work cannot be overwritten."
+                    )
+                persisted_evidence = self._synthesis_evidence_for_artifact(
+                    connection,
+                    artifact.artifact_id,
+                )
+                expected_evidence = tuple(
+                    ResearchSynthesisEvidenceRecord(
+                        artifact_id=artifact.artifact_id,
+                        work_item_id=work_item_id,
+                        output_kind=kind,
+                        output_ordinal=output_ordinal,
+                        input_ordinal=input_ordinal,
+                    )
+                    for kind, output_ordinal, input_ordinal in evidence_rows
+                )
+                if persisted_evidence != expected_evidence:
+                    raise ResearchStateError(
+                        "Idempotent Research synthesis artifact disagrees on evidence."
+                    )
+                return artifact
+
+            if item.state is not ResearchSynthesisWorkState.PENDING:
+                raise ResearchStateError(
+                    "Only pending Research synthesis work can commit an artifact."
+                )
+            signature_blob = row["model_signature_id"]
+            if signature_blob is None:
+                raise ResearchStateError(
+                    "Research synthesis work has no pinned ModelSignature."
+                )
+            run = connection.execute(
+                """
+                SELECT status, model_signature_id, pipeline_version,
+                       prompt_template_id, prompt_template_version
+                FROM processing_runs
+                WHERE processing_run_id = ?
+                """,
+                (uuid_to_blob(processing_run_id),),
+            ).fetchone()
+            if run is None or str(run["status"]) != "running":
+                raise ResearchStateError(
+                    "Research synthesis artifact ProcessingRun is not running."
+                )
+            if run["model_signature_id"] is None or bytes(
+                run["model_signature_id"]
+            ) != bytes(signature_blob):
+                raise ResearchStateError(
+                    "Research synthesis ProcessingRun lost the scope ModelSignature."
+                )
+            if (
+                str(run["pipeline_version"]) != item.pipeline_version
+                or run["prompt_template_id"] is None
+                or str(run["prompt_template_id"]) != item.prompt_template_id
+                or run["prompt_template_version"] is None
+                or str(run["prompt_template_version"])
+                != item.prompt_template_version
+            ):
+                raise ResearchStateError(
+                    "Research synthesis ProcessingRun prompt/pipeline provenance drifted."
+                )
+
+            input_ordinals = {
+                input_item.ordinal
+                for input_item in self._synthesis_inputs_for_work_item(
+                    connection,
+                    work_item_id,
+                )
+            }
+            if any(
+                input_ordinal not in input_ordinals
+                for _kind, _output_ordinal, input_ordinal in evidence_rows
+            ):
+                raise ResearchStateError(
+                    "Research synthesis output evidence references a missing work input."
+                )
+
+            now_us = utc_now_us()
+            artifact_id = new_uuid7()
+            connection.execute(
+                """
+                INSERT INTO research_synthesis_artifacts (
+                    artifact_id, scope_id, work_item_id, artifact_kind,
+                    level, ordinal, content_json, content_hash,
+                    processing_run_id, created_at_us
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    uuid_to_blob(artifact_id),
+                    uuid_to_blob(item.scope_id),
+                    uuid_to_blob(work_item_id),
+                    item.stage.value,
+                    item.level,
+                    item.ordinal,
+                    content_json,
+                    content_hash,
+                    uuid_to_blob(processing_run_id),
+                    now_us,
+                ),
+            )
+            for kind, output_ordinal, input_ordinal in evidence_rows:
+                connection.execute(
+                    """
+                    INSERT INTO research_synthesis_output_evidence (
+                        artifact_id, work_item_id, output_kind,
+                        output_ordinal, input_ordinal
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        uuid_to_blob(artifact_id),
+                        uuid_to_blob(work_item_id),
+                        kind,
+                        output_ordinal,
+                        input_ordinal,
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE research_synthesis_work_items
+                SET state = 'completed', updated_at_us = ?
+                WHERE work_item_id = ? AND state = 'pending'
+                """,
+                (now_us, uuid_to_blob(work_item_id)),
+            )
+            connection.execute(
+                """
+                UPDATE processing_runs
+                SET finished_at_us = ?, status = 'succeeded', error_detail = NULL
+                WHERE processing_run_id = ? AND status = 'running'
+                """,
+                (now_us, uuid_to_blob(processing_run_id)),
+            )
+            artifact_row = connection.execute(
+                "SELECT * FROM research_synthesis_artifacts WHERE artifact_id = ?",
+                (uuid_to_blob(artifact_id),),
+            ).fetchone()
+            assert artifact_row is not None
+            return _synthesis_artifact_from_row(artifact_row)
+
+    def get_synthesis_artifact(
+        self,
+        artifact_id: uuid.UUID,
+    ) -> ResearchSynthesisArtifactRecord:
+        row = self.database.connection.execute(
+            "SELECT * FROM research_synthesis_artifacts WHERE artifact_id = ?",
+            (uuid_to_blob(artifact_id),),
+        ).fetchone()
+        if row is None:
+            raise ResearchNotFoundError(
+                f"Research synthesis artifact {artifact_id} does not exist."
+            )
+        return _synthesis_artifact_from_row(row)
+
+    def synthesis_artifact_for_work_item(
+        self,
+        work_item_id: uuid.UUID,
+    ) -> ResearchSynthesisArtifactRecord | None:
+        row = self.database.connection.execute(
+            "SELECT * FROM research_synthesis_artifacts WHERE work_item_id = ?",
+            (uuid_to_blob(work_item_id),),
+        ).fetchone()
+        return None if row is None else _synthesis_artifact_from_row(row)
+
+    def synthesis_evidence_for_artifact(
+        self,
+        artifact_id: uuid.UUID,
+    ) -> tuple[ResearchSynthesisEvidenceRecord, ...]:
+        return self._synthesis_evidence_for_artifact(
+            self.database.connection,
+            artifact_id,
+        )
+
+    @staticmethod
+    def _synthesis_evidence_for_artifact(
+        connection: sqlite3.Connection,
+        artifact_id: uuid.UUID,
+    ) -> tuple[ResearchSynthesisEvidenceRecord, ...]:
+        rows = connection.execute(
+            """
+            SELECT * FROM research_synthesis_output_evidence
+            WHERE artifact_id = ?
+            ORDER BY output_kind, output_ordinal, input_ordinal
+            """,
+            (uuid_to_blob(artifact_id),),
+        ).fetchall()
+        return tuple(_synthesis_evidence_from_row(row) for row in rows)
+
+    def source_analysis_artifact_ids_for_synthesis_artifact(
+        self,
+        artifact_id: uuid.UUID,
+    ) -> tuple[uuid.UUID, ...]:
+        return self._source_analysis_artifact_ids_for_synthesis_artifact(
+            self.database.connection,
+            artifact_id,
+        )
+
+    @staticmethod
+    def _source_analysis_artifact_ids_for_synthesis_artifact(
+        connection: sqlite3.Connection,
+        artifact_id: uuid.UUID,
+    ) -> tuple[uuid.UUID, ...]:
+        exists = connection.execute(
+            "SELECT 1 FROM research_synthesis_artifacts WHERE artifact_id = ?",
+            (uuid_to_blob(artifact_id),),
+        ).fetchone()
+        if exists is None:
+            raise ResearchNotFoundError(
+                f"Research synthesis artifact {artifact_id} does not exist."
+            )
+        rows = connection.execute(
+            """
+            WITH RECURSIVE research_graph(artifact_id) AS (
+                SELECT ?
+                UNION
+                SELECT input.research_synthesis_artifact_id
+                FROM research_graph AS graph
+                JOIN research_synthesis_artifacts AS artifact
+                  ON artifact.artifact_id = graph.artifact_id
+                JOIN research_synthesis_work_inputs AS input
+                  ON input.work_item_id = artifact.work_item_id
+                WHERE input.input_kind = 'research_synthesis_artifact'
+                  AND input.research_synthesis_artifact_id IS NOT NULL
+            )
+            SELECT DISTINCT input.source_analysis_artifact_id
+            FROM research_graph AS graph
+            JOIN research_synthesis_artifacts AS artifact
+              ON artifact.artifact_id = graph.artifact_id
+            JOIN research_synthesis_work_inputs AS input
+              ON input.work_item_id = artifact.work_item_id
+            WHERE input.input_kind = 'source_analysis_artifact'
+              AND input.source_analysis_artifact_id IS NOT NULL
+            ORDER BY input.source_analysis_artifact_id
+            """,
+            (uuid_to_blob(artifact_id),),
+        ).fetchall()
+        return tuple(uuid_from_blob(bytes(row[0])) for row in rows)
+
+    def source_analysis_artifact_ids_for_synthesis_output(
+        self,
+        artifact_id: uuid.UUID,
+        *,
+        output_kind: str,
+        output_ordinal: int,
+    ) -> tuple[uuid.UUID, ...]:
+        if output_kind not in {"finding", "contradiction"} or output_ordinal < 0:
+            raise ResearchStateError(
+                "Research synthesis output identity is invalid."
+            )
+        evidence = tuple(
+            item
+            for item in self.synthesis_evidence_for_artifact(artifact_id)
+            if item.output_kind == output_kind
+            and item.output_ordinal == output_ordinal
+        )
+        if not evidence:
+            raise ResearchStateError(
+                "Research synthesis output has no durable evidence backlinks."
+            )
+        artifact = self.get_synthesis_artifact(artifact_id)
+        inputs = {
+            input_item.ordinal: input_item
+            for input_item in self.synthesis_inputs_for_work_item(
+                artifact.work_item_id
+            )
+        }
+        resolved: set[uuid.UUID] = set()
+        for link in evidence:
+            input_item = inputs.get(link.input_ordinal)
+            if input_item is None:
+                raise ResearchStateError(
+                    "Research synthesis evidence points at a missing input."
+                )
+            if (
+                input_item.input_kind
+                is ResearchSynthesisInputKind.SOURCE_ANALYSIS_ARTIFACT
+            ):
+                assert input_item.source_analysis_artifact_id is not None
+                resolved.add(input_item.source_analysis_artifact_id)
+            else:
+                assert input_item.research_synthesis_artifact_id is not None
+                resolved.update(
+                    self.source_analysis_artifact_ids_for_synthesis_artifact(
+                        input_item.research_synthesis_artifact_id
+                    )
+                )
+        return tuple(sorted(resolved, key=lambda item: item.bytes))
+
+    def get_result_for_scope(
+        self,
+        scope_id: uuid.UUID,
+    ) -> ResearchResultRecord | None:
+        row = self.database.connection.execute(
+            "SELECT * FROM research_results WHERE scope_id = ?",
+            (uuid_to_blob(scope_id),),
+        ).fetchone()
+        return None if row is None else _research_result_from_row(row)
+
+    def finalize_result_fenced(
+        self,
+        scope_id: uuid.UUID,
+        *,
+        parent_job_id: uuid.UUID,
+        lease_token: bytes,
+        semantic_content: Mapping[str, Any],
+        final_artifact_id: uuid.UUID | None,
+        synthesis_pipeline_version: str,
+    ) -> ResearchResultRecord:
+        normalized_pipeline = _required_text(
+            synthesis_pipeline_version,
+            "ResearchResult synthesis_pipeline_version",
+        )
+        reserved = {"coverage", "problem_sources", "snapshot_commit_seq"}
+        if reserved.intersection(semantic_content):
+            raise ResearchStateError(
+                "ResearchResult semantic content contains Core-owned coverage fields."
+            )
+
+        with self.database.write_transaction() as connection:
+            self._require_running_fence(
+                connection,
+                parent_job_id,
+                lease_token,
+            )
+            existing = connection.execute(
+                "SELECT * FROM research_results WHERE scope_id = ?",
+                (uuid_to_blob(scope_id),),
+            ).fetchone()
+            if existing is not None:
+                record = _research_result_from_row(existing)
+                if (
+                    record.final_artifact_id != final_artifact_id
+                    or record.synthesis_pipeline_version != normalized_pipeline
+                ):
+                    raise ResearchStateError(
+                        "Existing ResearchResult disagrees with finalization identity."
+                    )
+                return record
+
+            scope_row = connection.execute(
+                "SELECT * FROM research_scopes WHERE scope_id = ?",
+                (uuid_to_blob(scope_id),),
+            ).fetchone()
+            if scope_row is None:
+                raise ResearchNotFoundError(str(scope_id))
+            if bytes(scope_row["job_id"]) != parent_job_id.bytes:
+                raise ResearchStateError(
+                    "ResearchResult scope belongs to another parent job."
+                )
+            if str(scope_row["state"]) != ResearchScopeState.RUNNING.value:
+                raise ResearchStateError(
+                    "ResearchResult can only finalize a running scope."
+                )
+
+            now_us = utc_now_us()
+            self._recompute_scope_counters(
+                connection,
+                scope_id=scope_id,
+                now_us=now_us,
+            )
+            refreshed = connection.execute(
+                "SELECT * FROM research_scopes WHERE scope_id = ?",
+                (uuid_to_blob(scope_id),),
+            ).fetchone()
+            assert refreshed is not None
+            scope = _scope_from_row(refreshed)
+            eligible_count = scope.candidate_total - scope.excluded_count
+            if scope.processed_count != eligible_count:
+                raise ResearchStateError(
+                    "ResearchResult cannot finalize while eligible source work is nonterminal."
+                )
+
+            expected_source_artifacts = set(
+                self._successful_source_analysis_final_artifact_ids(
+                    connection,
+                    scope_id,
+                )
+            )
+            if scope.successful_count > 0:
+                if final_artifact_id is None:
+                    raise ResearchStateError(
+                        "Successful Research requires a FINAL synthesis artifact."
+                    )
+                final_row = connection.execute(
+                    """
+                    SELECT artifact.artifact_kind, work.state
+                    FROM research_synthesis_artifacts AS artifact
+                    JOIN research_synthesis_work_items AS work
+                      ON work.work_item_id = artifact.work_item_id
+                    WHERE artifact.artifact_id = ?
+                      AND artifact.scope_id = ?
+                    """,
+                    (
+                        uuid_to_blob(final_artifact_id),
+                        uuid_to_blob(scope_id),
+                    ),
+                ).fetchone()
+                if (
+                    final_row is None
+                    or str(final_row["artifact_kind"])
+                    != ResearchSynthesisStage.FINAL.value
+                    or str(final_row["state"])
+                    != ResearchSynthesisWorkState.COMPLETED.value
+                ):
+                    raise ResearchStateError(
+                        "ResearchResult final artifact is absent, cross-scope, "
+                        "or not a completed FINAL synthesis artifact."
+                    )
+                actual_source_artifacts = set(
+                    self._source_analysis_artifact_ids_for_synthesis_artifact(
+                        connection,
+                        final_artifact_id,
+                    )
+                )
+                if actual_source_artifacts != expected_source_artifacts:
+                    raise ResearchStateError(
+                        "ResearchResult FINAL artifact does not cover exactly every "
+                        "SUCCESSFUL SourceAnalysis FINAL artifact."
+                    )
+            elif final_artifact_id is not None:
+                raise ResearchStateError(
+                    "Research with no successful source evidence must not invent "
+                    "a semantic FINAL artifact."
+                )
+
+            problem_rows = connection.execute(
+                """
+                SELECT rc.ordinal, rc.source_id, rw.state
+                FROM research_work_items AS rw
+                JOIN research_candidates AS rc ON rc.candidate_id = rw.candidate_id
+                WHERE rw.scope_id = ?
+                  AND rw.state IN ('failed', 'unavailable')
+                ORDER BY rc.ordinal ASC, rc.source_id ASC
+                """,
+                (uuid_to_blob(scope_id),),
+            ).fetchall()
+            problems = [
+                {
+                    "candidate_ordinal": int(row["ordinal"]),
+                    "source_id": str(uuid_from_blob(bytes(row["source_id"]))),
+                    "state": str(row["state"]),
+                }
+                for row in problem_rows
+            ]
+            coverage_payload = {
+                "candidate_total": scope.candidate_total,
+                "processed_count": scope.processed_count,
+                "successful_count": scope.successful_count,
+                "irrelevant_count": scope.irrelevant_count,
+                "failed_count": scope.failed_count,
+                "unavailable_count": scope.unavailable_count,
+                "excluded_count": scope.excluded_count,
+                "eligible_count": eligible_count,
+                "coverage_ratio": scope.coverage_ratio,
+            }
+            payload = dict(semantic_content)
+            payload["coverage"] = coverage_payload
+            payload["problem_sources"] = problems
+            payload["snapshot_commit_seq"] = scope.snapshot_commit_seq
+            content_json = _canonical_json_object(payload)
+            content_hash = hashlib.sha256(
+                content_json.encode("utf-8")
+            ).digest()
+            problems_json = _canonical_json_value(problems)
+            result_id = new_uuid7()
+
+            connection.execute(
+                """
+                INSERT INTO research_results (
+                    result_id, scope_id, final_artifact_id,
+                    content_json, content_hash, snapshot_commit_seq,
+                    model_signature_id, synthesis_pipeline_version,
+                    candidate_total, processed_count, successful_count,
+                    irrelevant_count, failed_count, unavailable_count,
+                    excluded_count, coverage_ratio, problem_sources_json,
+                    created_at_us
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    uuid_to_blob(result_id),
+                    uuid_to_blob(scope_id),
+                    (
+                        uuid_to_blob(final_artifact_id)
+                        if final_artifact_id is not None
+                        else None
+                    ),
+                    content_json,
+                    content_hash,
+                    scope.snapshot_commit_seq,
+                    (
+                        uuid_to_blob(scope.model_signature_id)
+                        if scope.model_signature_id is not None
+                        else None
+                    ),
+                    normalized_pipeline,
+                    scope.candidate_total,
+                    scope.processed_count,
+                    scope.successful_count,
+                    scope.irrelevant_count,
+                    scope.failed_count,
+                    scope.unavailable_count,
+                    scope.excluded_count,
+                    scope.coverage_ratio,
+                    problems_json,
+                    now_us,
+                ),
+            )
+            cursor = connection.execute(
+                """
+                UPDATE research_scopes
+                SET state = 'completed', updated_at_us = ?
+                WHERE scope_id = ? AND state = 'running'
+                """,
+                (now_us, uuid_to_blob(scope_id)),
+            )
+            if cursor.rowcount != 1:
+                raise ResearchStateError(
+                    "Research scope lost its running state during finalization."
+                )
+            result_row = connection.execute(
+                "SELECT * FROM research_results WHERE result_id = ?",
+                (uuid_to_blob(result_id),),
+            ).fetchone()
+            assert result_row is not None
+            return _research_result_from_row(result_row)
+
+    @staticmethod
+    def _require_running_fence(
+        connection: sqlite3.Connection,
+        job_id: uuid.UUID,
+        lease_token: bytes,
+    ) -> None:
+        ResearchRepository._require_live_fence(
+            connection,
+            job_id,
+            lease_token,
+        )
+        row = connection.execute(
+            "SELECT state FROM jobs WHERE job_id = ?",
+            (uuid_to_blob(job_id),),
+        ).fetchone()
+        if row is None or str(row["state"]) != "running":
+            raise ResearchFenceError(
+                "Research semantic commit requires an actively running parent; "
+                "cancel_requested is not commit-capable."
+            )
+
     def coverage(self, scope_id: uuid.UUID) -> ResearchCoverage:
         scope = self.get_scope(scope_id)
         eligible_count = scope.candidate_total - scope.excluded_count
@@ -1100,6 +2462,219 @@ def _work_item_from_row(row: sqlite3.Row) -> ResearchWorkItemRecord:
         attempt_count=int(row["attempt_count"]),
         created_at_us=int(row["created_at_us"]),
         updated_at_us=int(row["updated_at_us"]),
+    )
+
+
+
+def _synthesis_work_item_from_row(
+    row: sqlite3.Row,
+) -> ResearchSynthesisWorkItemRecord:
+    return ResearchSynthesisWorkItemRecord(
+        work_item_id=uuid_from_blob(bytes(row["work_item_id"])),
+        scope_id=uuid_from_blob(bytes(row["scope_id"])),
+        stage=ResearchSynthesisStage(str(row["stage"])),
+        level=int(row["level"]),
+        ordinal=int(row["ordinal"]),
+        state=ResearchSynthesisWorkState(str(row["state"])),
+        idempotency_key=bytes(row["idempotency_key"]),
+        pipeline_version=str(row["pipeline_version"]),
+        prompt_template_id=str(row["prompt_template_id"]),
+        prompt_template_version=str(row["prompt_template_version"]),
+        attempt_count=int(row["attempt_count"]),
+        created_at_us=int(row["created_at_us"]),
+        updated_at_us=int(row["updated_at_us"]),
+    )
+
+
+def _synthesis_work_input_from_row(
+    row: sqlite3.Row,
+) -> ResearchSynthesisWorkInputRecord:
+    return ResearchSynthesisWorkInputRecord(
+        work_item_id=uuid_from_blob(bytes(row["work_item_id"])),
+        ordinal=int(row["ordinal"]),
+        input_kind=ResearchSynthesisInputKind(str(row["input_kind"])),
+        source_analysis_artifact_id=(
+            uuid_from_blob(bytes(row["source_analysis_artifact_id"]))
+            if row["source_analysis_artifact_id"] is not None
+            else None
+        ),
+        research_synthesis_artifact_id=(
+            uuid_from_blob(bytes(row["research_synthesis_artifact_id"]))
+            if row["research_synthesis_artifact_id"] is not None
+            else None
+        ),
+    )
+
+
+def _synthesis_artifact_from_row(
+    row: sqlite3.Row,
+) -> ResearchSynthesisArtifactRecord:
+    return ResearchSynthesisArtifactRecord(
+        artifact_id=uuid_from_blob(bytes(row["artifact_id"])),
+        scope_id=uuid_from_blob(bytes(row["scope_id"])),
+        work_item_id=uuid_from_blob(bytes(row["work_item_id"])),
+        artifact_kind=ResearchSynthesisStage(str(row["artifact_kind"])),
+        level=int(row["level"]),
+        ordinal=int(row["ordinal"]),
+        content_json=str(row["content_json"]),
+        content_hash=bytes(row["content_hash"]),
+        processing_run_id=uuid_from_blob(bytes(row["processing_run_id"])),
+        created_at_us=int(row["created_at_us"]),
+    )
+
+
+def _synthesis_evidence_from_row(
+    row: sqlite3.Row,
+) -> ResearchSynthesisEvidenceRecord:
+    return ResearchSynthesisEvidenceRecord(
+        artifact_id=uuid_from_blob(bytes(row["artifact_id"])),
+        work_item_id=uuid_from_blob(bytes(row["work_item_id"])),
+        output_kind=str(row["output_kind"]),
+        output_ordinal=int(row["output_ordinal"]),
+        input_ordinal=int(row["input_ordinal"]),
+    )
+
+
+def _research_result_from_row(row: sqlite3.Row) -> ResearchResultRecord:
+    return ResearchResultRecord(
+        result_id=uuid_from_blob(bytes(row["result_id"])),
+        scope_id=uuid_from_blob(bytes(row["scope_id"])),
+        final_artifact_id=(
+            uuid_from_blob(bytes(row["final_artifact_id"]))
+            if row["final_artifact_id"] is not None
+            else None
+        ),
+        content_json=str(row["content_json"]),
+        content_hash=bytes(row["content_hash"]),
+        snapshot_commit_seq=int(row["snapshot_commit_seq"]),
+        model_signature_id=(
+            uuid_from_blob(bytes(row["model_signature_id"]))
+            if row["model_signature_id"] is not None
+            else None
+        ),
+        synthesis_pipeline_version=str(row["synthesis_pipeline_version"]),
+        candidate_total=int(row["candidate_total"]),
+        processed_count=int(row["processed_count"]),
+        successful_count=int(row["successful_count"]),
+        irrelevant_count=int(row["irrelevant_count"]),
+        failed_count=int(row["failed_count"]),
+        unavailable_count=int(row["unavailable_count"]),
+        excluded_count=int(row["excluded_count"]),
+        coverage_ratio=float(row["coverage_ratio"]),
+        problem_sources_json=str(row["problem_sources_json"]),
+        created_at_us=int(row["created_at_us"]),
+    )
+
+
+def _required_text(value: str, field: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise ResearchStateError(f"{field} must not be empty.")
+    return normalized
+
+
+def _canonical_json_value(value: Any) -> str:
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ResearchStateError(
+            "Research synthesis state must be finite canonical JSON."
+        ) from exc
+
+
+def _canonical_json_object(value: Mapping[str, Any]) -> str:
+    return _canonical_json_value(dict(value))
+
+
+def _synthesis_work_idempotency_key(
+    *,
+    scope_id: uuid.UUID,
+    stage: ResearchSynthesisStage,
+    level: int,
+    ordinal: int,
+    inputs: Sequence[tuple[ResearchSynthesisInputKind, uuid.UUID]],
+    descriptor: Mapping[str, Any],
+    pipeline_version: str,
+    prompt_template_id: str,
+    prompt_template_version: str,
+) -> bytes:
+    identity = {
+        "scope_id": str(scope_id),
+        "stage": stage.value,
+        "level": level,
+        "ordinal": ordinal,
+        "inputs": [
+            {"kind": kind.value, "id": str(ref_id)}
+            for kind, ref_id in inputs
+        ],
+        "descriptor": dict(descriptor),
+        "pipeline_version": pipeline_version,
+        "prompt_template_id": prompt_template_id,
+        "prompt_template_version": prompt_template_version,
+    }
+    digest = hashlib.sha256()
+    digest.update(b"athena.exhaustive-research.synthesis-work.v1\0")
+    digest.update(_canonical_json_value(identity).encode("utf-8"))
+    return digest.digest()
+
+
+def _validated_synthesis_evidence(
+    content: Mapping[str, Any],
+    evidence: Sequence[tuple[str, int, int]],
+) -> tuple[tuple[str, int, int], ...]:
+    outputs: dict[str, list[Any]] = {}
+    for field, kind in (
+        ("findings", "finding"),
+        ("contradictions", "contradiction"),
+    ):
+        value = content.get(field)
+        if not isinstance(value, list):
+            raise ResearchStateError(
+                f"Research synthesis content field {field!r} must be an array."
+            )
+        outputs[kind] = value
+
+    normalized: set[tuple[str, int, int]] = set()
+    for kind, output_ordinal, input_ordinal in evidence:
+        if kind not in outputs:
+            raise ResearchStateError(
+                f"Unsupported Research synthesis evidence output kind {kind!r}."
+            )
+        if output_ordinal < 0 or output_ordinal >= len(outputs[kind]):
+            raise ResearchStateError(
+                "Research synthesis evidence output ordinal is out of range."
+            )
+        if input_ordinal < 0:
+            raise ResearchStateError(
+                "Research synthesis evidence input ordinal must not be negative."
+            )
+        normalized.add((kind, output_ordinal, input_ordinal))
+
+    expected_outputs = {
+        (kind, output_ordinal)
+        for kind, values in outputs.items()
+        for output_ordinal in range(len(values))
+    }
+    covered_outputs = {
+        (kind, output_ordinal)
+        for kind, output_ordinal, _input_ordinal in normalized
+    }
+    if covered_outputs != expected_outputs:
+        raise ResearchStateError(
+            "Every Research synthesis finding and contradiction requires at least "
+            "one explicit durable input backlink."
+        )
+    return tuple(
+        sorted(
+            normalized,
+            key=lambda item: (item[0], item[1], item[2]),
+        )
     )
 
 

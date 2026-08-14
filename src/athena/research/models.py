@@ -132,3 +132,95 @@ class ResearchCoverage:
     excluded_count: int
     eligible_count: int
     coverage_ratio: float
+
+
+
+class ResearchSynthesisStage(str, Enum):
+    REDUCE = "reduce"
+    FINAL = "final"
+
+
+class ResearchSynthesisWorkState(str, Enum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    SPLIT = "split"
+
+    @property
+    def terminal(self) -> bool:
+        return self is not self.PENDING
+
+
+class ResearchSynthesisInputKind(str, Enum):
+    SOURCE_ANALYSIS_ARTIFACT = "source_analysis_artifact"
+    RESEARCH_SYNTHESIS_ARTIFACT = "research_synthesis_artifact"
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchSynthesisWorkItemRecord:
+    work_item_id: uuid.UUID
+    scope_id: uuid.UUID
+    stage: ResearchSynthesisStage
+    level: int
+    ordinal: int
+    state: ResearchSynthesisWorkState
+    idempotency_key: bytes
+    pipeline_version: str
+    prompt_template_id: str
+    prompt_template_version: str
+    attempt_count: int
+    created_at_us: int
+    updated_at_us: int
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchSynthesisWorkInputRecord:
+    work_item_id: uuid.UUID
+    ordinal: int
+    input_kind: ResearchSynthesisInputKind
+    source_analysis_artifact_id: uuid.UUID | None
+    research_synthesis_artifact_id: uuid.UUID | None
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchSynthesisArtifactRecord:
+    artifact_id: uuid.UUID
+    scope_id: uuid.UUID
+    work_item_id: uuid.UUID
+    artifact_kind: ResearchSynthesisStage
+    level: int
+    ordinal: int
+    content_json: str
+    content_hash: bytes
+    processing_run_id: uuid.UUID
+    created_at_us: int
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchSynthesisEvidenceRecord:
+    artifact_id: uuid.UUID
+    work_item_id: uuid.UUID
+    output_kind: str
+    output_ordinal: int
+    input_ordinal: int
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchResultRecord:
+    result_id: uuid.UUID
+    scope_id: uuid.UUID
+    final_artifact_id: uuid.UUID | None
+    content_json: str
+    content_hash: bytes
+    snapshot_commit_seq: int
+    model_signature_id: uuid.UUID | None
+    synthesis_pipeline_version: str
+    candidate_total: int
+    processed_count: int
+    successful_count: int
+    irrelevant_count: int
+    failed_count: int
+    unavailable_count: int
+    excluded_count: int
+    coverage_ratio: float
+    problem_sources_json: str
+    created_at_us: int

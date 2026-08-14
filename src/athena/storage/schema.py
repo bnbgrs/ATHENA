@@ -28,7 +28,8 @@ HIERARCHICAL_SOURCE_EXTRACTION_SCHEMA_VERSION = 20
 PERSONAL_MEMORY_SCHEMA_VERSION = 21
 EXHAUSTIVE_RESEARCH_SCHEMA_VERSION = 22
 RESEARCH_ORCHESTRATION_SCHEMA_VERSION = 23
-SCHEMA_VERSION = RESEARCH_ORCHESTRATION_SCHEMA_VERSION
+RESEARCH_SYNTHESIS_SCHEMA_VERSION = 24
+SCHEMA_VERSION = RESEARCH_SYNTHESIS_SCHEMA_VERSION
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
@@ -53,6 +54,7 @@ HIERARCHICAL_SOURCE_EXTRACTION_MIGRATION_ID = "0020_hierarchical_source_knowledg
 PERSONAL_MEMORY_MIGRATION_ID = "0021_personal_memory_core"
 EXHAUSTIVE_RESEARCH_MIGRATION_ID = "0022_exhaustive_research_foundation"
 RESEARCH_ORCHESTRATION_MIGRATION_ID = "0023_exhaustive_research_orchestration"
+RESEARCH_SYNTHESIS_MIGRATION_ID = "0024_exhaustive_research_synthesis"
 
 
 class DatabaseCompatibilityError(RuntimeError):
@@ -140,6 +142,7 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         HIERARCHICAL_SOURCE_EXTRACTION_SCHEMA_VERSION,
         PERSONAL_MEMORY_SCHEMA_VERSION,
         EXHAUSTIVE_RESEARCH_SCHEMA_VERSION,
+        RESEARCH_ORCHESTRATION_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -241,9 +244,13 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
 
     if existing_user_version == EXHAUSTIVE_RESEARCH_SCHEMA_VERSION:
         _migrate_schema_v22_to_v23(connection)
+        existing_user_version = RESEARCH_ORCHESTRATION_SCHEMA_VERSION
+
+    if existing_user_version == RESEARCH_ORCHESTRATION_SCHEMA_VERSION:
+        _migrate_schema_v23_to_v24(connection)
 
     _configure_connection(connection)
-    _verify_schema_v23(connection)
+    _verify_schema_v24(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -1980,6 +1987,282 @@ def _migrate_schema_v22_to_v23(connection: sqlite3.Connection) -> None:
         COMMIT;
         """
     )
+
+
+
+def _migrate_schema_v23_to_v24(connection: sqlite3.Connection) -> None:
+    """Add durable hierarchical Research synthesis, evidence links, and ResearchResult."""
+    connection.executescript(
+        f"""
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE research_synthesis_work_items (
+            work_item_id BLOB(16) PRIMARY KEY CHECK(length(work_item_id) = 16),
+            scope_id BLOB(16) NOT NULL CHECK(length(scope_id) = 16),
+            stage TEXT NOT NULL CHECK(stage IN ('reduce', 'final')),
+            level INTEGER NOT NULL CHECK(level >= 0),
+            ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+            state TEXT NOT NULL CHECK(state IN ('pending', 'completed', 'split')),
+            idempotency_key BLOB(32) NOT NULL UNIQUE CHECK(length(idempotency_key) = 32),
+            pipeline_version TEXT NOT NULL CHECK(length(pipeline_version) > 0),
+            prompt_template_id TEXT NOT NULL CHECK(length(prompt_template_id) > 0),
+            prompt_template_version TEXT NOT NULL CHECK(length(prompt_template_version) > 0),
+            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+            created_at_us INTEGER NOT NULL,
+            updated_at_us INTEGER NOT NULL CHECK(updated_at_us >= created_at_us),
+            FOREIGN KEY(scope_id) REFERENCES research_scopes(scope_id)
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_research_synthesis_work_scope_state
+            ON research_synthesis_work_items(
+                scope_id, state, level, ordinal, work_item_id
+            );
+
+        CREATE TABLE research_synthesis_artifacts (
+            artifact_id BLOB(16) PRIMARY KEY CHECK(length(artifact_id) = 16),
+            scope_id BLOB(16) NOT NULL CHECK(length(scope_id) = 16),
+            work_item_id BLOB(16) NOT NULL UNIQUE CHECK(length(work_item_id) = 16),
+            artifact_kind TEXT NOT NULL CHECK(artifact_kind IN ('reduce', 'final')),
+            level INTEGER NOT NULL CHECK(level >= 0),
+            ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+            content_json TEXT NOT NULL,
+            content_hash BLOB(32) NOT NULL CHECK(length(content_hash) = 32),
+            processing_run_id BLOB(16) NOT NULL UNIQUE
+                CHECK(length(processing_run_id) = 16),
+            created_at_us INTEGER NOT NULL,
+            UNIQUE(artifact_id, work_item_id),
+            FOREIGN KEY(scope_id) REFERENCES research_scopes(scope_id),
+            FOREIGN KEY(work_item_id)
+                REFERENCES research_synthesis_work_items(work_item_id),
+            FOREIGN KEY(processing_run_id)
+                REFERENCES processing_runs(processing_run_id)
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_research_synthesis_artifacts_scope
+            ON research_synthesis_artifacts(
+                scope_id, level, ordinal, artifact_id
+            );
+
+        CREATE TABLE research_synthesis_work_inputs (
+            work_item_id BLOB(16) NOT NULL CHECK(length(work_item_id) = 16),
+            ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+            input_kind TEXT NOT NULL CHECK(input_kind IN (
+                'source_analysis_artifact',
+                'research_synthesis_artifact'
+            )),
+            source_analysis_artifact_id BLOB(16) NULL CHECK(
+                source_analysis_artifact_id IS NULL
+                OR length(source_analysis_artifact_id) = 16
+            ),
+            research_synthesis_artifact_id BLOB(16) NULL CHECK(
+                research_synthesis_artifact_id IS NULL
+                OR length(research_synthesis_artifact_id) = 16
+            ),
+            PRIMARY KEY(work_item_id, ordinal),
+            FOREIGN KEY(work_item_id)
+                REFERENCES research_synthesis_work_items(work_item_id),
+            FOREIGN KEY(source_analysis_artifact_id)
+                REFERENCES source_analysis_artifacts(artifact_id),
+            FOREIGN KEY(research_synthesis_artifact_id)
+                REFERENCES research_synthesis_artifacts(artifact_id),
+            CHECK(
+                (
+                    input_kind = 'source_analysis_artifact'
+                    AND source_analysis_artifact_id IS NOT NULL
+                    AND research_synthesis_artifact_id IS NULL
+                )
+                OR
+                (
+                    input_kind = 'research_synthesis_artifact'
+                    AND source_analysis_artifact_id IS NULL
+                    AND research_synthesis_artifact_id IS NOT NULL
+                )
+            )
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_research_synthesis_inputs_source_artifact
+            ON research_synthesis_work_inputs(source_analysis_artifact_id)
+            WHERE source_analysis_artifact_id IS NOT NULL;
+
+        CREATE INDEX idx_research_synthesis_inputs_research_artifact
+            ON research_synthesis_work_inputs(research_synthesis_artifact_id)
+            WHERE research_synthesis_artifact_id IS NOT NULL;
+
+        CREATE TABLE research_synthesis_output_evidence (
+            artifact_id BLOB(16) NOT NULL CHECK(length(artifact_id) = 16),
+            work_item_id BLOB(16) NOT NULL CHECK(length(work_item_id) = 16),
+            output_kind TEXT NOT NULL CHECK(output_kind IN (
+                'finding', 'contradiction'
+            )),
+            output_ordinal INTEGER NOT NULL CHECK(output_ordinal >= 0),
+            input_ordinal INTEGER NOT NULL CHECK(input_ordinal >= 0),
+            PRIMARY KEY(
+                artifact_id, output_kind, output_ordinal, input_ordinal
+            ),
+            FOREIGN KEY(artifact_id, work_item_id)
+                REFERENCES research_synthesis_artifacts(
+                    artifact_id, work_item_id
+                ),
+            FOREIGN KEY(work_item_id, input_ordinal)
+                REFERENCES research_synthesis_work_inputs(
+                    work_item_id, ordinal
+                )
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_research_synthesis_evidence_input
+            ON research_synthesis_output_evidence(
+                work_item_id, input_ordinal, artifact_id
+            );
+
+        CREATE TABLE research_results (
+            result_id BLOB(16) PRIMARY KEY CHECK(length(result_id) = 16),
+            scope_id BLOB(16) NOT NULL UNIQUE CHECK(length(scope_id) = 16),
+            final_artifact_id BLOB(16) NULL UNIQUE CHECK(
+                final_artifact_id IS NULL OR length(final_artifact_id) = 16
+            ),
+            content_json TEXT NOT NULL,
+            content_hash BLOB(32) NOT NULL CHECK(length(content_hash) = 32),
+            snapshot_commit_seq INTEGER NOT NULL CHECK(snapshot_commit_seq >= 0),
+            model_signature_id BLOB(16) NULL CHECK(
+                model_signature_id IS NULL OR length(model_signature_id) = 16
+            ),
+            synthesis_pipeline_version TEXT NOT NULL
+                CHECK(length(synthesis_pipeline_version) > 0),
+            candidate_total INTEGER NOT NULL CHECK(candidate_total >= 0),
+            processed_count INTEGER NOT NULL CHECK(processed_count >= 0),
+            successful_count INTEGER NOT NULL CHECK(successful_count >= 0),
+            irrelevant_count INTEGER NOT NULL CHECK(irrelevant_count >= 0),
+            failed_count INTEGER NOT NULL CHECK(failed_count >= 0),
+            unavailable_count INTEGER NOT NULL CHECK(unavailable_count >= 0),
+            excluded_count INTEGER NOT NULL CHECK(excluded_count >= 0),
+            coverage_ratio REAL NOT NULL CHECK(
+                coverage_ratio >= 0.0 AND coverage_ratio <= 1.0
+            ),
+            problem_sources_json TEXT NOT NULL,
+            created_at_us INTEGER NOT NULL,
+            FOREIGN KEY(scope_id) REFERENCES research_scopes(scope_id),
+            FOREIGN KEY(final_artifact_id)
+                REFERENCES research_synthesis_artifacts(artifact_id),
+            FOREIGN KEY(model_signature_id)
+                REFERENCES model_signatures(model_signature_id),
+            CHECK(
+                processed_count
+                = successful_count
+                + irrelevant_count
+                + failed_count
+                + unavailable_count
+            ),
+            CHECK(candidate_total >= processed_count + excluded_count)
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_research_results_model_signature
+            ON research_results(model_signature_id)
+            WHERE model_signature_id IS NOT NULL;
+
+        UPDATE schema_metadata
+        SET schema_version = {RESEARCH_SYNTHESIS_SCHEMA_VERSION},
+            last_migration_id = '{RESEARCH_SYNTHESIS_MIGRATION_ID}',
+            minimum_reader_version = {RESEARCH_SYNTHESIS_SCHEMA_VERSION}
+        WHERE singleton_id = 1;
+
+        PRAGMA user_version = {RESEARCH_SYNTHESIS_SCHEMA_VERSION};
+        COMMIT;
+        """
+    )
+
+
+def _verify_schema_v24(connection: sqlite3.Connection) -> None:
+    application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
+    user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if application_id != ATHENA_APPLICATION_ID:
+        raise DatabaseCompatibilityError("ATHENA application_id verification failed.")
+    if user_version != RESEARCH_SYNTHESIS_SCHEMA_VERSION:
+        raise DatabaseCompatibilityError("ATHENA schema version verification failed.")
+
+    metadata = connection.execute(
+        "SELECT schema_version, storage_layout_version, blob_format_version, "
+        "last_migration_id, minimum_reader_version "
+        "FROM schema_metadata WHERE singleton_id = 1"
+    ).fetchone()
+    expected = (
+        RESEARCH_SYNTHESIS_SCHEMA_VERSION,
+        STORAGE_LAYOUT_VERSION,
+        BLOB_FORMAT_VERSION,
+        RESEARCH_SYNTHESIS_MIGRATION_ID,
+        RESEARCH_SYNTHESIS_SCHEMA_VERSION,
+    )
+    if metadata is None or tuple(metadata) != expected:
+        raise DatabaseCompatibilityError("ATHENA schema_metadata verification failed.")
+
+    required_tables = {
+        "knowledge_units", "knowledge_unit_revisions", "claims", "claim_revisions",
+        "claim_evidence", "provenance_inputs", "model_signatures", "processing_runs",
+        "semantic_review_items", "semantic_merge_review_payloads",
+        "extraction_result_snapshots", "search_fts", "search_index_state",
+        "search_embeddings", "search_embedding_state", "blob_records", "sources",
+        "source_representations", "source_representation_pages",
+        "source_representation_structures", "source_anchor_structures",
+        "chunking_profiles", "source_anchors", "jobs", "checkpoints",
+        "source_analyses", "source_analysis_work_items", "source_analysis_artifacts",
+        "source_analysis_work_inputs", "source_extraction_result_snapshots",
+        "source_analysis_knowledge_origins", "source_extractions",
+        "source_extraction_evidence", "source_extraction_work_items",
+        "source_extraction_artifacts", "source_extraction_work_inputs",
+        "personal_memory_entries", "personal_memory_revisions",
+        "research_scopes", "research_candidate_sets", "research_candidates",
+        "research_work_items", "research_synthesis_work_items",
+        "research_synthesis_work_inputs", "research_synthesis_artifacts",
+        "research_synthesis_output_evidence", "research_results",
+    }
+    missing_tables = required_tables.difference(_user_tables(connection))
+    if missing_tables:
+        missing = ", ".join(sorted(missing_tables))
+        raise DatabaseCompatibilityError(
+            f"ATHENA semantic schema is incomplete: {missing}."
+        )
+
+    synthesis_input_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(research_synthesis_work_inputs)"
+        )
+    }
+    if not {
+        "input_kind",
+        "source_analysis_artifact_id",
+        "research_synthesis_artifact_id",
+    }.issubset(synthesis_input_columns):
+        raise DatabaseCompatibilityError(
+            "ATHENA Research synthesis input provenance is incomplete."
+        )
+
+    result_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(research_results)")
+    }
+    if not {
+        "final_artifact_id",
+        "content_json",
+        "content_hash",
+        "snapshot_commit_seq",
+        "model_signature_id",
+        "synthesis_pipeline_version",
+        "candidate_total",
+        "processed_count",
+        "successful_count",
+        "irrelevant_count",
+        "failed_count",
+        "unavailable_count",
+        "excluded_count",
+        "coverage_ratio",
+        "problem_sources_json",
+    }.issubset(result_columns):
+        raise DatabaseCompatibilityError(
+            "ATHENA ResearchResult persistence is incomplete."
+        )
+
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise DatabaseCompatibilityError("ATHENA foreign-key verification failed.")
 
 
 def _verify_schema_v23(connection: sqlite3.Connection) -> None:

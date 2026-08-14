@@ -476,7 +476,7 @@ def test_scheduler_drives_research_dependency_polling_to_synthesis_without_retry
             parent.state is JobState.WAITING
             and parent.blocked_reason == WaitingReason.DEPENDENCY.value
             and parent.current_stage == "research_awaiting_synthesis"
-            and parent.next_run_at_us is None
+            and parent.next_run_at_us is not None
         ):
             break
 
