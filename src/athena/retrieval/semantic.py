@@ -120,14 +120,36 @@ class LocalSemanticSearchService:
 
         # Make FTS current first because it defines the allowed current,
         # unprotected document set for both lexical and semantic retrieval.
-        self._ensure_fts_current()
-        source_rows = self.database.connection.execute(
-            """
-            SELECT entity_type, entity_id, revision_id, title, body
-            FROM search_fts
-            ORDER BY entity_type, entity_id, revision_id
-            """
-        ).fetchall()
+        #
+        # The external embedding call must never be allowed to publish vectors
+        # for an older FTS snapshot under a newer canonical commit watermark.
+        # Acquire a short writer lock after the normal FTS freshness check and
+        # capture the FTS rows plus canonical watermark atomically. If another
+        # canonical writer won the race between _ensure_fts_current() and this
+        # lock, repeat until both watermarks describe the same snapshot.
+        while True:
+            self._ensure_fts_current()
+            with self.database.write_transaction() as connection:
+                current_commit_seq = self._current_commit_seq(connection)
+                state = connection.execute(
+                    """
+                    SELECT indexed_commit_seq
+                    FROM search_index_state
+                    WHERE singleton_id = 1
+                    """
+                ).fetchone()
+                if state is None:
+                    raise SemanticSearchError("Search index state is missing.")
+                if int(state["indexed_commit_seq"]) < current_commit_seq:
+                    continue
+                source_rows = connection.execute(
+                    """
+                    SELECT entity_type, entity_id, revision_id, title, body
+                    FROM search_fts
+                    ORDER BY entity_type, entity_id, revision_id
+                    """
+                ).fetchall()
+            break
 
         documents = [
             (
@@ -163,7 +185,6 @@ class LocalSemanticSearchService:
                 )
 
         normalized_vectors = [_normalize_vector(vector) for vector in vectors]
-        current_commit_seq = self._current_commit_seq(self.database.connection)
 
         with self.database.write_transaction() as connection:
             # Fail closed if canonical state changed while external embedding
