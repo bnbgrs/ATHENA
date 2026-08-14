@@ -817,15 +817,44 @@ class SourceAnalysisService:
         safety_margin: int | None,
         max_hierarchy_depth: int,
     ) -> tuple[AnalysisPinnedConfiguration, ModelSignature]:
-        if model.context_capacity is None and context_limit is None:
-            raise SourceAnalysisConfigurationError(
-                "Model provider did not report a context capacity; specify a context limit explicitly."
-            )
-        model_capacity = model.context_capacity if model.context_capacity is not None else context_limit
-        assert model_capacity is not None
-        effective = model_capacity if context_limit is None else min(context_limit, model_capacity)
+        if context_limit is None:
+            if model.loaded_context_length is None:
+                raise SourceAnalysisConfigurationError(
+                    "Active model did not report its loaded runtime context; "
+                    "provide an explicit source analysis context limit."
+                )
+            effective = model.loaded_context_length
+            if (
+                model.context_capacity is not None
+                and effective > model.context_capacity
+            ):
+                raise SourceAnalysisConfigurationError(
+                    "Loaded runtime context exceeds the model capacity."
+                )
+        else:
+            if context_limit < 1:
+                raise SourceAnalysisConfigurationError(
+                    "Source analysis context limit must be positive."
+                )
+            if (
+                model.context_capacity is not None
+                and context_limit > model.context_capacity
+            ):
+                raise SourceAnalysisConfigurationError(
+                    "Requested source analysis context exceeds model capacity."
+                )
+            if (
+                model.loaded_context_length is not None
+                and context_limit > model.loaded_context_length
+            ):
+                raise SourceAnalysisConfigurationError(
+                    "Requested source analysis context exceeds loaded runtime context."
+                )
+            effective = context_limit
         if effective < 64:
-            raise SourceAnalysisConfigurationError("Effective model context limit is too small.")
+            raise SourceAnalysisConfigurationError(
+                "Effective model context limit is too small."
+            )
         reserve = (
             max(16, min(2048, effective // 4))
             if output_reserve is None
