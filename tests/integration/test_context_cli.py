@@ -22,7 +22,7 @@ def test_context_cli_empty_database_returns_valid_json(capsys, monkeypatch, tmp_
 
     json_start = captured.out.index("{")
     payload = json.loads(captured.out[json_start:])
-    assert payload["athena_context_version"] == 1
+    assert payload["athena_context_version"] == 2
     assert payload["query"] == "nichts"
     assert payload["items"] == []
 

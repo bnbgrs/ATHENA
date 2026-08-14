@@ -49,6 +49,7 @@ from athena.retrieval.archive import (
     ArchiveSemanticSearchService,
 )
 from athena.retrieval.context import ContextBuilderService
+from athena.retrieval.context_package import ContextPackageService
 from athena.retrieval.evidence import MemoryEvidencePolicy
 from athena.retrieval.hybrid import HybridRetrievalService
 from athena.retrieval.ranking import RetrievalRankingService
@@ -303,14 +304,17 @@ class AthenaApplication:
             self.semantic_search,
         )
         self.context_builder = ContextBuilderService()
+        self.context_packages = ContextPackageService(self.database)
         self.memory_evidence_policy = MemoryEvidencePolicy(self.database)
         self.memory_chat = MemoryAugmentedChatService(
             chat_generation=self.chat_generation,
             embedding_provider=self.embedding_provider,
             hybrid_retrieval=self.hybrid_retrieval,
             context_builder=self.context_builder,
+            context_packages=self.context_packages,
             evidence_policy=self.memory_evidence_policy,
             personal_memory=self.personal_memory,
+            model_runs=self.model_runs,
         )
         self.proposal_acceptance = ProposalAcceptanceService(
             database=self.database,

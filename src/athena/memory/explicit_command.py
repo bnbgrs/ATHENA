@@ -57,68 +57,58 @@ _PROJECT_COMMAND_PATTERNS = (
     ),
 )
 
-_PREFERENCE_MARKERS = (
-    "bevorzug",
-    "möchte",
-    "moechte",
-    "bitte",
-    "soll",
-    "immer",
-    "nie",
-    "keine",
-    "nicht",
-    "prefer",
-    "want",
-    "please",
-    "should",
-    "always",
-    "never",
-    "do not",
-    "don't",
+_PREFERENCE_PATTERNS = (
+    re.compile(r"\bbevorzug\w*", re.IGNORECASE),
+    re.compile(r"\bm[öo]chte\b", re.IGNORECASE),
+    re.compile(r"\bmoechte\b", re.IGNORECASE),
+    re.compile(r"\bbitte\b", re.IGNORECASE),
+    re.compile(r"\bsoll\w*", re.IGNORECASE),
+    re.compile(r"\bimmer\b", re.IGNORECASE),
+    re.compile(r"\bnie\b", re.IGNORECASE),
+    re.compile(r"\bkeine?\b", re.IGNORECASE),
+    re.compile(r"\bnicht\b", re.IGNORECASE),
+    re.compile(r"\bprefer\w*", re.IGNORECASE),
+    re.compile(r"\bwant\b", re.IGNORECASE),
+    re.compile(r"\bplease\b", re.IGNORECASE),
+    re.compile(r"\bshould\b", re.IGNORECASE),
+    re.compile(r"\balways\b", re.IGNORECASE),
+    re.compile(r"\bnever\b", re.IGNORECASE),
+    re.compile(r"\bdo\s+not\b", re.IGNORECASE),
+    re.compile(r"\bdon't\b", re.IGNORECASE),
 )
 
-_COLLABORATION_MARKERS = (
-    "antwort",
-    "schreib",
-    "markdown",
-    "tabelle",
-    "format",
-    "sprache",
-    "deutsch",
-    "englisch",
-    "kurz",
-    "knapp",
-    "ausführ",
-    "ausfuehr",
-    "detaill",
-    "rückfrag",
-    "rueckfrag",
-    "modell",
-    "provider",
-    "tool",
-    "werkzeug",
-    "python",
-    "workflow",
-    "arbeitsablauf",
-    "export",
-    "pfad",
-    "git",
-    "commit",
-    "test",
-    "prüf",
-    "pruef",
-    "answer",
-    "reply",
-    "write",
-    "table",
-    "language",
-    "german",
-    "english",
-    "concise",
-    "brief",
-    "detail",
-    "model",
-    "path",
+# These patterns identify the object of collaboration with ATHENA. Value-only
+# adjectives such as "kurz", "detailliert", "deutsch" or "englisch" are
+# deliberately absent: they may classify the MemoryKind only after the command
+# has independently been established as a collaboration preference.
+_COLLABORATION_PATTERNS = (
+    re.compile(r"\bantwort\w*", re.IGNORECASE),
+    re.compile(r"\bschreib\w*", re.IGNORECASE),
+    re.compile(r"\bmarkdown\b", re.IGNORECASE),
+    re.compile(r"\btabell\w*", re.IGNORECASE),
+    re.compile(r"\bsprache\w*", re.IGNORECASE),
+    re.compile(r"\brückfrag\w*", re.IGNORECASE),
+    re.compile(r"\brueckfrag\w*", re.IGNORECASE),
+    re.compile(r"\bmodell\w*", re.IGNORECASE),
+    re.compile(r"\bprovider\w*", re.IGNORECASE),
+    re.compile(r"\btools?\b", re.IGNORECASE),
+    re.compile(r"\bwerkzeug\w*", re.IGNORECASE),
+    re.compile(r"\bworkflow\w*", re.IGNORECASE),
+    re.compile(r"\barbeitsablauf\w*", re.IGNORECASE),
+    re.compile(r"\bexport\w*", re.IGNORECASE),
+    re.compile(r"\bpfad\w*", re.IGNORECASE),
+    re.compile(r"\bgit\b", re.IGNORECASE),
+    re.compile(r"\bcommit\w*", re.IGNORECASE),
+    re.compile(r"\btests?\b", re.IGNORECASE),
+    re.compile(r"\bprüf\w*", re.IGNORECASE),
+    re.compile(r"\bpruef\w*", re.IGNORECASE),
+    re.compile(r"\banswers?\b", re.IGNORECASE),
+    re.compile(r"\brepl(?:y|ies)\b", re.IGNORECASE),
+    re.compile(r"\bwrite\b", re.IGNORECASE),
+    re.compile(r"\btables?\b", re.IGNORECASE),
+    re.compile(r"\blanguage\w*", re.IGNORECASE),
+    re.compile(r"\bmodels?\b", re.IGNORECASE),
+    re.compile(r"\bpaths?\b", re.IGNORECASE),
 )
 
 
@@ -199,10 +189,14 @@ def parse_explicit_personal_memory_command(
 
 
 def _is_collaboration_preference(content: str) -> bool:
-    normalized = content.casefold()
-    return any(marker in normalized for marker in _PREFERENCE_MARKERS) and any(
-        marker in normalized for marker in _COLLABORATION_MARKERS
+    return _matches_any(content, _PREFERENCE_PATTERNS) and _matches_any(
+        content,
+        _COLLABORATION_PATTERNS,
     )
+
+
+def _matches_any(content: str, patterns: tuple[re.Pattern[str], ...]) -> bool:
+    return any(pattern.search(content) is not None for pattern in patterns)
 
 
 def _infer_memory_kind(content: str) -> MemoryKind:

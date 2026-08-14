@@ -54,6 +54,26 @@ def test_parser_does_not_route_fact_save_request_to_personal_memory() -> None:
     assert intent is None
 
 
+def test_parser_rejects_value_only_personal_preferences() -> None:
+    for content in (
+        "Merke dir, dass ich kurze Haare bevorzuge.",
+        "Merke dir, dass ich deutsches Bier bevorzuge.",
+        "Merke dir, dass ich englische Krimis bevorzuge.",
+        "Merke dir, dass ich detaillierte Landkarten bevorzuge.",
+        "Merke dir, dass ich Gitarren bevorzuge.",
+    ):
+        assert parse_explicit_personal_memory_command(content) is None
+
+
+def test_parser_keeps_language_value_after_collaboration_is_established() -> None:
+    intent = parse_explicit_personal_memory_command(
+        "Merke dir, dass du auf Deutsch antworten sollst."
+    )
+
+    assert intent is not None
+    assert intent.memory_kind is MemoryKind.LANGUAGE_PREFERENCE
+
+
 def test_fact_save_request_is_still_detected_as_explicit_persistence() -> None:
     from athena.memory.explicit_command import is_explicit_persistence_command
 

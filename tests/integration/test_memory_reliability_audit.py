@@ -15,7 +15,9 @@ from athena.chat.service import ChatService
 from athena.memory.repository import PersonalMemoryRepository
 from athena.memory.service import PersonalMemoryService
 from athena.model.domain import ModelChatMessage, ModelInfo, ProviderHealth, ProviderHealthStatus
+from athena.model.provenance import ModelRunRepository
 from athena.retrieval.context import ContextBuilderService
+from athena.retrieval.context_package import ContextPackageService
 from athena.retrieval.evidence import MemoryEvidencePolicy
 from athena.retrieval.hybrid import HybridSearchResult
 from athena.retrieval.search import SearchEntityType
@@ -141,8 +143,10 @@ def _runtime(
         embedding_provider=embedding or StaticEmbeddingProvider(),  # type: ignore[arg-type]
         hybrid_retrieval=hybrid or StaticHybrid(),  # type: ignore[arg-type]
         context_builder=ContextBuilderService(),
+        context_packages=ContextPackageService(database),
         evidence_policy=MemoryEvidencePolicy(database),
         personal_memory=personal_memory,
+        model_runs=ModelRunRepository(database),
     )
     return database, chat, provider, memory
 

@@ -18,6 +18,7 @@ from athena.chat.provenance import strip_durable_provenance_manifest
 from athena.chat.service import ChatService
 from athena.model.domain import ModelChatMessage, ModelInfo
 from athena.model.ports import ChatModelProvider
+from athena.retrieval.context_package import ContextPackage
 
 _RETRIEVED_CONTEXT_SYSTEM_PREFIX = """ATHENA RETRIEVED MEMORY
 
@@ -52,10 +53,10 @@ class ChatGenerationResult:
 class ChatGenerationService:
     """Coordinates local history, provider streaming, and final persistence.
 
-    The provider receives a complete history built from ATHENA's database.
-    Assistant text is written only after the provider stream completes. A
-    provider failure or ``KeyboardInterrupt`` therefore cannot create a false
-    completed assistant message.
+    Assistant text is written only after the provider stream completes. A provider
+    failure or ``KeyboardInterrupt`` therefore cannot create a false completed
+    assistant message. ContextPackage generation consumes only package sections;
+    it never reloads hidden chat/archive content for the provider call.
     """
 
     def __init__(self, chat: ChatService, provider: ChatModelProvider) -> None:
@@ -96,10 +97,108 @@ class ChatGenerationService:
                 *history,
             )
 
+        return self._generate_and_persist(
+            chat_id=chat_id,
+            user_message=user_message,
+            model=model,
+            history=history,
+            on_delta=on_delta,
+            grounding_contract=grounding_contract,
+            max_output_tokens=max_output_tokens,
+            reasoning_mode=reasoning_mode,
+            on_before_provider_call=None,
+        )
+
+    def send_context_package(
+        self,
+        *,
+        chat_id: uuid.UUID,
+        user_message: ChatMessage,
+        context_package: ContextPackage,
+        on_delta: Callable[[str], None] | None = None,
+        grounding_contract: GroundingContract | None = None,
+        on_before_provider_call: Callable[[], None] | None = None,
+    ) -> ChatGenerationResult:
+        """Generate strictly from ContextPackage sections, without DB history access."""
+        if user_message.chat_id != chat_id:
+            raise ValueError("ContextPackage user message belongs to another chat.")
+        if user_message.message_type is not MessageType.USER:
+            raise ValueError("ContextPackage generation requires a user message.")
+        if user_message.content is None:
+            raise ValueError("ContextPackage current user content is unavailable.")
+
+        current_ref = context_package.current_user_ref()
+        if (
+            current_ref.entity_id != user_message.message_id
+            or current_ref.revision_id != user_message.revision_id
+        ):
+            raise ValueError(
+                "ContextPackage CURRENT-USER reference does not match the "
+                "persisted user message."
+            )
+
+        model = self.select_model(context_package.model_signature.model_identifier)
+        signature = context_package.model_signature
+        if (
+            model.provider != signature.provider
+            or model.backend_model_id != signature.model_identifier
+            or model.quantization != signature.quantization
+        ):
+            raise ModelSelectionError(
+                "Active model drifted from the ContextPackage ModelSignature."
+            )
+        runtime_limit = model.loaded_context_length or model.context_capacity
+        if (
+            runtime_limit is not None
+            and context_package.budget.effective_context_limit > runtime_limit
+        ):
+            raise ModelSelectionError(
+                "Active model context is smaller than the pinned ContextPackage budget."
+            )
+
+        history = context_package.model_messages()
+        if (
+            not history
+            or history[-1].role != "user"
+            or history[-1].content != user_message.content
+        ):
+            raise ValueError(
+                "ContextPackage must end with the exact persisted current user message."
+            )
+        max_output_tokens, reasoning_mode = context_package.generation_controls()
+
+        return self._generate_and_persist(
+            chat_id=chat_id,
+            user_message=user_message,
+            model=model,
+            history=history,
+            on_delta=on_delta,
+            grounding_contract=grounding_contract,
+            max_output_tokens=max_output_tokens,
+            reasoning_mode=reasoning_mode,
+            on_before_provider_call=on_before_provider_call,
+        )
+
+    def _generate_and_persist(
+        self,
+        *,
+        chat_id: uuid.UUID,
+        user_message: ChatMessage,
+        model: ModelInfo,
+        history: tuple[ModelChatMessage, ...],
+        on_delta: Callable[[str], None] | None,
+        grounding_contract: GroundingContract | None,
+        max_output_tokens: int | None,
+        reasoning_mode: str | None,
+        on_before_provider_call: Callable[[], None] | None,
+    ) -> ChatGenerationResult:
         if max_output_tokens is not None and max_output_tokens < 1:
             raise ValueError("max_output_tokens must be positive when provided.")
         if reasoning_mode not in {None, "off"}:
             raise ValueError("reasoning_mode must be None or 'off'.")
+
+        if on_before_provider_call is not None:
+            on_before_provider_call()
 
         chunks: list[str] = []
         if reasoning_mode is not None:

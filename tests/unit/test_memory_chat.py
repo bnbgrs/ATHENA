@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 
 import pytest
 
@@ -20,7 +21,9 @@ from athena.memory.models import (
     PersonalMemorySnapshot,
 )
 from athena.model.domain import ModelInfo
+from athena.model.provenance import ModelSignature, ProcessingRun
 from athena.retrieval.context import ContextBuilderService
+from athena.retrieval.context_package import ContextPackageService
 from athena.retrieval.evidence import (
     EvidenceClass,
     MemoryEvidenceClassification,
@@ -103,6 +106,130 @@ class FakeChatStore:
         )
 
 
+    def add_user_message(self, *, chat_id: uuid.UUID, content: str) -> ChatMessage:
+        message = ChatMessage(
+            message_id=uuid.uuid4(),
+            chat_id=chat_id,
+            sequence_no=len(self.messages) + 1,
+            message_type=MessageType.USER,
+            actor_id=uuid.uuid4(),
+            created_at_us=1,
+            revision_id=uuid.uuid4(),
+            content=content,
+            content_format="text/plain",
+        )
+        self.messages = (*self.messages, message)
+        return message
+
+
+class FakeContextPackages:
+    def __init__(self) -> None:
+        self.current = 40
+        self.phases: list[str] = []
+
+    def current_commit_seq(self) -> int:
+        return self.current
+
+    def assert_snapshot_current(self, expected_commit_seq: int, *, phase: str) -> None:
+        assert expected_commit_seq == self.current
+        self.phases.append(phase)
+
+    def assert_user_commit_follows(
+        self,
+        previous_commit_seq: int,
+        user_message: ChatMessage,
+    ) -> int:
+        assert previous_commit_seq == self.current
+        assert user_message.message_type is MessageType.USER
+        self.current += 1
+        return self.current
+
+    def build(self, **kwargs):
+        return ContextPackageService.build(**kwargs)
+
+
+class FakeModelRuns:
+    def __init__(self) -> None:
+        self.runs: dict[uuid.UUID, ProcessingRun] = {}
+
+    def get_or_create_signature(
+        self,
+        *,
+        model: ModelInfo,
+        generation_parameters,
+        context_configuration=None,
+    ) -> ModelSignature:
+        return ModelSignature(
+            model_signature_id=uuid.uuid4(),
+            provider=model.provider,
+            model_identifier=model.backend_model_id,
+            model_revision=None,
+            quantization=model.quantization,
+            generation_parameters_json=json.dumps(
+                generation_parameters,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            context_configuration_json=(
+                json.dumps(
+                    context_configuration,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                if context_configuration is not None
+                else None
+            ),
+            signature_hash=b"s" * 32,
+            created_at_us=1,
+        )
+
+    def start_run(
+        self,
+        *,
+        run_type: str,
+        trigger_actor_id: uuid.UUID,
+        pipeline_version: str,
+        input_snapshot,
+        configuration,
+        model_signature_id: uuid.UUID | None,
+        prompt_template_id: str | None,
+        prompt_template_version: str | None,
+    ) -> ProcessingRun:
+        run = ProcessingRun(
+            processing_run_id=uuid.uuid4(),
+            run_type=run_type,
+            started_at_us=1,
+            finished_at_us=None,
+            status="running",
+            trigger_actor_id=trigger_actor_id,
+            pipeline_version=pipeline_version,
+            input_snapshot_json=json.dumps(input_snapshot, sort_keys=True),
+            configuration_hash=b"c" * 32,
+            model_signature_id=model_signature_id,
+            prompt_template_id=prompt_template_id,
+            prompt_template_version=prompt_template_version,
+            error_detail=None,
+        )
+        self.runs[run.processing_run_id] = run
+        return run
+
+    def finish_run(
+        self,
+        processing_run_id: uuid.UUID,
+        *,
+        status: str,
+        error_detail: str | None = None,
+    ) -> ProcessingRun:
+        run = replace(
+            self.runs[processing_run_id],
+            finished_at_us=2,
+            status=status,
+            error_detail=error_detail,
+        )
+        self.runs[processing_run_id] = run
+        return run
+
+
 class FakeChatGeneration:
     def __init__(self, *, loaded_context_length: int = 4096) -> None:
         self.calls: list[dict[str, object]] = []
@@ -124,6 +251,49 @@ class FakeChatGeneration:
         if requested_model_id not in {None, self.model.backend_model_id}:
             raise ValueError("unknown model")
         return self.model
+
+    def send_context_package(
+        self,
+        *,
+        chat_id: uuid.UUID,
+        user_message: ChatMessage,
+        context_package,
+        on_delta: Callable[[str], None] | None = None,
+        grounding_contract: GroundingContract | None = None,
+        on_before_provider_call: Callable[[], None] | None = None,
+    ) -> ChatGenerationResult:
+        if on_before_provider_call is not None:
+            on_before_provider_call()
+        max_output_tokens, reasoning_mode = context_package.generation_controls()
+        model_messages = context_package.model_messages()
+        self.calls.append(
+            {
+                "chat_id": chat_id,
+                "content": user_message.content,
+                "requested_model_id": context_package.model_signature.model_identifier,
+                "retrieved_context": model_messages[0].content,
+                "grounding_contract": grounding_contract,
+                "max_output_tokens": max_output_tokens,
+                "reasoning_mode": reasoning_mode,
+                "context_package": context_package,
+            }
+        )
+        assistant = ChatMessage(
+            message_id=uuid.uuid4(),
+            chat_id=chat_id,
+            sequence_no=user_message.sequence_no + 1,
+            message_type=MessageType.ASSISTANT,
+            actor_id=None,
+            created_at_us=2,
+            revision_id=uuid.uuid4(),
+            content="answer",
+            content_format="text/plain",
+        )
+        return ChatGenerationResult(
+            user_message=user_message,
+            assistant_message=assistant,
+            model=self.model,
+        )
 
     def send_message(
         self,
@@ -227,8 +397,10 @@ def _service(
         embedding_provider=FakeEmbeddingProvider(),  # type: ignore[arg-type]
         hybrid_retrieval=hybrid,  # type: ignore[arg-type]
         context_builder=ContextBuilderService(),
+        context_packages=FakeContextPackages(),  # type: ignore[arg-type]
         evidence_policy=FakeEvidencePolicy(),  # type: ignore[arg-type]
         personal_memory=memory or FakePersonalMemory(),  # type: ignore[arg-type]
+        model_runs=FakeModelRuns(),  # type: ignore[arg-type]
     )
 
 
@@ -254,6 +426,8 @@ def test_memory_chat_retrieves_and_passes_typed_bounded_ephemeral_context() -> N
     assert len(result.context.items) == 1
     assert result.budget.effective_context_limit == 4096
     assert result.budget.estimated_total_tokens <= 4096
+    assert result.context_package.snapshot_commit_seq == 41
+    assert result.processing_run.status == "succeeded"
     passed_context = generation.calls[0]["retrieved_context"]
     assert isinstance(passed_context, str)
     assert '"entity_id"' in passed_context
