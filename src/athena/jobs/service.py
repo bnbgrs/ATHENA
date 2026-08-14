@@ -39,6 +39,7 @@ class DurableJobService:
             "search.rebuild",
             "embedding.rebuild",
             "integrity.sweep",
+            "research.exhaustive",
         }
     )
 

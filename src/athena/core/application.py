@@ -44,6 +44,8 @@ from athena.model.adapters.lm_studio_embeddings import LMStudioEmbeddingProvider
 from athena.model.provenance import ModelRunRepository
 from athena.observability.health import HealthService
 from athena.observability.logging import configure_logging
+from athena.research.repository import ResearchRepository
+from athena.research.service import ResearchService
 from athena.retrieval.archive import (
     ArchiveHybridRetrievalService,
     ArchiveSearchService,
@@ -112,6 +114,11 @@ class AthenaApplication:
         self.personal_memory = PersonalMemoryService(self.personal_memory_repository, self.chat)
         self.job_repository = JobRepository(self.database)
         self.jobs = DurableJobService(self.job_repository, self.chat)
+        self.research_repository = ResearchRepository(self.database)
+        self.research = ResearchService(
+            repository=self.research_repository,
+            jobs=self.jobs,
+        )
         self.blob_store = BlobStore(self.paths)
         self.source_repository = SourceRepository(self.database)
         self.source_representation_repository = SourceRepresentationRepository(self.database)

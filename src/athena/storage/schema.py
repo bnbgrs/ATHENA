@@ -26,7 +26,8 @@ SOURCE_ANALYSIS_SCHEMA_VERSION = 18
 SOURCE_KNOWLEDGE_SCHEMA_VERSION = 19
 HIERARCHICAL_SOURCE_EXTRACTION_SCHEMA_VERSION = 20
 PERSONAL_MEMORY_SCHEMA_VERSION = 21
-SCHEMA_VERSION = PERSONAL_MEMORY_SCHEMA_VERSION
+EXHAUSTIVE_RESEARCH_SCHEMA_VERSION = 22
+SCHEMA_VERSION = EXHAUSTIVE_RESEARCH_SCHEMA_VERSION
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
@@ -49,6 +50,7 @@ SOURCE_ANALYSIS_MIGRATION_ID = "0018_hierarchical_source_analysis"
 SOURCE_KNOWLEDGE_MIGRATION_ID = "0019_source_analysis_knowledge_promotion"
 HIERARCHICAL_SOURCE_EXTRACTION_MIGRATION_ID = "0020_hierarchical_source_knowledge_extraction"
 PERSONAL_MEMORY_MIGRATION_ID = "0021_personal_memory_core"
+EXHAUSTIVE_RESEARCH_MIGRATION_ID = "0022_exhaustive_research_foundation"
 
 
 class DatabaseCompatibilityError(RuntimeError):
@@ -134,6 +136,7 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         SOURCE_ANALYSIS_SCHEMA_VERSION,
         SOURCE_KNOWLEDGE_SCHEMA_VERSION,
         HIERARCHICAL_SOURCE_EXTRACTION_SCHEMA_VERSION,
+        PERSONAL_MEMORY_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -227,9 +230,13 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
 
     if existing_user_version == HIERARCHICAL_SOURCE_EXTRACTION_SCHEMA_VERSION:
         _migrate_schema_v20_to_v21(connection)
+        existing_user_version = PERSONAL_MEMORY_SCHEMA_VERSION
+
+    if existing_user_version == PERSONAL_MEMORY_SCHEMA_VERSION:
+        _migrate_schema_v21_to_v22(connection)
 
     _configure_connection(connection)
-    _verify_schema_v21(connection)
+    _verify_schema_v22(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -1733,6 +1740,209 @@ def _migrate_schema_v20_to_v21(connection: sqlite3.Connection) -> None:
         COMMIT;
         """
     )
+
+
+
+def _migrate_schema_v21_to_v22(connection: sqlite3.Connection) -> None:
+    """Add snapshot-frozen Exhaustive Research scope, candidates, and coverage state."""
+    connection.executescript(
+        f"""
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE research_scopes (
+            scope_id BLOB(16) PRIMARY KEY CHECK(length(scope_id) = 16),
+            job_id BLOB(16) NOT NULL UNIQUE CHECK(length(job_id) = 16),
+            mode TEXT NOT NULL CHECK(mode IN (
+                'local_exhaustive', 'scoped_project', 'local_plus_web',
+                'historical_backfill', 'delta'
+            )),
+            query_text TEXT NOT NULL CHECK(length(trim(query_text)) > 0),
+            domains_json TEXT NOT NULL CHECK(
+                json_valid(domains_json) AND json_type(domains_json) = 'array'
+            ),
+            project_ids_json TEXT NOT NULL CHECK(
+                json_valid(project_ids_json) AND json_type(project_ids_json) = 'array'
+            ),
+            source_types_json TEXT NOT NULL CHECK(
+                json_valid(source_types_json) AND json_type(source_types_json) = 'array'
+            ),
+            explicit_source_ids_json TEXT NOT NULL CHECK(
+                json_valid(explicit_source_ids_json)
+                AND json_type(explicit_source_ids_json) = 'array'
+            ),
+            time_start_us INTEGER NULL CHECK(time_start_us IS NULL OR time_start_us >= 0),
+            time_end_us INTEGER NULL CHECK(time_end_us IS NULL OR time_end_us >= 0),
+            internet_scope_json TEXT NULL CHECK(
+                internet_scope_json IS NULL
+                OR (json_valid(internet_scope_json) AND json_type(internet_scope_json) = 'object')
+            ),
+            coverage_target REAL NOT NULL CHECK(
+                coverage_target > 0.0 AND coverage_target <= 1.0
+            ),
+            snapshot_commit_seq INTEGER NOT NULL CHECK(snapshot_commit_seq >= 0),
+            state TEXT NOT NULL CHECK(state IN (
+                'discovering', 'frozen', 'running', 'partial', 'completed', 'cancelled'
+            )),
+            candidate_total INTEGER NOT NULL DEFAULT 0 CHECK(candidate_total >= 0),
+            processed_count INTEGER NOT NULL DEFAULT 0 CHECK(processed_count >= 0),
+            successful_count INTEGER NOT NULL DEFAULT 0 CHECK(successful_count >= 0),
+            irrelevant_count INTEGER NOT NULL DEFAULT 0 CHECK(irrelevant_count >= 0),
+            failed_count INTEGER NOT NULL DEFAULT 0 CHECK(failed_count >= 0),
+            unavailable_count INTEGER NOT NULL DEFAULT 0 CHECK(unavailable_count >= 0),
+            excluded_count INTEGER NOT NULL DEFAULT 0 CHECK(excluded_count >= 0),
+            coverage_ratio REAL NOT NULL DEFAULT 0.0 CHECK(
+                coverage_ratio >= 0.0 AND coverage_ratio <= 1.0
+            ),
+            created_at_us INTEGER NOT NULL,
+            updated_at_us INTEGER NOT NULL CHECK(updated_at_us >= created_at_us),
+            FOREIGN KEY(job_id) REFERENCES jobs(job_id),
+            CHECK(time_end_us IS NULL OR time_start_us IS NULL OR time_end_us >= time_start_us),
+            CHECK(processed_count = (
+                successful_count + irrelevant_count + failed_count + unavailable_count
+            )),
+            CHECK(candidate_total >= processed_count + excluded_count)
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_research_scopes_state
+            ON research_scopes(state, updated_at_us);
+        CREATE INDEX idx_research_scopes_snapshot
+            ON research_scopes(snapshot_commit_seq, created_at_us);
+
+        CREATE TABLE research_candidate_sets (
+            candidate_set_id BLOB(16) PRIMARY KEY CHECK(length(candidate_set_id) = 16),
+            scope_id BLOB(16) NOT NULL UNIQUE CHECK(length(scope_id) = 16),
+            snapshot_commit_seq INTEGER NOT NULL CHECK(snapshot_commit_seq >= 0),
+            state TEXT NOT NULL CHECK(state IN ('building', 'frozen')),
+            candidate_total INTEGER NOT NULL DEFAULT 0 CHECK(candidate_total >= 0),
+            eligible_count INTEGER NOT NULL DEFAULT 0 CHECK(eligible_count >= 0),
+            excluded_count INTEGER NOT NULL DEFAULT 0 CHECK(excluded_count >= 0),
+            created_at_us INTEGER NOT NULL,
+            frozen_at_us INTEGER NULL CHECK(
+                frozen_at_us IS NULL OR frozen_at_us >= created_at_us
+            ),
+            FOREIGN KEY(scope_id) REFERENCES research_scopes(scope_id),
+            CHECK(candidate_total = eligible_count + excluded_count),
+            CHECK(state != 'frozen' OR frozen_at_us IS NOT NULL)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE research_candidates (
+            candidate_id BLOB(16) PRIMARY KEY CHECK(length(candidate_id) = 16),
+            candidate_set_id BLOB(16) NOT NULL CHECK(length(candidate_set_id) = 16),
+            source_id BLOB(16) NOT NULL CHECK(length(source_id) = 16),
+            ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+            content_sha256 BLOB(32) NOT NULL CHECK(length(content_sha256) = 32),
+            eligibility_state TEXT NOT NULL CHECK(eligibility_state IN (
+                'eligible', 'excluded_duplicate'
+            )),
+            duplicate_of_candidate_id BLOB(16) NULL CHECK(
+                duplicate_of_candidate_id IS NULL OR length(duplicate_of_candidate_id) = 16
+            ),
+            created_at_us INTEGER NOT NULL,
+            UNIQUE(candidate_set_id, source_id),
+            UNIQUE(candidate_set_id, ordinal),
+            FOREIGN KEY(candidate_set_id)
+                REFERENCES research_candidate_sets(candidate_set_id),
+            FOREIGN KEY(source_id) REFERENCES sources(source_id),
+            FOREIGN KEY(duplicate_of_candidate_id)
+                REFERENCES research_candidates(candidate_id),
+            CHECK(
+                (eligibility_state = 'eligible' AND duplicate_of_candidate_id IS NULL)
+                OR
+                (
+                    eligibility_state = 'excluded_duplicate'
+                    AND duplicate_of_candidate_id IS NOT NULL
+                )
+            )
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_research_candidates_set_eligibility
+            ON research_candidates(candidate_set_id, eligibility_state, ordinal);
+        CREATE INDEX idx_research_candidates_source
+            ON research_candidates(source_id, candidate_set_id);
+
+        CREATE TABLE research_work_items (
+            work_item_id BLOB(16) PRIMARY KEY CHECK(length(work_item_id) = 16),
+            scope_id BLOB(16) NOT NULL CHECK(length(scope_id) = 16),
+            candidate_id BLOB(16) NOT NULL UNIQUE CHECK(length(candidate_id) = 16),
+            state TEXT NOT NULL CHECK(state IN (
+                'pending', 'successful', 'irrelevant', 'failed', 'unavailable'
+            )),
+            idempotency_key BLOB(32) NOT NULL UNIQUE CHECK(length(idempotency_key) = 32),
+            source_analysis_job_id BLOB(16) NULL CHECK(
+                source_analysis_job_id IS NULL OR length(source_analysis_job_id) = 16
+            ),
+            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+            created_at_us INTEGER NOT NULL,
+            updated_at_us INTEGER NOT NULL CHECK(updated_at_us >= created_at_us),
+            FOREIGN KEY(scope_id) REFERENCES research_scopes(scope_id),
+            FOREIGN KEY(candidate_id) REFERENCES research_candidates(candidate_id),
+            FOREIGN KEY(source_analysis_job_id) REFERENCES jobs(job_id)
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_research_work_scope_state
+            ON research_work_items(scope_id, state, created_at_us);
+
+        UPDATE schema_metadata
+        SET schema_version = {EXHAUSTIVE_RESEARCH_SCHEMA_VERSION},
+            last_migration_id = '{EXHAUSTIVE_RESEARCH_MIGRATION_ID}',
+            minimum_reader_version = {EXHAUSTIVE_RESEARCH_SCHEMA_VERSION}
+        WHERE singleton_id = 1;
+
+        PRAGMA user_version = {EXHAUSTIVE_RESEARCH_SCHEMA_VERSION};
+        COMMIT;
+        """
+    )
+
+
+def _verify_schema_v22(connection: sqlite3.Connection) -> None:
+    application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
+    user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if application_id != ATHENA_APPLICATION_ID:
+        raise DatabaseCompatibilityError("ATHENA application_id verification failed.")
+    if user_version != EXHAUSTIVE_RESEARCH_SCHEMA_VERSION:
+        raise DatabaseCompatibilityError("ATHENA schema version verification failed.")
+
+    metadata = connection.execute(
+        "SELECT schema_version, storage_layout_version, blob_format_version, "
+        "last_migration_id, minimum_reader_version "
+        "FROM schema_metadata WHERE singleton_id = 1"
+    ).fetchone()
+    expected = (
+        EXHAUSTIVE_RESEARCH_SCHEMA_VERSION,
+        STORAGE_LAYOUT_VERSION,
+        BLOB_FORMAT_VERSION,
+        EXHAUSTIVE_RESEARCH_MIGRATION_ID,
+        EXHAUSTIVE_RESEARCH_SCHEMA_VERSION,
+    )
+    if metadata is None or tuple(metadata) != expected:
+        raise DatabaseCompatibilityError("ATHENA schema_metadata verification failed.")
+
+    required_tables = {
+        "knowledge_units", "knowledge_unit_revisions", "claims", "claim_revisions",
+        "claim_evidence", "provenance_inputs", "model_signatures", "processing_runs",
+        "semantic_review_items", "semantic_merge_review_payloads",
+        "extraction_result_snapshots", "search_fts", "search_index_state",
+        "search_embeddings", "search_embedding_state", "blob_records", "sources",
+        "source_representations", "source_representation_pages",
+        "source_representation_structures", "source_anchor_structures",
+        "chunking_profiles", "source_anchors", "jobs", "checkpoints",
+        "source_analyses", "source_analysis_work_items", "source_analysis_artifacts",
+        "source_analysis_work_inputs", "source_extraction_result_snapshots",
+        "source_analysis_knowledge_origins", "source_extractions",
+        "source_extraction_evidence", "source_extraction_work_items",
+        "source_extraction_artifacts", "source_extraction_work_inputs",
+        "personal_memory_entries", "personal_memory_revisions",
+        "research_scopes", "research_candidate_sets", "research_candidates",
+        "research_work_items",
+    }
+    missing_tables = required_tables.difference(_user_tables(connection))
+    if missing_tables:
+        missing = ", ".join(sorted(missing_tables))
+        raise DatabaseCompatibilityError(
+            f"ATHENA semantic schema is incomplete: {missing}."
+        )
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise DatabaseCompatibilityError("ATHENA foreign-key verification failed.")
 
 
 def _verify_schema_v21(connection: sqlite3.Connection) -> None:
