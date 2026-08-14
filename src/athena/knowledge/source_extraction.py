@@ -32,6 +32,15 @@ from athena.knowledge.models import ClaimKind, EpistemicStatus, KnowledgeKind
 from athena.model.domain import ModelChatMessage, ModelInfo
 from athena.model.ports import ChatModelProvider
 from athena.model.provenance import ModelRunRepository, ModelSignature, ProcessingRun
+from athena.retrieval.context_package import (
+    ContextIncludedRef,
+    ContextPackage,
+    ContextPackageBudget,
+    ContextPackageService,
+    ContextSection,
+    ContextTokenEstimates,
+    ExcludedCandidateSummary,
+)
 from athena.source.analysis_models import (
     AnalysisStage,
     SourceAnalysisArtifact,
@@ -113,6 +122,7 @@ class SourceAnalysisKnowledgeExtractionService:
         self.chat_generation = chat_generation
         self.provider = provider
         self.runs = runs
+        self.context_packages = ContextPackageService(runs.database)
         self.snapshots = snapshots
 
     def extract_analysis(
@@ -124,6 +134,8 @@ class SourceAnalysisKnowledgeExtractionService:
         output_reserve: int | None = None,
         safety_margin: int | None = None,
     ) -> SourceAnalysisExtractionResult:
+        actor_id = self.chat.ensure_local_user()
+        snapshot_commit_seq = self.context_packages.current_commit_seq()
         analysis, final = self._require_completed_analysis(analysis_id)
         evidence, source_messages = self._load_evidence(analysis, final)
         model = self.chat_generation.select_model(requested_model_id)
@@ -132,35 +144,60 @@ class SourceAnalysisKnowledgeExtractionService:
             final=final,
             source_messages=source_messages,
         )
+        messages = (
+            ModelChatMessage(role="system", content=system_message),
+            ModelChatMessage(role="user", content=user_message),
+        )
+        schema = extraction_json_schema()
         budget = self._budget(
             model,
-            messages=(
-                ModelChatMessage(role="system", content=system_message),
-                ModelChatMessage(role="user", content=user_message),
-            ),
+            messages=messages,
             context_limit=context_limit,
             output_reserve=output_reserve,
             safety_margin=safety_margin,
         )
-        signature = self.runs.get_or_create_signature(
+        signature = self._signature_for_call(
             model=model,
-            generation_parameters={
-                "temperature": 0.0,
-                "stream": False,
-                "response_format": "json_schema",
-                "schema_id": SOURCE_EXTRACTION_SCHEMA_ID,
-                "contradiction_audit_schema_id": CONTRADICTION_AUDIT_SCHEMA_ID,
-                "max_output_tokens": budget.output_reserve,
-            },
-            context_configuration={
-                "effective_context_limit": budget.effective_context_limit,
-                "output_reserve": budget.output_reserve,
-                "safety_margin": budget.safety_margin,
-                "token_estimator": TOKEN_ESTIMATOR,
-                "grounding": "single_verified_source_anchor_exact_quote",
-            },
+            schema_id=SOURCE_EXTRACTION_SCHEMA_ID,
+            budget=budget,
+            task="source_knowledge_extraction",
         )
-        actor_id = self.chat.ensure_local_user()
+        refs = (
+            ContextIncludedRef(
+                ref_id="ANALYSIS",
+                entity_type="source_analysis",
+                entity_id=analysis.analysis_id,
+                revision_id=None,
+            ),
+            ContextIncludedRef(
+                ref_id="FINAL-ARTIFACT",
+                entity_type="source_analysis_artifact",
+                entity_id=final.artifact_id,
+                revision_id=None,
+            ),
+            *tuple(
+                ContextIncludedRef(
+                    ref_id=f"SOURCE-{item.sequence_no:06d}",
+                    entity_type="source_anchor",
+                    entity_id=item.anchor_id,
+                    revision_id=None,
+                )
+                for item in evidence
+            ),
+        )
+        package = self._package_for_call(
+            signature=signature,
+            messages=messages,
+            refs=refs,
+            budget=budget,
+            snapshot_commit_seq=snapshot_commit_seq,
+            schema_id=SOURCE_EXTRACTION_SCHEMA_ID,
+            schema=schema,
+        )
+        self.context_packages.assert_snapshot_current(
+            package.snapshot_commit_seq,
+            phase="source-knowledge-extraction-pre-run",
+        )
         run = self.runs.start_run(
             run_type="source_knowledge_extraction",
             trigger_actor_id=actor_id,
@@ -184,6 +221,7 @@ class SourceAnalysisKnowledgeExtractionService:
                 "safety_margin": budget.safety_margin,
                 "estimated_input_tokens": budget.estimated_input_tokens,
                 "token_estimator": TOKEN_ESTIMATOR,
+                "context_package": package.run_snapshot(),
             },
             configuration={
                 "pipeline_version": PIPELINE_VERSION,
@@ -196,17 +234,23 @@ class SourceAnalysisKnowledgeExtractionService:
             prompt_template_id=PROMPT_TEMPLATE_ID,
             prompt_template_version=PROMPT_TEMPLATE_VERSION,
         )
-
         try:
+            self.context_packages.assert_snapshot_current(
+                package.snapshot_commit_seq,
+                phase="immediately-before-source-knowledge-extraction-model-call",
+            )
+            structured_schema = package.structured_schema()
+            assert structured_schema is not None
             raw = self.provider.generate_structured(
                 model_id=model.backend_model_id,
-                messages=(
-                    ModelChatMessage(role="system", content=system_message),
-                    ModelChatMessage(role="user", content=user_message),
-                ),
-                schema_id=SOURCE_EXTRACTION_SCHEMA_ID,
-                json_schema=extraction_json_schema(),
+                messages=package.model_messages(),
+                schema_id=package.structured_schema_id or SOURCE_EXTRACTION_SCHEMA_ID,
+                json_schema=structured_schema,
                 max_output_tokens=budget.output_reserve,
+            )
+            self.context_packages.assert_snapshot_current(
+                package.snapshot_commit_seq,
+                phase="immediately-after-source-knowledge-extraction-model-call",
             )
             proposals = parse_extraction_proposals(raw, source_messages=source_messages)
             if proposals.relations:
@@ -218,9 +262,12 @@ class SourceAnalysisKnowledgeExtractionService:
                     "Source extractor must not invent merge candidates without canonical context."
                 )
             proposals = self._audit_claim_pairs(
-                model_id=model.backend_model_id,
+                model=model,
                 proposals=proposals,
                 budget=budget,
+                evidence=evidence,
+                parent_run=run,
+                trigger_actor_id=actor_id,
             )
         except KeyboardInterrupt:
             self.runs.finish_run(run.processing_run_id, status="cancelled")
@@ -232,7 +279,10 @@ class SourceAnalysisKnowledgeExtractionService:
                 error_detail=f"{type(exc).__name__}: {exc}",
             )
             raise
-
+        self.context_packages.assert_snapshot_current(
+            package.snapshot_commit_seq,
+            phase="source-knowledge-extraction-before-success",
+        )
         finished = self.runs.finish_run(run.processing_run_id, status="succeeded")
         result = SourceAnalysisExtractionResult(
             analysis_id=analysis.analysis_id,
@@ -248,6 +298,96 @@ class SourceAnalysisKnowledgeExtractionService:
         if self.snapshots is not None:
             self.snapshots.save(result)
         return result
+
+    def _signature_for_call(
+        self,
+        *,
+        model: ModelInfo,
+        schema_id: str,
+        budget: SourceExtractionBudget,
+        task: str,
+    ) -> ModelSignature:
+        return self.runs.get_or_create_signature(
+            model=model,
+            generation_parameters={
+                "temperature": 0.0,
+                "stream": False,
+                "response_format": "json_schema",
+                "schema_id": schema_id,
+                "max_output_tokens": budget.output_reserve,
+            },
+            context_configuration={
+                "context_package_version": 1,
+                "effective_context_limit": budget.effective_context_limit,
+                "output_reserve": budget.output_reserve,
+                "safety_margin": budget.safety_margin,
+                "token_estimator": TOKEN_ESTIMATOR,
+                "task": task,
+                "grounding": "single_verified_source_anchor_exact_quote",
+            },
+        )
+
+    def _package_for_call(
+        self,
+        *,
+        signature: ModelSignature,
+        messages: tuple[ModelChatMessage, ...],
+        refs: tuple[ContextIncludedRef, ...],
+        budget: SourceExtractionBudget,
+        snapshot_commit_seq: int,
+        schema_id: str,
+        schema: Mapping[str, Any],
+    ) -> ContextPackage:
+        return self.context_packages.build_from_sections(
+            model_signature=signature,
+            budget=ContextPackageBudget(
+                effective_context_limit=budget.effective_context_limit,
+                context_budget=budget.input_budget,
+                output_reserve=budget.output_reserve,
+                safety_margin=budget.safety_margin,
+            ),
+            sections=(
+                ContextSection(
+                    name="source_knowledge_policy",
+                    role="system",
+                    content=messages[0].content,
+                    included_ref_ids=(),
+                ),
+                ContextSection(
+                    name="source_knowledge_input",
+                    role="user",
+                    content=messages[1].content,
+                    included_ref_ids=tuple(item.ref_id for item in refs),
+                ),
+            ),
+            included_refs=refs,
+            excluded_candidate_summary=ExcludedCandidateSummary(
+                retrieval_candidate_count=len(refs),
+                retrieval_included_count=len(refs),
+                retrieval_excluded_count=0,
+                memory_candidate_count=0,
+                memory_included_count=0,
+                memory_excluded_count=0,
+                conversation_candidate_count=0,
+                conversation_included_count=0,
+                conversation_excluded_count=0,
+            ),
+            token_estimates=ContextTokenEstimates(
+                conversation_tokens=0,
+                current_user_tokens=0,
+                system_tokens=0,
+                context_tokens=budget.estimated_input_tokens,
+                estimated_input_tokens=budget.estimated_input_tokens,
+                estimated_total_tokens=(
+                    budget.estimated_input_tokens
+                    + budget.output_reserve
+                    + budget.safety_margin
+                ),
+            ),
+            snapshot_commit_seq=snapshot_commit_seq,
+            structured_schema_id=schema_id,
+            structured_schema=schema,
+        )
 
     def _require_completed_analysis(
         self, analysis_id: uuid.UUID
@@ -336,9 +476,12 @@ class SourceAnalysisKnowledgeExtractionService:
     def _audit_claim_pairs(
         self,
         *,
-        model_id: str,
+        model: ModelInfo,
         proposals: ExtractionProposalSet,
         budget: SourceExtractionBudget,
+        evidence: tuple[SourceExtractionEvidence, ...],
+        parent_run: ProcessingRun,
+        trigger_actor_id: uuid.UUID,
     ) -> ExtractionProposalSet:
         if len(proposals.claims) < 2:
             return proposals
@@ -353,31 +496,115 @@ class SourceAnalysisKnowledgeExtractionService:
             "outside knowledge. Return only the supplied JSON schema."
         )
         user = "CLAIM PROPOSALS\n" + "\n".join(rendered)
+        messages = (
+            ModelChatMessage(role="system", content=system),
+            ModelChatMessage(role="user", content=user),
+        )
         schema = contradiction_audit_json_schema(claim_count=len(proposals.claims))
         estimated = _estimate_request_tokens(
-            (
-                ModelChatMessage(role="system", content=system),
-                ModelChatMessage(role="user", content=user),
-            ),
-            schema,
+            messages, schema, CONTRADICTION_AUDIT_SCHEMA_ID
         )
         if estimated > budget.input_budget:
             raise SourceExtractionError(
                 "Claim-pair contradiction audit exceeds the pinned extraction input budget."
             )
-        raw = self.provider.generate_structured(
-            model_id=model_id,
-            messages=(
-                ModelChatMessage(role="system", content=system),
-                ModelChatMessage(role="user", content=user),
-            ),
-            schema_id=CONTRADICTION_AUDIT_SCHEMA_ID,
-            json_schema=schema,
-            max_output_tokens=budget.output_reserve,
+        audit_budget = SourceExtractionBudget(
+            effective_context_limit=budget.effective_context_limit,
+            output_reserve=budget.output_reserve,
+            safety_margin=budget.safety_margin,
+            estimated_input_tokens=estimated,
         )
-        assessments = parse_claim_pair_audit(raw, claim_count=len(proposals.claims))
+        evidence_by_sequence = {item.sequence_no: item for item in evidence}
+        cited = tuple(
+            evidence_by_sequence[sequence_no]
+            for sequence_no in sorted({claim.source_sequence_no for claim in proposals.claims})
+        )
+        refs = (
+            ContextIncludedRef(
+                ref_id="PARENT-RUN",
+                entity_type="processing_run",
+                entity_id=parent_run.processing_run_id,
+                revision_id=None,
+            ),
+            *tuple(
+                ContextIncludedRef(
+                    ref_id=f"SOURCE-{item.sequence_no:06d}",
+                    entity_type="source_anchor",
+                    entity_id=item.anchor_id,
+                    revision_id=None,
+                )
+                for item in cited
+            ),
+        )
+        signature = self._signature_for_call(
+            model=model,
+            schema_id=CONTRADICTION_AUDIT_SCHEMA_ID,
+            budget=audit_budget,
+            task="source_knowledge_extraction_claim_audit",
+        )
+        package = self._package_for_call(
+            signature=signature,
+            messages=messages,
+            refs=refs,
+            budget=audit_budget,
+            snapshot_commit_seq=self.context_packages.current_commit_seq(),
+            schema_id=CONTRADICTION_AUDIT_SCHEMA_ID,
+            schema=schema,
+        )
+        audit_run = self.runs.start_run(
+            run_type="source_knowledge_extraction_claim_audit",
+            trigger_actor_id=trigger_actor_id,
+            pipeline_version=PIPELINE_VERSION,
+            input_snapshot={
+                "parent_processing_run_id": str(parent_run.processing_run_id),
+                "claim_count": len(proposals.claims),
+                "context_package": package.run_snapshot(),
+            },
+            configuration={
+                "pipeline_version": PIPELINE_VERSION,
+                "schema_id": CONTRADICTION_AUDIT_SCHEMA_ID,
+                "max_output_tokens": audit_budget.output_reserve,
+                "effective_context_limit": audit_budget.effective_context_limit,
+                "safety_margin": audit_budget.safety_margin,
+                "token_estimator": TOKEN_ESTIMATOR,
+            },
+            model_signature_id=signature.model_signature_id,
+            prompt_template_id=f"{PROMPT_TEMPLATE_ID}.claim_audit",
+            prompt_template_version="1",
+        )
+        try:
+            self.context_packages.assert_snapshot_current(
+                package.snapshot_commit_seq,
+                phase="immediately-before-source-claim-audit-model-call",
+            )
+            structured_schema = package.structured_schema()
+            assert structured_schema is not None
+            raw = self.provider.generate_structured(
+                model_id=model.backend_model_id,
+                messages=package.model_messages(),
+                schema_id=package.structured_schema_id or CONTRADICTION_AUDIT_SCHEMA_ID,
+                json_schema=structured_schema,
+                max_output_tokens=audit_budget.output_reserve,
+            )
+            self.context_packages.assert_snapshot_current(
+                package.snapshot_commit_seq,
+                phase="immediately-after-source-claim-audit-model-call",
+            )
+            assessments = parse_claim_pair_audit(raw, claim_count=len(proposals.claims))
+        except KeyboardInterrupt:
+            self.runs.finish_run(audit_run.processing_run_id, status="cancelled")
+            raise
+        except Exception as exc:
+            self.runs.finish_run(
+                audit_run.processing_run_id,
+                status="failed",
+                error_detail=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        self.runs.finish_run(audit_run.processing_run_id, status="succeeded")
         return apply_claim_pair_audit(proposals, assessments)
 
+    @staticmethod
     @staticmethod
     def _budget(
         model: ModelInfo,
@@ -387,20 +614,37 @@ class SourceAnalysisKnowledgeExtractionService:
         output_reserve: int | None,
         safety_margin: int | None,
     ) -> SourceExtractionBudget:
-        if model.context_capacity is None and context_limit is None:
-            raise SourceExtractionError(
-                "Model provider did not report context capacity; specify --context-limit."
-            )
-        capacity = model.context_capacity if model.context_capacity is not None else context_limit
-        assert capacity is not None
-        effective = capacity if context_limit is None else min(context_limit, capacity)
+        if context_limit is None:
+            if model.loaded_context_length is None:
+                raise SourceExtractionError(
+                    "Active model did not report its loaded runtime context; "
+                    "provide an explicit source extraction context limit."
+                )
+            effective = model.loaded_context_length
+        else:
+            if context_limit < 1:
+                raise SourceExtractionError("Source extraction context limit must be positive.")
+            if model.context_capacity is not None and context_limit > model.context_capacity:
+                raise SourceExtractionError(
+                    "Requested source extraction context exceeds model capacity."
+                )
+            if (
+                model.loaded_context_length is not None
+                and context_limit > model.loaded_context_length
+            ):
+                raise SourceExtractionError(
+                    "Requested source extraction context exceeds loaded runtime context."
+                )
+            effective = context_limit
         if effective < 256:
             raise SourceExtractionError("Effective extraction context limit is too small.")
         reserve = min(8192, max(512, effective // 4)) if output_reserve is None else output_reserve
         margin = min(1024, max(128, effective // 20)) if safety_margin is None else safety_margin
         if reserve <= 0 or margin < 0 or reserve + margin >= effective:
             raise SourceExtractionError("Invalid source extraction context budget.")
-        estimated = _estimate_request_tokens(messages, extraction_json_schema())
+        estimated = _estimate_request_tokens(
+            messages, extraction_json_schema(), SOURCE_EXTRACTION_SCHEMA_ID
+        )
         budget = SourceExtractionBudget(
             effective_context_limit=effective,
             output_reserve=reserve,
@@ -410,7 +654,7 @@ class SourceAnalysisKnowledgeExtractionService:
         if estimated > budget.input_budget:
             raise SourceExtractionError(
                 "Verified SourceAnchor evidence does not fit the bounded extraction context. "
-                "A later hierarchical extraction slice is required for this analysis."
+                "Use hierarchical source extraction for this analysis."
             )
         return budget
 
@@ -640,8 +884,11 @@ def _anchor_order_key(anchor: SourceAnchorRecord) -> tuple[int, int, bytes]:
 def _estimate_request_tokens(
     messages: Sequence[ModelChatMessage],
     schema: Mapping[str, Any],
+    schema_id: str | None = None,
 ) -> int:
     payload = "\n".join(f"{message.role}:{message.content}" for message in messages)
+    if schema_id is not None:
+        payload += "\nSCHEMA_ID:" + schema_id
     payload += "\n" + json.dumps(schema, ensure_ascii=False, sort_keys=True)
     return math.ceil(len(payload.encode("utf-8")) / 3) + 32 * len(messages)
 

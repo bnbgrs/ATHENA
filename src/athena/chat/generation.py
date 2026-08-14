@@ -75,39 +75,236 @@ class ChatGenerationService:
         max_output_tokens: int | None = None,
         reasoning_mode: str | None = None,
     ) -> ChatGenerationResult:
-        model = self.select_model(requested_model_id)
-        user_message = self.chat.add_user_message(chat_id=chat_id, content=content)
-        thread = self.chat.load_chat(chat_id)
-        history = tuple(self._to_model_message(message) for message in thread.messages)
+        """Compatibility entrypoint routed through traceable ContextPackages."""
         if grounding_contract is not None and retrieved_context is None:
             raise ValueError("Grounding requires retrieved context input.")
+        if retrieved_context is None:
+            if reasoning_mode not in {None, "off"}:
+                raise ValueError("reasoning_mode must be None or 'off'.")
+            from athena.chat.direct import DirectChatService
+            from athena.model.provenance import ModelRunRepository
+            from athena.retrieval.context_package import ContextPackageService
 
-        if retrieved_context is not None:
-            normalized_context = retrieved_context.strip()
-            if not normalized_context:
-                raise ValueError("Retrieved context must not be blank.")
-            system_prefix = _RETRIEVED_CONTEXT_SYSTEM_PREFIX
-            if grounding_contract is not None:
-                system_prefix = render_grounding_instructions(grounding_contract)
-            history = (
-                ModelChatMessage(
-                    role="system",
-                    content=system_prefix + normalized_context,
-                ),
-                *history,
+            database = self.chat.repository.database
+            result = DirectChatService(
+                chat_generation=self,
+                context_packages=ContextPackageService(database),
+                model_runs=ModelRunRepository(database),
+            ).send_message(
+                chat_id=chat_id,
+                content=content,
+                requested_model_id=requested_model_id,
+                output_reserve=(2048 if max_output_tokens is None else max_output_tokens),
+                safety_margin=256,
+                on_delta=on_delta,
             )
+            return result.generation
 
-        return self._generate_and_persist(
+        if grounding_contract is None:
+            raise ValueError(
+                "Retrieved context without durable grounding references cannot enter "
+                "a persistence-relevant model call."
+            )
+        return self._send_grounded_context_package(
             chat_id=chat_id,
-            user_message=user_message,
-            model=model,
-            history=history,
+            content=content,
+            requested_model_id=requested_model_id,
             on_delta=on_delta,
+            retrieved_context=retrieved_context,
             grounding_contract=grounding_contract,
             max_output_tokens=max_output_tokens,
             reasoning_mode=reasoning_mode,
-            on_before_provider_call=None,
         )
+
+    def _send_grounded_context_package(
+        self,
+        *,
+        chat_id: uuid.UUID,
+        content: str,
+        requested_model_id: str | None,
+        on_delta: Callable[[str], None] | None,
+        retrieved_context: str,
+        grounding_contract: GroundingContract,
+        max_output_tokens: int | None,
+        reasoning_mode: str | None,
+    ) -> ChatGenerationResult:
+        from athena.chat.direct import (
+            _estimate_persisted_messages,
+            _prior_chat_sections,
+            _resolve_context_limit,
+            _select_recent_conversation_window,
+        )
+        from athena.model.provenance import ModelRunRepository
+        from athena.retrieval.context import ContextBuilderError, estimate_tokens
+        from athena.retrieval.context_package import (
+            ContextIncludedRef,
+            ContextPackageBudget,
+            ContextPackageService,
+            ContextSection,
+            ContextTokenEstimates,
+            ExcludedCandidateSummary,
+        )
+
+        if reasoning_mode not in {None, "off"}:
+            raise ValueError("reasoning_mode must be None or 'off'.")
+        normalized_context = retrieved_context.strip()
+        if not normalized_context:
+            raise ValueError("Retrieved context must not be blank.")
+        if not grounding_contract.evidence_refs:
+            raise ValueError(
+                "Grounded retrieved context requires durable evidence references."
+            )
+
+        output_reserve = 2048 if max_output_tokens is None else max_output_tokens
+        safety_margin = 256
+        model = self.select_model(requested_model_id)
+        context_limit = _resolve_context_limit(model=model, requested_limit=None)
+        database = self.chat.repository.database
+        context_packages = ContextPackageService(database)
+        model_runs = ModelRunRepository(database)
+        snapshot_before_user = context_packages.current_commit_seq()
+        thread = self.chat.load_chat(chat_id)
+        recent_messages = _select_recent_conversation_window(
+            thread.messages,
+            max_turns=8,
+        )
+        prior_sections, prior_refs = _prior_chat_sections(recent_messages)
+        system_text = render_grounding_instructions(grounding_contract) + normalized_context
+        conversation_tokens = _estimate_persisted_messages(recent_messages)
+        system_tokens = estimate_tokens(system_text) + 6
+        current_user_tokens = estimate_tokens(content) + 6
+        estimated_input = conversation_tokens + system_tokens + current_user_tokens
+        estimated_total = estimated_input + output_reserve + safety_margin
+        if estimated_total > context_limit:
+            raise ContextBuilderError(
+                "Grounded conversation, current input, output reserve and safety "
+                "margin exceed the active model context."
+            )
+        context_packages.assert_snapshot_current(
+            snapshot_before_user,
+            phase="post-legacy-grounded-context-build",
+        )
+
+        signature = model_runs.get_or_create_signature(
+            model=model,
+            generation_parameters={
+                "max_output_tokens": output_reserve,
+                "reasoning_mode": "off",
+            },
+            context_configuration={
+                "context_package_version": 1,
+                "mode": "legacy_grounded_chat",
+                "effective_context_limit": context_limit,
+                "max_recent_conversation_turns": 8,
+                "safety_margin": safety_margin,
+            },
+        )
+        user_message = self.chat.add_user_message(chat_id=chat_id, content=content)
+        snapshot_with_user = context_packages.assert_user_commit_follows(
+            snapshot_before_user,
+            user_message,
+        )
+        evidence_refs = tuple(
+            ContextIncludedRef(
+                ref_id=item.context_id,
+                entity_type=item.entity_type,
+                entity_id=item.entity_id,
+                revision_id=item.revision_id,
+            )
+            for item in grounding_contract.evidence_refs
+        )
+        current_ref = ContextIncludedRef(
+            ref_id="CURRENT-USER",
+            entity_type="chat_message",
+            entity_id=user_message.message_id,
+            revision_id=user_message.revision_id,
+        )
+        package = context_packages.build_from_sections(
+            model_signature=signature,
+            budget=ContextPackageBudget(
+                effective_context_limit=context_limit,
+                context_budget=context_limit - output_reserve - safety_margin,
+                output_reserve=output_reserve,
+                safety_margin=safety_margin,
+            ),
+            sections=(
+                ContextSection(
+                    name="retrieved_context",
+                    role="system",
+                    content=system_text,
+                    included_ref_ids=tuple(item.ref_id for item in evidence_refs),
+                ),
+                *prior_sections,
+                ContextSection(
+                    name="current_user",
+                    role="user",
+                    content=content,
+                    included_ref_ids=(current_ref.ref_id,),
+                ),
+            ),
+            included_refs=(*evidence_refs, *prior_refs, current_ref),
+            excluded_candidate_summary=ExcludedCandidateSummary(
+                retrieval_candidate_count=len(evidence_refs),
+                retrieval_included_count=len(evidence_refs),
+                retrieval_excluded_count=0,
+                memory_candidate_count=0,
+                memory_included_count=0,
+                memory_excluded_count=0,
+                conversation_candidate_count=len(thread.messages),
+                conversation_included_count=len(recent_messages),
+                conversation_excluded_count=len(thread.messages) - len(recent_messages),
+            ),
+            token_estimates=ContextTokenEstimates(
+                conversation_tokens=conversation_tokens,
+                current_user_tokens=current_user_tokens,
+                system_tokens=system_tokens,
+                context_tokens=system_tokens,
+                estimated_input_tokens=estimated_input,
+                estimated_total_tokens=estimated_total,
+            ),
+            snapshot_commit_seq=snapshot_with_user,
+        )
+        if user_message.actor_id is None:
+            raise RuntimeError("Persisted user message has no actor for ProcessingRun.")
+        run = model_runs.start_run(
+            run_type="chat.legacy_grounded_context_package",
+            trigger_actor_id=user_message.actor_id,
+            pipeline_version="legacy-grounded-chat-context-package-v1",
+            input_snapshot=package.run_snapshot(),
+            configuration={
+                "context_package_version": 1,
+                "effective_context_limit": context_limit,
+                "output_reserve": output_reserve,
+                "safety_margin": safety_margin,
+            },
+            model_signature_id=signature.model_signature_id,
+            prompt_template_id="legacy-grounded-chat",
+            prompt_template_version="1",
+        )
+        try:
+            generation = self.send_context_package(
+                chat_id=chat_id,
+                user_message=user_message,
+                context_package=package,
+                on_delta=on_delta,
+                grounding_contract=grounding_contract,
+                on_before_provider_call=lambda: context_packages.assert_snapshot_current(
+                    package.snapshot_commit_seq,
+                    phase="immediately-before-legacy-grounded-model-call",
+                ),
+            )
+        except KeyboardInterrupt:
+            model_runs.finish_run(run.processing_run_id, status="cancelled")
+            raise
+        except Exception as exc:
+            model_runs.finish_run(
+                run.processing_run_id,
+                status="failed",
+                error_detail=f"{type(exc).__name__}: {exc}"[:4000],
+            )
+            raise
+        model_runs.finish_run(run.processing_run_id, status="succeeded")
+        return generation
 
     def send_context_package(
         self,

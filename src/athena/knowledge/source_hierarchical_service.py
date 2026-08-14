@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from itertools import combinations
-from typing import Any
+from typing import Any, cast
 
 from athena.jobs.models import JobPriority, JobRecord
 from athena.jobs.service import DurableJobService
@@ -55,6 +55,16 @@ from athena.model.ports import (
     controlled_structured_contract_prefix,
 )
 from athena.model.provenance import ModelRunRepository, ModelSignature
+from athena.retrieval.context_package import (
+    ContextIncludedRef,
+    ContextPackage,
+    ContextPackageBudget,
+    ContextPackageService,
+    ContextRole,
+    ContextSection,
+    ContextTokenEstimates,
+    ExcludedCandidateSummary,
+)
 from athena.source.analysis_models import (
     AnalysisStage,
     SourceAnalysisArtifact,
@@ -160,6 +170,7 @@ class SourceHierarchicalExtractionService:
         provider: ControlledStructuredModelProvider,
         runs: ModelRunRepository,
         snapshots: SourceExtractionSnapshotRepository,
+        context_packages: ContextPackageService | None = None,
     ) -> None:
         self.jobs = jobs
         self.repository = repository
@@ -169,6 +180,7 @@ class SourceHierarchicalExtractionService:
         self.provider = provider
         self.runs = runs
         self.snapshots = snapshots
+        self.context_packages = context_packages or ContextPackageService(runs.database)
 
     def enqueue(
         self,
@@ -674,6 +686,108 @@ class SourceHierarchicalExtractionService:
             input_refs=refs,
         )
 
+    def _context_package_for_prepared(
+        self,
+        *,
+        extraction: SourceHierarchicalExtractionRecord,
+        prepared: PreparedHierarchicalExtractionCall,
+    ) -> ContextPackage:
+        snapshot_commit_seq = self.context_packages.current_commit_seq()
+
+        # prepared.input_refs are operation-level logical labels. In BATCH they
+        # intentionally look like "evidence:1", not UUIDs. Durable ContextPackage
+        # identity must therefore come from the persisted WorkItem inputs.
+        work_inputs = self.repository.inputs_for_work_item(
+            prepared.work_item.work_item_id
+        )
+        refs_list: list[ContextIncludedRef] = []
+        for index, item in enumerate(work_inputs, start=1):
+            if (
+                item.input_kind is SourceExtractionInputKind.SOURCE_ANCHOR
+                and item.source_anchor_id is not None
+            ):
+                entity_type = "source_anchor"
+                entity_id = item.source_anchor_id
+            elif (
+                item.input_kind is SourceExtractionInputKind.ARTIFACT
+                and item.artifact_id is not None
+            ):
+                entity_type = "source_extraction_artifact"
+                entity_id = item.artifact_id
+            else:
+                raise SourceHierarchicalExtractionConfigurationError(
+                    "Hierarchical ContextPackage input lacks durable identity."
+                )
+            refs_list.append(
+                ContextIncludedRef(
+                    ref_id=f"INPUT-{index:03d}",
+                    entity_type=entity_type,
+                    entity_id=entity_id,
+                    revision_id=None,
+                )
+            )
+        refs = tuple(refs_list)
+        if not refs:
+            raise SourceHierarchicalExtractionConfigurationError(
+                "Hierarchical ContextPackage has no durable WorkItem inputs."
+            )
+
+        sections = tuple(
+            ContextSection(
+                name=(
+                    "hierarchical_extraction_policy"
+                    if index == 0
+                    else "hierarchical_extraction_task"
+                ),
+                role=cast(ContextRole, message.role),
+                content=message.content,
+                included_ref_ids=(
+                    tuple(item.ref_id for item in refs)
+                    if index == len(prepared.messages) - 1
+                    else ()
+                ),
+            )
+            for index, message in enumerate(prepared.messages)
+        )
+        signature = self.runs.load_signature(extraction.model_signature_id)
+        return self.context_packages.build_from_sections(
+            model_signature=signature,
+            budget=ContextPackageBudget(
+                effective_context_limit=extraction.effective_context_limit,
+                context_budget=extraction.input_budget,
+                output_reserve=extraction.output_reserve,
+                safety_margin=extraction.safety_margin,
+            ),
+            sections=sections,
+            included_refs=refs,
+            excluded_candidate_summary=ExcludedCandidateSummary(
+                retrieval_candidate_count=len(refs),
+                retrieval_included_count=len(refs),
+                retrieval_excluded_count=0,
+                memory_candidate_count=0,
+                memory_included_count=0,
+                memory_excluded_count=0,
+                conversation_candidate_count=0,
+                conversation_included_count=0,
+                conversation_excluded_count=0,
+            ),
+            token_estimates=ContextTokenEstimates(
+                conversation_tokens=0,
+                current_user_tokens=0,
+                system_tokens=0,
+                context_tokens=prepared.estimated_input_tokens,
+                estimated_input_tokens=prepared.estimated_input_tokens,
+                estimated_total_tokens=(
+                    prepared.estimated_input_tokens
+                    + extraction.output_reserve
+                    + extraction.safety_margin
+                ),
+            ),
+            snapshot_commit_seq=snapshot_commit_seq,
+            structured_schema_id=prepared.schema_id,
+            structured_schema=prepared.schema,
+        )
+
     def execute_call(
         self,
         *,
@@ -683,6 +797,14 @@ class SourceHierarchicalExtractionService:
         model: ModelInfo,
         prepared: PreparedHierarchicalExtractionCall,
     ) -> SourceHierarchicalExtractionArtifact:
+        package = self._context_package_for_prepared(
+            extraction=extraction,
+            prepared=prepared,
+        )
+        self.context_packages.assert_snapshot_current(
+            package.snapshot_commit_seq,
+            phase="hierarchical-extraction-pre-attempt",
+        )
         attempted = self.repository.begin_attempt(
             prepared.work_item.work_item_id,
             job_id=job.job_id,
@@ -695,6 +817,11 @@ class SourceHierarchicalExtractionService:
             trigger_actor_id=actor_id,
             pipeline_version=HIERARCHICAL_PIPELINE_VERSION,
             input_snapshot={
+                # Keep the established 4C-B ProcessingRun fields stable and
+                # attach the formal model-call contract under context_package.
+                "context_package": package.run_snapshot(),
+                "context_package_request_id": str(package.request_id),
+                "snapshot_commit_seq": package.snapshot_commit_seq,
                 "extraction_id": str(extraction.extraction_id),
                 "analysis_id": str(extraction.analysis_id),
                 "final_artifact_id": str(extraction.final_artifact_id),
@@ -733,11 +860,17 @@ class SourceHierarchicalExtractionService:
             prompt_template_version=HIERARCHICAL_PROMPT_TEMPLATE_VERSION,
         )
         try:
+            self.context_packages.assert_snapshot_current(
+                package.snapshot_commit_seq,
+                phase="immediately-before-hierarchical-extraction-model-call",
+            )
+            structured_schema = package.structured_schema()
+            assert structured_schema is not None
             raw = self.provider.generate_controlled_structured(
                 model_id=model.backend_model_id,
-                messages=prepared.messages,
-                schema_id=prepared.schema_id,
-                json_schema=prepared.schema,
+                messages=package.model_messages(),
+                schema_id=package.structured_schema_id or prepared.schema_id,
+                json_schema=structured_schema,
                 reasoning_mode=config.reasoning_mode,
                 context_length=extraction.effective_context_limit,
                 max_output_tokens=extraction.output_reserve,

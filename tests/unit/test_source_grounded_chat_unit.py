@@ -2,19 +2,66 @@ from __future__ import annotations
 
 import hashlib
 import uuid
-from collections.abc import Callable
+from collections.abc import Iterator, Sequence
 
 import pytest
 
-from athena.chat.generation import ChatGenerationResult
-from athena.chat.grounding import GroundingContract
-from athena.chat.models import ChatMessage, MessageType
+from athena.chat.generation import ChatGenerationService
+from athena.chat.repository import ChatRepository
+from athena.chat.service import ChatService
 from athena.chat.source_grounding import SourceGroundedChatService
-from athena.model.domain import ModelInfo
+from athena.model.domain import (
+    ModelChatMessage,
+    ModelInfo,
+    ProviderHealth,
+    ProviderHealthStatus,
+)
+from athena.model.provenance import ModelRunRepository
 from athena.retrieval.archive import ArchiveHybridSearchResult
-from athena.retrieval.evidence import EvidenceClass
+from athena.retrieval.context_package import ContextPackageService
 from athena.retrieval.source_context import SourceContextBuilderService
 from athena.source.models import SourceAnchorRecord, SourceAnchorType
+from athena.storage.database import SQLiteDatabase
+
+
+class FakeProvider:
+    provider_id = "lm_studio"
+
+    def __init__(self) -> None:
+        self.requests: list[tuple[ModelChatMessage, ...]] = []
+
+    def health(self) -> ProviderHealth:
+        return ProviderHealth(ProviderHealthStatus.READY)
+
+    def discover_models(self) -> tuple[ModelInfo, ...]:
+        return (
+            ModelInfo(
+                provider="lm_studio",
+                backend_model_id="primary",
+                display_name="primary",
+                model_type="llm",
+                context_capacity=32768,
+                quantization="Q4_K_M",
+                loaded=True,
+                vision=False,
+                trained_for_tool_use=False,
+                loaded_context_length=4096,
+            ),
+        )
+
+    def stream_chat(
+        self,
+        *,
+        model_id: str,
+        messages: Sequence[ModelChatMessage],
+        max_output_tokens: int | None = None,
+        reasoning_mode: str | None = None,
+    ) -> Iterator[str]:
+        assert model_id == "primary"
+        assert max_output_tokens == 1000
+        assert reasoning_mode == "off"
+        self.requests.append(tuple(messages))
+        yield "The source mentions Berlin. [SOURCE:CTX-001]"
 
 
 class FakeEmbeddingProvider:
@@ -28,11 +75,12 @@ class FakeEmbeddingProvider:
             backend_model_id=requested_model_id or "embed",
             display_name="embed",
             model_type="embedding",
-            context_capacity=None,
+            context_capacity=2048,
             quantization=None,
             loaded=True,
-            vision=None,
-            trained_for_tool_use=None,
+            vision=False,
+            trained_for_tool_use=False,
+            loaded_context_length=2048,
         )
 
 
@@ -94,65 +142,6 @@ class FakeAnchors:
         return self.text
 
 
-class FakeChatGeneration:
-    def __init__(self) -> None:
-        self.calls: list[dict[str, object]] = []
-
-    def send_message(
-        self,
-        *,
-        chat_id: uuid.UUID,
-        content: str,
-        requested_model_id: str | None = None,
-        on_delta: Callable[[str], None] | None = None,
-        retrieved_context: str | None = None,
-        grounding_contract: GroundingContract | None = None,
-    ) -> ChatGenerationResult:
-        self.calls.append(
-            {
-                "chat_id": chat_id,
-                "content": content,
-                "requested_model_id": requested_model_id,
-                "retrieved_context": retrieved_context,
-                "grounding_contract": grounding_contract,
-            }
-        )
-        user = ChatMessage(
-            message_id=uuid.uuid4(),
-            chat_id=chat_id,
-            sequence_no=1,
-            message_type=MessageType.USER,
-            actor_id=None,
-            created_at_us=1,
-            revision_id=uuid.uuid4(),
-            content=content,
-            content_format="text/plain",
-        )
-        assistant = ChatMessage(
-            message_id=uuid.uuid4(),
-            chat_id=chat_id,
-            sequence_no=2,
-            message_type=MessageType.ASSISTANT,
-            actor_id=None,
-            created_at_us=2,
-            revision_id=uuid.uuid4(),
-            content="answer",
-            content_format="text/plain",
-        )
-        model = ModelInfo(
-            provider="lm_studio",
-            backend_model_id="primary",
-            display_name="primary",
-            model_type="llm",
-            context_capacity=32768,
-            quantization=None,
-            loaded=True,
-            vision=False,
-            trained_for_tool_use=False,
-        )
-        return ChatGenerationResult(user_message=user, assistant_message=assistant, model=model)
-
-
 def _archive_result() -> ArchiveHybridSearchResult:
     text = "Berlin appears in this imported source."
     return ArchiveHybridSearchResult(
@@ -174,74 +163,98 @@ def _archive_result() -> ArchiveHybridSearchResult:
     )
 
 
-def test_source_grounded_chat_uses_persistent_anchor_identity_not_chunk_identity() -> None:
-    archive_result = _archive_result()
-    anchors = FakeAnchors(archive_result)
-    context_builder = SourceContextBuilderService(anchors)  # type: ignore[arg-type]
-    embedding = FakeEmbeddingProvider()
-    retrieval = FakeArchiveRetrieval(archive_result)
-    generation = FakeChatGeneration()
-    service = SourceGroundedChatService(
-        chat_generation=generation,  # type: ignore[arg-type]
-        embedding_provider=embedding,  # type: ignore[arg-type]
-        archive_retrieval=retrieval,  # type: ignore[arg-type]
-        context_builder=context_builder,
-    )
-
-    result = service.send_message(
-        chat_id=uuid.uuid4(),
-        content="What does my source say about Berlin?",
-        requested_model_id="primary",
-        requested_embedding_model_id="embed-model",
-    )
-
-    assert embedding.requests == ["embed-model"]
-    assert retrieval.calls[0][0] == "What does my source say about Berlin?"
-    assert retrieval.calls[0][1] == "embed-model"
-    assert len(result.context.items) == 1
-    context_item = result.context.items[0]
-    assert context_item.anchor_id == anchors.anchor_id
-    assert str(archive_result.chunk_id) not in result.context.rendered_text
-    assert "chunk_id" not in result.context.rendered_text
-
-    call = generation.calls[0]
-    contract = call["grounding_contract"]
-    assert isinstance(contract, GroundingContract)
-    assert contract.allowed_context_ids == ("CTX-001",)
-    evidence = contract.evidence_refs[0]
-    assert evidence.evidence_class is EvidenceClass.SOURCE
-    assert evidence.entity_type == "source_anchor"
-    assert evidence.entity_id == anchors.anchor_id
-    assert evidence.revision_id is None
-    assert evidence.source_id == archive_result.source_id
-    assert evidence.representation_id == archive_result.representation_id
-    assert evidence.quoted_hash == archive_result.content_hash
-    assert evidence.entity_id != archive_result.chunk_id
-
-
-def test_source_grounded_chat_rejects_invalid_budget_before_retrieval() -> None:
-    archive_result = _archive_result()
+def _runtime(tmp_path, archive_result: ArchiveHybridSearchResult):
+    database = SQLiteDatabase(tmp_path / "athena.db")
+    database.start()
+    chat = ChatService(ChatRepository(database))
+    provider = FakeProvider()
     anchors = FakeAnchors(archive_result)
     embedding = FakeEmbeddingProvider()
     retrieval = FakeArchiveRetrieval(archive_result)
-    generation = FakeChatGeneration()
+    runs = ModelRunRepository(database)
     service = SourceGroundedChatService(
-        chat_generation=generation,  # type: ignore[arg-type]
+        chat_generation=ChatGenerationService(chat, provider),
         embedding_provider=embedding,  # type: ignore[arg-type]
         archive_retrieval=retrieval,  # type: ignore[arg-type]
         context_builder=SourceContextBuilderService(anchors),  # type: ignore[arg-type]
+        context_packages=ContextPackageService(database),
+        model_runs=runs,
     )
+    return database, chat, provider, anchors, embedding, retrieval, service
 
-    with pytest.raises(ValueError, match="Context token budget"):
-        service.send_message(
-            chat_id=uuid.uuid4(),
-            content="Berlin?",
-            max_context_tokens=50,
+
+def test_source_grounded_chat_uses_persistent_anchor_identity_not_chunk_identity(tmp_path) -> None:
+    archive_result = _archive_result()
+    (
+        database,
+        chat,
+        provider,
+        anchors,
+        embedding,
+        retrieval,
+        service,
+    ) = _runtime(tmp_path, archive_result)
+    try:
+        chat_id = chat.create_chat()
+        result = service.send_message(
+            chat_id=chat_id,
+            content="What does my source say about Berlin?",
+            requested_model_id="primary",
+            requested_embedding_model_id="embed-model",
+            output_reserve=1000,
+            safety_margin=100,
         )
 
-    assert embedding.requests == []
-    assert retrieval.calls == []
-    assert generation.calls == []
+        assert embedding.requests == ["embed-model"]
+        assert retrieval.calls[0][0] == "What does my source say about Berlin?"
+        assert retrieval.calls[0][1] == "embed-model"
+        assert len(result.context.items) == 1
+        context_item = result.context.items[0]
+        assert context_item.anchor_id == anchors.anchor_id
+        assert str(archive_result.chunk_id) not in result.context.rendered_text
+        assert "chunk_id" not in result.context.rendered_text
+
+        contract = result.generation.grounding_report
+        assert contract is not None
+        assert contract.source_context_ids == ("CTX-001",)
+
+        refs = result.context_package.included_refs
+        source_ref = next(item for item in refs if item.ref_id == "CTX-001")
+        assert source_ref.entity_type == "source_anchor"
+        assert source_ref.entity_id == anchors.anchor_id
+        assert source_ref.revision_id is None
+        assert source_ref.entity_id != archive_result.chunk_id
+
+        assert provider.requests
+        assert tuple(
+            (item.role, item.content)
+            for item in provider.requests[0]
+        ) == tuple(
+            (item.role, item.content)
+            for item in result.context_package.model_messages()
+        )
+        assert result.processing_run.status == "succeeded"
+    finally:
+        database.stop()
+
+
+def test_source_grounded_chat_rejects_invalid_budget_before_retrieval(tmp_path) -> None:
+    archive_result = _archive_result()
+    database, chat, _provider, _anchors, embedding, retrieval, service = _runtime(
+        tmp_path, archive_result
+    )
+    try:
+        chat_id = chat.create_chat()
+        with pytest.raises(ValueError, match="Context token budget"):
+            service.send_message(
+                chat_id=chat_id,
+                content="Berlin?",
+                max_context_tokens=50,
+            )
+        assert embedding.requests == []
+        assert retrieval.calls == []
+    finally:
+        database.stop()
 
 
 def test_source_grounded_cli_arguments_are_explicit_and_separate_from_memory() -> None:

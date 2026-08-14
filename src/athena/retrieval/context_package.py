@@ -6,7 +6,7 @@ import hashlib
 import json
 import uuid
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 from athena.chat.models import ChatMessage, MessageType
 from athena.chat.provenance import strip_durable_provenance_manifest
@@ -100,6 +100,8 @@ class ContextPackage:
     excluded_candidate_summary: ExcludedCandidateSummary
     token_estimates: ContextTokenEstimates
     snapshot_commit_seq: int
+    structured_schema_id: str | None = None
+    structured_schema_json: str | None = None
 
     def model_messages(self) -> tuple[ModelChatMessage, ...]:
         return tuple(
@@ -146,9 +148,28 @@ class ContextPackage:
             )
         return max_output_tokens, reasoning_mode
 
+    def structured_schema(self) -> dict[str, Any] | None:
+        if self.structured_schema_id is None and self.structured_schema_json is None:
+            return None
+        if self.structured_schema_id is None or self.structured_schema_json is None:
+            raise ContextPackageError(
+                "Structured ContextPackage requires both schema ID and schema JSON."
+            )
+        try:
+            payload = json.loads(self.structured_schema_json)
+        except json.JSONDecodeError as exc:
+            raise ContextPackageError(
+                "ContextPackage structured schema JSON is invalid."
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ContextPackageError(
+                "ContextPackage structured schema must be a JSON object."
+            )
+        return payload
+
     def run_snapshot(self) -> dict[str, Any]:
         """Persist reconstructible package metadata without duplicating plaintext."""
-        return {
+        snapshot: dict[str, Any] = {
             "context_package_version": _CONTEXT_PACKAGE_VERSION,
             "request_id": str(self.request_id),
             "model_signature": {
@@ -233,6 +254,15 @@ class ContextPackage:
             },
             "snapshot_commit_seq": self.snapshot_commit_seq,
         }
+        if self.structured_schema_id is not None:
+            assert self.structured_schema_json is not None
+            snapshot["structured_output"] = {
+                "schema_id": self.structured_schema_id,
+                "schema_sha256": hashlib.sha256(
+                    self.structured_schema_json.encode("utf-8")
+                ).hexdigest(),
+            }
+        return snapshot
 
 
 class ContextPackageService:
@@ -291,6 +321,113 @@ class ContextPackageService:
                 f"current={current}."
             )
         return user_commit_seq
+
+    @staticmethod
+    def build_from_sections(
+        *,
+        model_signature: ModelSignature,
+        budget: ContextPackageBudget,
+        sections: tuple[ContextSection, ...],
+        included_refs: tuple[ContextIncludedRef, ...],
+        excluded_candidate_summary: ExcludedCandidateSummary,
+        token_estimates: ContextTokenEstimates,
+        snapshot_commit_seq: int,
+        structured_schema_id: str | None = None,
+        structured_schema: Mapping[str, Any] | None = None,
+    ) -> ContextPackage:
+        """Build a generic package for chat or structured Primary Model calls."""
+        if snapshot_commit_seq < 0:
+            raise ContextPackageError("snapshot_commit_seq must not be negative.")
+        if not sections:
+            raise ContextPackageError("ContextPackage must contain at least one section.")
+        if any(not section.content.strip() for section in sections):
+            raise ContextPackageError("ContextPackage sections must not be blank.")
+        if token_estimates.estimated_total_tokens > budget.effective_context_limit:
+            raise ContextPackageError(
+                "ContextPackage token estimate exceeds the effective context limit."
+            )
+        if budget.output_reserve < 1 or budget.safety_margin < 0:
+            raise ContextPackageError("ContextPackage budget controls are invalid.")
+
+        ref_ids = tuple(item.ref_id for item in included_refs)
+        if len(set(ref_ids)) != len(ref_ids):
+            raise ContextPackageError("ContextPackage reference IDs must be unique.")
+        known_refs = set(ref_ids)
+        for section in sections:
+            if any(ref_id not in known_refs for ref_id in section.included_ref_ids):
+                raise ContextPackageError(
+                    "ContextPackage section references an unknown included ref."
+                )
+
+        counters = (
+            (
+                excluded_candidate_summary.retrieval_candidate_count,
+                excluded_candidate_summary.retrieval_included_count,
+                excluded_candidate_summary.retrieval_excluded_count,
+            ),
+            (
+                excluded_candidate_summary.memory_candidate_count,
+                excluded_candidate_summary.memory_included_count,
+                excluded_candidate_summary.memory_excluded_count,
+            ),
+            (
+                excluded_candidate_summary.conversation_candidate_count,
+                excluded_candidate_summary.conversation_included_count,
+                excluded_candidate_summary.conversation_excluded_count,
+            ),
+        )
+        for candidate_count, included_count, excluded_count in counters:
+            if min(candidate_count, included_count, excluded_count) < 0:
+                raise ContextPackageError(
+                    "ContextPackage candidate counts must not be negative."
+                )
+            if included_count + excluded_count != candidate_count:
+                raise ContextPackageError(
+                    "ContextPackage candidate counts are internally inconsistent."
+                )
+
+        if (structured_schema_id is None) != (structured_schema is None):
+            raise ContextPackageError(
+                "Structured ContextPackage requires schema ID and schema together."
+            )
+        schema_json: str | None = None
+        normalized_schema_id: str | None = None
+        if structured_schema is not None:
+            assert structured_schema_id is not None
+            normalized_schema_id = structured_schema_id.strip()
+            if not normalized_schema_id:
+                raise ContextPackageError(
+                    "Structured ContextPackage schema ID must not be blank."
+                )
+            schema_json = json.dumps(
+                dict(structured_schema),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+
+        signature = ContextModelSignature(
+            model_signature_id=model_signature.model_signature_id,
+            provider=model_signature.provider,
+            model_identifier=model_signature.model_identifier,
+            quantization=model_signature.quantization,
+            generation_parameters_json=model_signature.generation_parameters_json,
+            context_configuration_json=model_signature.context_configuration_json,
+            signature_hash_hex=model_signature.signature_hash.hex(),
+        )
+        return ContextPackage(
+            request_id=new_uuid7(),
+            model_signature=signature,
+            budget=budget,
+            sections=sections,
+            included_refs=included_refs,
+            excluded_candidate_summary=excluded_candidate_summary,
+            token_estimates=token_estimates,
+            snapshot_commit_seq=snapshot_commit_seq,
+            structured_schema_id=normalized_schema_id,
+            structured_schema_json=schema_json,
+        )
 
     @staticmethod
     def build(

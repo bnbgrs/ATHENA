@@ -210,6 +210,10 @@ class LMStudioProvider:
                 },
             },
             "temperature": 0.0,
+            # ATHENA structured generation is deterministic/non-reasoning.
+            # Force this per request so LM Studio GUI/model defaults cannot
+            # silently enable thinking for persistence-relevant calls.
+            "reasoning_effort": "none",
             "stream": False,
         }
         if max_output_tokens is not None:
@@ -268,6 +272,24 @@ class LMStudioProvider:
             raise ProviderProtocolError(
                 "LM Studio structured choice is missing a message object."
             )
+
+        # LM Studio can expose reasoning separately from message.content.
+        # Structured ATHENA calls pin reasoning off, so any non-empty reasoning
+        # channel means the backend ignored the request contract.
+        for reasoning_key in ("reasoning", "reasoning_content"):
+            reasoning_value = message.get(reasoning_key)
+            if isinstance(reasoning_value, str):
+                has_reasoning = bool(reasoning_value.strip())
+            elif isinstance(reasoning_value, (list, tuple, Mapping)):
+                has_reasoning = bool(reasoning_value)
+            else:
+                has_reasoning = reasoning_value not in (None, 0, 0.0, False)
+            if has_reasoning:
+                raise ProviderProtocolError(
+                    "LM Studio returned reasoning content despite ATHENA "
+                    "pinning structured generation reasoning off."
+                )
+
         content = message.get("content")
         if not isinstance(content, str) or not content.strip():
             raise ProviderProtocolError(

@@ -7,7 +7,7 @@ import math
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from athena.chat.generation import ModelSelectionError
 from athena.chat.service import ChatService
@@ -22,6 +22,16 @@ from athena.model.adapters.lm_studio import (
 from athena.model.domain import ModelChatMessage, ModelInfo
 from athena.model.ports import ChatModelProvider
 from athena.model.provenance import ModelRunRepository, ModelSignature
+from athena.retrieval.context_package import (
+    ContextIncludedRef,
+    ContextPackage,
+    ContextPackageBudget,
+    ContextPackageService,
+    ContextRole,
+    ContextSection,
+    ContextTokenEstimates,
+    ExcludedCandidateSummary,
+)
 from athena.source.analysis_models import (
     AnalysisInputKind,
     AnalysisStage,
@@ -134,6 +144,7 @@ class SourceAnalysisService:
         provider: ChatModelProvider,
         runs: ModelRunRepository,
         chat: ChatService,
+        context_packages: ContextPackageService | None = None,
     ) -> None:
         self.jobs = jobs
         self.repository = repository
@@ -143,6 +154,7 @@ class SourceAnalysisService:
         self.provider = provider
         self.runs = runs
         self.chat = chat
+        self.context_packages = context_packages or ContextPackageService(runs.database)
 
     def enqueue(
         self,
@@ -350,7 +362,9 @@ class SourceAnalysisService:
         inputs = self.repository.inputs_for_work_item(work_item.work_item_id)
         if work_item.stage is AnalysisStage.MAP:
             if len(inputs) != 1 or inputs[0].input_kind is not AnalysisInputKind.SOURCE_ANCHOR:
-                raise SourceAnalysisConfigurationError("Map work must reference exactly one SourceAnchor.")
+                raise SourceAnalysisConfigurationError(
+                    "Map work must reference exactly one SourceAnchor."
+                )
             anchor_id = inputs[0].source_anchor_id
             assert anchor_id is not None
             source_text = self.source_anchors.read_text(anchor_id)
@@ -359,7 +373,9 @@ class SourceAnalysisService:
             schema: Mapping[str, Any] = _MAP_SCHEMA
             refs: tuple[str, ...] = (f"source_anchor:{anchor_id}",)
         else:
-            if not inputs or any(item.input_kind is not AnalysisInputKind.ARTIFACT for item in inputs):
+            if not inputs or any(
+                item.input_kind is not AnalysisInputKind.ARTIFACT for item in inputs
+            ):
                 raise SourceAnalysisConfigurationError(
                     "Reduce/final work must reference one or more analysis artifacts."
                 )
@@ -375,9 +391,11 @@ class SourceAnalysisService:
             )
             schema = _SYNTHESIS_SCHEMA
             refs = tuple(f"artifact:{artifact.artifact_id}" for artifact in artifacts)
-        estimated = estimate_message_tokens(messages)
+        estimated = estimate_structured_request_tokens(messages, schema_id, schema)
         input_budget = (
-            analysis.effective_context_limit - analysis.output_reserve - analysis.safety_margin
+            analysis.effective_context_limit
+            - analysis.output_reserve
+            - analysis.safety_margin
         )
         if estimated > input_budget:
             raise SourceAnalysisInputTooLargeError(
@@ -392,6 +410,70 @@ class SourceAnalysisService:
             input_refs=_stable_unique(refs),
         )
 
+    def _context_package_for_prepared(
+        self,
+        *,
+        analysis: SourceAnalysisRecord,
+        config: AnalysisPinnedConfiguration,
+        prepared: PreparedWorkCall,
+    ) -> ContextPackage:
+        snapshot_commit_seq = self.context_packages.current_commit_seq()
+        refs = tuple(
+            _analysis_context_ref(token, index)
+            for index, token in enumerate(prepared.input_refs, start=1)
+        )
+        sections = tuple(
+            ContextSection(
+                name="source_analysis_policy" if index == 0 else "source_analysis_task",
+                role=cast(ContextRole, message.role),
+                content=message.content,
+                included_ref_ids=(
+                    tuple(item.ref_id for item in refs) if index == len(prepared.messages) - 1 else ()
+                ),
+            )
+            for index, message in enumerate(prepared.messages)
+        )
+        signature = self.runs.load_signature(config.model_signature_id)
+        return self.context_packages.build_from_sections(
+            model_signature=signature,
+            budget=ContextPackageBudget(
+                effective_context_limit=analysis.effective_context_limit,
+                context_budget=analysis.effective_context_limit
+                - analysis.output_reserve
+                - analysis.safety_margin,
+                output_reserve=analysis.output_reserve,
+                safety_margin=analysis.safety_margin,
+            ),
+            sections=sections,
+            included_refs=refs,
+            excluded_candidate_summary=ExcludedCandidateSummary(
+                retrieval_candidate_count=len(refs),
+                retrieval_included_count=len(refs),
+                retrieval_excluded_count=0,
+                memory_candidate_count=0,
+                memory_included_count=0,
+                memory_excluded_count=0,
+                conversation_candidate_count=0,
+                conversation_included_count=0,
+                conversation_excluded_count=0,
+            ),
+            token_estimates=ContextTokenEstimates(
+                conversation_tokens=0,
+                current_user_tokens=0,
+                system_tokens=estimate_text_tokens(prepared.messages[0].content),
+                context_tokens=prepared.estimated_input_tokens,
+                estimated_input_tokens=prepared.estimated_input_tokens,
+                estimated_total_tokens=(
+                    prepared.estimated_input_tokens
+                    + analysis.output_reserve
+                    + analysis.safety_margin
+                ),
+            ),
+            snapshot_commit_seq=snapshot_commit_seq,
+            structured_schema_id=prepared.schema_id,
+            structured_schema=prepared.schema,
+        )
+
     def execute_call(
         self,
         *,
@@ -403,6 +485,15 @@ class SourceAnalysisService:
         extend_seconds: int,
     ) -> SourceAnalysisArtifact:
         config = self.pinned_configuration(job)
+        package = self._context_package_for_prepared(
+            analysis=analysis,
+            config=config,
+            prepared=prepared,
+        )
+        self.context_packages.assert_snapshot_current(
+            package.snapshot_commit_seq,
+            phase="source-analysis-pre-attempt",
+        )
         self.repository.begin_attempt(
             prepared.work_item.work_item_id,
             job_id=job.job_id,
@@ -414,6 +505,11 @@ class SourceAnalysisService:
             trigger_actor_id=actor_id,
             pipeline_version=PIPELINE_VERSION,
             input_snapshot={
+                # Preserve the established Source Analysis snapshot surface while
+                # adding the complete formal ContextPackage as a namespaced object.
+                "context_package": package.run_snapshot(),
+                "context_package_request_id": str(package.request_id),
+                "snapshot_commit_seq": package.snapshot_commit_seq,
                 "analysis_id": str(analysis.analysis_id),
                 "work_item_id": str(prepared.work_item.work_item_id),
                 "stage": prepared.work_item.stage.value,
@@ -440,11 +536,17 @@ class SourceAnalysisService:
             prompt_template_version=PROMPT_TEMPLATE_VERSION,
         )
         try:
+            self.context_packages.assert_snapshot_current(
+                package.snapshot_commit_seq,
+                phase="immediately-before-source-analysis-model-call",
+            )
+            structured_schema = package.structured_schema()
+            assert structured_schema is not None
             output = self.provider.generate_structured(
                 model_id=model.backend_model_id,
-                messages=prepared.messages,
-                schema_id=prepared.schema_id,
-                json_schema=prepared.schema,
+                messages=package.model_messages(),
+                schema_id=package.structured_schema_id or prepared.schema_id,
+                json_schema=structured_schema,
                 max_output_tokens=analysis.output_reserve,
             )
             validated = self.validate_output(
@@ -481,8 +583,6 @@ class SourceAnalysisService:
             )
             raise
 
-        # Provider calls may outlive the lease interval. Revalidate/extend the
-        # live fence before the semantic artifact transaction.
         try:
             self.jobs.heartbeat(
                 job.job_id,
@@ -845,6 +945,52 @@ class SourceAnalysisService:
             ModelChatMessage(role="user", content=task),
         )
 
+
+def _analysis_context_ref(token: str, index: int) -> ContextIncludedRef:
+    prefix, separator, raw_id = token.partition(":")
+    if not separator:
+        raise SourceAnalysisConfigurationError(
+            f"Source analysis input ref {token!r} has no type prefix."
+        )
+    try:
+        entity_id = uuid.UUID(raw_id)
+    except ValueError as exc:
+        raise SourceAnalysisConfigurationError(
+            f"Source analysis input ref {token!r} has an invalid UUID."
+        ) from exc
+    entity_type = {
+        "source_anchor": "source_anchor",
+        "artifact": "source_analysis_artifact",
+    }.get(prefix)
+    if entity_type is None:
+        raise SourceAnalysisConfigurationError(
+            f"Unsupported source analysis input ref type {prefix!r}."
+        )
+    return ContextIncludedRef(
+        ref_id=f"INPUT-{index:03d}",
+        entity_type=entity_type,
+        entity_id=entity_id,
+        revision_id=None,
+    )
+
+
+def estimate_structured_request_tokens(
+    messages: Sequence[ModelChatMessage],
+    schema_id: str,
+    schema: Mapping[str, Any],
+) -> int:
+    schema_text = json.dumps(
+        dict(schema),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return (
+        estimate_message_tokens(messages)
+        + estimate_text_tokens(schema_id)
+        + estimate_text_tokens(schema_text)
+        + 32
+    )
 
 def estimate_text_tokens(text: str) -> int:
     """Conservative deterministic estimator pinned by identifier in analysis state."""

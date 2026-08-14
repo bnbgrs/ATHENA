@@ -69,6 +69,7 @@ class ScriptedProvider:
                 quantization=None,
                 loaded=True,
                 vision=False,
+                loaded_context_length=32768,
                 trained_for_tool_use=False,
             ),
         )
@@ -78,6 +79,8 @@ class ScriptedProvider:
         *,
         model_id: str,
         messages: Sequence[ModelChatMessage],
+        max_output_tokens: int | None = None,
+        reasoning_mode: str | None = None,
     ) -> Iterator[str]:
         self.requests.append((model_id, tuple(messages)))
         yield self.answer
@@ -118,6 +121,8 @@ def test_source_grounded_chat_persists_anchor_and_survives_rechunk_restart(tmp_p
         embedding_provider=embedding,  # type: ignore[arg-type]
         archive_retrieval=archive,
         context_builder=SourceContextBuilderService(app.source_anchors),
+        context_packages=app.context_packages,
+        model_runs=app.model_runs,
     )
     chat_id = app.chat.create_chat()
 

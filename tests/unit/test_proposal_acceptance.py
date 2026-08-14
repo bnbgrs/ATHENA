@@ -41,6 +41,7 @@ class FakeProvider:
                 loaded=True,
                 vision=False,
                 trained_for_tool_use=False,
+                loaded_context_length=32768,
             ),
         )
 
@@ -60,8 +61,9 @@ class FakeProvider:
         messages: Sequence[ModelChatMessage],
         schema_id: str,
         json_schema: Mapping[str, Any],
+        max_output_tokens: int | None = None,
     ) -> Mapping[str, Any]:
-        del model_id, messages, json_schema
+        del model_id, messages, json_schema, max_output_tokens
         if schema_id == EXTRACTION_SCHEMA_ID:
             return {
                 "knowledge_units": [

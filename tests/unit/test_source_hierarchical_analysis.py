@@ -204,7 +204,46 @@ def test_small_context_uses_multilevel_reduce_and_preserves_full_provenance(tmp_
     provenance = app.source_analysis_repository.source_anchor_ids_for_artifact(
         result.analysis.final_artifact_id
     )
-    assert len(provenance) == len(chunks)
+    # Schema-aware request budgeting may split one original chunk into multiple
+    # durable SourceAnchors. Provenance correctness is therefore range coverage,
+    # not a brittle one-anchor-per-original-chunk cardinality assumption.
+    assert len(provenance) == len(set(provenance))
+    provenance_records = tuple(app.source_anchors.get(anchor_id) for anchor_id in provenance)
+    chunk_ranges = tuple(
+        (chunk.start_anchor_value, chunk.end_anchor_value) for chunk in chunks
+    )
+
+    for anchor in provenance_records:
+        assert anchor.start_offset is not None
+        assert anchor.end_offset is not None
+        assert any(
+            chunk_start <= anchor.start_offset
+            and anchor.end_offset <= chunk_end
+            for chunk_start, chunk_end in chunk_ranges
+        )
+
+    for chunk_start, chunk_end in chunk_ranges:
+        covering = sorted(
+            (
+                anchor.start_offset,
+                anchor.end_offset,
+            )
+            for anchor in provenance_records
+            if anchor.start_offset is not None
+            and anchor.end_offset is not None
+            and anchor.end_offset > chunk_start
+            and anchor.start_offset < chunk_end
+        )
+        cursor = chunk_start
+        for start_offset, end_offset in covering:
+            if end_offset <= cursor:
+                continue
+            assert start_offset <= cursor
+            cursor = max(cursor, end_offset)
+            if cursor >= chunk_end:
+                break
+        assert cursor >= chunk_end
+
     app.stop()
 
 

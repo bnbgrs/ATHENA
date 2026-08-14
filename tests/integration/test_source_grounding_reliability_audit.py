@@ -76,6 +76,7 @@ class ScriptedProvider:
                 quantization=None,
                 loaded=True,
                 vision=False,
+                loaded_context_length=32768,
                 trained_for_tool_use=False,
             ),
         )
@@ -85,6 +86,8 @@ class ScriptedProvider:
         *,
         model_id: str,
         messages: Sequence[ModelChatMessage],
+        max_output_tokens: int | None = None,
+        reasoning_mode: str | None = None,
     ) -> Iterator[str]:
         self.requests.append((model_id, tuple(messages)))
         if not self.answers:
@@ -140,6 +143,8 @@ def _source_chat(
         embedding_provider=embedding,  # type: ignore[arg-type]
         archive_retrieval=archive,
         context_builder=context_builder or SourceContextBuilderService(app.source_anchors),
+        context_packages=app.context_packages,
+        model_runs=app.model_runs,
     )
 
 
@@ -154,6 +159,8 @@ def test_source_embedding_failure_occurs_before_user_persistence(tmp_path) -> No
             embedding_provider=StaticEmbeddingProvider(fail_resolve=True),  # type: ignore[arg-type]
             archive_retrieval=FailingRetrieval(),  # type: ignore[arg-type]
             context_builder=SourceContextBuilderService(app.source_anchors),
+            context_packages=app.context_packages,
+            model_runs=app.model_runs,
         )
 
         with pytest.raises(RuntimeError, match="embedding backend unavailable"):
@@ -175,6 +182,8 @@ def test_source_retrieval_failure_occurs_before_user_persistence(tmp_path) -> No
             embedding_provider=StaticEmbeddingProvider(),  # type: ignore[arg-type]
             archive_retrieval=FailingRetrieval(),  # type: ignore[arg-type]
             context_builder=SourceContextBuilderService(app.source_anchors),
+            context_packages=app.context_packages,
+            model_runs=app.model_runs,
         )
 
         with pytest.raises(RuntimeError, match="archive retrieval unavailable"):

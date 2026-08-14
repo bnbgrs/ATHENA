@@ -1453,12 +1453,13 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
                 )
                 result = source_result.generation
             else:
-                result = app.chat_generation.send_message(
+                direct_result = app.direct_chat.send_message(
                     chat_id=args.chat_id,
                     content=args.content,
                     requested_model_id=args.model_id,
                     on_delta=lambda chunk: print(chunk, end="", flush=True),
                 )
+                result = direct_result.generation
         except KeyboardInterrupt:
             print()
             print(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
@@ -48,6 +49,7 @@ class FakeStructuredProvider:
                 loaded=True,
                 vision=False,
                 trained_for_tool_use=False,
+                loaded_context_length=32768,
             ),
         )
 
@@ -67,8 +69,9 @@ class FakeStructuredProvider:
         messages: Sequence[ModelChatMessage],
         schema_id: str,
         json_schema: Mapping[str, Any],
+        max_output_tokens: int | None = None,
     ) -> Mapping[str, Any]:
-        del model_id, json_schema
+        del model_id, json_schema, max_output_tokens
         self.calls.append((schema_id, messages))
         if schema_id == EXTRACTION_SCHEMA_ID:
             return self.extraction_payload
@@ -277,6 +280,22 @@ def test_every_claim_pair_is_audited_and_contradiction_is_added(tmp_path) -> Non
         EXTRACTION_SCHEMA_ID,
         CONTRADICTION_AUDIT_SCHEMA_ID,
     ]
+    rows = database.connection.execute(
+        "SELECT run_type, status, input_snapshot_json FROM processing_runs "
+        "WHERE run_type IN ('knowledge_extraction', 'knowledge_extraction_claim_audit')"
+    ).fetchall()
+    by_type = {str(row["run_type"]): row for row in rows}
+    assert set(by_type) == {"knowledge_extraction", "knowledge_extraction_claim_audit"}
+    for row in by_type.values():
+        assert row["status"] == "succeeded"
+        snapshot = json.loads(str(row["input_snapshot_json"]))
+        package = snapshot["context_package"]
+        assert package["snapshot_commit_seq"] >= 0
+        assert package["model_signature"]["model_signature_id"]
+        assert package["structured_output"]["schema_id"] in {
+            EXTRACTION_SCHEMA_ID, CONTRADICTION_AUDIT_SCHEMA_ID
+        }
+
     contradiction = result.proposals.relations[0]
     assert contradiction.left_index == 0
     assert contradiction.right_index == 1

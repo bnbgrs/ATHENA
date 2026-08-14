@@ -56,6 +56,7 @@ class FakeSourceKnowledgeProvider:
                 loaded=True,
                 vision=False,
                 trained_for_tool_use=False,
+                loaded_context_length=32768,
             ),
         )
 
@@ -562,6 +563,29 @@ def test_source_claim_contradiction_is_audited_and_queued_for_review(tmp_path: P
             CONTRADICTION_AUDIT_SCHEMA_ID,
         ]
         assert extracted.proposals.relations[0].relation_type == "contradicts"
+        rows = app.database.connection.execute(
+            "SELECT run_type, status, input_snapshot_json FROM processing_runs "
+            "WHERE run_type IN ('source_knowledge_extraction', "
+            "'source_knowledge_extraction_claim_audit')"
+        ).fetchall()
+        by_type = {str(row["run_type"]): row for row in rows}
+        assert {
+            "source_knowledge_extraction",
+            "source_knowledge_extraction_claim_audit",
+        } <= set(by_type)
+        for run_type in (
+            "source_knowledge_extraction",
+            "source_knowledge_extraction_claim_audit",
+        ):
+            row = by_type[run_type]
+            assert row["status"] == "succeeded"
+            snapshot = json.loads(str(row["input_snapshot_json"]))
+            package = snapshot["context_package"]
+            assert package["snapshot_commit_seq"] >= 0
+            assert package["structured_output"]["schema_id"] in {
+                SOURCE_EXTRACTION_SCHEMA_ID, CONTRADICTION_AUDIT_SCHEMA_ID
+            }
+
         accepted = app.source_proposal_acceptance.accept_all(extracted)
         assert len(accepted.contradiction_review_ids) == 1
         row = app.database.connection.execute(

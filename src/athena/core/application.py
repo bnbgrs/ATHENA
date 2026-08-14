@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from enum import Enum
 
+from athena.chat.direct import DirectChatService
 from athena.chat.generation import ChatGenerationService
 from athena.chat.memory import MemoryAugmentedChatService
 from athena.chat.repository import ChatRepository
@@ -141,6 +142,12 @@ class AthenaApplication:
             generation_timeout_seconds=self.settings.model_generation_timeout_seconds,
         )
         self.model_runs = ModelRunRepository(self.database)
+        self.context_packages = ContextPackageService(self.database)
+        self.direct_chat = DirectChatService(
+            chat_generation=self.chat_generation,
+            context_packages=self.context_packages,
+            model_runs=self.model_runs,
+        )
         self.source_text = SourceTextRepresentationService(
             sources=self.source_repository,
             representations=self.source_representation_repository,
@@ -208,6 +215,8 @@ class AthenaApplication:
             embedding_provider=self.embedding_provider,
             archive_retrieval=self.archive_hybrid_retrieval,
             context_builder=self.source_context_builder,
+            context_packages=self.context_packages,
+            model_runs=self.model_runs,
         )
         self.source_analysis_repository = SourceAnalysisRepository(self.database)
         self.source_analysis_service = SourceAnalysisService(
@@ -219,6 +228,7 @@ class AthenaApplication:
             provider=self.model_provider,
             runs=self.model_runs,
             chat=self.chat,
+            context_packages=self.context_packages,
         )
         self.source_analysis = DurableSourceAnalysisWorker(
             jobs=self.jobs,
@@ -262,6 +272,7 @@ class AthenaApplication:
             provider=self.model_provider,
             runs=self.model_runs,
             snapshots=self.source_extraction_snapshots,
+            context_packages=self.context_packages,
         )
         self.source_hierarchical_extraction = DurableSourceHierarchicalExtractionWorker(
             jobs=self.jobs,
@@ -304,7 +315,6 @@ class AthenaApplication:
             self.semantic_search,
         )
         self.context_builder = ContextBuilderService()
-        self.context_packages = ContextPackageService(self.database)
         self.memory_evidence_policy = MemoryEvidencePolicy(self.database)
         self.memory_chat = MemoryAugmentedChatService(
             chat_generation=self.chat_generation,
