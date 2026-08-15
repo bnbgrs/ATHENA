@@ -208,7 +208,12 @@ class JobRepository:
                     """
                     UPDATE jobs
                     SET state = 'queued', blocked_reason = NULL,
-                        next_run_at_us = NULL, updated_at_us = ?
+                        next_run_at_us = CASE
+                            WHEN blocked_reason = 'waiting_dependency'
+                            THEN next_run_at_us
+                            ELSE NULL
+                        END,
+                        updated_at_us = ?
                     WHERE job_id = ? AND state = 'waiting'
                     """,
                     (now, uuid_to_blob(job_id)),

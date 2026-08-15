@@ -317,7 +317,7 @@ def test_dependency_wait_wakes_when_due_without_consuming_retry_budget(tmp_path)
     queued = app.jobs.get(job.job_id)
     assert queued.state is JobState.QUEUED
     assert queued.blocked_reason is None
-    assert queued.next_run_at_us is None
+    assert queued.next_run_at_us == 500
     assert queued.retry_count == 0
     app.stop()
 

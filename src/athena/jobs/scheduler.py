@@ -691,7 +691,8 @@ class DurableJobScheduler:
         return max(1, int(raw_seconds * multiplier * 1_000_000))
 
     def _rank_key(self, job: JobRecord, now_us: int) -> tuple[int, int, int, bytes]:
-        age_us = max(0, now_us - job.created_at_us)
+        eligible_at = job.next_run_at_us or job.created_at_us
+        age_us = max(0, now_us - eligible_at)
         aging_steps = age_us // (self.policy.fairness_aging_seconds * 1_000_000)
         base_priority = int(job.priority)
         if base_priority == 0:
@@ -700,7 +701,6 @@ class DurableJobScheduler:
             # P0 remains reserved for data-safety. Aging can promote old work
             # through the remaining classes so background jobs cannot starve.
             effective_priority = max(1, base_priority - int(aging_steps))
-        eligible_at = job.next_run_at_us or job.created_at_us
         return (
             effective_priority,
             eligible_at,

@@ -244,3 +244,61 @@ def test_scheduler_repairs_waiter_if_process_died_before_backoff_was_assigned(tm
     assert repaired.next_run_at_us > now
     assert repaired.retry_count == 1
     app.stop()
+
+def test_due_dependency_parent_does_not_starve_queued_child(tmp_path) -> None:
+    app = _app(tmp_path / "runtime")
+    parent = app.jobs.create(
+        job_type="research.exhaustive",
+        priority=JobPriority.BACKGROUND,
+        requested_scope={"mode": "regression-test"},
+        pinned_configuration={"pipeline": "regression-test"},
+    )
+    source = _capture_source(
+        app,
+        tmp_path / "dependency-child.md",
+        "Dependency child scheduling regression marker.\n",
+    )
+    child = app.source_processing.enqueue(
+        source.source_id,
+        priority=JobPriority.BACKGROUND,
+    )
+    now = utc_now_us()
+    aging_us = app.job_scheduler.policy.fairness_aging_seconds * 1_000_000
+    with app.database.write_transaction() as connection:
+        connection.execute(
+            "UPDATE jobs SET created_at_us = ? WHERE job_id = ?",
+            (now - 4 * aging_us, parent.job_id.bytes),
+        )
+
+    leased = app.jobs.acquire(
+        parent.job_id,
+        worker_id="research-parent",
+        lease_seconds=60,
+        now_us=now,
+    )
+    assert leased.lease_token is not None
+
+    due_at = now + 5_000_000
+    waiting = app.jobs.wait(
+        parent.job_id,
+        lease_token=leased.lease_token,
+        reason=WaitingReason.DEPENDENCY,
+        next_run_at_us=due_at,
+        now_us=now,
+    )
+    assert waiting.state is JobState.WAITING
+
+    tick = app.job_scheduler.tick(
+        worker_id="scheduler-a",
+        now_us=due_at,
+    )
+
+    assert tick.woken_jobs == 1
+    assert tick.selected_job_id == child.job_id
+    assert tick.selected_job_type == "source.process"
+    assert app.jobs.get(child.job_id).state is JobState.COMPLETED
+
+    queued_parent = app.jobs.get(parent.job_id)
+    assert queued_parent.state is JobState.QUEUED
+    assert queued_parent.next_run_at_us == due_at
+    app.stop()
