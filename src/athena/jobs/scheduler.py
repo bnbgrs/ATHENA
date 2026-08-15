@@ -7,6 +7,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
+from typing import Protocol
 
 from athena.common.time import utc_now_us
 from athena.jobs.embedding_processing import (
@@ -26,6 +27,7 @@ from athena.jobs.source_processing import (
     DurableSourceProcessingWorker,
     SourceProcessingJobError,
 )
+from athena.news.models import NEWS_JOB_TYPE, NEWS_PERIOD_JOB_TYPE, NewsConsentRequired
 from athena.resources.manager import ResourceManager
 
 logger = logging.getLogger(__name__)
@@ -48,6 +50,12 @@ _AUTO_RETRY_REASONS = frozenset(
     }
 )
 
+
+
+class DurableNewsSchedulerWorker(Protocol):
+    def schedule_due(self) -> tuple[uuid.UUID, ...]: ...
+    def reconcile_dependencies(self) -> int: ...
+    def process_leased(self, job: JobRecord) -> JobRecord: ...
 
 class JobSchedulerError(RuntimeError):
     """Raised when scheduler orchestration cannot continue safely."""
@@ -137,6 +145,7 @@ class DurableJobScheduler:
         extraction_worker: DurableSourceHierarchicalExtractionWorker | None = None,
         research_worker: DurableResearchWorker | None = None,
         resources: ResourceManager | None = None,
+        news_worker: DurableNewsSchedulerWorker | None = None,
         policy: SchedulerPolicy | None = None,
     ) -> None:
         self.jobs = jobs
@@ -146,11 +155,14 @@ class DurableJobScheduler:
         self.extraction_worker = extraction_worker
         self.research_worker = research_worker
         self.resources = resources
+        self.news_worker = news_worker
         self.policy = policy or SchedulerPolicy()
 
     @property
     def supported_job_types(self) -> frozenset[str]:
-        return _SUPPORTED_JOB_TYPES
+        if self.news_worker is None:
+            return _SUPPORTED_JOB_TYPES
+        return _SUPPORTED_JOB_TYPES | frozenset({NEWS_JOB_TYPE, NEWS_PERIOD_JOB_TYPE})
 
     def tick(
         self,
@@ -164,6 +176,14 @@ class DurableJobScheduler:
             raise ValueError("Scheduler worker_id must not be empty.")
         now = utc_now_us() if now_us is None else now_us
 
+        news_woken = 0
+        if self.news_worker is not None:
+            try:
+                self.news_worker.schedule_due()
+            except NewsConsentRequired:
+                pass
+            news_woken = self.news_worker.reconcile_dependencies()
+
         recovered = self.jobs.recover_startup(now_us=now)
         scheduled_retries = self._schedule_orphaned_retry_waiters(now)
         woken = self.jobs.wake_due_waiting(now_us=now)
@@ -173,7 +193,7 @@ class DurableJobScheduler:
 
         candidates = self.jobs.eligible_queued(
             now_us=now,
-            job_types=_SUPPORTED_JOB_TYPES,
+            job_types=self.supported_job_types,
             limit=self.policy.candidate_limit,
         )
         ranked = sorted(candidates, key=lambda job: self._rank_key(job, now))
@@ -196,7 +216,7 @@ class DurableJobScheduler:
             return SchedulerTickResult(
                 recovered_jobs=len(recovered),
                 scheduled_retries=scheduled_retries,
-                woken_jobs=len(woken) + legacy_research_woken,
+                woken_jobs=len(woken) + legacy_research_woken + news_woken,
                 selected_job_id=None,
                 selected_job_type=None,
                 action="idle",
@@ -234,7 +254,7 @@ class DurableJobScheduler:
                 return SchedulerTickResult(
                     recovered_jobs=len(recovered),
                     scheduled_retries=scheduled_retries,
-                    woken_jobs=len(woken) + legacy_research_woken,
+                    woken_jobs=len(woken) + legacy_research_woken + news_woken,
                     selected_job_id=current.job_id,
                     selected_job_type=current.job_type,
                     action="waiting_resource",
@@ -280,7 +300,7 @@ class DurableJobScheduler:
         return SchedulerTickResult(
             recovered_jobs=len(recovered),
             scheduled_retries=scheduled_retries,
-            woken_jobs=len(woken) + legacy_research_woken,
+            woken_jobs=len(woken) + legacy_research_woken + news_woken,
             selected_job_id=current.job_id,
             selected_job_type=current.job_type,
             action=action,
@@ -397,6 +417,8 @@ class DurableJobScheduler:
                 if self.research_worker is None:
                     raise JobSchedulerError("No research.exhaustive worker is configured.")
                 return self._dispatch_research(leased.job_id, lease_token)
+            if leased.job_type in {NEWS_JOB_TYPE, NEWS_PERIOD_JOB_TYPE}:
+                return self._dispatch_news(leased)
             raise JobSchedulerError(
                 f"No scheduler dispatcher registered for {leased.job_type!r}."
             )
@@ -420,6 +442,20 @@ class DurableJobScheduler:
                 lease_token,
                 reason=f"scheduler_unexpected:{type(exc).__name__}",
             )
+
+    def _dispatch_news(self, leased: JobRecord) -> tuple[str, JobRecord]:
+        if self.news_worker is None:
+            raise JobSchedulerError("No News worker is configured.")
+        current = self.news_worker.process_leased(leased)
+        if current.state is JobState.COMPLETED:
+            return "completed", current
+        if current.state is JobState.CANCELLED:
+            return "cancelled", current
+        if current.state is JobState.FAILED:
+            return "failed", current
+        if current.state is JobState.WAITING:
+            return "waiting", current
+        raise JobSchedulerError(f"News worker returned unsupported state {current.state.value!r}.")
 
     def _dispatch_source(
         self,

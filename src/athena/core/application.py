@@ -45,6 +45,7 @@ from athena.memory.service import PersonalMemoryService
 from athena.model.adapters.lm_studio import LMStudioProvider
 from athena.model.adapters.lm_studio_embeddings import LMStudioEmbeddingProvider
 from athena.model.provenance import ModelRunRepository
+from athena.news.service import NewsService
 from athena.observability.health import HealthService
 from athena.observability.logging import configure_logging
 from athena.research.promotion import ResearchPromotionService
@@ -331,6 +332,7 @@ class AthenaApplication:
             jobs=self.jobs,
             service=self.source_hierarchical_extraction_service,
         )
+        self.news = NewsService(self)
         self.job_scheduler = DurableJobScheduler(
             jobs=self.jobs,
             source_worker=self.source_processing,
@@ -339,6 +341,7 @@ class AthenaApplication:
             extraction_worker=self.source_hierarchical_extraction,
             research_worker=self.research_worker,
             resources=self.resources,
+            news_worker=self.news,
         )
         self.source_proposal_acceptance = SourceProposalAcceptanceService(
             database=self.database,
@@ -412,6 +415,7 @@ class AthenaApplication:
 
         try:
             self.services.start_all()
+            self.news.start()
             recovered_backups = self.backup.recover_incomplete()
             if recovered_backups:
                 logger.warning(
