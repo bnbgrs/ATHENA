@@ -752,7 +752,26 @@ class ExternalAccessGateway:
         parsed = urlsplit(url)
         host = parsed.hostname or "<invalid>"
         url_hash = hashlib.sha256(url.encode("utf-8")).digest()
+        event_now_us = utc_now_us()
         with self.database.write_transaction() as connection:
+            previous = connection.execute(
+                """
+                SELECT MAX(created_at_us) AS created_at_us
+                FROM external_access_events
+                WHERE authorization_id = ?
+                """,
+                (uuid_to_blob(authorization.authorization_id),),
+            ).fetchone()
+            previous_created_at_us = (
+                None
+                if previous is None or previous["created_at_us"] is None
+                else int(previous["created_at_us"])
+            )
+            event_created_at_us = (
+                event_now_us
+                if previous_created_at_us is None
+                else max(event_now_us, previous_created_at_us + 1)
+            )
             connection.execute(
                 """
                 INSERT INTO external_access_events (
@@ -771,7 +790,7 @@ class ExternalAccessGateway:
                     reason_code,
                     response_bytes,
                     uuid_to_blob(source_id) if source_id is not None else None,
-                    utc_now_us(),
+                    event_created_at_us,
                 ),
             )
         return event_id

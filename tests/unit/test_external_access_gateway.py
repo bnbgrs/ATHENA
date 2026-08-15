@@ -274,3 +274,47 @@ def test_direct_access_challenge_is_not_captured_as_source_evidence(
         )
     assert len(app.sources.list()) == before
     app.stop()
+
+def test_external_audit_order_is_strict_with_coarse_clock(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app = AthenaApplication(
+        settings=AthenaSettings(local_root=tmp_path / "coarse-clock-runtime")
+    )
+    app.start()
+    blocked = _BlockedTorTransport()
+    app.external_access.transports["tor"] = blocked
+
+    authorization = app.external_access.authorize_explicit(
+        purpose="coarse clock audit ordering",
+        allowed_hosts=("example.com",),
+    )
+
+    fixed_now = authorization.created_at_us + 1
+    monkeypatch.setattr(
+        "athena.external.gateway.utc_now_us",
+        lambda: fixed_now,
+    )
+
+    with pytest.raises(ExternalDirectApprovalRequired):
+        app.external_access.capture_url(
+            authorization.authorization_id,
+            "https://example.com/blocked",
+        )
+
+    events = app.database.connection.execute(
+        """
+        SELECT reason_code, created_at_us
+        FROM external_access_events
+        WHERE authorization_id = ?
+        ORDER BY created_at_us ASC
+        """,
+        (authorization.authorization_id.bytes,),
+    ).fetchall()
+
+    assert len(events) == 2
+    assert events[0]["reason_code"] == "tor_blocked_http_403_retry"
+    assert "direct_approval_required" in str(events[1]["reason_code"])
+    assert int(events[1]["created_at_us"]) > int(events[0]["created_at_us"])
+    app.stop()
