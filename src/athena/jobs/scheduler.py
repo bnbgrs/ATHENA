@@ -26,6 +26,7 @@ from athena.jobs.source_processing import (
     DurableSourceProcessingWorker,
     SourceProcessingJobError,
 )
+from athena.resources.manager import ResourceManager
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +136,7 @@ class DurableJobScheduler:
         analysis_worker: DurableSourceAnalysisWorker | None = None,
         extraction_worker: DurableSourceHierarchicalExtractionWorker | None = None,
         research_worker: DurableResearchWorker | None = None,
+        resources: ResourceManager | None = None,
         policy: SchedulerPolicy | None = None,
     ) -> None:
         self.jobs = jobs
@@ -143,6 +145,7 @@ class DurableJobScheduler:
         self.analysis_worker = analysis_worker
         self.extraction_worker = extraction_worker
         self.research_worker = research_worker
+        self.resources = resources
         self.policy = policy or SchedulerPolicy()
 
     @property
@@ -204,6 +207,41 @@ class DurableJobScheduler:
             raise JobSchedulerError(
                 f"Scheduler acquired job {leased.job_id} without a lease token."
             )
+
+        if self.resources is not None:
+            decision = self.resources.admit(leased)
+            if not decision.admitted:
+                resource_retry_at_us = (
+                    now + decision.retry_after_seconds * 1_000_000
+                )
+                current = self.jobs.wait(
+                    leased.job_id,
+                    lease_token=leased.lease_token,
+                    reason=WaitingReason.RESOURCE,
+                    next_run_at_us=resource_retry_at_us,
+                    now_us=now,
+                )
+                logger.info(
+                    "Scheduler deferred durable job for resource policy",
+                    extra={
+                        "event": "jobs.scheduler_resource_wait",
+                        "job_id": str(leased.job_id),
+                        "job_type": leased.job_type,
+                        "reason": decision.reason,
+                        "retry_at_us": resource_retry_at_us,
+                    },
+                )
+                return SchedulerTickResult(
+                    recovered_jobs=len(recovered),
+                    scheduled_retries=scheduled_retries,
+                    woken_jobs=len(woken) + legacy_research_woken,
+                    selected_job_id=current.job_id,
+                    selected_job_type=current.job_type,
+                    action="waiting_resource",
+                    final_state=current.state,
+                    fencing_sequence=current.fencing_sequence,
+                    retry_at_us=resource_retry_at_us,
+                )
 
         logger.info(
             "Scheduler dispatched durable job",

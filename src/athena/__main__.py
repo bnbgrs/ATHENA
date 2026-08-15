@@ -82,6 +82,11 @@ from athena.memory.repository import (
     PersonalMemoryProtectionError,
 )
 from athena.model.adapters.lm_studio import ModelProviderError
+from athena.operations.cli import (
+    OperationalCommandError,
+    add_operational_parsers,
+    run_operational_command,
+)
 from athena.retrieval.archive import ArchiveSearchError
 from athena.retrieval.context import ContextBuilderError
 from athena.retrieval.search import SearchEntityType, SearchError
@@ -1210,6 +1215,8 @@ def build_parser() -> argparse.ArgumentParser:
         "recover",
         help="Recover only jobs whose worker lease has expired.",
     )
+
+    add_operational_parsers(commands)
 
     model_parser = commands.add_parser("model", help="Local model provider commands.")
     model_commands = model_parser.add_subparsers(dest="model_command", required=True)
@@ -3466,6 +3473,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ValueError,
             ) as exc:
                 print(f"ATHENA source error: {exc}", file=sys.stderr)
+                return 2
+
+        if args.command in {"research", "external", "resource", "backup"}:
+            try:
+                return run_operational_command(app, args)
+            except OperationalCommandError as exc:
+                print(f"ATHENA operational error: {exc}", file=sys.stderr)
                 return 2
 
         if args.command == "model":

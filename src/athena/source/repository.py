@@ -40,11 +40,13 @@ class SourceRepository:
         original_name: str,
         source_uri: str,
         prepared_blob: PreparedBlob,
+        source_type: SourceType = SourceType.FILE,
     ) -> SourceCaptureResult:
         now_us = utc_now_us()
         source_id = new_uuid7()
         source_provenance_id = new_uuid7()
         commit_id = new_uuid7()
+        operation_type = f"source.capture.{source_type.value}"
 
         with self.database.write_transaction() as connection:
             self._require_active_actor(connection, actor_id)
@@ -65,7 +67,7 @@ class SourceRepository:
                 connection,
                 commit_id=commit_id,
                 actor_id=actor_id,
-                operation_type="source.capture.file",
+                operation_type=operation_type,
                 committed_at_us=now_us,
             )
 
@@ -133,7 +135,7 @@ class SourceRepository:
                 connection,
                 provenance_id=source_provenance_id,
                 entity_id=source_id,
-                operation="source.capture.file",
+                operation=operation_type,
                 actor_id=actor_id,
                 created_at_us=now_us,
             )
@@ -152,10 +154,11 @@ class SourceRepository:
                     source_uri,
                     lifecycle_state,
                     provenance_id
-                ) VALUES (?, 'file', ?, ?, ?, ?, ?, ?, ?, ?, 'captured', ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'captured', ?)
                 """,
                 (
                     uuid_to_blob(source_id),
+                    source_type.value,
                     now_us,
                     now_us,
                     original_name,
@@ -178,7 +181,7 @@ class SourceRepository:
 
         source = SourceRecord(
             source_id=source_id,
-            source_type=SourceType.FILE,
+            source_type=source_type,
             created_at_us=now_us,
             acquired_at_us=now_us,
             original_name=original_name,

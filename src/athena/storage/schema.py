@@ -29,7 +29,8 @@ PERSONAL_MEMORY_SCHEMA_VERSION = 21
 EXHAUSTIVE_RESEARCH_SCHEMA_VERSION = 22
 RESEARCH_ORCHESTRATION_SCHEMA_VERSION = 23
 RESEARCH_SYNTHESIS_SCHEMA_VERSION = 24
-SCHEMA_VERSION = RESEARCH_SYNTHESIS_SCHEMA_VERSION
+CONSOLIDATED_OPERATIONS_SCHEMA_VERSION = 25
+SCHEMA_VERSION = CONSOLIDATED_OPERATIONS_SCHEMA_VERSION
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
@@ -55,6 +56,7 @@ PERSONAL_MEMORY_MIGRATION_ID = "0021_personal_memory_core"
 EXHAUSTIVE_RESEARCH_MIGRATION_ID = "0022_exhaustive_research_foundation"
 RESEARCH_ORCHESTRATION_MIGRATION_ID = "0023_exhaustive_research_orchestration"
 RESEARCH_SYNTHESIS_MIGRATION_ID = "0024_exhaustive_research_synthesis"
+CONSOLIDATED_OPERATIONS_MIGRATION_ID = "0025_consolidated_operational_capabilities"
 
 
 class DatabaseCompatibilityError(RuntimeError):
@@ -143,6 +145,7 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         PERSONAL_MEMORY_SCHEMA_VERSION,
         EXHAUSTIVE_RESEARCH_SCHEMA_VERSION,
         RESEARCH_ORCHESTRATION_SCHEMA_VERSION,
+        RESEARCH_SYNTHESIS_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -248,9 +251,13 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
 
     if existing_user_version == RESEARCH_ORCHESTRATION_SCHEMA_VERSION:
         _migrate_schema_v23_to_v24(connection)
+        existing_user_version = RESEARCH_SYNTHESIS_SCHEMA_VERSION
+
+    if existing_user_version == RESEARCH_SYNTHESIS_SCHEMA_VERSION:
+        _migrate_schema_v24_to_v25(connection)
 
     _configure_connection(connection)
-    _verify_schema_v24(connection)
+    _verify_schema_v25(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -2170,6 +2177,368 @@ def _migrate_schema_v23_to_v24(connection: sqlite3.Connection) -> None:
         """
     )
 
+
+def _migrate_schema_v24_to_v25(connection: sqlite3.Connection) -> None:
+    """Add Research promotion, external access, resources, and verified backup state."""
+    connection.executescript(
+        f"""
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE research_promotion_sets (
+            proposal_set_id BLOB(16) PRIMARY KEY CHECK(length(proposal_set_id) = 16),
+            result_id BLOB(16) NOT NULL UNIQUE CHECK(length(result_id) = 16),
+            result_content_hash BLOB(32) NOT NULL CHECK(length(result_content_hash) = 32),
+            state TEXT NOT NULL CHECK(state IN ('pending', 'completed')),
+            created_at_us INTEGER NOT NULL,
+            updated_at_us INTEGER NOT NULL CHECK(updated_at_us >= created_at_us),
+            FOREIGN KEY(result_id) REFERENCES research_results(result_id)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE research_promotion_items (
+            proposal_id BLOB(16) PRIMARY KEY CHECK(length(proposal_id) = 16),
+            proposal_set_id BLOB(16) NOT NULL CHECK(length(proposal_set_id) = 16),
+            ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+            proposal_type TEXT NOT NULL
+                CHECK(proposal_type IN ('knowledge', 'claim', 'contradiction')),
+            payload_json TEXT NOT NULL,
+            evidence_kind TEXT NOT NULL
+                CHECK(evidence_kind IN ('summary', 'finding', 'contradiction')),
+            evidence_ordinal INTEGER NULL CHECK(
+                evidence_ordinal IS NULL OR evidence_ordinal >= 0
+            ),
+            source_analysis_artifact_ids_json TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('pending', 'accepted', 'rejected')),
+            accepted_entity_id BLOB(16) NULL CHECK(
+                accepted_entity_id IS NULL OR length(accepted_entity_id) = 16
+            ),
+            accepted_revision_id BLOB(16) NULL CHECK(
+                accepted_revision_id IS NULL OR length(accepted_revision_id) = 16
+            ),
+            created_at_us INTEGER NOT NULL,
+            decided_at_us INTEGER NULL CHECK(
+                decided_at_us IS NULL OR decided_at_us >= created_at_us
+            ),
+            UNIQUE(proposal_set_id, ordinal),
+            FOREIGN KEY(proposal_set_id)
+                REFERENCES research_promotion_sets(proposal_set_id),
+            FOREIGN KEY(accepted_entity_id) REFERENCES entity_registry(entity_id),
+            FOREIGN KEY(accepted_revision_id) REFERENCES revisions(revision_id),
+            CHECK(
+                (state = 'accepted'
+                 AND accepted_entity_id IS NOT NULL
+                 AND accepted_revision_id IS NOT NULL
+                 AND decided_at_us IS NOT NULL)
+                OR
+                (state = 'rejected'
+                 AND accepted_entity_id IS NULL
+                 AND accepted_revision_id IS NULL
+                 AND decided_at_us IS NOT NULL)
+                OR
+                (state = 'pending'
+                 AND accepted_entity_id IS NULL
+                 AND accepted_revision_id IS NULL
+                 AND decided_at_us IS NULL)
+            ),
+            CHECK(
+                (evidence_kind = 'summary' AND evidence_ordinal IS NULL)
+                OR
+                (evidence_kind IN ('finding', 'contradiction')
+                 AND evidence_ordinal IS NOT NULL)
+            )
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_research_promotion_items_state
+            ON research_promotion_items(proposal_set_id, state, ordinal);
+
+        CREATE TABLE research_knowledge_origins (
+            origin_id BLOB(16) PRIMARY KEY CHECK(length(origin_id) = 16),
+            subject_revision_id BLOB(16) NOT NULL CHECK(length(subject_revision_id) = 16),
+            subject_entity_id BLOB(16) NOT NULL CHECK(length(subject_entity_id) = 16),
+            result_id BLOB(16) NOT NULL CHECK(length(result_id) = 16),
+            proposal_id BLOB(16) NOT NULL UNIQUE CHECK(length(proposal_id) = 16),
+            acceptance_commit_id BLOB(16) NOT NULL UNIQUE
+                CHECK(length(acceptance_commit_id) = 16),
+            final_artifact_id BLOB(16) NOT NULL CHECK(length(final_artifact_id) = 16),
+            source_analysis_artifact_ids_json TEXT NOT NULL,
+            source_anchor_ids_json TEXT NOT NULL,
+            source_ids_json TEXT NOT NULL,
+            created_at_us INTEGER NOT NULL,
+            FOREIGN KEY(subject_revision_id) REFERENCES revisions(revision_id),
+            FOREIGN KEY(subject_entity_id) REFERENCES entity_registry(entity_id),
+            FOREIGN KEY(result_id) REFERENCES research_results(result_id),
+            FOREIGN KEY(proposal_id) REFERENCES research_promotion_items(proposal_id),
+            FOREIGN KEY(acceptance_commit_id) REFERENCES commit_records(commit_id),
+            FOREIGN KEY(final_artifact_id)
+                REFERENCES research_synthesis_artifacts(artifact_id)
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_research_knowledge_origins_result
+            ON research_knowledge_origins(result_id, subject_entity_id);
+
+        CREATE TABLE external_access_authorizations (
+            authorization_id BLOB(16) PRIMARY KEY CHECK(length(authorization_id) = 16),
+            actor_id BLOB(16) NOT NULL CHECK(length(actor_id) = 16),
+            purpose TEXT NOT NULL CHECK(length(purpose) > 0),
+            allowed_hosts_json TEXT NOT NULL,
+            privacy_route TEXT NOT NULL CHECK(
+                privacy_route IN ('tor_preferred', 'tor', 'direct_explicit')
+            ),
+            origin TEXT NOT NULL CHECK(origin = 'explicit_user'),
+            expires_at_us INTEGER NOT NULL,
+            revoked_at_us INTEGER NULL,
+            created_at_us INTEGER NOT NULL,
+            FOREIGN KEY(actor_id) REFERENCES actors(actor_id),
+            CHECK(expires_at_us > created_at_us),
+            CHECK(revoked_at_us IS NULL OR revoked_at_us >= created_at_us)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE external_access_events (
+            event_id BLOB(16) PRIMARY KEY CHECK(length(event_id) = 16),
+            authorization_id BLOB(16) NOT NULL CHECK(length(authorization_id) = 16),
+            request_url_hash BLOB(32) NOT NULL CHECK(length(request_url_hash) = 32),
+            destination_host TEXT NOT NULL CHECK(length(destination_host) > 0),
+            method TEXT NOT NULL CHECK(method IN ('GET')),
+            privacy_route TEXT NOT NULL CHECK(
+                privacy_route IN ('tor_preferred', 'tor', 'direct_explicit')
+            ),
+            outcome TEXT NOT NULL CHECK(
+                outcome IN ('captured', 'failed', 'denied')
+            ),
+            reason_code TEXT NULL,
+            response_bytes INTEGER NULL CHECK(
+                response_bytes IS NULL OR response_bytes >= 0
+            ),
+            source_id BLOB(16) NULL CHECK(
+                source_id IS NULL OR length(source_id) = 16
+            ),
+            created_at_us INTEGER NOT NULL,
+            FOREIGN KEY(authorization_id)
+                REFERENCES external_access_authorizations(authorization_id),
+            FOREIGN KEY(source_id) REFERENCES sources(source_id)
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_external_access_events_authorization
+            ON external_access_events(authorization_id, created_at_us);
+
+        CREATE TABLE external_source_captures (
+            source_id BLOB(16) PRIMARY KEY CHECK(length(source_id) = 16),
+            authorization_id BLOB(16) NOT NULL CHECK(length(authorization_id) = 16),
+            access_event_id BLOB(16) NOT NULL UNIQUE CHECK(length(access_event_id) = 16),
+            provenance_url TEXT NOT NULL CHECK(length(provenance_url) > 0),
+            captured_at_us INTEGER NOT NULL,
+            FOREIGN KEY(source_id) REFERENCES sources(source_id),
+            FOREIGN KEY(authorization_id)
+                REFERENCES external_access_authorizations(authorization_id),
+            FOREIGN KEY(access_event_id) REFERENCES external_access_events(event_id)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE resource_policy (
+            singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+            mode TEXT NOT NULL CHECK(
+                mode IN ('balanced', 'quiet', 'performance', 'pause_background')
+            ),
+            ram_headroom_bytes INTEGER NOT NULL CHECK(ram_headroom_bytes >= 0),
+            disk_headroom_bytes INTEGER NOT NULL CHECK(disk_headroom_bytes >= 0),
+            gpu_background_threshold REAL NOT NULL CHECK(
+                gpu_background_threshold >= 0.0
+                AND gpu_background_threshold <= 1.0
+            ),
+            updated_at_us INTEGER NOT NULL,
+            updated_by_actor_id BLOB(16) NULL CHECK(
+                updated_by_actor_id IS NULL OR length(updated_by_actor_id) = 16
+            ),
+            FOREIGN KEY(updated_by_actor_id) REFERENCES actors(actor_id)
+        );
+
+        INSERT INTO resource_policy (
+            singleton_id, mode, ram_headroom_bytes, disk_headroom_bytes,
+            gpu_background_threshold, updated_at_us, updated_by_actor_id
+        ) VALUES (
+            1, 'balanced', 1073741824, 1073741824, 0.85,
+            CAST(strftime('%s','now') AS INTEGER) * 1000000, NULL
+        );
+
+        CREATE TABLE resource_runtime_snapshots (
+            snapshot_id BLOB(16) PRIMARY KEY CHECK(length(snapshot_id) = 16),
+            captured_at_us INTEGER NOT NULL,
+            ram_total_bytes INTEGER NULL CHECK(
+                ram_total_bytes IS NULL OR ram_total_bytes >= 0
+            ),
+            ram_available_bytes INTEGER NULL CHECK(
+                ram_available_bytes IS NULL OR ram_available_bytes >= 0
+            ),
+            disk_free_bytes INTEGER NOT NULL CHECK(disk_free_bytes >= 0),
+            cpu_load_fraction REAL NULL CHECK(
+                cpu_load_fraction IS NULL OR
+                (cpu_load_fraction >= 0.0 AND cpu_load_fraction <= 1.0)
+            ),
+            gpu_utilization_fraction REAL NULL CHECK(
+                gpu_utilization_fraction IS NULL OR
+                (gpu_utilization_fraction >= 0.0 AND gpu_utilization_fraction <= 1.0)
+            ),
+            vram_total_bytes INTEGER NULL CHECK(
+                vram_total_bytes IS NULL OR vram_total_bytes >= 0
+            ),
+            vram_available_bytes INTEGER NULL CHECK(
+                vram_available_bytes IS NULL OR vram_available_bytes >= 0
+            ),
+            model_loaded INTEGER NULL CHECK(model_loaded IN (0, 1)),
+            degraded_metrics_json TEXT NOT NULL
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_resource_runtime_snapshots_time
+            ON resource_runtime_snapshots(captured_at_us DESC);
+
+        CREATE TABLE backup_targets (
+            target_id BLOB(16) PRIMARY KEY CHECK(length(target_id) = 16),
+            root_path TEXT NOT NULL UNIQUE CHECK(length(root_path) > 0),
+            status TEXT NOT NULL CHECK(status IN ('active', 'offline', 'retired')),
+            created_at_us INTEGER NOT NULL,
+            created_by_actor_id BLOB(16) NOT NULL CHECK(
+                length(created_by_actor_id) = 16
+            ),
+            FOREIGN KEY(created_by_actor_id) REFERENCES actors(actor_id)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE backup_snapshots (
+            snapshot_id BLOB(16) PRIMARY KEY CHECK(length(snapshot_id) = 16),
+            target_id BLOB(16) NOT NULL CHECK(length(target_id) = 16),
+            state TEXT NOT NULL CHECK(state IN ('creating', 'complete', 'failed')),
+            verification_status TEXT NOT NULL CHECK(
+                verification_status IN (
+                    'unverified', 'verified_light', 'verified_deep', 'failed'
+                )
+            ),
+            relative_path TEXT NOT NULL CHECK(length(relative_path) > 0),
+            snapshot_commit_seq INTEGER NULL CHECK(
+                snapshot_commit_seq IS NULL OR snapshot_commit_seq >= 0
+            ),
+            schema_version INTEGER NULL CHECK(
+                schema_version IS NULL OR schema_version >= 1
+            ),
+            db_sha256 BLOB(32) NULL CHECK(
+                db_sha256 IS NULL OR length(db_sha256) = 32
+            ),
+            manifest_sha256 BLOB(32) NULL CHECK(
+                manifest_sha256 IS NULL OR length(manifest_sha256) = 32
+            ),
+            object_count INTEGER NOT NULL CHECK(object_count >= 0),
+            created_at_us INTEGER NOT NULL,
+            completed_at_us INTEGER NULL CHECK(
+                completed_at_us IS NULL OR completed_at_us >= created_at_us
+            ),
+            failure_detail TEXT NULL,
+            FOREIGN KEY(target_id) REFERENCES backup_targets(target_id),
+            CHECK(
+                (state = 'complete'
+                 AND verification_status IN ('verified_light', 'verified_deep')
+                 AND snapshot_commit_seq IS NOT NULL
+                 AND schema_version IS NOT NULL
+                 AND db_sha256 IS NOT NULL
+                 AND manifest_sha256 IS NOT NULL
+                 AND completed_at_us IS NOT NULL)
+                OR state != 'complete'
+            )
+        ) WITHOUT ROWID;
+
+        CREATE INDEX idx_backup_snapshots_target_time
+            ON backup_snapshots(target_id, created_at_us DESC);
+
+        CREATE TABLE backup_snapshot_pins (
+            snapshot_id BLOB(16) NOT NULL CHECK(length(snapshot_id) = 16),
+            blob_id BLOB(16) NOT NULL CHECK(length(blob_id) = 16),
+            pinned_at_us INTEGER NOT NULL,
+            PRIMARY KEY(snapshot_id, blob_id),
+            FOREIGN KEY(snapshot_id) REFERENCES backup_snapshots(snapshot_id),
+            FOREIGN KEY(blob_id) REFERENCES blob_records(blob_id)
+        ) WITHOUT ROWID;
+
+        UPDATE schema_metadata
+        SET schema_version = {CONSOLIDATED_OPERATIONS_SCHEMA_VERSION},
+            last_migration_id = '{CONSOLIDATED_OPERATIONS_MIGRATION_ID}',
+            minimum_reader_version = {CONSOLIDATED_OPERATIONS_SCHEMA_VERSION}
+        WHERE singleton_id = 1;
+
+        PRAGMA user_version = {CONSOLIDATED_OPERATIONS_SCHEMA_VERSION};
+        COMMIT;
+        """
+    )
+
+
+def _verify_schema_v25(connection: sqlite3.Connection) -> None:
+    application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
+    user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if application_id != ATHENA_APPLICATION_ID:
+        raise DatabaseCompatibilityError("ATHENA application_id verification failed.")
+    if user_version != CONSOLIDATED_OPERATIONS_SCHEMA_VERSION:
+        raise DatabaseCompatibilityError("ATHENA schema version verification failed.")
+
+    metadata = connection.execute(
+        "SELECT schema_version, storage_layout_version, blob_format_version, "
+        "last_migration_id, minimum_reader_version "
+        "FROM schema_metadata WHERE singleton_id = 1"
+    ).fetchone()
+    expected = (
+        CONSOLIDATED_OPERATIONS_SCHEMA_VERSION,
+        STORAGE_LAYOUT_VERSION,
+        BLOB_FORMAT_VERSION,
+        CONSOLIDATED_OPERATIONS_MIGRATION_ID,
+        CONSOLIDATED_OPERATIONS_SCHEMA_VERSION,
+    )
+    if metadata is None or tuple(metadata) != expected:
+        raise DatabaseCompatibilityError("ATHENA schema_metadata verification failed.")
+
+    required_tables = {
+        "research_promotion_sets",
+        "research_promotion_items",
+        "research_knowledge_origins",
+        "external_access_authorizations",
+        "external_access_events",
+        "external_source_captures",
+        "resource_policy",
+        "resource_runtime_snapshots",
+        "backup_targets",
+        "backup_snapshots",
+        "backup_snapshot_pins",
+    }
+    missing_tables = required_tables.difference(_user_tables(connection))
+    if missing_tables:
+        missing = ", ".join(sorted(missing_tables))
+        raise DatabaseCompatibilityError(
+            f"ATHENA consolidated operational schema is incomplete: {missing}."
+        )
+    _verify_schema_v24_compatible(connection)
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise DatabaseCompatibilityError("ATHENA foreign-key verification failed.")
+
+
+def _verify_schema_v24_compatible(connection: sqlite3.Connection) -> None:
+    required_tables = {
+        "knowledge_units", "knowledge_unit_revisions", "claims", "claim_revisions",
+        "claim_evidence", "provenance_inputs", "model_signatures", "processing_runs",
+        "semantic_review_items", "semantic_merge_review_payloads",
+        "extraction_result_snapshots", "search_fts", "search_index_state",
+        "search_embeddings", "search_embedding_state", "blob_records", "sources",
+        "source_representations", "source_representation_pages",
+        "source_representation_structures", "source_anchor_structures",
+        "chunking_profiles", "source_anchors", "jobs", "checkpoints",
+        "source_analyses", "source_analysis_work_items", "source_analysis_artifacts",
+        "source_analysis_work_inputs", "source_extraction_result_snapshots",
+        "source_analysis_knowledge_origins", "source_extractions",
+        "source_extraction_evidence", "source_extraction_work_items",
+        "source_extraction_artifacts", "source_extraction_work_inputs",
+        "personal_memory_entries", "personal_memory_revisions",
+        "research_scopes", "research_candidate_sets", "research_candidates",
+        "research_work_items", "research_synthesis_work_items",
+        "research_synthesis_work_inputs", "research_synthesis_artifacts",
+        "research_synthesis_output_evidence", "research_results",
+    }
+    missing_tables = required_tables.difference(_user_tables(connection))
+    if missing_tables:
+        missing = ", ".join(sorted(missing_tables))
+        raise DatabaseCompatibilityError(
+            f"ATHENA v24 semantic foundation is incomplete: {missing}."
+        )
 
 def _verify_schema_v24(connection: sqlite3.Connection) -> None:
     application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])

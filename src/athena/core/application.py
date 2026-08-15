@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from enum import Enum
 
+from athena.backup.service import BackupService
 from athena.chat.direct import DirectChatService
 from athena.chat.generation import ChatGenerationService
 from athena.chat.memory import MemoryAugmentedChatService
@@ -13,6 +14,7 @@ from athena.chat.service import ChatService
 from athena.chat.source_grounding import SourceGroundedChatService
 from athena.config.settings import AthenaSettings
 from athena.core.services import LifecycleService, ServiceManager
+from athena.external.gateway import ExternalAccessGateway, ExternalResearchService
 from athena.jobs.embedding_processing import DurableEmbeddingRebuildWorker
 from athena.jobs.repository import JobRepository
 from athena.jobs.research import DurableResearchWorker
@@ -45,9 +47,11 @@ from athena.model.adapters.lm_studio_embeddings import LMStudioEmbeddingProvider
 from athena.model.provenance import ModelRunRepository
 from athena.observability.health import HealthService
 from athena.observability.logging import configure_logging
+from athena.research.promotion import ResearchPromotionService
 from athena.research.repository import ResearchRepository
 from athena.research.service import ResearchService
 from athena.research.synthesis_service import ResearchSynthesisService
+from athena.resources.manager import ResourceManager
 from athena.retrieval.archive import (
     ArchiveHybridRetrievalService,
     ArchiveSearchService,
@@ -132,6 +136,18 @@ class AthenaApplication:
             blob_store=self.blob_store,
             chat=self.chat,
         )
+        self.backup = BackupService(
+            database=self.database,
+            blob_store=self.blob_store,
+            paths=self.paths,
+            chat=self.chat,
+        )
+        self.external_access = ExternalAccessGateway(
+            database=self.database,
+            chat=self.chat,
+            sources=self.sources,
+            paths=self.paths,
+        )
         self.knowledge_repository = KnowledgeRepository(self.database)
         self.knowledge = KnowledgeService(self.knowledge_repository, self.chat)
         self.claim_repository = ClaimRepository(self.database)
@@ -140,6 +156,12 @@ class AthenaApplication:
             base_url=self.settings.lm_studio_base_url,
             timeout_seconds=self.settings.model_request_timeout_seconds,
             generation_timeout_seconds=self.settings.model_generation_timeout_seconds,
+        )
+        self.resources = ResourceManager(
+            database=self.database,
+            paths=self.paths,
+            chat=self.chat,
+            model_provider=self.model_provider,
         )
         self.chat_generation = ChatGenerationService(self.chat, self.model_provider)
         self.embedding_provider = LMStudioEmbeddingProvider(
@@ -244,6 +266,17 @@ class AthenaApplication:
             jobs=self.jobs,
             source_analysis=self.source_analysis_service,
         )
+        self.external_research = ExternalResearchService(
+            gateway=self.external_access,
+            research=self.research,
+        )
+        self.research_promotion = ResearchPromotionService(
+            database=self.database,
+            chat=self.chat,
+            research=self.research_repository,
+            source_analyses=self.source_analysis_repository,
+            anchors=self.source_anchors,
+        )
         self.research_synthesis = ResearchSynthesisService(
             repository=self.research_repository,
             source_analysis=self.source_analysis_service,
@@ -305,6 +338,7 @@ class AthenaApplication:
             analysis_worker=self.source_analysis,
             extraction_worker=self.source_hierarchical_extraction,
             research_worker=self.research_worker,
+            resources=self.resources,
         )
         self.source_proposal_acceptance = SourceProposalAcceptanceService(
             database=self.database,
@@ -378,6 +412,15 @@ class AthenaApplication:
 
         try:
             self.services.start_all()
+            recovered_backups = self.backup.recover_incomplete()
+            if recovered_backups:
+                logger.warning(
+                    "Recovered interrupted backup publication",
+                    extra={
+                        "event": "backup.startup_recovered",
+                        "recovered_backup_count": len(recovered_backups),
+                    },
+                )
             recovered_jobs = self.jobs.recover_startup()
             if recovered_jobs:
                 logger.warning(

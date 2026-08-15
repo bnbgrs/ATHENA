@@ -3,6 +3,8 @@ import sqlite3
 from athena.common.ids import new_uuid7, uuid_to_blob
 from athena.storage.database import SQLiteDatabase
 from athena.storage.schema import (
+    CONSOLIDATED_OPERATIONS_MIGRATION_ID,
+    CONSOLIDATED_OPERATIONS_SCHEMA_VERSION,
     DURABLE_JOBS_SCHEMA_VERSION,
     EXHAUSTIVE_RESEARCH_SCHEMA_VERSION,
     EXTRACTION_SNAPSHOT_SCHEMA_VERSION,
@@ -83,6 +85,17 @@ EXPECTED_SEMANTIC_TABLES = {
     "research_synthesis_artifacts",
     "research_synthesis_output_evidence",
     "research_results",
+    "research_promotion_sets",
+    "research_promotion_items",
+    "research_knowledge_origins",
+    "external_access_authorizations",
+    "external_access_events",
+    "external_source_captures",
+    "resource_policy",
+    "resource_runtime_snapshots",
+    "backup_targets",
+    "backup_snapshots",
+    "backup_snapshot_pins",
 }
 
 
@@ -107,7 +120,7 @@ def test_fresh_database_contains_semantic_schema(tmp_path) -> None:
     ).fetchone()
     assert tuple(metadata) == (
         SCHEMA_VERSION,
-        RESEARCH_SYNTHESIS_MIGRATION_ID,
+        CONSOLIDATED_OPERATIONS_MIGRATION_ID,
         SCHEMA_VERSION,
     )
 
@@ -640,7 +653,7 @@ def test_v14_database_is_upgraded_additively_to_durable_jobs(tmp_path) -> None:
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == RESEARCH_SYNTHESIS_MIGRATION_ID
+    assert metadata["last_migration_id"] == CONSOLIDATED_OPERATIONS_MIGRATION_ID
     database.stop()
 
 
@@ -805,7 +818,7 @@ def test_v17_database_is_upgraded_additively_to_hierarchical_source_analysis(tmp
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == RESEARCH_SYNTHESIS_MIGRATION_ID
+    assert metadata["last_migration_id"] == CONSOLIDATED_OPERATIONS_MIGRATION_ID
     database.stop()
 
 
@@ -864,7 +877,7 @@ def test_v18_database_is_upgraded_additively_to_source_knowledge_promotion(tmp_p
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == RESEARCH_SYNTHESIS_MIGRATION_ID
+    assert metadata["last_migration_id"] == CONSOLIDATED_OPERATIONS_MIGRATION_ID
     database.stop()
 
 
@@ -930,7 +943,7 @@ def test_v19_database_is_upgraded_additively_to_hierarchical_source_extraction(t
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == RESEARCH_SYNTHESIS_MIGRATION_ID
+    assert metadata["last_migration_id"] == CONSOLIDATED_OPERATIONS_MIGRATION_ID
     database.stop()
 
 
@@ -999,7 +1012,7 @@ def test_v20_database_is_upgraded_additively_to_personal_memory(tmp_path) -> Non
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == RESEARCH_SYNTHESIS_MIGRATION_ID
+    assert metadata["last_migration_id"] == CONSOLIDATED_OPERATIONS_MIGRATION_ID
     database.stop()
 
 
@@ -1077,7 +1090,7 @@ def test_v21_database_is_upgraded_additively_to_exhaustive_research(tmp_path) ->
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == RESEARCH_SYNTHESIS_MIGRATION_ID
+    assert metadata["last_migration_id"] == CONSOLIDATED_OPERATIONS_MIGRATION_ID
     database.stop()
 
 
@@ -1171,7 +1184,7 @@ def test_v22_database_is_upgraded_additively_to_research_orchestration(
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == RESEARCH_SYNTHESIS_MIGRATION_ID
+    assert metadata["last_migration_id"] == CONSOLIDATED_OPERATIONS_MIGRATION_ID
     database.stop()
 
 
@@ -1242,7 +1255,7 @@ def test_v23_database_is_upgraded_additively_to_research_synthesis(tmp_path) -> 
     database.start()
     connection = database.connection
     assert connection.execute("PRAGMA user_version").fetchone()[0] == (
-        RESEARCH_SYNTHESIS_SCHEMA_VERSION
+        CONSOLIDATED_OPERATIONS_SCHEMA_VERSION
     )
     assert {
         "research_synthesis_work_items",
@@ -1256,7 +1269,31 @@ def test_v23_database_is_upgraded_additively_to_research_synthesis(tmp_path) -> 
         "FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == RESEARCH_SYNTHESIS_MIGRATION_ID
-    assert metadata["minimum_reader_version"] == RESEARCH_SYNTHESIS_SCHEMA_VERSION
+    assert metadata["last_migration_id"] == CONSOLIDATED_OPERATIONS_MIGRATION_ID
+    assert metadata["minimum_reader_version"] == CONSOLIDATED_OPERATIONS_SCHEMA_VERSION
+    assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    database.stop()
+
+
+def test_v25_consolidated_operational_schema_is_fail_closed(tmp_path) -> None:
+    assert RESEARCH_SYNTHESIS_SCHEMA_VERSION == 24
+    assert RESEARCH_SYNTHESIS_MIGRATION_ID == "0024_exhaustive_research_synthesis"
+    database = SQLiteDatabase(tmp_path / "athena.db")
+    database.start()
+    connection = database.connection
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == (
+        CONSOLIDATED_OPERATIONS_SCHEMA_VERSION
+    )
+    policy = connection.execute(
+        """
+        SELECT mode, ram_headroom_bytes, disk_headroom_bytes
+        FROM resource_policy
+        WHERE singleton_id = 1
+        """
+    ).fetchone()
+    assert policy is not None
+    assert policy["mode"] == "balanced"
+    assert int(policy["ram_headroom_bytes"]) > 0
+    assert int(policy["disk_headroom_bytes"]) > 0
     assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     database.stop()
