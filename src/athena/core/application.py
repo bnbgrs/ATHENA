@@ -12,6 +12,7 @@ from athena.chat.memory import MemoryAugmentedChatService
 from athena.chat.repository import ChatRepository
 from athena.chat.service import ChatService
 from athena.chat.source_grounding import SourceGroundedChatService
+from athena.chat.unified import UnifiedLocalChatService
 from athena.config.settings import AthenaSettings
 from athena.core.services import LifecycleService, ServiceManager
 from athena.external.gateway import ExternalAccessGateway, ExternalResearchService
@@ -382,6 +383,18 @@ class AthenaApplication:
             context_packages=self.context_packages,
             evidence_policy=self.memory_evidence_policy,
             personal_memory=self.personal_memory,
+            model_runs=self.model_runs,
+        )
+        self.unified_local_chat = UnifiedLocalChatService(
+            chat_generation=self.chat_generation,
+            embedding_provider=self.embedding_provider,
+            hybrid_retrieval=self.hybrid_retrieval,
+            memory_context_builder=self.context_builder,
+            evidence_policy=self.memory_evidence_policy,
+            personal_memory=self.personal_memory,
+            archive_retrieval=self.archive_hybrid_retrieval,
+            source_context_builder=self.source_context_builder,
+            context_packages=self.context_packages,
             model_runs=self.model_runs,
         )
         self.proposal_acceptance = ProposalAcceptanceService(

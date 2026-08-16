@@ -15,6 +15,7 @@ from athena.chat.models import ChatThread
 from athena.chat.repository import ChatNotFoundError
 from athena.chat.service import EmptyMessageError
 from athena.chat.source_grounding import SourceGroundedChatResult
+from athena.chat.unified import UnifiedLocalChatResult
 from athena.config.settings import ConfigurationError
 from athena.core.application import AthenaApplication
 from athena.jobs.embedding_processing import (
@@ -1333,10 +1334,16 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
         return 0
 
     if args.chat_command == "send":
-        if args.memory and args.sources:
+        if (
+            args.memory
+            and args.sources
+            and args.memory_allow_model_prior is not None
+            and args.source_allow_model_prior is not None
+            and args.memory_allow_model_prior != args.source_allow_model_prior
+        ):
             print(
-                "ATHENA chat error: --memory and --sources cannot be combined in "
-                "VS4 Step 6.",
+                "ATHENA chat error: combined --memory --sources received "
+                "conflicting model-prior policies.",
                 file=sys.stderr,
             )
             return 2
@@ -1420,8 +1427,35 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
         print("Assistant: ", end="", flush=True)
         memory_result: MemoryChatGenerationResult | None = None
         source_result: SourceGroundedChatResult | None = None
+        unified_result: UnifiedLocalChatResult | None = None
         try:
-            if args.memory:
+            if args.memory and args.sources:
+                unified_allow_model_prior = True
+                if args.memory_allow_model_prior is not None:
+                    unified_allow_model_prior = args.memory_allow_model_prior
+                if args.source_allow_model_prior is not None:
+                    unified_allow_model_prior = args.source_allow_model_prior
+
+                unified_result = app.unified_local_chat.send_message(
+                    chat_id=args.chat_id,
+                    content=args.content,
+                    requested_model_id=args.model_id,
+                    requested_embedding_model_id=args.embedding_model_id,
+                    max_memory_context_tokens=args.memory_max_tokens,
+                    max_memory_context_items=args.memory_max_items,
+                    max_memory_items=args.memory_max_preferences,
+                    max_source_context_tokens=args.source_max_tokens,
+                    max_source_context_items=args.source_max_items,
+                    memory_scope_kind=args.memory_scope_kind,
+                    memory_scope_entity_id=args.memory_scope_id,
+                    effective_context_limit=args.memory_context_limit,
+                    output_reserve=args.memory_output_reserve,
+                    safety_margin=args.memory_safety_margin,
+                    allow_model_prior=unified_allow_model_prior,
+                    on_delta=lambda chunk: print(chunk, end="", flush=True),
+                )
+                result = unified_result.generation
+            elif args.memory:
                 memory_result = app.memory_chat.send_message(
                     chat_id=args.chat_id,
                     content=args.content,
@@ -1477,6 +1511,65 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
             return 130
         print()
         print(f"Model: {result.model.backend_model_id}")
+        if unified_result is not None:
+            print(
+                "Unified local context: "
+                f"memory_items={len(unified_result.memory_context.items)} "
+                f"memory_preferences="
+                f"{len(unified_result.memory_context.memory_items)} "
+                f"source_items={len(unified_result.source_context.items)} "
+                f"embedding_model="
+                f"{unified_result.embedding_model.backend_model_id}"
+            )
+            print(
+                "Unified context budgets: "
+                f"memory={unified_result.budget.memory_context_budget} "
+                f"source={unified_result.budget.source_context_budget} "
+                f"input={unified_result.budget.estimated_input_tokens} "
+                f"output_reserve={unified_result.budget.output_reserve} "
+                f"safety_margin={unified_result.budget.safety_margin} "
+                f"total={unified_result.budget.estimated_total_tokens}/"
+                f"{unified_result.budget.effective_context_limit}"
+            )
+            memory_ids = ", ".join(
+                item.context_id
+                for item in unified_result.memory_context.items
+            ) or "<none>"
+            source_refs = ", ".join(
+                f"{item.context_id}={item.anchor_id}"
+                for item in unified_result.source_context.items
+            ) or "<none>"
+            print(f"Unified memory context IDs: {memory_ids}")
+            print(f"Unified source context anchors: {source_refs}")
+
+            evidence_counts = ", ".join(
+                f"{evidence_class.value}:{count}"
+                for evidence_class, count
+                in unified_result.evidence_selection.counts
+            ) or "<none>"
+            print(
+                "Unified memory evidence: "
+                f"policy={unified_result.evidence_selection.policy_id} "
+                f"classes={evidence_counts}"
+            )
+
+            grounding = result.grounding_report
+            if grounding is not None:
+                cited = ", ".join(grounding.cited_context_ids) or "<none>"
+                print(
+                    "Grounding: "
+                    f"cited={cited} "
+                    f"canonical={len(grounding.canonical_context_ids)} "
+                    f"user_statements="
+                    f"{len(grounding.user_statement_context_ids)} "
+                    f"conversation="
+                    f"{len(grounding.conversation_context_ids)} "
+                    f"sources={len(grounding.source_context_ids)} "
+                    f"inference={grounding.uses_inference} "
+                    f"model_prior={grounding.uses_model_prior} "
+                    f"unknown={grounding.uses_unknown}"
+                )
+
         if memory_result is not None:
             print(
                 "Memory context: "
