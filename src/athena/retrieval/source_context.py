@@ -174,20 +174,42 @@ class SourceContextBuilderService:
         """
 
         actual_context_ids = tuple(item.context_id for item in bundle.items)
-        if bundle.items:
-            first_match = _CONTEXT_ID_PATTERN.fullmatch(bundle.items[0].context_id)
-            if first_match is None:
+
+        context_indices: list[int] = []
+
+        for context_id in actual_context_ids:
+            match = _CONTEXT_ID_PATTERN.fullmatch(context_id)
+
+            if match is None:
                 raise SourceContextIntegrityError(
                     "Source context ID does not use the CTX-NNN format."
                 )
-            first_index = int(first_match.group(1))
-            expected_context_ids = tuple(
-                f"CTX-{first_index + offset:03d}"
-                for offset in range(len(bundle.items))
+
+            index = int(match.group(1))
+
+            if not 1 <= index <= 999:
+                raise SourceContextIntegrityError(
+                    "Source context ID must be between CTX-001 and CTX-999."
+                )
+
+            context_indices.append(index)
+
+        if context_indices:
+            expected_indices = list(
+                range(
+                    context_indices[0],
+                    context_indices[0] + len(context_indices),
+                )
             )
+
+            if expected_indices[-1] > 999:
+                raise SourceContextIntegrityError(
+                    "Source context ID range exceeds CTX-999."
+                )
         else:
-            expected_context_ids = ()
-        if actual_context_ids != expected_context_ids:
+            expected_indices = []
+
+        if context_indices != expected_indices:
             raise SourceContextIntegrityError(
                 "Source context IDs are not contiguous and deterministic."
             )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -89,6 +90,17 @@ class UnifiedLocalChatResult:
     budget: UnifiedLocalBudgetReport
 
 
+def _canonical_text_key(value: str) -> str:
+    """Normalize canonical text consistently with HybridRetrievalService."""
+
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    normalized = "".join(
+        character if character.isalnum() else " "
+        for character in normalized
+    )
+    return " ".join(normalized.split())
+
+
 def _merge_canonical_results(
     knowledge_results: tuple[HybridSearchResult, ...],
     claim_results: tuple[HybridSearchResult, ...],
@@ -123,7 +135,7 @@ def _merge_canonical_results(
                 "Canonical merge received a non-canonical search result."
             )
 
-        key = " ".join(item.text.casefold().split())
+        key = _canonical_text_key(item.text)
 
         current = by_text.get(key)
 

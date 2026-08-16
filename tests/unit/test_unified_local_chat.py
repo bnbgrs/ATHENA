@@ -13,7 +13,7 @@ from athena.chat.unified import UnifiedLocalChatService
 from athena.model.domain import ModelInfo
 from athena.model.provenance import ModelSignature, ProcessingRun
 from athena.retrieval.archive import ArchiveHybridSearchResult
-from athena.retrieval.context import ContextBuilderService
+from athena.retrieval.context import ContextBuilderService, estimate_tokens
 from athena.retrieval.context_package import ContextPackageService
 from athena.retrieval.evidence import (
     EvidenceClass,
@@ -22,7 +22,11 @@ from athena.retrieval.evidence import (
 )
 from athena.retrieval.hybrid import HybridSearchResult
 from athena.retrieval.search import SearchEntityType
-from athena.retrieval.source_context import SourceContextBuilderService
+from athena.retrieval.source_context import (
+    SourceContextBuilderService,
+    SourceContextIntegrityError,
+    _render_source_context,
+)
 from athena.source.models import SourceAnchorRecord, SourceAnchorType
 
 
@@ -79,7 +83,7 @@ class FakeMemoryHybrid:
             revision_id=uuid.uuid4(),
             entity_type=SearchEntityType.CLAIM,
             title=None,
-            text="Berlin ist die Hauptstadt von Deutschland.",
+            text="Berlin ist die Hauptstadt von Deutschland!",
             score=0.94,
             lexical_score=0.8,
             semantic_score=0.9,
@@ -481,7 +485,7 @@ def test_unified_local_chat_composes_memory_and_source_evidence_once() -> None:
 
     result = service.send_message(
         chat_id=uuid.uuid4(),
-        content="Was wei? ATHENA lokal ?ber Berlin?",
+        content="Was wei\\u00df ATHENA lokal \\u00fcber Berlin?",
         requested_model_id="primary",
         requested_embedding_model_id="embed-model",
         max_memory_context_tokens=500,
@@ -608,7 +612,7 @@ def test_unified_canonical_merge_preserves_contradictions_and_deduplicates() -> 
         revision_id=uuid.uuid4(),
         entity_type=SearchEntityType.KNOWLEDGE,
         title="Hauptstadt von Deutschland",
-        text="M?nchen ist die Hauptstadt von Deutschland.",
+        text="M\\u00fcnchen ist die Hauptstadt von Deutschland.",
         score=0.97,
         lexical_score=0.88,
         semantic_score=0.98,
@@ -632,7 +636,7 @@ def test_unified_canonical_merge_preserves_contradictions_and_deduplicates() -> 
 
     assert set(by_text) == {
         "Berlin ist die Hauptstadt von Deutschland.",
-        "M?nchen ist die Hauptstadt von Deutschland.",
+        "M\\u00fcnchen ist die Hauptstadt von Deutschland.",
     }
 
     berlin = by_text[
@@ -673,4 +677,105 @@ def test_unified_canonical_merge_rejects_chat_results() -> None:
     else:
         raise AssertionError(
             "Unified canonical merge admitted a chat result."
+        )
+
+
+def test_source_context_verifier_rejects_ctx_zero() -> None:
+    source = archive_result()
+    anchors = FakeAnchors(source)
+    builder = SourceContextBuilderService(anchors)
+
+    valid = builder.build_from_hybrid(
+        query="Berlin",
+        results=(source,),
+        max_estimated_tokens=500,
+        max_items=1,
+    )
+
+    assert len(valid.items) == 1
+
+    invalid_items = (
+        replace(
+            valid.items[0],
+            context_id="CTX-000",
+        ),
+    )
+
+    rendered = _render_source_context(
+        query=valid.query,
+        mode=valid.mode,
+        items=invalid_items,
+    )
+
+    invalid = replace(
+        valid,
+        items=invalid_items,
+        rendered_text=rendered,
+        estimated_tokens=estimate_tokens(
+            rendered
+        ),
+    )
+
+    try:
+        builder.verify_bundle(invalid)
+    except SourceContextIntegrityError as exc:
+        assert "CTX-001 and CTX-999" in str(exc)
+    else:
+        raise AssertionError(
+            "Source context verifier accepted CTX-000."
+        )
+
+
+def test_source_context_verifier_rejects_ctx_1000_after_999() -> None:
+    source = archive_result()
+    anchors = FakeAnchors(source)
+    builder = SourceContextBuilderService(anchors)
+
+    valid = builder.build_from_hybrid(
+        query="Berlin",
+        results=(source,),
+        max_estimated_tokens=500,
+        max_items=1,
+    )
+
+    assert len(valid.items) == 1
+
+    # Duplicate the otherwise valid durable item so the old verifier would
+    # construct CTX-999, CTX-1000 as its own expected sequence.
+    invalid_items = (
+        replace(
+            valid.items[0],
+            context_id="CTX-999",
+        ),
+        replace(
+            valid.items[0],
+            context_id="CTX-1000",
+        ),
+    )
+
+    rendered = _render_source_context(
+        query=valid.query,
+        mode=valid.mode,
+        items=invalid_items,
+    )
+
+    invalid = replace(
+        valid,
+        items=invalid_items,
+        rendered_text=rendered,
+        estimated_tokens=estimate_tokens(
+            rendered
+        ),
+    )
+
+    try:
+        builder.verify_bundle(invalid)
+    except SourceContextIntegrityError as exc:
+        assert (
+            "CTX-NNN" in str(exc)
+            or "CTX-999" in str(exc)
+        )
+    else:
+        raise AssertionError(
+            "Source context verifier accepted CTX-1000."
         )
