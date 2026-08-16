@@ -496,7 +496,7 @@ def test_provider_failure_moves_job_to_controlled_waiting_state(tmp_path: Path) 
     result = app.source_analysis.step(job.job_id, lease_token=lease_token)
 
     assert result.waiting is True
-    assert result.job.blocked_reason == WaitingReason.USER.value
+    assert result.job.blocked_reason == WaitingReason.NETWORK.value
     assert app.source_analysis_repository.list_artifacts(analysis.analysis_id) == ()
     app.stop()
 
