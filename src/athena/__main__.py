@@ -270,8 +270,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Automatically choose the smallest mature local chat path: direct, "
-            "Memory/Knowledge, Raw Archive, or unified local retrieval. "
-            "Planner v1 performs no additional model call."
+            "Memory/Knowledge, Prior Research, Raw Archive, or unified local retrieval. "
+            "Planner v2 performs no additional routing-model call."
         ),
     )
     send_parser.add_argument(
@@ -1574,6 +1574,7 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
                 f"reason={plan.reason.value} "
                 f"probe={'yes' if plan.probe_query is not None else 'no'} "
                 f"canonical_hit={plan.canonical_probe_hit} "
+                f"research_hit={plan.research_probe_hit} "
                 f"archive_hit={plan.archive_probe_hit} "
                 f"contextualized={adaptive_result.contextualized} "
                 f"anchor="
@@ -1599,6 +1600,7 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
                     f"conversation="
                     f"{len(grounding.conversation_context_ids)} "
                     f"sources={len(grounding.source_context_ids)} "
+                    f"research={len(grounding.research_context_ids)} "
                     f"inference={grounding.uses_inference} "
                     f"model_prior={grounding.uses_model_prior} "
                     f"unknown={grounding.uses_unknown}"

@@ -14,6 +14,7 @@ from athena.chat.direct import DirectChatService
 from athena.chat.generation import ChatGenerationService
 from athena.chat.memory import MemoryAugmentedChatService
 from athena.chat.repository import ChatRepository
+from athena.chat.research_grounding import ResearchGroundedChatService
 from athena.chat.service import ChatService
 from athena.chat.source_grounding import SourceGroundedChatService
 from athena.chat.unified import UnifiedLocalChatService
@@ -67,6 +68,10 @@ from athena.retrieval.context import ContextBuilderService
 from athena.retrieval.context_package import ContextPackageService
 from athena.retrieval.evidence import MemoryEvidencePolicy
 from athena.retrieval.hybrid import HybridRetrievalService
+from athena.retrieval.prior_research import (
+    PriorResearchContextBuilderService,
+    PriorResearchSearchService,
+)
 from athena.retrieval.ranking import RetrievalRankingService
 from athena.retrieval.search import LocalSearchService
 from athena.retrieval.semantic import LocalSemanticSearchService
@@ -178,6 +183,21 @@ class AthenaApplication:
         self.context_packages = ContextPackageService(self.database)
         self.direct_chat = DirectChatService(
             chat_generation=self.chat_generation,
+            context_packages=self.context_packages,
+            model_runs=self.model_runs,
+        )
+        self.prior_research_search = PriorResearchSearchService(
+            self.database
+        )
+        self.prior_research_context_builder = (
+            PriorResearchContextBuilderService(
+                self.prior_research_search
+            )
+        )
+        self.research_grounded_chat = ResearchGroundedChatService(
+            chat_generation=self.chat_generation,
+            retrieval=self.prior_research_search,
+            context_builder=self.prior_research_context_builder,
             context_packages=self.context_packages,
             model_runs=self.model_runs,
         )
@@ -404,6 +424,7 @@ class AthenaApplication:
         self.adaptive_retrieval_planner = AdaptiveRetrievalPlanner(
             local_search=self.search,
             archive_search=self.archive_search,
+            prior_research=self.prior_research_search,
         )
         self.adaptive_chat = AdaptiveChatService(
             chat=self.chat,
@@ -412,6 +433,7 @@ class AthenaApplication:
             memory_chat=self.memory_chat,
             source_grounded_chat=self.source_grounded_chat,
             unified_local_chat=self.unified_local_chat,
+            research_grounded_chat=self.research_grounded_chat,
         )
         self.proposal_acceptance = ProposalAcceptanceService(
             database=self.database,

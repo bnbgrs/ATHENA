@@ -15,7 +15,7 @@ _DURABLE_PROVENANCE_SUFFIX_PATTERN = re.compile(
 
 _TURN_LOCAL_GROUNDING_MARKER_PATTERN = re.compile(
     r"(?:"
-    r"\[(?:USER-STATEMENT:|CONVERSATION:|SOURCE:)?CTX-\d{3}\]"
+    r"\[(?:USER-STATEMENT:|CONVERSATION:|SOURCE:|RESEARCH:)?CTX-\d{3}\]"
     r"|\[INFERENCE:\s*CTX-\d{3}"
     r"(?:\s*,\s*CTX-\d{3})*\s*\]"
     r")"

@@ -408,3 +408,146 @@ def test_source_evidence_requires_complete_persistent_anchor_metadata() -> None:
             revision_id=None,
             evidence_class=EvidenceClass.SOURCE,
         )
+
+
+
+def _research_ref(
+    context_id: str,
+) -> GroundingEvidenceRef:
+    return GroundingEvidenceRef(
+        context_id=context_id,
+        entity_type="research_result",
+        entity_id=uuid.uuid4(),
+        revision_id=None,
+        evidence_class=EvidenceClass.RESEARCH,
+        research_scope_id=uuid.uuid4(),
+        research_final_artifact_id=uuid.uuid4(),
+        research_content_hash=b"r" * 32,
+    )
+
+
+def test_grounding_accepts_typed_research_marker() -> None:
+    contract = GroundingContract(
+        evidence_refs=(
+            _research_ref(
+                "CTX-005"
+            ),
+        )
+    )
+
+    report = validate_grounded_answer(
+        "Prior research found this result. "
+        "[RESEARCH:CTX-005]",
+        contract=contract,
+    )
+
+    assert (
+        report.research_context_ids
+        == ("CTX-005",)
+    )
+    assert report.canonical_context_ids == ()
+    assert report.source_context_ids == ()
+
+
+def test_grounding_rejects_research_as_canonical_evidence() -> None:
+    contract = GroundingContract(
+        evidence_refs=(
+            _research_ref(
+                "CTX-005"
+            ),
+        )
+    )
+
+    with pytest.raises(
+        GroundingViolation,
+        match="cannot use the canonical",
+    ):
+        validate_grounded_answer(
+            "Wrong role. [CTX-005]",
+            contract=contract,
+        )
+
+
+def test_grounding_rejects_research_in_generic_inference() -> None:
+    contract = GroundingContract(
+        evidence_refs=(
+            _research_ref(
+                "CTX-005"
+            ),
+        )
+    )
+
+    with pytest.raises(
+        GroundingViolation,
+        match="canonical evidence only",
+    ):
+        validate_grounded_answer(
+            "Wrong inference role. "
+            "[INFERENCE:CTX-005]",
+            contract=contract,
+        )
+
+
+def test_research_grounding_manifest_keeps_stable_result_identity() -> None:
+    ref = _research_ref(
+        "CTX-005"
+    )
+
+    contract = GroundingContract(
+        evidence_refs=(ref,)
+    )
+
+    report = validate_grounded_answer(
+        "Prior research result. "
+        "[RESEARCH:CTX-005]",
+        contract=contract,
+    )
+
+    manifest = render_durable_provenance_manifest(
+        contract=contract,
+        report=report,
+    )
+
+    assert (
+        '"evidence_class":"research"'
+        in manifest
+    )
+
+    assert (
+        '"research_result_id":"'
+        + str(ref.entity_id)
+        + '"'
+        in manifest
+    )
+
+    assert (
+        '"research_scope_id":"'
+        + str(
+            ref.research_scope_id
+        )
+        + '"'
+        in manifest
+    )
+
+    assert (
+        '"content_sha256":"'
+        + (
+            b"r" * 32
+        ).hex()
+        + '"'
+        in manifest
+    )
+
+
+def test_research_grounding_ref_requires_stable_hash_and_scope() -> None:
+    with pytest.raises(
+        ValueError,
+        match="Research evidence requires",
+    ):
+        GroundingEvidenceRef(
+            context_id="CTX-005",
+            entity_type="research_result",
+            entity_id=uuid.uuid4(),
+            revision_id=None,
+            evidence_class=EvidenceClass.RESEARCH,
+        )

@@ -14,6 +14,7 @@ from athena.chat.adaptive import (
 )
 from athena.chat.models import ChatMessage, ChatThread, MessageType
 from athena.retrieval.archive import ArchiveSearchError
+from athena.retrieval.prior_research import PriorResearchSearchError
 from athena.retrieval.search import SearchEntityType
 
 
@@ -107,12 +108,53 @@ class FakeArchiveSearch:
         )
 
 
+class FakePriorResearchSearch:
+    def __init__(
+        self,
+        *,
+        texts: tuple[str, ...] = (),
+        fail: bool = False,
+    ) -> None:
+        self.texts = texts
+        self.fail = fail
+        self.calls: list[
+            tuple[str, int]
+        ] = []
+
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int,
+    ):
+        self.calls.append(
+            (
+                query,
+                limit,
+            )
+        )
+
+        if self.fail:
+            raise PriorResearchSearchError(
+                "synthetic research probe failure"
+            )
+
+        return tuple(
+            SimpleNamespace(
+                text=text,
+            )
+            for text in self.texts[:limit]
+        )
+
+
 def planner(
     *,
     knowledge_texts: tuple[str, ...] = (),
     claim_texts: tuple[str, ...] = (),
     archive_texts: tuple[str, ...] = (),
     archive_fail: bool = False,
+    research_texts: tuple[str, ...] = (),
+    research_fail: bool = False,
 ):
     local = FakeLocalSearch(
         knowledge_texts=knowledge_texts,
@@ -124,9 +166,15 @@ def planner(
         fail=archive_fail,
     )
 
+    research = FakePriorResearchSearch(
+        texts=research_texts,
+        fail=research_fail,
+    )
+
     planned = AdaptiveRetrievalPlanner(
         local_search=local,  # type: ignore[arg-type]
         archive_search=archive,  # type: ignore[arg-type]
+        prior_research=research,  # type: ignore[arg-type]
     )
 
     return planned, local, archive
@@ -505,6 +553,7 @@ def _adaptive_runtime(
     memory = FakeDelegate()
     source = FakeDelegate()
     unified = FakeDelegate()
+    research = FakeDelegate()
 
     service = AdaptiveChatService(
         chat=chat,  # type: ignore[arg-type]
@@ -513,6 +562,7 @@ def _adaptive_runtime(
         memory_chat=memory,  # type: ignore[arg-type]
         source_grounded_chat=source,  # type: ignore[arg-type]
         unified_local_chat=unified,  # type: ignore[arg-type]
+        research_grounded_chat=research,  # type: ignore[arg-type]
     )
 
     return (
@@ -1019,3 +1069,208 @@ def test_adaptive_chat_delegates_exactly_once(
             ]
             is False
         )
+
+
+
+def test_explicit_prior_research_selects_research_without_storage_probes() -> None:
+    planned, local, archive = planner()
+
+    result = planned.plan(
+        "What did our prior research find about Project Helios?"
+    )
+
+    assert (
+        result.mode
+        is AdaptiveRetrievalMode.RESEARCH
+    )
+    assert (
+        result.reason
+        is AdaptivePlanReason.EXPLICIT_RESEARCH
+    )
+    assert result.probe_query is None
+    assert local.calls == []
+    assert archive.calls == []
+
+    research = planned.prior_research
+
+    assert research is not None
+    assert research.calls == []
+
+
+def test_canonical_hit_still_beats_generic_prior_research_hit() -> None:
+    planned, _local, archive = planner(
+        knowledge_texts=(
+            "Project Helios uses launch code 2468.",
+        ),
+        research_texts=(
+            "Project Helios uses launch code 2468.",
+        ),
+    )
+
+    result = planned.plan(
+        "Which launch code does Project Helios use?"
+    )
+
+    assert (
+        result.mode
+        is AdaptiveRetrievalMode.MEMORY
+    )
+
+    research = planned.prior_research
+
+    assert research is not None
+    assert research.calls == []
+    assert archive.calls == []
+
+
+def test_prior_research_hit_runs_after_canonical_miss_before_archive() -> None:
+    planned, local, archive = planner(
+        research_texts=(
+            "Project Helios launch code 2468",
+        ),
+        archive_texts=(
+            "Project Helios launch code 9999",
+        ),
+    )
+
+    result = planned.plan(
+        "Which launch code does Project Helios use?"
+    )
+
+    assert (
+        result.mode
+        is AdaptiveRetrievalMode.RESEARCH
+    )
+    assert (
+        result.reason
+        is AdaptivePlanReason.RESEARCH_LEXICAL_HIT
+    )
+    assert result.research_probe_hit is True
+    assert len(local.calls) == 2
+
+    research = planned.prior_research
+
+    assert research is not None
+    assert len(
+        research.calls
+    ) == 1
+
+    assert archive.calls == []
+
+
+def test_prior_research_probe_failure_is_transparent_and_archive_can_win() -> None:
+    planned, _local, archive = planner(
+        research_fail=True,
+        archive_texts=(
+            "Project Helios launch code 2468",
+        ),
+    )
+
+    result = planned.plan(
+        "Which launch code does Project Helios use?"
+    )
+
+    assert (
+        result.mode
+        is AdaptiveRetrievalMode.SOURCES
+    )
+    assert result.archive_probe_hit is True
+
+    assert any(
+        warning.startswith(
+            "research_probe_unavailable:"
+        )
+        for warning in result.warnings
+    )
+
+    assert len(archive.calls) == 1
+
+
+def test_followup_inherits_explicit_prior_research_domain() -> None:
+    chat_id = uuid.uuid4()
+
+    anchor = _chat_message(
+        chat_id=chat_id,
+        sequence_no=1,
+        message_type=MessageType.USER,
+        content=(
+            "What did our prior research find "
+            "about Project Helios?"
+        ),
+    )
+
+    planned, local, archive = planner()
+
+    (
+        service,
+        direct,
+        memory,
+        source,
+        unified,
+    ) = _adaptive_runtime(
+        planned=planned,
+        chat=FakeChatHistory(
+            (anchor,)
+        ),
+    )
+
+    result = service.send_message(
+        chat_id=chat_id,
+        content="And which code exactly?",
+    )
+
+    expected_query = (
+        "What did our prior research find "
+        "about Project Helios?\n"
+        "And which code exactly?"
+    )
+
+    assert result.contextualized is True
+    assert (
+        result.context_anchor_message_id
+        == anchor.message_id
+    )
+    assert (
+        result.plan.mode
+        is AdaptiveRetrievalMode.RESEARCH
+    )
+    assert (
+        result.plan.reason
+        is AdaptivePlanReason.FOLLOWUP_INHERITED_DOMAIN
+    )
+    assert (
+        result.retrieval_query
+        == expected_query
+    )
+
+    assert direct.calls == []
+    assert memory.calls == []
+    assert source.calls == []
+    assert unified.calls == []
+
+    research = service.research_grounded_chat
+
+    assert research is not None
+    assert len(
+        research.calls
+    ) == 1
+
+    calls = research.calls
+
+    assert (
+        calls[0]["content"]
+        == "And which code exactly?"
+    )
+
+    assert (
+        calls[0]["retrieval_query"]
+        == expected_query
+    )
+
+    assert (
+        "requested_embedding_model_id"
+        not in calls[0]
+    )
+
+    assert local.calls == []
+    assert archive.calls == []

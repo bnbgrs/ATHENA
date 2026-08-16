@@ -18,6 +18,7 @@ _DIRECT_MARKER_PATTERN = re.compile(r"\[(CTX-\d{3})\]")
 _USER_STATEMENT_MARKER_PATTERN = re.compile(r"\[USER-STATEMENT:(CTX-\d{3})\]")
 _CONVERSATION_MARKER_PATTERN = re.compile(r"\[CONVERSATION:(CTX-\d{3})\]")
 _SOURCE_MARKER_PATTERN = re.compile(r"\[SOURCE:(CTX-\d{3})\]")
+_RESEARCH_MARKER_PATTERN = re.compile(r"\[RESEARCH:(CTX-\d{3})\]")
 _INFERENCE_MARKER_PATTERN = re.compile(r"\[INFERENCE:([^\]]+)\]")
 _MODEL_PRIOR_MARKER = "[MODEL-PRIOR]"
 _UNKNOWN_MARKER = "[UNKNOWN]"
@@ -27,6 +28,7 @@ _MARKER_TOKEN_PATTERN = re.compile(
     r"|\[USER-STATEMENT:CTX-\d{3}\]"
     r"|\[CONVERSATION:CTX-\d{3}\]"
     r"|\[SOURCE:CTX-\d{3}\]"
+    r"|\[RESEARCH:CTX-\d{3}\]"
     r"|\[INFERENCE:[^\]]+\]"
     r"|\[MODEL-PRIOR\]"
     r"|\[UNKNOWN\])"
@@ -52,6 +54,9 @@ class GroundingEvidenceRef:
     start_offset: int | None = None
     end_offset: int | None = None
     quoted_hash: bytes | None = None
+    research_scope_id: uuid.UUID | None = None
+    research_final_artifact_id: uuid.UUID | None = None
+    research_content_hash: bytes | None = None
 
     def __post_init__(self) -> None:
         if _CONTEXT_ID_PATTERN.fullmatch(self.context_id) is None:
@@ -69,26 +74,121 @@ class GroundingEvidenceRef:
             self.end_offset,
             self.quoted_hash,
         )
+        research_fields = (
+            self.research_scope_id,
+            self.research_final_artifact_id,
+            self.research_content_hash,
+        )
+
         if self.evidence_class is EvidenceClass.SOURCE:
             if self.entity_type != "source_anchor":
-                raise ValueError("Source evidence must identify a source_anchor entity.")
+                raise ValueError(
+                    "Source evidence must identify "
+                    "a source_anchor entity."
+                )
             if self.revision_id is not None:
-                raise ValueError("SourceAnchor evidence must not invent a revision_id.")
-            if any(value is None for value in source_fields):
-                raise ValueError("Source evidence requires complete stable anchor metadata.")
+                raise ValueError(
+                    "SourceAnchor evidence must not "
+                    "invent a revision_id."
+                )
+            if any(
+                value is None
+                for value in source_fields
+            ):
+                raise ValueError(
+                    "Source evidence requires complete "
+                    "stable anchor metadata."
+                )
+            if any(
+                value is not None
+                for value in research_fields
+            ):
+                raise ValueError(
+                    "Research metadata is only valid "
+                    "for Research evidence."
+                )
+
             assert self.start_offset is not None
             assert self.end_offset is not None
             assert self.quoted_hash is not None
-            if not 0 <= self.start_offset < self.end_offset:
-                raise ValueError("Source evidence range must be non-empty and ordered.")
+
+            if not (
+                0
+                <= self.start_offset
+                < self.end_offset
+            ):
+                raise ValueError(
+                    "Source evidence range must be "
+                    "non-empty and ordered."
+                )
+
             if len(self.quoted_hash) != 32:
-                raise ValueError("Source evidence quoted_hash must be SHA-256 bytes.")
+                raise ValueError(
+                    "Source evidence quoted_hash "
+                    "must be SHA-256 bytes."
+                )
+
+        elif self.evidence_class is EvidenceClass.RESEARCH:
+            if self.entity_type != "research_result":
+                raise ValueError(
+                    "Research evidence must identify "
+                    "a research_result entity."
+                )
+
+            if self.revision_id is not None:
+                raise ValueError(
+                    "ResearchResult evidence must not "
+                    "invent a canonical revision_id."
+                )
+
+            if any(
+                value is not None
+                for value in source_fields
+            ):
+                raise ValueError(
+                    "Source anchor metadata is only "
+                    "valid for source evidence."
+                )
+
+            if (
+                self.research_scope_id is None
+                or self.research_content_hash is None
+            ):
+                raise ValueError(
+                    "Research evidence requires "
+                    "research_scope_id and "
+                    "research_content_hash."
+                )
+
+            if len(self.research_content_hash) != 32:
+                raise ValueError(
+                    "Research evidence content hash "
+                    "must be SHA-256 bytes."
+                )
+
         else:
             if self.revision_id is None:
-                raise ValueError("Non-source grounding evidence requires a revision_id.")
-            if any(value is not None for value in source_fields):
                 raise ValueError(
-                    "Source anchor metadata is only valid for source evidence."
+                    "Non-source, non-research grounding "
+                    "evidence requires a revision_id."
+                )
+
+            if any(
+                value is not None
+                for value in source_fields
+            ):
+                raise ValueError(
+                    "Source anchor metadata is only "
+                    "valid for source evidence."
+                )
+
+            if any(
+                value is not None
+                for value in research_fields
+            ):
+                raise ValueError(
+                    "Research metadata is only valid "
+                    "for Research evidence."
                 )
 
 
@@ -132,6 +232,7 @@ class GroundingReport:
     uses_model_prior: bool
     uses_unknown: bool
     has_provenance_marker: bool
+    research_context_ids: tuple[str, ...] = ()
 
 
 _BASE_GROUNDING_INSTRUCTIONS = """ATHENA GROUNDING CONTRACT
@@ -155,6 +256,9 @@ ATHENA distinguishes evidence roles:
   persistent SourceAnchor. Cite directly supported statements as
   [SOURCE:CTX-NNN]. The model must never invent an anchor identifier or treat a
   Derived SourceChunk identifier as durable provenance.
+- research: a durable result from an earlier ATHENA ResearchScope. It is a
+  prior synthesis with preserved Research provenance, not Canonical Knowledge
+  and not one raw SourceAnchor. Cite it as [RESEARCH:CTX-NNN].
 
 Provenance rules for the answer:
 - Use [CTX-NNN] only for evidence classified as canonical.
@@ -163,11 +267,14 @@ Provenance rules for the answer:
 - Use [SOURCE:CTX-NNN] only for evidence classified as source. When a statement
   synthesizes multiple source items, include every supporting [SOURCE:CTX-NNN]
   marker on that same line.
+- Use [RESEARCH:CTX-NNN] only for evidence classified as research. Research
+  evidence must remain visibly distinct from Canonical Knowledge and Raw Archive
+  source evidence.
 - An inference that combines supplied evidence may end with a marker such as
   [INFERENCE:CTX-NNN,CTX-NNN]. Only canonical CTX identifiers are allowed in
-  this generic inference marker; source evidence, user statements, and
-  conversation records retain their typed markers and must not be promoted
-  through generic inference.
+  this generic inference marker; source evidence, prior Research, user
+  statements, and conversation records retain their typed markers and must not
+  be promoted through generic inference.
 - If retrieved evidence and allowed model knowledge are insufficient, use
   [UNKNOWN] rather than inventing a fact.
 - Never invent, renumber, or alter CTX identifiers.
@@ -236,6 +343,7 @@ def validate_grounded_answer(
     user_statement_ids = set(_USER_STATEMENT_MARKER_PATTERN.findall(normalized))
     conversation_ids = set(_CONVERSATION_MARKER_PATTERN.findall(normalized))
     source_ids = set(_SOURCE_MARKER_PATTERN.findall(normalized))
+    research_ids = set(_RESEARCH_MARKER_PATTERN.findall(normalized))
 
     inference_ids: set[str] = set()
     inference_markers = tuple(_INFERENCE_MARKER_PATTERN.findall(normalized))
@@ -258,6 +366,7 @@ def validate_grounded_answer(
         | user_statement_ids
         | conversation_ids
         | source_ids
+        | research_ids
         | inference_ids
     )
     allowed = set(contract.allowed_context_ids)
@@ -274,6 +383,7 @@ def validate_grounded_answer(
         user_statement_ids=user_statement_ids,
         conversation_ids=conversation_ids,
         source_ids=source_ids,
+        research_ids=research_ids,
     )
     _validate_inference_inputs(contract=contract, inference_ids=inference_ids)
 
@@ -291,8 +401,8 @@ def validate_grounded_answer(
         raise GroundingViolation(
             "Answer contains no ATHENA provenance marker. Expected [CTX-NNN], "
             "[USER-STATEMENT:CTX-NNN], [CONVERSATION:CTX-NNN], "
-            "[SOURCE:CTX-NNN], [INFERENCE:...], [UNKNOWN], or an explicitly "
-            "allowed [MODEL-PRIOR]."
+            "[SOURCE:CTX-NNN], [RESEARCH:CTX-NNN], [INFERENCE:...], "
+            "[UNKNOWN], or an explicitly allowed [MODEL-PRIOR]."
         )
 
     if uses_model_prior and not contract.allow_model_prior:
@@ -335,6 +445,14 @@ def validate_grounded_answer(
             if contract.evidence_for(context_id).evidence_class is EvidenceClass.SOURCE
         )
     )
+    research_context_ids = tuple(
+        sorted(
+            context_id
+            for context_id in cited_ids
+            if contract.evidence_for(context_id).evidence_class
+            is EvidenceClass.RESEARCH
+        )
+    )
 
     return GroundingReport(
         cited_context_ids=tuple(sorted(cited_ids)),
@@ -347,6 +465,7 @@ def validate_grounded_answer(
         uses_model_prior=uses_model_prior,
         uses_unknown=uses_unknown,
         has_provenance_marker=has_marker,
+        research_context_ids=research_context_ids,
     )
 
 
@@ -444,8 +563,9 @@ def _validate_inference_inputs(
     if invalid:
         raise GroundingViolation(
             "Generic [INFERENCE:...] may reference canonical evidence only. "
-            "Source evidence, user statements, and conversation records retain "
-            "their typed roles: " + ", ".join(invalid)
+            "Source evidence, Research evidence, user statements, and "
+            "conversation records retain their typed roles: "
+            + ", ".join(invalid)
         )
 
 
@@ -456,17 +576,25 @@ def _validate_typed_markers(
     user_statement_ids: set[str],
     conversation_ids: set[str],
     source_ids: set[str],
+    research_ids: set[str],
 ) -> None:
     for context_id in direct_ids:
-        evidence = contract.evidence_for(context_id)
+        evidence = contract.evidence_for(
+            context_id
+        )
+
         if evidence.evidence_class is not EvidenceClass.CANONICAL:
             raise GroundingViolation(
-                f"{context_id} is {evidence.evidence_class.value} evidence and "
+                f"{context_id} is "
+                f"{evidence.evidence_class.value} evidence and "
                 "cannot use the canonical [CTX-NNN] marker."
             )
 
     for context_id in user_statement_ids:
-        evidence = contract.evidence_for(context_id)
+        evidence = contract.evidence_for(
+            context_id
+        )
+
         if evidence.evidence_class is not EvidenceClass.USER_STATEMENT:
             raise GroundingViolation(
                 f"{context_id} is not user_statement evidence and cannot use "
@@ -474,7 +602,10 @@ def _validate_typed_markers(
             )
 
     for context_id in conversation_ids:
-        evidence = contract.evidence_for(context_id)
+        evidence = contract.evidence_for(
+            context_id
+        )
+
         if evidence.evidence_class is not EvidenceClass.CONVERSATION_RECORD:
             raise GroundingViolation(
                 f"{context_id} is not conversation_record evidence and cannot use "
@@ -482,11 +613,25 @@ def _validate_typed_markers(
             )
 
     for context_id in source_ids:
-        evidence = contract.evidence_for(context_id)
+        evidence = contract.evidence_for(
+            context_id
+        )
+
         if evidence.evidence_class is not EvidenceClass.SOURCE:
             raise GroundingViolation(
                 f"{context_id} is not source evidence and cannot use "
                 "[SOURCE:CTX-NNN]."
+            )
+
+    for context_id in research_ids:
+        evidence = contract.evidence_for(
+            context_id
+        )
+
+        if evidence.evidence_class is not EvidenceClass.RESEARCH:
+            raise GroundingViolation(
+                f"{context_id} is not research evidence and cannot use "
+                "[RESEARCH:CTX-NNN]."
             )
 
 
@@ -537,6 +682,21 @@ def _durable_evidence_payload(item: GroundingEvidenceRef) -> dict[str, object]:
                 "start_offset": item.start_offset,
                 "end_offset": item.end_offset,
                 "quoted_sha256": item.quoted_hash.hex(),
+            }
+        )
+    elif item.evidence_class is EvidenceClass.RESEARCH:
+        assert item.research_scope_id is not None
+        assert item.research_content_hash is not None
+        payload.update(
+            {
+                "research_result_id": str(item.entity_id),
+                "research_scope_id": str(item.research_scope_id),
+                "final_artifact_id": (
+                    None
+                    if item.research_final_artifact_id is None
+                    else str(item.research_final_artifact_id)
+                ),
+                "content_sha256": item.research_content_hash.hex(),
             }
         )
     return payload
