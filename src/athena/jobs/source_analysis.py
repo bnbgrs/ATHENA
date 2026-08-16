@@ -223,9 +223,10 @@ class DurableSourceAnalysisWorker:
 
         try:
             model = self.service.assert_model_unchanged(job, analysis)
+        except ProviderUnavailableError as exc:
+            return self._wait_network(job, lease_token, analysis, exc)
         except (
             SourceAnalysisModelDriftError,
-            ProviderUnavailableError,
             ModelSelectionError,
         ) as exc:
             return self._wait_user(job, lease_token, analysis, exc)
@@ -250,7 +251,9 @@ class DurableSourceAnalysisWorker:
             return self._split_pending(job, lease_token, analysis, pending)
         except ProviderOutputLimitError:
             return self._split_pending(job, lease_token, analysis, pending)
-        except (ProviderUnavailableError, ModelProviderError, SourceAnalysisOutputError) as exc:
+        except ProviderUnavailableError as exc:
+            return self._wait_network(job, lease_token, analysis, exc)
+        except (ModelProviderError, SourceAnalysisOutputError) as exc:
             return self._wait_user(job, lease_token, analysis, exc)
         except SourceAnalysisFenceError as exc:
             raise JobLeaseError(str(exc)) from exc
@@ -326,6 +329,37 @@ class DurableSourceAnalysisWorker:
             "split",
             checkpoint,
             artifact_id=None,
+        )
+
+    def _wait_network(
+        self,
+        job: JobRecord,
+        lease_token: bytes,
+        analysis: SourceAnalysisRecord,
+        exc: Exception,
+    ) -> SourceAnalysisStepResult:
+        checkpoint = self._checkpoint(
+            job,
+            lease_token,
+            analysis,
+            current_stage="analysis_waiting_network",
+            map_planned=True,
+            last_input=None,
+            last_output={"reason": type(exc).__name__, "detail": str(exc)[:500]},
+        )
+        waiting = self.jobs.wait(
+            job.job_id,
+            lease_token=lease_token,
+            reason=WaitingReason.NETWORK,
+        )
+        return SourceAnalysisStepResult(
+            job=waiting,
+            analysis=self.service.repository.get_analysis(analysis.analysis_id),
+            completed_stage="waiting_network",
+            checkpoint=checkpoint,
+            artifact_id=None,
+            done=False,
+            waiting=True,
         )
 
     def _wait_user(

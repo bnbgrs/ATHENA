@@ -245,9 +245,10 @@ class DurableSourceHierarchicalExtractionWorker:
 
         try:
             model = self.service.assert_model_unchanged(job, extraction)
+        except ProviderUnavailableError as exc:
+            return self._wait_network(job, lease_token, extraction, exc)
         except (
             SourceHierarchicalExtractionModelDriftError,
-            ProviderUnavailableError,
             ModelSelectionError,
             ModelProviderError,
         ) as exc:
@@ -268,8 +269,9 @@ class DurableSourceHierarchicalExtractionWorker:
             )
         except ProviderContextLimitError as exc:
             return self._wait_user(job, lease_token, extraction, exc)
+        except ProviderUnavailableError as exc:
+            return self._wait_network(job, lease_token, extraction, exc)
         except (
-            ProviderUnavailableError,
             ModelProviderError,
             SourceHierarchicalExtractionOutputError,
         ) as exc:
@@ -300,7 +302,6 @@ class DurableSourceHierarchicalExtractionWorker:
             artifact_id=artifact.artifact_id,
             processing_run_id=artifact.processing_run_id,
         )
-
 
     def _finalize(
         self,
@@ -340,6 +341,37 @@ class DurableSourceHierarchicalExtractionWorker:
             checkpoint,
             artifact_id=final_artifact.artifact_id,
             processing_run_id=result.processing_run.processing_run_id,
+        )
+
+    def _wait_network(
+        self,
+        job: JobRecord,
+        lease_token: bytes,
+        extraction: SourceHierarchicalExtractionRecord,
+        exc: Exception,
+    ) -> SourceHierarchicalExtractionStepResult:
+        checkpoint = self._checkpoint(
+            job,
+            lease_token,
+            extraction,
+            current_stage="extraction_waiting_network",
+            last_input={"extraction_id": str(extraction.extraction_id)},
+            last_output={"error": f"{type(exc).__name__}: {exc}"},
+        )
+        waiting = self.jobs.wait(
+            job.job_id,
+            lease_token=lease_token,
+            reason=WaitingReason.NETWORK,
+        )
+        return SourceHierarchicalExtractionStepResult(
+            job=waiting,
+            extraction=extraction,
+            completed_stage=None,
+            checkpoint=checkpoint,
+            artifact_id=None,
+            processing_run_id=None,
+            done=False,
+            waiting=True,
         )
 
     def _wait_user(
