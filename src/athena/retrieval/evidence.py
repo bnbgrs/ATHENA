@@ -23,6 +23,7 @@ class EvidenceClass(str, Enum):
     CONVERSATION_RECORD = "conversation_record"
     SOURCE = "source"
     RESEARCH = "research"
+    NEWS = "news"
 
 
 class MemoryEvidencePolicyError(RuntimeError):

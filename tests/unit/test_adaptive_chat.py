@@ -14,6 +14,7 @@ from athena.chat.adaptive import (
 )
 from athena.chat.models import ChatMessage, ChatThread, MessageType
 from athena.retrieval.archive import ArchiveSearchError
+from athena.retrieval.news_events import NewsEventSearchError
 from athena.retrieval.prior_research import PriorResearchSearchError
 from athena.retrieval.search import SearchEntityType
 
@@ -108,6 +109,45 @@ class FakeArchiveSearch:
         )
 
 
+class FakeNewsEventSearch:
+    def __init__(
+        self,
+        *,
+        texts: tuple[str, ...] = (),
+        fail: bool = False,
+    ) -> None:
+        self.texts = texts
+        self.fail = fail
+        self.calls: list[
+            tuple[str, int]
+        ] = []
+
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int,
+    ):
+        self.calls.append(
+            (
+                query,
+                limit,
+            )
+        )
+
+        if self.fail:
+            raise NewsEventSearchError(
+                "synthetic News probe failure"
+            )
+
+        return tuple(
+            SimpleNamespace(
+                text=text,
+            )
+            for text in self.texts[:limit]
+        )
+
+
 class FakePriorResearchSearch:
     def __init__(
         self,
@@ -155,6 +195,8 @@ def planner(
     archive_fail: bool = False,
     research_texts: tuple[str, ...] = (),
     research_fail: bool = False,
+    news_texts: tuple[str, ...] = (),
+    news_fail: bool = False,
 ):
     local = FakeLocalSearch(
         knowledge_texts=knowledge_texts,
@@ -171,10 +213,16 @@ def planner(
         fail=research_fail,
     )
 
+    news = FakeNewsEventSearch(
+        texts=news_texts,
+        fail=news_fail,
+    )
+
     planned = AdaptiveRetrievalPlanner(
         local_search=local,  # type: ignore[arg-type]
         archive_search=archive,  # type: ignore[arg-type]
         prior_research=research,  # type: ignore[arg-type]
+        news_events=news,  # type: ignore[arg-type]
     )
 
     return planned, local, archive
@@ -554,6 +602,7 @@ def _adaptive_runtime(
     source = FakeDelegate()
     unified = FakeDelegate()
     research = FakeDelegate()
+    news = FakeDelegate()
 
     service = AdaptiveChatService(
         chat=chat,  # type: ignore[arg-type]
@@ -563,6 +612,7 @@ def _adaptive_runtime(
         source_grounded_chat=source,  # type: ignore[arg-type]
         unified_local_chat=unified,  # type: ignore[arg-type]
         research_grounded_chat=research,  # type: ignore[arg-type]
+        news_grounded_chat=news,  # type: ignore[arg-type]
     )
 
     return (
@@ -1260,6 +1310,234 @@ def test_followup_inherits_explicit_prior_research_domain() -> None:
     assert (
         calls[0]["content"]
         == "And which code exactly?"
+    )
+
+    assert (
+        calls[0]["retrieval_query"]
+        == expected_query
+    )
+
+    assert (
+        "requested_embedding_model_id"
+        not in calls[0]
+    )
+
+    assert local.calls == []
+    assert archive.calls == []
+
+
+
+def test_explicit_news_selects_news_without_storage_probes() -> None:
+    planned, local, archive = planner()
+
+    result = planned.plan(
+        "Was sind die neuesten Nachrichten zu Project Helios?"
+    )
+
+    assert (
+        result.mode
+        is AdaptiveRetrievalMode.NEWS
+    )
+    assert (
+        result.reason
+        is AdaptivePlanReason.EXPLICIT_NEWS
+    )
+    assert result.probe_query is None
+    assert local.calls == []
+    assert archive.calls == []
+
+    research = planned.prior_research
+    news = planned.news_events
+
+    assert research is not None
+    assert news is not None
+    assert research.calls == []
+    assert news.calls == []
+
+
+def test_explicit_source_remains_more_specific_than_news_wording() -> None:
+    planned, _local, _archive = planner()
+
+    result = planned.plan(
+        "Welche Nachrichten stehen in diesem PDF?"
+    )
+
+    assert (
+        result.mode
+        is AdaptiveRetrievalMode.SOURCES
+    )
+
+
+def test_prior_research_hit_still_beats_generic_news_hit() -> None:
+    planned, _local, archive = planner(
+        research_texts=(
+            "Project Helios launch code 2468",
+        ),
+        news_texts=(
+            "Project Helios launch code 5931",
+        ),
+    )
+
+    result = planned.plan(
+        "Which launch code does Project Helios use?"
+    )
+
+    assert (
+        result.mode
+        is AdaptiveRetrievalMode.RESEARCH
+    )
+
+    news = planned.news_events
+
+    assert news is not None
+    assert news.calls == []
+    assert archive.calls == []
+
+
+def test_news_hit_runs_after_research_miss_before_archive() -> None:
+    planned, local, archive = planner(
+        news_texts=(
+            "Project Helios launch code 5931",
+        ),
+        archive_texts=(
+            "Project Helios launch code 9999",
+        ),
+    )
+
+    result = planned.plan(
+        "Which launch code does Project Helios use?"
+    )
+
+    assert (
+        result.mode
+        is AdaptiveRetrievalMode.NEWS
+    )
+    assert (
+        result.reason
+        is AdaptivePlanReason.NEWS_LEXICAL_HIT
+    )
+    assert result.news_probe_hit is True
+    assert len(local.calls) == 2
+
+    research = planned.prior_research
+    news = planned.news_events
+
+    assert research is not None
+    assert news is not None
+    assert len(
+        research.calls
+    ) == 1
+    assert len(
+        news.calls
+    ) == 1
+    assert archive.calls == []
+
+
+def test_news_probe_failure_is_transparent_and_archive_can_win() -> None:
+    planned, _local, archive = planner(
+        news_fail=True,
+        archive_texts=(
+            "Project Helios launch code 5931",
+        ),
+    )
+
+    result = planned.plan(
+        "Which launch code does Project Helios use?"
+    )
+
+    assert (
+        result.mode
+        is AdaptiveRetrievalMode.SOURCES
+    )
+    assert result.archive_probe_hit is True
+
+    assert any(
+        warning.startswith(
+            "news_probe_unavailable:"
+        )
+        for warning in result.warnings
+    )
+
+    assert len(
+        archive.calls
+    ) == 1
+
+
+def test_followup_inherits_explicit_news_domain() -> None:
+    chat_id = uuid.uuid4()
+
+    anchor = _chat_message(
+        chat_id=chat_id,
+        sequence_no=1,
+        message_type=MessageType.USER,
+        content=(
+            "Was sind die neuesten Nachrichten "
+            "zu Project Helios?"
+        ),
+    )
+
+    planned, local, archive = planner()
+
+    (
+        service,
+        direct,
+        memory,
+        source,
+        unified,
+    ) = _adaptive_runtime(
+        planned=planned,
+        chat=FakeChatHistory(
+            (anchor,)
+        ),
+    )
+
+    result = service.send_message(
+        chat_id=chat_id,
+        content="Und welcher Startcode genau?",
+    )
+
+    expected_query = (
+        "Was sind die neuesten Nachrichten "
+        "zu Project Helios?\n"
+        "Und welcher Startcode genau?"
+    )
+
+    assert result.contextualized is True
+    assert (
+        result.context_anchor_message_id
+        == anchor.message_id
+    )
+    assert (
+        result.plan.mode
+        is AdaptiveRetrievalMode.NEWS
+    )
+    assert (
+        result.plan.reason
+        is AdaptivePlanReason.FOLLOWUP_INHERITED_DOMAIN
+    )
+    assert (
+        result.retrieval_query
+        == expected_query
+    )
+
+    assert direct.calls == []
+    assert memory.calls == []
+    assert source.calls == []
+    assert unified.calls == []
+
+    news = service.news_grounded_chat
+
+    assert news is not None
+
+    calls = news.calls
+
+    assert len(
+        calls
+    ) == 1
+
+    assert (
+        calls[0]["content"]
+        == "Und welcher Startcode genau?"
     )
 
     assert (

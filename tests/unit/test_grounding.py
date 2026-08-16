@@ -551,3 +551,171 @@ def test_research_grounding_ref_requires_stable_hash_and_scope() -> None:
             revision_id=None,
             evidence_class=EvidenceClass.RESEARCH,
         )
+
+
+
+def _news_ref(
+    context_id: str,
+) -> GroundingEvidenceRef:
+    return GroundingEvidenceRef(
+        context_id=context_id,
+        entity_type="news_event",
+        entity_id=uuid.uuid4(),
+        revision_id=None,
+        evidence_class=EvidenceClass.NEWS,
+        news_run_id=uuid.uuid4(),
+        news_research_result_id=uuid.uuid4(),
+        news_finding_ordinal=2,
+        news_finding_hash=b"n" * 32,
+        news_source_ids=(
+            uuid.uuid4(),
+            uuid.uuid4(),
+        ),
+    )
+
+
+def test_grounding_accepts_typed_news_marker() -> None:
+    contract = GroundingContract(
+        evidence_refs=(
+            _news_ref(
+                "CTX-006"
+            ),
+        )
+    )
+
+    report = validate_grounded_answer(
+        "ATHENA News recorded this event. "
+        "[NEWS:CTX-006]",
+        contract=contract,
+    )
+
+    assert (
+        report.news_context_ids
+        == ("CTX-006",)
+    )
+    assert report.canonical_context_ids == ()
+    assert report.research_context_ids == ()
+    assert report.source_context_ids == ()
+
+
+def test_grounding_rejects_news_as_canonical_evidence() -> None:
+    contract = GroundingContract(
+        evidence_refs=(
+            _news_ref(
+                "CTX-006"
+            ),
+        )
+    )
+
+    with pytest.raises(
+        GroundingViolation,
+        match="cannot use the canonical",
+    ):
+        validate_grounded_answer(
+            "Wrong role. [CTX-006]",
+            contract=contract,
+        )
+
+
+def test_grounding_rejects_news_in_generic_inference() -> None:
+    contract = GroundingContract(
+        evidence_refs=(
+            _news_ref(
+                "CTX-006"
+            ),
+        )
+    )
+
+    with pytest.raises(
+        GroundingViolation,
+        match="canonical evidence only",
+    ):
+        validate_grounded_answer(
+            "Wrong inference role. "
+            "[INFERENCE:CTX-006]",
+            contract=contract,
+        )
+
+
+def test_news_grounding_manifest_keeps_stable_event_identity() -> None:
+    ref = _news_ref(
+        "CTX-006"
+    )
+
+    contract = GroundingContract(
+        evidence_refs=(ref,)
+    )
+
+    report = validate_grounded_answer(
+        "ATHENA News recorded this event. "
+        "[NEWS:CTX-006]",
+        contract=contract,
+    )
+
+    manifest = render_durable_provenance_manifest(
+        contract=contract,
+        report=report,
+    )
+
+    assert (
+        '"evidence_class":"news"'
+        in manifest
+    )
+
+    assert (
+        '"news_event_id":"'
+        + str(ref.entity_id)
+        + '"'
+        in manifest
+    )
+
+    assert (
+        '"news_run_id":"'
+        + str(
+            ref.news_run_id
+        )
+        + '"'
+        in manifest
+    )
+
+    assert (
+        '"research_result_id":"'
+        + str(
+            ref.news_research_result_id
+        )
+        + '"'
+        in manifest
+    )
+
+    assert (
+        '"finding_ordinal":2'
+        in manifest
+    )
+
+    assert (
+        '"finding_sha256":"'
+        + (
+            b"n" * 32
+        ).hex()
+        + '"'
+        in manifest
+    )
+
+    assert (
+        '"source_ids":['
+        in manifest
+    )
+
+
+def test_news_grounding_ref_requires_stable_finding_identity() -> None:
+    with pytest.raises(
+        ValueError,
+        match="News evidence requires",
+    ):
+        GroundingEvidenceRef(
+            context_id="CTX-006",
+            entity_type="news_event",
+            entity_id=uuid.uuid4(),
+            revision_id=None,
+            evidence_class=EvidenceClass.NEWS,
+        )

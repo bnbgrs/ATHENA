@@ -43,7 +43,8 @@ def test_strip_turn_local_grounding_markers_removes_all_ctx_marker_forms() -> No
         "conversation [CONVERSATION:CTX-003], "
         "source [SOURCE:CTX-004], "
         "research [RESEARCH:CTX-005], "
-        "inference [INFERENCE:CTX-006,CTX-007]. "
+        "news [NEWS:CTX-006], "
+        "inference [INFERENCE:CTX-007,CTX-008]. "
         "[MODEL-PRIOR] [UNKNOWN]"
     )
 
@@ -86,6 +87,7 @@ def test_canonical_promotion_trace_removes_all_grounding_control_annotations() -
         "Canonical fact [CTX-001]. "
         "Source fact [SOURCE:CTX-002]. "
         "Research fact [RESEARCH:CTX-003]. "
+        "News fact [NEWS:CTX-004]. "
         "Combined fact [INFERENCE:CTX-001]. "
         "Prior fact [MODEL-PRIOR]. "
         "Missing fact [UNKNOWN].\n\n"
@@ -101,6 +103,7 @@ def test_canonical_promotion_trace_removes_all_grounding_control_annotations() -
         "Canonical fact. "
         "Source fact. "
         "Research fact. "
+        "News fact. "
         "Combined fact. "
         "Prior fact. "
         "Missing fact."

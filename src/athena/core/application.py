@@ -13,6 +13,7 @@ from athena.chat.adaptive import (
 from athena.chat.direct import DirectChatService
 from athena.chat.generation import ChatGenerationService
 from athena.chat.memory import MemoryAugmentedChatService
+from athena.chat.news_grounding import NewsGroundedChatService
 from athena.chat.repository import ChatRepository
 from athena.chat.research_grounding import ResearchGroundedChatService
 from athena.chat.service import ChatService
@@ -68,6 +69,10 @@ from athena.retrieval.context import ContextBuilderService
 from athena.retrieval.context_package import ContextPackageService
 from athena.retrieval.evidence import MemoryEvidencePolicy
 from athena.retrieval.hybrid import HybridRetrievalService
+from athena.retrieval.news_events import (
+    NewsEventContextBuilderService,
+    NewsEventSearchService,
+)
 from athena.retrieval.prior_research import (
     PriorResearchContextBuilderService,
     PriorResearchSearchService,
@@ -198,6 +203,19 @@ class AthenaApplication:
             chat_generation=self.chat_generation,
             retrieval=self.prior_research_search,
             context_builder=self.prior_research_context_builder,
+            context_packages=self.context_packages,
+            model_runs=self.model_runs,
+        )
+        self.news_event_search = NewsEventSearchService(
+            self.database
+        )
+        self.news_event_context_builder = NewsEventContextBuilderService(
+            self.news_event_search
+        )
+        self.news_grounded_chat = NewsGroundedChatService(
+            chat_generation=self.chat_generation,
+            retrieval=self.news_event_search,
+            context_builder=self.news_event_context_builder,
             context_packages=self.context_packages,
             model_runs=self.model_runs,
         )
@@ -425,6 +443,7 @@ class AthenaApplication:
             local_search=self.search,
             archive_search=self.archive_search,
             prior_research=self.prior_research_search,
+            news_events=self.news_event_search,
         )
         self.adaptive_chat = AdaptiveChatService(
             chat=self.chat,
@@ -434,6 +453,7 @@ class AthenaApplication:
             source_grounded_chat=self.source_grounded_chat,
             unified_local_chat=self.unified_local_chat,
             research_grounded_chat=self.research_grounded_chat,
+            news_grounded_chat=self.news_grounded_chat,
         )
         self.proposal_acceptance = ProposalAcceptanceService(
             database=self.database,

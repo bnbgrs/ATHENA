@@ -19,6 +19,10 @@ from athena.chat.memory import (
     MemoryChatGenerationResult,
 )
 from athena.chat.models import ChatMessage, MessageType
+from athena.chat.news_grounding import (
+    NewsGroundedChatResult,
+    NewsGroundedChatService,
+)
 from athena.chat.research_grounding import (
     ResearchGroundedChatResult,
     ResearchGroundedChatService,
@@ -37,6 +41,10 @@ from athena.retrieval.archive import (
     ArchiveSearchError,
     ArchiveSearchService,
 )
+from athena.retrieval.news_events import (
+    NewsEventSearchError,
+    NewsEventSearchService,
+)
 from athena.retrieval.prior_research import (
     PriorResearchSearchError,
     PriorResearchSearchService,
@@ -54,6 +62,7 @@ class AdaptiveRetrievalMode(str, Enum):
     DIRECT = "direct"
     MEMORY = "memory"
     RESEARCH = "research"
+    NEWS = "news"
     SOURCES = "sources"
     UNIFIED = "unified"
 
@@ -65,9 +74,11 @@ class AdaptivePlanReason(str, Enum):
     EXPLICIT_SOURCE = "explicit_source"
     EXPLICIT_MEMORY = "explicit_memory"
     EXPLICIT_RESEARCH = "explicit_research"
+    EXPLICIT_NEWS = "explicit_news"
     FOLLOWUP_INHERITED_DOMAIN = "followup_inherited_domain"
     CANONICAL_LEXICAL_HIT = "canonical_lexical_hit"
     RESEARCH_LEXICAL_HIT = "research_lexical_hit"
+    NEWS_LEXICAL_HIT = "news_lexical_hit"
     ARCHIVE_LEXICAL_HIT = "archive_lexical_hit"
     NO_LOCAL_LEXICAL_HIT = "no_local_lexical_hit"
     NO_INFORMATIVE_QUERY_TERMS = "no_informative_query_terms"
@@ -84,6 +95,7 @@ class AdaptiveRetrievalPlan:
     archive_probe_hit: bool
     warnings: tuple[str, ...]
     research_probe_hit: bool = False
+    news_probe_hit: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,8 +110,24 @@ class AdaptiveChatResult:
     direct_result: DirectChatGenerationResult | None = None
     memory_result: MemoryChatGenerationResult | None = None
     research_result: ResearchGroundedChatResult | None = None
+    news_result: NewsGroundedChatResult | None = None
     source_result: SourceGroundedChatResult | None = None
     unified_result: UnifiedLocalChatResult | None = None
+
+
+_NEWS_PATTERNS = (
+    re.compile(
+        r"\b(?:news|nachrichten|meldung\w*|schlagzeilen|headlines)\b"
+    ),
+    re.compile(
+        r"\b(?:aktuell\w*|neueste\w*|latest|recent)\b"
+        r".*\b(?:entwicklung\w*|developments?|news|nachrichten)\b"
+    ),
+    re.compile(
+        r"\b(?:entwicklung\w*|developments?)\b"
+        r".*\b(?:aktuell\w*|neueste\w*|latest|recent)\b"
+    ),
+)
 
 
 _RESEARCH_PATTERNS = (
@@ -133,7 +161,7 @@ _SOURCE_PATTERNS = (
     ),
     re.compile(
         r"\b(?:im|in|aus|laut)\s+"
-        r"(?:(?:dem|der|den|einem|einer)\s+)?"
+        r"(?:(?:dem|der|den|einem|einer|diesem|dieser|diesen)\s+)?"
         r"(?:pdf|dokument\w*|datei\w*|bericht\w*|quelle\w*)\b"
     ),
     re.compile(
@@ -400,10 +428,12 @@ class AdaptiveRetrievalPlanner:
         local_search: LocalSearchService,
         archive_search: ArchiveSearchService,
         prior_research: PriorResearchSearchService | None = None,
+        news_events: NewsEventSearchService | None = None,
     ) -> None:
         self.local_search = local_search
         self.archive_search = archive_search
         self.prior_research = prior_research
+        self.news_events = news_events
 
     def explicit_plan(
         self,
@@ -428,6 +458,11 @@ class AdaptiveRetrievalPlanner:
         explicit_research = _matches_any(
             normalized,
             _RESEARCH_PATTERNS,
+        )
+
+        explicit_news = _matches_any(
+            normalized,
+            _NEWS_PATTERNS,
         )
 
         if explicit_memory and explicit_source:
@@ -459,6 +494,17 @@ class AdaptiveRetrievalPlanner:
                 canonical_probe_hit=False,
                 archive_probe_hit=False,
                 warnings=(),
+            )
+
+        if explicit_news:
+            return AdaptiveRetrievalPlan(
+                mode=AdaptiveRetrievalMode.NEWS,
+                reason=AdaptivePlanReason.EXPLICIT_NEWS,
+                probe_query=None,
+                canonical_probe_hit=False,
+                archive_probe_hit=False,
+                warnings=(),
+                news_probe_hit=False,
             )
 
         if explicit_memory:
@@ -585,6 +631,35 @@ class AdaptiveRetrievalPlanner:
                 research_probe_hit=True,
             )
 
+        news_hit = False
+
+        if self.news_events is not None:
+            try:
+                news = self.news_events.search(
+                    probe_query,
+                    limit=5,
+                )
+                news_hit = bool(
+                    news
+                )
+            except NewsEventSearchError as exc:
+                warnings.append(
+                    "news_probe_unavailable:"
+                    f"{type(exc).__name__}:{exc}"
+                )
+
+        if news_hit:
+            return AdaptiveRetrievalPlan(
+                mode=AdaptiveRetrievalMode.NEWS,
+                reason=AdaptivePlanReason.NEWS_LEXICAL_HIT,
+                probe_query=probe_query,
+                canonical_probe_hit=False,
+                archive_probe_hit=False,
+                warnings=tuple(warnings),
+                research_probe_hit=False,
+                news_probe_hit=True,
+            )
+
         archive_hit = False
 
         try:
@@ -641,6 +716,7 @@ class AdaptiveChatService:
         source_grounded_chat: SourceGroundedChatService,
         unified_local_chat: UnifiedLocalChatService,
         research_grounded_chat: ResearchGroundedChatService | None = None,
+        news_grounded_chat: NewsGroundedChatService | None = None,
     ) -> None:
         self.chat = chat
         self.planner = planner
@@ -649,6 +725,7 @@ class AdaptiveChatService:
         self.source_grounded_chat = source_grounded_chat
         self.unified_local_chat = unified_local_chat
         self.research_grounded_chat = research_grounded_chat
+        self.news_grounded_chat = news_grounded_chat
 
     def send_message(
         self,
@@ -664,6 +741,8 @@ class AdaptiveChatService:
         max_source_context_items: int = 8,
         max_research_context_tokens: int = 1200,
         max_research_context_items: int = 8,
+        max_news_context_tokens: int = 1200,
+        max_news_context_items: int = 8,
         memory_scope_kind: MemoryScopeKind | None = None,
         memory_scope_entity_id: uuid.UUID | None = None,
         effective_context_limit: int | None = None,
@@ -827,6 +906,35 @@ class AdaptiveChatService:
                 contextualized=contextualized,
                 context_anchor_message_id=anchor_id,
                 research_result=research_result,
+            )
+
+        if plan.mode is AdaptiveRetrievalMode.NEWS:
+            if self.news_grounded_chat is None:
+                raise RuntimeError(
+                    "Adaptive News route is not configured."
+                )
+
+            news_result = self.news_grounded_chat.send_message(
+                chat_id=chat_id,
+                content=content,
+                retrieval_query=retrieval_override,
+                requested_model_id=requested_model_id,
+                max_context_tokens=max_news_context_tokens,
+                max_context_items=max_news_context_items,
+                effective_context_limit=effective_context_limit,
+                output_reserve=output_reserve,
+                safety_margin=safety_margin,
+                allow_model_prior=allow_model_prior,
+                on_delta=on_delta,
+            )
+
+            return AdaptiveChatResult(
+                plan=plan,
+                generation=news_result.generation,
+                retrieval_query=retrieval_query,
+                contextualized=contextualized,
+                context_anchor_message_id=anchor_id,
+                news_result=news_result,
             )
 
         if plan.mode is AdaptiveRetrievalMode.SOURCES:
