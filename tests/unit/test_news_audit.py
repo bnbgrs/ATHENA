@@ -1264,8 +1264,31 @@ def test_v29_migration_backfills_legacy_event_assessment_without_model(
 
     try:
         # This test first creates the current schema and then reconstructs
-        # the historical v29 boundary. Remove every additive v31 object
+        # the historical v29 boundary. Remove every additive v31/v32 object
         # before declaring the database to be v29.
+        # Reconstruct a pre-v32 boundary: remove every additive
+        # Protected-Content object before downgrading metadata.
+        legacy.execute(
+            "DROP TABLE "
+            "protected_blob_envelopes"
+        )
+        legacy.execute(
+            "DROP TABLE "
+            "protected_payloads"
+        )
+        legacy.execute(
+            "DROP TABLE "
+            "protection_scope_keys"
+        )
+        legacy.execute(
+            "DROP TABLE "
+            "protection_scopes"
+        )
+        legacy.execute(
+            "DROP TABLE "
+            "key_slots"
+        )
+
         legacy.execute(
             "DROP TRIGGER "
             "trg_blob_records_archive_replication_outbox"

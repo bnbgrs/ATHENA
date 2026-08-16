@@ -47,7 +47,8 @@ NEWS_OPERATIONAL_SCHEMA_VERSION = 28
 PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION = 29
 NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION = 30
 ARCHIVE_REPLICATION_SCHEMA_VERSION = 31
-SCHEMA_VERSION = ARCHIVE_REPLICATION_SCHEMA_VERSION
+PROTECTED_CONTENT_SCHEMA_VERSION = 32
+SCHEMA_VERSION = PROTECTED_CONTENT_SCHEMA_VERSION
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
@@ -85,6 +86,9 @@ NEWS_EVENT_ELIGIBILITY_MIGRATION_ID = (
 )
 ARCHIVE_REPLICATION_MIGRATION_ID = (
     "0031_archive_replication_outbox"
+)
+PROTECTED_CONTENT_MIGRATION_ID = (
+    "0032_protected_content_foundation"
 )
 
 
@@ -181,6 +185,7 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         NEWS_OPERATIONAL_SCHEMA_VERSION,
         PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION,
         NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION,
+        ARCHIVE_REPLICATION_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -350,8 +355,18 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
             ARCHIVE_REPLICATION_SCHEMA_VERSION
         )
 
+    if (
+        existing_user_version
+        == ARCHIVE_REPLICATION_SCHEMA_VERSION
+    ):
+        _verify_schema_v31(connection)
+        _migrate_schema_v31_to_v32(connection)
+        existing_user_version = (
+            PROTECTED_CONTENT_SCHEMA_VERSION
+        )
+
     _configure_connection(connection)
-    _verify_schema_v31(connection)
+    _verify_schema_v32(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -2772,7 +2787,301 @@ def _migrate_schema_v30_to_v31(
         raise
 
 
-def _verify_schema_v31(
+def _migrate_schema_v31_to_v32(
+    connection: sqlite3.Connection,
+) -> None:
+    """Add Protected-Content key hierarchy and encrypted payload envelopes."""
+    if connection.in_transaction:
+        raise RuntimeError(
+            "Protected Content migration requires no active transaction."
+        )
+
+    _verify_schema_v31(connection)
+
+    try:
+        connection.executescript(
+            f"""
+            BEGIN IMMEDIATE;
+
+            CREATE TABLE key_slots (
+                key_slot_id BLOB(16) PRIMARY KEY
+                    CHECK(length(key_slot_id) = 16),
+                slot_type TEXT NOT NULL
+                    CHECK(slot_type IN (
+                        'password',
+                        'recovery',
+                        'os_secret'
+                    )),
+                kdf_algorithm TEXT NULL
+                    CHECK(
+                        kdf_algorithm IS NULL
+                        OR kdf_algorithm = 'argon2id'
+                    ),
+                kdf_parameters_json TEXT NULL,
+                salt BLOB NULL,
+                wrap_algorithm TEXT NOT NULL
+                    CHECK(
+                        wrap_algorithm = 'AES-256-GCM'
+                    ),
+                wrap_nonce BLOB NOT NULL
+                    CHECK(length(wrap_nonce) = 12),
+                wrapped_root_key BLOB NOT NULL
+                    CHECK(length(wrapped_root_key) = 48),
+                created_at_us INTEGER NOT NULL,
+                retired_at_us INTEGER NULL,
+                status TEXT NOT NULL
+                    CHECK(status IN (
+                        'active',
+                        'retired'
+                    )),
+                CHECK(
+                    (
+                        slot_type = 'password'
+                        AND kdf_algorithm = 'argon2id'
+                        AND kdf_parameters_json IS NOT NULL
+                        AND salt IS NOT NULL
+                        AND length(salt) >= 16
+                    )
+                    OR
+                    slot_type IN (
+                        'recovery',
+                        'os_secret'
+                    )
+                ),
+                CHECK(
+                    (
+                        status = 'active'
+                        AND retired_at_us IS NULL
+                    )
+                    OR
+                    (
+                        status = 'retired'
+                        AND retired_at_us IS NOT NULL
+                    )
+                )
+            ) WITHOUT ROWID;
+
+            CREATE UNIQUE INDEX
+                uq_key_slots_active_password
+            ON key_slots(slot_type)
+            WHERE
+                slot_type = 'password'
+                AND status = 'active';
+
+            CREATE TABLE protection_scopes (
+                protection_scope_id BLOB(16)
+                    PRIMARY KEY
+                    CHECK(
+                        length(protection_scope_id) = 16
+                    ),
+                lifecycle_state TEXT NOT NULL
+                    CHECK(lifecycle_state IN (
+                        'active',
+                        'retired',
+                        'pending_delete'
+                    )),
+                created_at_us INTEGER NOT NULL,
+                current_scope_key_id BLOB(16) NULL
+                    CHECK(
+                        current_scope_key_id IS NULL
+                        OR
+                        length(current_scope_key_id) = 16
+                    ),
+                neutral_label TEXT NULL
+                    CHECK(
+                        neutral_label IS NULL
+                        OR
+                        length(neutral_label) <= 128
+                    ),
+                FOREIGN KEY(
+                    current_scope_key_id,
+                    protection_scope_id
+                ) REFERENCES protection_scope_keys(
+                    scope_key_id,
+                    protection_scope_id
+                )
+            ) WITHOUT ROWID;
+
+            CREATE TABLE protection_scope_keys (
+                scope_key_id BLOB(16)
+                    PRIMARY KEY
+                    CHECK(length(scope_key_id) = 16),
+                protection_scope_id BLOB(16)
+                    NOT NULL
+                    CHECK(
+                        length(protection_scope_id) = 16
+                    ),
+                key_version INTEGER NOT NULL
+                    CHECK(key_version >= 1),
+                wrap_algorithm TEXT NOT NULL
+                    CHECK(
+                        wrap_algorithm = 'AES-256-GCM'
+                    ),
+                wrap_nonce BLOB NOT NULL
+                    CHECK(length(wrap_nonce) = 12),
+                wrapped_scope_key BLOB NOT NULL
+                    CHECK(length(wrapped_scope_key) = 48),
+                created_at_us INTEGER NOT NULL,
+                retired_at_us INTEGER NULL,
+                status TEXT NOT NULL
+                    CHECK(status IN (
+                        'active',
+                        'retired'
+                    )),
+                UNIQUE(
+                    protection_scope_id,
+                    key_version
+                ),
+                UNIQUE(
+                    scope_key_id,
+                    protection_scope_id
+                ),
+                FOREIGN KEY(protection_scope_id)
+                    REFERENCES protection_scopes(
+                        protection_scope_id
+                    ),
+                CHECK(
+                    (
+                        status = 'active'
+                        AND retired_at_us IS NULL
+                    )
+                    OR
+                    (
+                        status = 'retired'
+                        AND retired_at_us IS NOT NULL
+                    )
+                )
+            ) WITHOUT ROWID;
+
+            CREATE INDEX
+                idx_protection_scope_keys_scope
+            ON protection_scope_keys(
+                protection_scope_id,
+                key_version
+            );
+
+            CREATE TABLE protected_payloads (
+                protected_payload_id BLOB(16)
+                    PRIMARY KEY
+                    CHECK(
+                        length(protected_payload_id) = 16
+                    ),
+                protection_scope_id BLOB(16)
+                    NOT NULL
+                    CHECK(
+                        length(protection_scope_id) = 16
+                    ),
+                scope_key_id BLOB(16)
+                    NOT NULL
+                    CHECK(length(scope_key_id) = 16),
+                cipher_suite TEXT NOT NULL
+                    CHECK(
+                        cipher_suite = 'AES-256-GCM'
+                    ),
+                ciphertext BLOB NOT NULL
+                    CHECK(length(ciphertext) >= 16),
+                nonce BLOB NOT NULL
+                    CHECK(length(nonce) = 12),
+                wrapped_dek BLOB NOT NULL
+                    CHECK(length(wrapped_dek) = 48),
+                dek_wrap_nonce BLOB NOT NULL
+                    CHECK(length(dek_wrap_nonce) = 12),
+                aad_version INTEGER NOT NULL
+                    CHECK(aad_version >= 1),
+                ciphertext_hash BLOB(32)
+                    NOT NULL
+                    CHECK(
+                        length(ciphertext_hash) = 32
+                    ),
+                created_at_us INTEGER NOT NULL,
+                FOREIGN KEY(protection_scope_id)
+                    REFERENCES protection_scopes(
+                        protection_scope_id
+                    ),
+                FOREIGN KEY(
+                    scope_key_id,
+                    protection_scope_id
+                ) REFERENCES protection_scope_keys(
+                    scope_key_id,
+                    protection_scope_id
+                )
+            ) WITHOUT ROWID;
+
+            CREATE INDEX
+                idx_protected_payloads_scope
+            ON protected_payloads(
+                protection_scope_id,
+                created_at_us,
+                protected_payload_id
+            );
+
+            CREATE TABLE protected_blob_envelopes (
+                blob_id BLOB(16)
+                    PRIMARY KEY
+                    CHECK(length(blob_id) = 16),
+                protection_scope_id BLOB(16)
+                    NOT NULL
+                    CHECK(
+                        length(protection_scope_id) = 16
+                    ),
+                scope_key_id BLOB(16)
+                    NOT NULL
+                    CHECK(length(scope_key_id) = 16),
+                wrapped_dek BLOB NOT NULL
+                    CHECK(length(wrapped_dek) = 48),
+                dek_wrap_nonce BLOB NOT NULL
+                    CHECK(length(dek_wrap_nonce) = 12),
+                nonce_prefix BLOB NOT NULL
+                    CHECK(length(nonce_prefix) = 8),
+                chunk_size INTEGER NOT NULL
+                    CHECK(chunk_size > 0),
+                cipher_suite TEXT NOT NULL
+                    CHECK(
+                        cipher_suite = 'AES-256-GCM'
+                    ),
+                format_version INTEGER NOT NULL
+                    CHECK(format_version >= 1),
+                FOREIGN KEY(blob_id)
+                    REFERENCES blob_records(blob_id),
+                FOREIGN KEY(protection_scope_id)
+                    REFERENCES protection_scopes(
+                        protection_scope_id
+                    ),
+                FOREIGN KEY(
+                    scope_key_id,
+                    protection_scope_id
+                ) REFERENCES protection_scope_keys(
+                    scope_key_id,
+                    protection_scope_id
+                )
+            ) WITHOUT ROWID;
+
+            UPDATE schema_metadata
+            SET schema_version = {
+                    PROTECTED_CONTENT_SCHEMA_VERSION
+                },
+                last_migration_id = '{
+                    PROTECTED_CONTENT_MIGRATION_ID
+                }',
+                minimum_reader_version = {
+                    PROTECTED_CONTENT_SCHEMA_VERSION
+                }
+            WHERE singleton_id = 1;
+
+            PRAGMA user_version = {
+                PROTECTED_CONTENT_SCHEMA_VERSION
+            };
+
+            COMMIT;
+            """
+        )
+
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def _verify_schema_v32(
     connection: sqlite3.Connection,
 ) -> None:
     application_id = int(
@@ -2780,6 +3089,7 @@ def _verify_schema_v31(
             "PRAGMA application_id"
         ).fetchone()[0]
     )
+
     user_version = int(
         connection.execute(
             "PRAGMA user_version"
@@ -2791,7 +3101,316 @@ def _verify_schema_v31(
             "ATHENA application_id verification failed."
         )
 
-    if user_version != ARCHIVE_REPLICATION_SCHEMA_VERSION:
+    if (
+        user_version
+        != PROTECTED_CONTENT_SCHEMA_VERSION
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA schema version verification failed."
+        )
+
+    metadata = connection.execute(
+        "SELECT schema_version, "
+        "storage_layout_version, "
+        "blob_format_version, "
+        "last_migration_id, "
+        "minimum_reader_version "
+        "FROM schema_metadata "
+        "WHERE singleton_id = 1"
+    ).fetchone()
+
+    expected = (
+        PROTECTED_CONTENT_SCHEMA_VERSION,
+        STORAGE_LAYOUT_VERSION,
+        BLOB_FORMAT_VERSION,
+        PROTECTED_CONTENT_MIGRATION_ID,
+        PROTECTED_CONTENT_SCHEMA_VERSION,
+    )
+
+    if (
+        metadata is None
+        or tuple(metadata) != expected
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA schema_metadata verification failed."
+        )
+
+    _verify_schema_v31_compatible(
+        connection
+    )
+
+    required_tables = {
+        "key_slots",
+        "protection_scopes",
+        "protection_scope_keys",
+        "protected_payloads",
+        "protected_blob_envelopes",
+    }
+
+    missing_tables = (
+        required_tables.difference(
+            _user_tables(
+                connection
+            )
+        )
+    )
+
+    if missing_tables:
+        raise DatabaseCompatibilityError(
+            "ATHENA Protected Content schema "
+            "is incomplete: "
+            + ", ".join(
+                sorted(
+                    missing_tables
+                )
+            )
+            + "."
+        )
+
+    scope_columns = {
+        str(row[1])
+        for row in connection.execute(
+            """
+            PRAGMA table_info(
+                protection_scopes
+            )
+            """
+        )
+    }
+
+    required_scope_columns = {
+        "protection_scope_id",
+        "lifecycle_state",
+        "created_at_us",
+        "current_scope_key_id",
+        "neutral_label",
+    }
+
+    if not (
+        required_scope_columns
+        .issubset(
+            scope_columns
+        )
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA ProtectionScope schema "
+            "is incomplete."
+        )
+
+    if (
+        {
+            "locked",
+            "unlocked",
+            "is_unlocked",
+        }
+        & scope_columns
+    ):
+        raise DatabaseCompatibilityError(
+            "ProtectionScope lock state "
+            "must never be persisted."
+        )
+
+    slot_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(key_slots)"
+        )
+    }
+
+    if not {
+        "key_slot_id",
+        "slot_type",
+        "kdf_algorithm",
+        "kdf_parameters_json",
+        "salt",
+        "wrap_algorithm",
+        "wrap_nonce",
+        "wrapped_root_key",
+        "created_at_us",
+        "retired_at_us",
+        "status",
+    }.issubset(
+        slot_columns
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA key-slot schema is incomplete."
+        )
+
+    scope_key_columns = {
+        str(row[1])
+        for row in connection.execute(
+            """
+            PRAGMA table_info(
+                protection_scope_keys
+            )
+            """
+        )
+    }
+
+    if not {
+        "scope_key_id",
+        "protection_scope_id",
+        "key_version",
+        "wrap_algorithm",
+        "wrap_nonce",
+        "wrapped_scope_key",
+        "created_at_us",
+        "retired_at_us",
+        "status",
+    }.issubset(
+        scope_key_columns
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA ProtectionScope-key "
+            "schema is incomplete."
+        )
+
+    payload_columns = {
+        str(row[1])
+        for row in connection.execute(
+            """
+            PRAGMA table_info(
+                protected_payloads
+            )
+            """
+        )
+    }
+
+    if not {
+        "protected_payload_id",
+        "protection_scope_id",
+        "scope_key_id",
+        "cipher_suite",
+        "ciphertext",
+        "nonce",
+        "wrapped_dek",
+        "dek_wrap_nonce",
+        "aad_version",
+        "ciphertext_hash",
+        "created_at_us",
+    }.issubset(
+        payload_columns
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA protected-payload "
+            "schema is incomplete."
+        )
+
+    envelope_columns = {
+        str(row[1])
+        for row in connection.execute(
+            """
+            PRAGMA table_info(
+                protected_blob_envelopes
+            )
+            """
+        )
+    }
+
+    if not {
+        "blob_id",
+        "protection_scope_id",
+        "scope_key_id",
+        "wrapped_dek",
+        "dek_wrap_nonce",
+        "nonce_prefix",
+        "chunk_size",
+        "cipher_suite",
+        "format_version",
+    }.issubset(
+        envelope_columns
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA protected-blob-envelope "
+            "schema is incomplete."
+        )
+
+    password_index = (
+        connection.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'index'
+              AND name =
+                  'uq_key_slots_active_password'
+            """
+        ).fetchone()
+    )
+
+    if password_index is None:
+        raise DatabaseCompatibilityError(
+            "ATHENA active-password-slot "
+            "uniqueness index is missing."
+        )
+
+    invalid_active_scope = (
+        connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM protection_scopes AS s
+            LEFT JOIN protection_scope_keys AS k
+              ON
+                k.scope_key_id
+                = s.current_scope_key_id
+              AND
+                k.protection_scope_id
+                = s.protection_scope_id
+            WHERE
+                s.lifecycle_state = 'active'
+                AND (
+                    s.current_scope_key_id
+                    IS NULL
+                    OR
+                    k.scope_key_id IS NULL
+                )
+            """
+        ).fetchone()
+    )
+
+    if (
+        invalid_active_scope is None
+        or int(
+            invalid_active_scope[0]
+        )
+        != 0
+    ):
+        raise DatabaseCompatibilityError(
+            "An active ProtectionScope has "
+            "no valid current Scope Key."
+        )
+
+    if connection.execute(
+        "PRAGMA foreign_key_check"
+    ).fetchall():
+        raise DatabaseCompatibilityError(
+            "ATHENA foreign-key verification failed."
+        )
+
+
+def _verify_schema_v31(
+    connection: sqlite3.Connection,
+) -> None:
+    application_id = int(
+        connection.execute(
+            "PRAGMA application_id"
+        ).fetchone()[0]
+    )
+
+    user_version = int(
+        connection.execute(
+            "PRAGMA user_version"
+        ).fetchone()[0]
+    )
+
+    if application_id != ATHENA_APPLICATION_ID:
+        raise DatabaseCompatibilityError(
+            "ATHENA application_id verification failed."
+        )
+
+    if (
+        user_version
+        != ARCHIVE_REPLICATION_SCHEMA_VERSION
+    ):
         raise DatabaseCompatibilityError(
             "ATHENA schema version verification failed."
         )
@@ -2814,12 +3433,25 @@ def _verify_schema_v31(
         ARCHIVE_REPLICATION_SCHEMA_VERSION,
     )
 
-    if metadata is None or tuple(metadata) != expected:
+    if (
+        metadata is None
+        or tuple(metadata) != expected
+    ):
         raise DatabaseCompatibilityError(
             "ATHENA schema_metadata verification failed."
         )
 
-    _verify_schema_v24_compatible(connection)
+    _verify_schema_v31_compatible(
+        connection
+    )
+
+
+def _verify_schema_v31_compatible(
+    connection: sqlite3.Connection,
+) -> None:
+    _verify_schema_v24_compatible(
+        connection
+    )
 
     required_tables = {
         "research_synthesis_output_source_evidence",
@@ -2827,21 +3459,34 @@ def _verify_schema_v31(
         "archive_replication_watermark",
     }
 
-    missing_tables = required_tables.difference(
-        _user_tables(connection)
+    missing_tables = (
+        required_tables.difference(
+            _user_tables(
+                connection
+            )
+        )
     )
 
     if missing_tables:
         raise DatabaseCompatibilityError(
-            "ATHENA archive replication schema is incomplete: "
-            + ", ".join(sorted(missing_tables))
+            "ATHENA archive replication schema "
+            "is incomplete: "
+            + ", ".join(
+                sorted(
+                    missing_tables
+                )
+            )
             + "."
         )
 
     outbox_columns = {
         str(row[1])
         for row in connection.execute(
-            "PRAGMA table_info(archive_replication_outbox)"
+            """
+            PRAGMA table_info(
+                archive_replication_outbox
+            )
+            """
         )
     }
 
@@ -2858,70 +3503,95 @@ def _verify_schema_v31(
         "verified_at_us",
     }
 
-    if not required_outbox_columns.issubset(
-        outbox_columns
+    if not (
+        required_outbox_columns
+        .issubset(
+            outbox_columns
+        )
     ):
         raise DatabaseCompatibilityError(
-            "ATHENA archive replication outbox is incomplete."
+            "ATHENA archive replication "
+            "outbox is incomplete."
         )
 
-    trigger = connection.execute(
-        """
-        SELECT name
-        FROM sqlite_master
-        WHERE type = 'trigger'
-          AND name = 'trg_blob_records_archive_replication_outbox'
-        """
-    ).fetchone()
+    trigger = (
+        connection.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'trigger'
+              AND name =
+                'trg_blob_records_archive_replication_outbox'
+            """
+        ).fetchone()
+    )
 
     if trigger is None:
         raise DatabaseCompatibilityError(
-            "ATHENA archive replication enqueue trigger is missing."
+            "ATHENA archive replication "
+            "enqueue trigger is missing."
         )
 
-    watermark = connection.execute(
-        """
-        SELECT contiguous_verified_seq
-        FROM archive_replication_watermark
-        WHERE singleton_id = 1
-        """
-    ).fetchone()
+    watermark = (
+        connection.execute(
+            """
+            SELECT contiguous_verified_seq
+            FROM archive_replication_watermark
+            WHERE singleton_id = 1
+            """
+        ).fetchone()
+    )
 
     if watermark is None:
         raise DatabaseCompatibilityError(
-            "ATHENA archive replication watermark is missing."
+            "ATHENA archive replication "
+            "watermark is missing."
         )
 
-    invalid_state = connection.execute(
-        """
-        SELECT COUNT(*)
-        FROM archive_replication_outbox AS o
-        JOIN blob_records AS b
-          ON b.blob_id = o.blob_id
-        WHERE
-            (o.state = 'pending'
-             AND b.storage_area != 'spool')
-            OR
-            (o.state = 'verified'
-             AND b.storage_area != 'archive')
-        """
-    ).fetchone()
+    invalid_state = (
+        connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM archive_replication_outbox AS o
+            JOIN blob_records AS b
+              ON b.blob_id = o.blob_id
+            WHERE
+                (
+                    o.state = 'pending'
+                    AND
+                    b.storage_area != 'spool'
+                )
+                OR
+                (
+                    o.state = 'verified'
+                    AND
+                    b.storage_area != 'archive'
+                )
+            """
+        ).fetchone()
+    )
 
     if (
         invalid_state is None
-        or int(invalid_state[0]) != 0
+        or int(
+            invalid_state[0]
+        )
+        != 0
     ):
         raise DatabaseCompatibilityError(
-            "ATHENA archive replication state disagrees "
-            "with BlobRecord storage state."
+            "ATHENA archive replication state "
+            "disagrees with BlobRecord "
+            "storage state."
         )
 
     precise_columns = {
         str(row[1])
         for row in connection.execute(
-            "PRAGMA table_info("
-            "research_synthesis_output_source_evidence"
-            ")"
+            """
+            PRAGMA table_info(
+                research_synthesis_output_source_evidence
+            )
+            """
         )
     }
 
@@ -2930,17 +3600,24 @@ def _verify_schema_v31(
         "output_kind",
         "output_ordinal",
         "source_analysis_artifact_id",
-    }.issubset(precise_columns):
+    }.issubset(
+        precise_columns
+    ):
         raise DatabaseCompatibilityError(
-            "ATHENA precise Research synthesis provenance "
-            "is incomplete."
+            "ATHENA precise Research synthesis "
+            "provenance is incomplete."
         )
 
     try:
-        verify_news_schema_v30(connection)
+        verify_news_schema_v30(
+            connection
+        )
+
     except RuntimeError as exc:
         raise DatabaseCompatibilityError(
-            str(exc)
+            str(
+                exc
+            )
         ) from exc
 
     if connection.execute(
@@ -2949,6 +3626,7 @@ def _verify_schema_v31(
         raise DatabaseCompatibilityError(
             "ATHENA foreign-key verification failed."
         )
+
 
 
 def _verify_schema_v30(

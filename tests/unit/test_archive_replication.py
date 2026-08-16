@@ -11,10 +11,10 @@ from athena.jobs.models import JobPriority, JobState, WaitingReason
 from athena.source.models import BlobStorageArea
 from athena.storage.database import SQLiteDatabase
 from athena.storage.schema import (
-    ARCHIVE_REPLICATION_MIGRATION_ID,
-    ARCHIVE_REPLICATION_SCHEMA_VERSION,
     NEWS_EVENT_ELIGIBILITY_MIGRATION_ID,
     NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION,
+    PROTECTED_CONTENT_MIGRATION_ID,
+    PROTECTED_CONTENT_SCHEMA_VERSION,
 )
 
 
@@ -668,12 +668,35 @@ def test_v30_to_v31_migration_creates_replication_schema(
     latest.stop()
 
     # Reconstruct the exact v30 boundary by removing
-    # only the additive v31 objects and metadata.
+    # the additive v31/v32 objects and metadata.
     legacy = sqlite3.connect(
         path,
         autocommit=True,
     )
     legacy.row_factory = sqlite3.Row
+
+    # Reconstruct a pre-v32 boundary: remove every additive
+    # Protected-Content object before downgrading metadata.
+    legacy.execute(
+        "DROP TABLE "
+        "protected_blob_envelopes"
+    )
+    legacy.execute(
+        "DROP TABLE "
+        "protected_payloads"
+    )
+    legacy.execute(
+        "DROP TABLE "
+        "protection_scope_keys"
+    )
+    legacy.execute(
+        "DROP TABLE "
+        "protection_scopes"
+    )
+    legacy.execute(
+        "DROP TABLE "
+        "key_slots"
+    )
 
     legacy.execute(
         "DROP TRIGGER "
@@ -718,7 +741,7 @@ def test_v30_to_v31_migration_creates_replication_schema(
             connection.execute(
                 "PRAGMA user_version"
             ).fetchone()[0]
-            == ARCHIVE_REPLICATION_SCHEMA_VERSION
+            == PROTECTED_CONTENT_SCHEMA_VERSION
         )
 
         tables = {
@@ -763,9 +786,9 @@ def test_v30_to_v31_migration_creates_replication_schema(
         assert metadata is not None
 
         assert tuple(metadata) == (
-            ARCHIVE_REPLICATION_SCHEMA_VERSION,
-            ARCHIVE_REPLICATION_MIGRATION_ID,
-            ARCHIVE_REPLICATION_SCHEMA_VERSION,
+            PROTECTED_CONTENT_SCHEMA_VERSION,
+            PROTECTED_CONTENT_MIGRATION_ID,
+            PROTECTED_CONTENT_SCHEMA_VERSION,
         )
 
         assert connection.execute(
@@ -812,6 +835,29 @@ def test_v30_migration_backfills_existing_spool_blob(
     legacy = sqlite3.connect(
         database_path,
         autocommit=True,
+    )
+
+    # Reconstruct a pre-v32 boundary: remove every additive
+    # Protected-Content object before downgrading metadata.
+    legacy.execute(
+        "DROP TABLE "
+        "protected_blob_envelopes"
+    )
+    legacy.execute(
+        "DROP TABLE "
+        "protected_payloads"
+    )
+    legacy.execute(
+        "DROP TABLE "
+        "protection_scope_keys"
+    )
+    legacy.execute(
+        "DROP TABLE "
+        "protection_scopes"
+    )
+    legacy.execute(
+        "DROP TABLE "
+        "key_slots"
     )
 
     legacy.execute(

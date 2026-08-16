@@ -82,6 +82,9 @@ from athena.retrieval.ranking import RetrievalRankingService
 from athena.retrieval.search import LocalSearchService
 from athena.retrieval.semantic import LocalSemanticSearchService
 from athena.retrieval.source_context import SourceContextBuilderService
+from athena.security.crypto import CryptoProvider
+from athena.security.repository import ProtectionRepository
+from athena.security.service import ProtectedContentService
 from athena.source.analysis_repository import SourceAnalysisRepository
 from athena.source.analysis_service import SourceAnalysisService
 from athena.source.anchor_repository import SourceAnchorRepository
@@ -135,6 +138,14 @@ class AthenaApplication:
         self.state = ApplicationState.STOPPED
         self.health = HealthService()
         self.database = SQLiteDatabase(self.paths.database_path)
+        self.crypto_provider = CryptoProvider()
+        self.protection_repository = ProtectionRepository(
+            self.database
+        )
+        self.protected_content = ProtectedContentService(
+            repository=self.protection_repository,
+            crypto=self.crypto_provider,
+        )
         self.chat_repository = ChatRepository(self.database)
         self.chat = ChatService(self.chat_repository)
         self.personal_memory_repository = PersonalMemoryRepository(self.database)
@@ -493,6 +504,7 @@ class AthenaApplication:
         bootstrap_services: tuple[LifecycleService, ...] = (
             RuntimeLayoutService(self.paths),
             self.database,
+            self.protected_content,
         )
         self.services = ServiceManager(bootstrap_services + services)
 
