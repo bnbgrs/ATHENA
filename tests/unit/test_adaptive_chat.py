@@ -1,0 +1,1021 @@
+from __future__ import annotations
+
+import uuid
+from types import SimpleNamespace
+
+import pytest
+
+from athena.chat.adaptive import (
+    AdaptiveChatService,
+    AdaptivePlanReason,
+    AdaptiveRetrievalMode,
+    AdaptiveRetrievalPlan,
+    AdaptiveRetrievalPlanner,
+)
+from athena.chat.models import ChatMessage, ChatThread, MessageType
+from athena.retrieval.archive import ArchiveSearchError
+from athena.retrieval.search import SearchEntityType
+
+
+class FakeLocalSearch:
+    def __init__(
+        self,
+        *,
+        knowledge_texts: tuple[str, ...] = (),
+        claim_texts: tuple[str, ...] = (),
+    ) -> None:
+        self.knowledge_texts = knowledge_texts
+        self.claim_texts = claim_texts
+        self.calls: list[
+            tuple[
+                str,
+                int,
+                SearchEntityType | None,
+            ]
+        ] = []
+
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int,
+        entity_type: SearchEntityType | None = None,
+    ):
+        self.calls.append(
+            (
+                query,
+                limit,
+                entity_type,
+            )
+        )
+
+        if entity_type is SearchEntityType.KNOWLEDGE:
+            values = self.knowledge_texts
+        elif entity_type is SearchEntityType.CLAIM:
+            values = self.claim_texts
+        else:
+            raise AssertionError(
+                "Adaptive planner must use typed canonical probes."
+            )
+
+        return tuple(
+            SimpleNamespace(
+                title=None,
+                text=text,
+            )
+            for text in values[:limit]
+        )
+
+
+class FakeArchiveSearch:
+    def __init__(
+        self,
+        *,
+        texts: tuple[str, ...] = (),
+        fail: bool = False,
+    ) -> None:
+        self.texts = texts
+        self.fail = fail
+        self.calls: list[
+            tuple[str, int]
+        ] = []
+
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int,
+    ):
+        self.calls.append(
+            (
+                query,
+                limit,
+            )
+        )
+
+        if self.fail:
+            raise ArchiveSearchError(
+                "synthetic archive probe failure"
+            )
+
+        return tuple(
+            SimpleNamespace(
+                source_name=None,
+                text=text,
+            )
+            for text in self.texts[:limit]
+        )
+
+
+def planner(
+    *,
+    knowledge_texts: tuple[str, ...] = (),
+    claim_texts: tuple[str, ...] = (),
+    archive_texts: tuple[str, ...] = (),
+    archive_fail: bool = False,
+):
+    local = FakeLocalSearch(
+        knowledge_texts=knowledge_texts,
+        claim_texts=claim_texts,
+    )
+
+    archive = FakeArchiveSearch(
+        texts=archive_texts,
+        fail=archive_fail,
+    )
+
+    planned = AdaptiveRetrievalPlanner(
+        local_search=local,  # type: ignore[arg-type]
+        archive_search=archive,  # type: ignore[arg-type]
+    )
+
+    return planned, local, archive
+
+
+def test_explicit_memory_and_source_selects_unified_without_probes() -> None:
+    planned, local, archive = planner()
+
+    result = planned.plan(
+        "Was wei\u00dft du noch \u00fcber Berlin und "
+        "was steht im importierten PDF dazu?"
+    )
+
+    assert result.mode is AdaptiveRetrievalMode.UNIFIED
+    assert (
+        result.reason
+        is AdaptivePlanReason.EXPLICIT_MEMORY_AND_SOURCE
+    )
+    assert result.probe_query is None
+    assert local.calls == []
+    assert archive.calls == []
+
+
+def test_explicit_source_selects_source_without_probes() -> None:
+    planned, local, archive = planner()
+
+    result = planned.plan(
+        "Was steht im PDF \u00fcber Berlin?"
+    )
+
+    assert result.mode is AdaptiveRetrievalMode.SOURCES
+    assert result.reason is AdaptivePlanReason.EXPLICIT_SOURCE
+    assert local.calls == []
+    assert archive.calls == []
+
+
+def test_only_wissen_noch_is_explicit_memory() -> None:
+    planned, local, archive = planner()
+
+    result = planned.plan(
+        "Was wei\u00dft du noch \u00fcber Berlin?"
+    )
+
+    assert result.mode is AdaptiveRetrievalMode.MEMORY
+    assert result.reason is AdaptivePlanReason.EXPLICIT_MEMORY
+    assert local.calls == []
+    assert archive.calls == []
+
+
+def test_generic_wissen_ueber_is_not_forced_to_memory() -> None:
+    planned, local, archive = planner()
+
+    result = planned.plan(
+        "Was wei\u00dft du \u00fcber Berlin?"
+    )
+
+    assert result.mode is AdaptiveRetrievalMode.DIRECT
+    assert (
+        result.reason
+        is AdaptivePlanReason.NO_LOCAL_LEXICAL_HIT
+    )
+    assert len(local.calls) == 2
+    assert len(archive.calls) == 1
+
+
+def test_canonical_knowledge_hit_stops_before_archive() -> None:
+    planned, local, archive = planner(
+        knowledge_texts=(
+            "Berlin ist die Hauptstadt von Deutschland.",
+        ),
+        archive_texts=(
+            "Deutschland hat Berlin als Hauptstadt.",
+        ),
+    )
+
+    result = planned.plan(
+        "Welche Hauptstadt hat Deutschland?"
+    )
+
+    assert result.mode is AdaptiveRetrievalMode.MEMORY
+    assert (
+        result.reason
+        is AdaptivePlanReason.CANONICAL_LEXICAL_HIT
+    )
+    assert result.canonical_probe_hit is True
+    assert result.archive_probe_hit is False
+
+    assert len(local.calls) == 1
+    assert local.calls[0][1] == 5
+    assert (
+        local.calls[0][2]
+        is SearchEntityType.KNOWLEDGE
+    )
+
+    assert archive.calls == []
+
+
+def test_claim_probe_runs_only_after_knowledge_miss() -> None:
+    planned, local, archive = planner(
+        claim_texts=(
+            "Berlin ist die Hauptstadt von Deutschland.",
+        ),
+        archive_texts=(
+            "Berlin Hauptstadt Deutschland",
+        ),
+    )
+
+    result = planned.plan(
+        "Welche Hauptstadt hat Deutschland?"
+    )
+
+    assert result.mode is AdaptiveRetrievalMode.MEMORY
+
+    assert [
+        call[2]
+        for call in local.calls
+    ] == [
+        SearchEntityType.KNOWLEDGE,
+        SearchEntityType.CLAIM,
+    ]
+
+    assert archive.calls == []
+
+
+def test_one_of_multiple_terms_is_not_enough_for_canonical_route() -> None:
+    planned, local, archive = planner(
+        knowledge_texts=(
+            "Orion ist ein interner Codename.",
+        ),
+        archive_texts=(
+            "Projekt Orion verwendet die Kennzahl 42.",
+        ),
+    )
+
+    result = planned.plan(
+        "Welche Kennzahl enth\u00e4lt Projekt Orion?"
+    )
+
+    assert result.mode is AdaptiveRetrievalMode.SOURCES
+    assert result.canonical_probe_hit is False
+    assert result.archive_probe_hit is True
+
+    assert len(local.calls) == 2
+    assert len(archive.calls) == 1
+
+
+def test_archive_probe_runs_after_canonical_miss() -> None:
+    planned, local, archive = planner(
+        archive_texts=(
+            "Projekt Orion Kennzahl 42",
+        ),
+    )
+
+    result = planned.plan(
+        "Welche Kennzahl enth\u00e4lt Projekt Orion?"
+    )
+
+    assert result.mode is AdaptiveRetrievalMode.SOURCES
+    assert (
+        result.reason
+        is AdaptivePlanReason.ARCHIVE_LEXICAL_HIT
+    )
+
+    assert [
+        call[2]
+        for call in local.calls
+    ] == [
+        SearchEntityType.KNOWLEDGE,
+        SearchEntityType.CLAIM,
+    ]
+
+    assert len(archive.calls) == 1
+
+
+def test_creative_task_does_not_force_direct_but_weak_hit_is_rejected() -> None:
+    planned, local, archive = planner(
+        knowledge_texts=(
+            "Berlin ist eine Stadt in Deutschland.",
+        ),
+    )
+
+    result = planned.plan(
+        "Schreibe ein Gedicht \u00fcber Berlin."
+    )
+
+    assert result.mode is AdaptiveRetrievalMode.DIRECT
+    assert (
+        result.reason
+        is AdaptivePlanReason.NO_LOCAL_LEXICAL_HIT
+    )
+
+    assert len(local.calls) == 2
+    assert len(archive.calls) == 1
+
+
+def test_local_knowledge_can_support_a_transformation_task() -> None:
+    planned, _local, archive = planner(
+        knowledge_texts=(
+            "ATHENA ist unser lokales Wissenssystem.",
+        ),
+    )
+
+    result = planned.plan(
+        "Fasse unser Wissen \u00fcber ATHENA zusammen."
+    )
+
+    assert result.mode is AdaptiveRetrievalMode.MEMORY
+    assert (
+        result.reason
+        is AdaptivePlanReason.CANONICAL_LEXICAL_HIT
+    )
+    assert archive.calls == []
+
+
+def test_single_distinctive_term_can_route_to_canonical() -> None:
+    planned, _local, archive = planner(
+        knowledge_texts=(
+            "ATHENA ist unser lokales Wissenssystem.",
+        ),
+    )
+
+    result = planned.plan(
+        "Erkl\u00e4re ATHENA."
+    )
+
+    assert result.mode is AdaptiveRetrievalMode.MEMORY
+    assert result.probe_query == "athena"
+    assert archive.calls == []
+
+
+def test_no_local_lexical_hit_falls_back_to_direct() -> None:
+    planned, local, archive = planner()
+
+    result = planned.plan(
+        "Warum leuchten Sterne?"
+    )
+
+    assert result.mode is AdaptiveRetrievalMode.DIRECT
+    assert (
+        result.reason
+        is AdaptivePlanReason.NO_LOCAL_LEXICAL_HIT
+    )
+
+    assert len(local.calls) == 2
+    assert len(archive.calls) == 1
+
+
+def test_archive_probe_failure_is_transparent() -> None:
+    planned, _local, _archive = planner(
+        archive_fail=True,
+    )
+
+    result = planned.plan(
+        "Warum leuchten Sterne?"
+    )
+
+    assert result.mode is AdaptiveRetrievalMode.DIRECT
+    assert len(result.warnings) == 1
+    assert result.warnings[0].startswith(
+        "archive_probe_unavailable:"
+    )
+
+
+def test_stopword_only_followup_does_not_probe_without_contextualization_yet() -> None:
+    planned, local, archive = planner()
+
+    result = planned.plan(
+        "Und wie?"
+    )
+
+    assert result.mode is AdaptiveRetrievalMode.DIRECT
+    assert (
+        result.reason
+        is AdaptivePlanReason.NO_INFORMATIVE_QUERY_TERMS
+    )
+
+    assert local.calls == []
+    assert archive.calls == []
+
+
+class FakeChatHistory:
+    def __init__(
+        self,
+        messages: tuple[ChatMessage, ...] = (),
+    ) -> None:
+        self.messages = messages
+
+    def load_chat(
+        self,
+        chat_id: uuid.UUID,
+    ) -> ChatThread:
+        return ChatThread(
+            chat_id=chat_id,
+            started_at_us=1,
+            ended_at_us=None,
+            archive_mode="standard",
+            lifecycle_state="active",
+            messages=self.messages,
+        )
+
+
+def _chat_message(
+    *,
+    chat_id: uuid.UUID,
+    sequence_no: int,
+    message_type: MessageType,
+    content: str,
+) -> ChatMessage:
+    return ChatMessage(
+        message_id=uuid.uuid4(),
+        chat_id=chat_id,
+        sequence_no=sequence_no,
+        message_type=message_type,
+        actor_id=(
+            uuid.uuid4()
+            if message_type is MessageType.USER
+            else None
+        ),
+        created_at_us=sequence_no,
+        revision_id=uuid.uuid4(),
+        content=content,
+        content_format="text/plain",
+    )
+
+
+class StubPlanner:
+    def __init__(
+        self,
+        mode: AdaptiveRetrievalMode,
+    ) -> None:
+        self.mode = mode
+        self.calls: list[str] = []
+
+    def plan(
+        self,
+        content: str,
+    ) -> AdaptiveRetrievalPlan:
+        self.calls.append(content)
+
+        return AdaptiveRetrievalPlan(
+            mode=self.mode,
+            reason=AdaptivePlanReason.NO_LOCAL_LEXICAL_HIT,
+            probe_query="probe",
+            canonical_probe_hit=False,
+            archive_probe_hit=False,
+            warnings=(),
+        )
+
+
+class FakeDelegate:
+    def __init__(self) -> None:
+        self.calls: list[
+            dict[str, object]
+        ] = []
+
+    def send_message(
+        self,
+        **kwargs,
+    ):
+        self.calls.append(kwargs)
+
+        return SimpleNamespace(
+            generation=SimpleNamespace(
+                marker=uuid.uuid4(),
+            )
+        )
+
+
+
+def _adaptive_runtime(
+    *,
+    planned: AdaptiveRetrievalPlanner,
+    chat: FakeChatHistory,
+):
+    direct = FakeDelegate()
+    memory = FakeDelegate()
+    source = FakeDelegate()
+    unified = FakeDelegate()
+
+    service = AdaptiveChatService(
+        chat=chat,  # type: ignore[arg-type]
+        planner=planned,
+        direct_chat=direct,  # type: ignore[arg-type]
+        memory_chat=memory,  # type: ignore[arg-type]
+        source_grounded_chat=source,  # type: ignore[arg-type]
+        unified_local_chat=unified,  # type: ignore[arg-type]
+    )
+
+    return (
+        service,
+        direct,
+        memory,
+        source,
+        unified,
+    )
+
+
+def test_followup_contextualizes_retrieval_but_preserves_current_user_content() -> None:
+    chat_id = uuid.uuid4()
+
+    anchor = _chat_message(
+        chat_id=chat_id,
+        sequence_no=1,
+        message_type=MessageType.USER,
+        content="Welche Hauptstadt hat Deutschland?",
+    )
+
+    planned, local, archive = planner(
+        knowledge_texts=(
+            "Berlin ist die Hauptstadt von Deutschland.",
+        ),
+    )
+
+    (
+        service,
+        direct,
+        memory,
+        source,
+        unified,
+    ) = _adaptive_runtime(
+        planned=planned,
+        chat=FakeChatHistory((anchor,)),
+    )
+
+    result = service.send_message(
+        chat_id=chat_id,
+        content="Und warum?",
+    )
+
+    expected_query = (
+        "Welche Hauptstadt hat Deutschland?\n"
+        "Und warum?"
+    )
+
+    assert result.contextualized is True
+    assert (
+        result.context_anchor_message_id
+        == anchor.message_id
+    )
+    assert result.retrieval_query == expected_query
+    assert result.plan.mode is AdaptiveRetrievalMode.MEMORY
+
+    assert direct.calls == []
+    assert source.calls == []
+    assert unified.calls == []
+
+    assert len(memory.calls) == 1
+    assert (
+        memory.calls[0]["content"]
+        == "Und warum?"
+    )
+    assert (
+        memory.calls[0]["retrieval_query"]
+        == expected_query
+    )
+
+    assert len(local.calls) == 1
+    assert archive.calls == []
+
+
+def test_followup_inherits_explicit_source_domain_without_reprobing() -> None:
+    chat_id = uuid.uuid4()
+
+    anchor = _chat_message(
+        chat_id=chat_id,
+        sequence_no=1,
+        message_type=MessageType.USER,
+        content="Was steht im importierten PDF \u00fcber Berlin?",
+    )
+
+    planned, local, archive = planner()
+
+    (
+        service,
+        direct,
+        memory,
+        source,
+        unified,
+    ) = _adaptive_runtime(
+        planned=planned,
+        chat=FakeChatHistory((anchor,)),
+    )
+
+    result = service.send_message(
+        chat_id=chat_id,
+        content="Und warum?",
+    )
+
+    assert result.contextualized is True
+    assert result.plan.mode is AdaptiveRetrievalMode.SOURCES
+    assert (
+        result.plan.reason
+        is AdaptivePlanReason.FOLLOWUP_INHERITED_DOMAIN
+    )
+
+    assert direct.calls == []
+    assert memory.calls == []
+    assert unified.calls == []
+    assert len(source.calls) == 1
+
+    assert local.calls == []
+    assert archive.calls == []
+
+
+def test_current_explicit_source_followup_overrides_memory_anchor() -> None:
+    chat_id = uuid.uuid4()
+
+    anchor = _chat_message(
+        chat_id=chat_id,
+        sequence_no=1,
+        message_type=MessageType.USER,
+        content="Was wei\u00dft du noch \u00fcber Berlin?",
+    )
+
+    planned, local, archive = planner()
+
+    (
+        service,
+        direct,
+        memory,
+        source,
+        unified,
+    ) = _adaptive_runtime(
+        planned=planned,
+        chat=FakeChatHistory((anchor,)),
+    )
+
+    result = service.send_message(
+        chat_id=chat_id,
+        content="Was sagen die Quellen dazu?",
+    )
+
+    assert result.contextualized is True
+    assert result.plan.mode is AdaptiveRetrievalMode.SOURCES
+    assert (
+        result.plan.reason
+        is AdaptivePlanReason.EXPLICIT_SOURCE
+    )
+
+    assert direct.calls == []
+    assert memory.calls == []
+    assert unified.calls == []
+    assert len(source.calls) == 1
+
+    assert local.calls == []
+    assert archive.calls == []
+
+
+def test_followup_skips_intermediate_followup_anchor() -> None:
+    chat_id = uuid.uuid4()
+
+    substantive = _chat_message(
+        chat_id=chat_id,
+        sequence_no=1,
+        message_type=MessageType.USER,
+        content="Was steht im PDF \u00fcber Berlin?",
+    )
+
+    prior_followup = _chat_message(
+        chat_id=chat_id,
+        sequence_no=2,
+        message_type=MessageType.USER,
+        content="Und warum?",
+    )
+
+    planned, _local, _archive = planner()
+
+    (
+        service,
+        _direct,
+        _memory,
+        source,
+        _unified,
+    ) = _adaptive_runtime(
+        planned=planned,
+        chat=FakeChatHistory(
+            (
+                substantive,
+                prior_followup,
+            )
+        ),
+    )
+
+    result = service.send_message(
+        chat_id=chat_id,
+        content="Und genauer?",
+    )
+
+    assert result.contextualized is True
+    assert (
+        result.context_anchor_message_id
+        == substantive.message_id
+    )
+    assert result.plan.mode is AdaptiveRetrievalMode.SOURCES
+    assert len(source.calls) == 1
+
+
+def test_non_followup_does_not_reuse_prior_domain() -> None:
+    chat_id = uuid.uuid4()
+
+    anchor = _chat_message(
+        chat_id=chat_id,
+        sequence_no=1,
+        message_type=MessageType.USER,
+        content="Was steht im PDF \u00fcber Berlin?",
+    )
+
+    planned, local, archive = planner()
+
+    (
+        service,
+        direct,
+        memory,
+        source,
+        unified,
+    ) = _adaptive_runtime(
+        planned=planned,
+        chat=FakeChatHistory((anchor,)),
+    )
+
+    result = service.send_message(
+        chat_id=chat_id,
+        content="Warum leuchten Sterne?",
+    )
+
+    assert result.contextualized is False
+    assert result.context_anchor_message_id is None
+    assert (
+        result.retrieval_query
+        == "Warum leuchten Sterne?"
+    )
+    assert result.plan.mode is AdaptiveRetrievalMode.DIRECT
+
+    assert len(direct.calls) == 1
+    assert memory.calls == []
+    assert source.calls == []
+    assert unified.calls == []
+
+    assert len(local.calls) == 2
+    assert len(archive.calls) == 1
+
+
+def test_followup_without_anchor_remains_uncontextualized() -> None:
+    chat_id = uuid.uuid4()
+
+    planned, local, archive = planner()
+
+    (
+        service,
+        direct,
+        memory,
+        source,
+        unified,
+    ) = _adaptive_runtime(
+        planned=planned,
+        chat=FakeChatHistory(),
+    )
+
+    result = service.send_message(
+        chat_id=chat_id,
+        content="Und warum?",
+    )
+
+    assert result.contextualized is False
+    assert result.context_anchor_message_id is None
+    assert result.retrieval_query == "Und warum?"
+    assert result.plan.mode is AdaptiveRetrievalMode.DIRECT
+
+    assert len(direct.calls) == 1
+    assert memory.calls == []
+    assert source.calls == []
+    assert unified.calls == []
+
+    assert local.calls == []
+    assert archive.calls == []
+
+
+
+def test_adaptive_canonical_memory_route_requests_canonical_only_evidence() -> None:
+    chat_id = uuid.uuid4()
+
+    planned, _local, _archive = planner(
+        knowledge_texts=(
+            "Athenafalke verwendet die Kennzahl 7319.",
+        ),
+    )
+
+    (
+        service,
+        direct,
+        memory,
+        source,
+        unified,
+    ) = _adaptive_runtime(
+        planned=planned,
+        chat=FakeChatHistory(),
+    )
+
+    result = service.send_message(
+        chat_id=chat_id,
+        content="Welche Kennzahl verwendet Athenafalke?",
+    )
+
+    assert result.plan.mode is AdaptiveRetrievalMode.MEMORY
+
+    assert direct.calls == []
+    assert source.calls == []
+    assert unified.calls == []
+
+    assert len(memory.calls) == 1
+
+    assert (
+        memory.calls[0]["canonical_only_retrieval"]
+        is True
+    )
+
+
+def test_adaptive_explicit_conversation_recall_allows_chat_message_evidence() -> None:
+    chat_id = uuid.uuid4()
+
+    planned, _local, _archive = planner()
+
+    (
+        service,
+        direct,
+        memory,
+        source,
+        unified,
+    ) = _adaptive_runtime(
+        planned=planned,
+        chat=FakeChatHistory(),
+    )
+
+    result = service.send_message(
+        chat_id=chat_id,
+        content="Was haben wir im Chat besprochen?",
+    )
+
+    assert result.plan.mode is AdaptiveRetrievalMode.MEMORY
+
+    assert direct.calls == []
+    assert source.calls == []
+    assert unified.calls == []
+
+    assert len(memory.calls) == 1
+
+    assert (
+        memory.calls[0]["canonical_only_retrieval"]
+        is False
+    )
+
+
+def test_adaptive_weisst_du_noch_uses_canonical_memory_not_raw_chat() -> None:
+    chat_id = uuid.uuid4()
+
+    planned, _local, _archive = planner()
+
+    (
+        service,
+        direct,
+        memory,
+        source,
+        unified,
+    ) = _adaptive_runtime(
+        planned=planned,
+        chat=FakeChatHistory(),
+    )
+
+    result = service.send_message(
+        chat_id=chat_id,
+        content="Was weisst du noch ueber Athenafalke?",
+    )
+
+    assert result.plan.mode is AdaptiveRetrievalMode.MEMORY
+    assert len(memory.calls) == 1
+
+    assert (
+        memory.calls[0]["canonical_only_retrieval"]
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "mode",
+        "expected_delegate",
+    ),
+    (
+        (
+            AdaptiveRetrievalMode.DIRECT,
+            "direct",
+        ),
+        (
+            AdaptiveRetrievalMode.MEMORY,
+            "memory",
+        ),
+        (
+            AdaptiveRetrievalMode.SOURCES,
+            "source",
+        ),
+        (
+            AdaptiveRetrievalMode.UNIFIED,
+            "unified",
+        ),
+    ),
+)
+def test_adaptive_chat_delegates_exactly_once(
+    mode: AdaptiveRetrievalMode,
+    expected_delegate: str,
+) -> None:
+    planned = StubPlanner(mode)
+
+    direct = FakeDelegate()
+    memory = FakeDelegate()
+    source = FakeDelegate()
+    unified = FakeDelegate()
+
+    service = AdaptiveChatService(
+        chat=FakeChatHistory(),  # type: ignore[arg-type]
+        planner=planned,  # type: ignore[arg-type]
+        direct_chat=direct,  # type: ignore[arg-type]
+        memory_chat=memory,  # type: ignore[arg-type]
+        source_grounded_chat=source,  # type: ignore[arg-type]
+        unified_local_chat=unified,  # type: ignore[arg-type]
+    )
+
+    result = service.send_message(
+        chat_id=uuid.uuid4(),
+        content="Adaptive test",
+        requested_model_id="primary",
+        requested_embedding_model_id="embed",
+        max_memory_context_tokens=1300,
+        max_memory_context_items=7,
+        max_memory_items=5,
+        max_source_context_tokens=1500,
+        max_source_context_items=6,
+        effective_context_limit=8192,
+        output_reserve=1000,
+        safety_margin=100,
+        allow_model_prior=False,
+    )
+
+    delegates = {
+        "direct": direct,
+        "memory": memory,
+        "source": source,
+        "unified": unified,
+    }
+
+    assert planned.calls == [
+        "Adaptive test"
+    ]
+
+    for name, delegate in delegates.items():
+        if name == expected_delegate:
+            assert len(delegate.calls) == 1
+        else:
+            assert delegate.calls == []
+
+    assert result.plan.mode is mode
+
+    if mode is AdaptiveRetrievalMode.DIRECT:
+        call = direct.calls[0]
+
+        assert (
+            "requested_embedding_model_id"
+            not in call
+        )
+
+        assert (
+            "allow_model_prior"
+            not in call
+        )
+
+    else:
+        selected = delegates[
+            expected_delegate
+        ].calls[0]
+
+        assert (
+            selected[
+                "requested_embedding_model_id"
+            ]
+            == "embed"
+        )
+
+        assert (
+            selected[
+                "allow_model_prior"
+            ]
+            is False
+        )

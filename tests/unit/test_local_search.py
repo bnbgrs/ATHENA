@@ -133,3 +133,79 @@ def test_search_projection_excludes_internal_assistant_provenance_manifest(tmp_p
         ) == ()
     finally:
         database.stop()
+
+
+
+def test_search_projection_excludes_turn_local_markers_from_all_chat_messages(
+    tmp_path,
+) -> None:
+    database, chat, _knowledge, _claims, search = _services(
+        tmp_path
+    )
+
+    try:
+        chat_id = chat.create_chat()
+
+        chat.add_user_message(
+            chat_id=chat_id,
+            content=(
+                "Athenafalke user history "
+                "[CTX-777]."
+            ),
+        )
+
+        chat.add_assistant_message(
+            chat_id=chat_id,
+            content=(
+                "Athenafalke assistant history "
+                "[CTX-001], [SOURCE:CTX-002].\n\n"
+                'ATHENA_PROVENANCE '
+                '{"athena_provenance_version":3,"evidence":[]}'
+            ),
+            provider_id="lm_studio",
+            model_id="primary",
+        )
+
+        results = search.search(
+            "Athenafalke",
+            entity_type=(
+                SearchEntityType.CHAT_MESSAGE
+            ),
+        )
+
+        assert len(results) == 2
+
+        texts = {
+            item.text
+            for item in results
+        }
+
+        assert (
+            "Athenafalke user history."
+            in texts
+        )
+
+        assert (
+            "Athenafalke assistant history."
+            in texts
+        )
+
+        assert all(
+            "CTX-" not in text
+            for text in texts
+        )
+
+        assert all(
+            "ATHENA_PROVENANCE" not in text
+            for text in texts
+        )
+
+        assert search.search(
+            "CTX 777",
+            entity_type=(
+                SearchEntityType.CHAT_MESSAGE
+            ),
+        ) == ()
+
+    finally:
+        database.stop()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import uuid
 from collections.abc import Iterator, Sequence
 
@@ -234,6 +235,65 @@ def test_source_grounded_chat_uses_persistent_anchor_identity_not_chunk_identity
             for item in result.context_package.model_messages()
         )
         assert result.processing_run.status == "succeeded"
+    finally:
+        database.stop()
+
+
+def test_source_chat_retrieval_override_preserves_current_user_semantics(tmp_path) -> None:
+    archive_result = _archive_result()
+
+    (
+        database,
+        chat,
+        _provider,
+        _anchors,
+        _embedding,
+        retrieval,
+        service,
+    ) = _runtime(
+        tmp_path,
+        archive_result,
+    )
+
+    try:
+        chat_id = chat.create_chat()
+
+        retrieval_query = (
+            "What does my imported source say about Berlin?\n"
+            "And why?"
+        )
+
+        result = service.send_message(
+            chat_id=chat_id,
+            content="And why?",
+            retrieval_query=retrieval_query,
+            requested_model_id="primary",
+            requested_embedding_model_id="embed-model",
+            output_reserve=1000,
+            safety_margin=100,
+        )
+
+        assert (
+            retrieval.calls[0][0]
+            == retrieval_query
+        )
+
+        # SourceContext presented to the model retains the real user query.
+        assert result.context.query == "And why?"
+        assert (
+            result.generation.user_message.content
+            == "And why?"
+        )
+
+        run_snapshot = json.loads(
+            result.processing_run.input_snapshot_json
+        )
+
+        assert (
+            run_snapshot["retrieval_query_override"]
+            == retrieval_query
+        )
+
     finally:
         database.stop()
 

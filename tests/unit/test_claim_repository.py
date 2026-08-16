@@ -198,3 +198,106 @@ def test_duplicate_contradiction_is_rejected_without_partial_write(tmp_path) -> 
     assert after is not None
     assert int(after["count"]) == int(before["count"]) == 2
     database.stop()
+
+
+
+def test_grounded_assistant_promotion_strips_trace_but_preserves_claim_origin(
+    tmp_path,
+) -> None:
+    database, chat, repository, claims = _services(
+        tmp_path
+    )
+
+    try:
+        chat_id = chat.create_chat()
+
+        chat.add_user_message(
+            chat_id=chat_id,
+            content="What archive code?",
+        )
+
+        assistant = chat.add_assistant_message(
+            chat_id=chat_id,
+            content=(
+                "The archive code is 8842 "
+                "[SOURCE:CTX-001].\n\n"
+                'ATHENA_PROVENANCE '
+                '{"athena_provenance_version":3,'
+                '"evidence":[{"context_id":"CTX-001"}]}'
+            ),
+            provider_id="lm_studio",
+            model_id="primary",
+        )
+
+        revision = claims.promote_chat_message(
+            chat_id=chat_id,
+            sequence_no=2,
+            claim_kind=ClaimKind.FACTUAL_ASSERTION,
+        )
+
+        snapshot = repository.load_current(
+            revision.claim_id
+        )
+
+        assert (
+            snapshot.revision.payload.statement
+            == "The archive code is 8842."
+        )
+
+        assert (
+            "CTX-"
+            not in snapshot.revision.payload.statement
+        )
+
+        assert (
+            "ATHENA_PROVENANCE"
+            not in snapshot.revision.payload.statement
+        )
+
+        inputs = repository.list_provenance_inputs(
+            revision.provenance_id
+        )
+
+        assert len(inputs) == 1
+        assert (
+            inputs[0].input_entity_id
+            == assistant.message_id
+        )
+        assert (
+            inputs[0].input_revision_id
+            == assistant.revision_id
+        )
+
+        evidence = repository.list_evidence(
+            revision.claim_id
+        )
+
+        assert len(evidence) == 1
+        assert (
+            evidence[0].evidence_role
+            is EvidenceRole.ORIGINATES
+        )
+        assert (
+            evidence[0].message_id
+            == assistant.message_id
+        )
+        assert (
+            evidence[0].evidence_revision_id
+            == assistant.revision_id
+        )
+
+        persisted = chat.load_chat(
+            chat_id
+        ).messages[1]
+
+        assert (
+            "[SOURCE:CTX-001]"
+            in persisted.content
+        )
+        assert (
+            "ATHENA_PROVENANCE"
+            in persisted.content
+        )
+
+    finally:
+        database.stop()

@@ -14,11 +14,12 @@ def _ranked(
     score: float = 0.9,
     contradictions: int = 0,
     duplicates: int = 0,
+    entity_type: SearchEntityType = SearchEntityType.KNOWLEDGE,
 ) -> RankedSearchResult:
     return RankedSearchResult(
         entity_id=uuid.uuid4(),
         revision_id=uuid.uuid4(),
-        entity_type=SearchEntityType.KNOWLEDGE,
+        entity_type=entity_type,
         title="Test",
         snippet=text,
         text=text,
@@ -183,3 +184,50 @@ def test_context_evidence_truncation_prefers_sentence_boundary() -> None:
     assert item.text.endswith("…[TRUNCATED]")
     prefix = item.text.removesuffix(" …[TRUNCATED]")
     assert prefix.endswith((".", "!", "?"))
+
+
+
+def test_context_builder_strips_stale_ctx_markers_from_chat_message_evidence() -> None:
+    source = _ranked(
+        "Athenafalke uses 7319 [CTX-001], [CONVERSATION:CTX-003].",
+        entity_type=SearchEntityType.CHAT_MESSAGE,
+    )
+
+    bundle = ContextBuilderService().build_from_ranked(
+        query="Athenafalke",
+        results=(source,),
+        max_estimated_tokens=800,
+    )
+
+    assert len(bundle.items) == 1
+    assert bundle.items[0].text == "Athenafalke uses 7319."
+
+    payload = json.loads(bundle.rendered_text)
+    assert payload["items"][0]["context_id"] == "CTX-001"
+    assert payload["items"][0]["text"] == "Athenafalke uses 7319."
+    assert "[CTX-" not in payload["items"][0]["text"]
+    assert "[CONVERSATION:CTX-" not in payload["items"][0]["text"]
+    assert "[USER-STATEMENT:CTX-" not in payload["items"][0]["text"]
+    assert "[SOURCE:CTX-" not in payload["items"][0]["text"]
+    assert "[INFERENCE:CTX-" not in payload["items"][0]["text"]
+
+
+def test_context_builder_does_not_rewrite_canonical_knowledge_text() -> None:
+    literal = (
+        "The canonical record literally contains "
+        "the token [CTX-001]."
+    )
+
+    source = _ranked(
+        literal,
+        entity_type=SearchEntityType.KNOWLEDGE,
+    )
+
+    bundle = ContextBuilderService().build_from_ranked(
+        query="canonical token",
+        results=(source,),
+        max_estimated_tokens=800,
+    )
+
+    assert bundle.items[0].text == literal
+    assert "[CTX-001]" in bundle.rendered_text

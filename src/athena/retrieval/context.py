@@ -9,6 +9,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Literal
 
+from athena.chat.provenance import strip_turn_local_grounding_markers
 from athena.memory.models import PersonalMemorySnapshot
 from athena.retrieval.hybrid import HybridSearchResult
 from athena.retrieval.ranking import RankedSearchResult
@@ -100,7 +101,10 @@ class ContextBuilderService:
                 revision_id=item.revision_id,
                 entity_type=item.entity_type,
                 title=item.title,
-                text=item.text,
+                text=_model_facing_retrieval_text(
+                    item.entity_type,
+                    item.text,
+                ),
                 score=item.score,
                 contradiction_count=item.contradiction_count,
                 duplicate_count=item.duplicate_count,
@@ -133,7 +137,10 @@ class ContextBuilderService:
                 revision_id=item.revision_id,
                 entity_type=item.entity_type,
                 title=item.title,
-                text=item.text,
+                text=_model_facing_retrieval_text(
+                    item.entity_type,
+                    item.text,
+                ),
                 score=item.score,
                 contradiction_count=item.contradiction_count,
                 duplicate_count=item.duplicate_count,
@@ -364,6 +371,16 @@ class _Source:
     score: float
     contradiction_count: int
     duplicate_count: int
+
+
+def _model_facing_retrieval_text(
+    entity_type: SearchEntityType,
+    text: str,
+) -> str:
+    if entity_type is SearchEntityType.CHAT_MESSAGE:
+        return strip_turn_local_grounding_markers(text)
+
+    return text
 
 
 def _to_context_item(

@@ -32,6 +32,7 @@ from athena.retrieval.context_package import (
 )
 from athena.retrieval.evidence import MemoryEvidencePolicy, MemoryEvidenceSelection
 from athena.retrieval.hybrid import HybridRetrievalService
+from athena.retrieval.search import SearchEntityType
 
 _MIN_CONTEXT_BUDGET = 128
 _MAX_CONTEXT_BUDGET = 64_000
@@ -100,6 +101,8 @@ class MemoryAugmentedChatService:
         *,
         chat_id: uuid.UUID,
         content: str,
+        retrieval_query: str | None = None,
+        canonical_only_retrieval: bool = False,
         requested_model_id: str | None = None,
         requested_embedding_model_id: str | None = None,
         max_context_tokens: int = 1200,
@@ -122,6 +125,14 @@ class MemoryAugmentedChatService:
             output_reserve=output_reserve,
             safety_margin=safety_margin,
         )
+
+        search_query = content
+        if retrieval_query is not None:
+            search_query = retrieval_query.strip()
+            if not search_query:
+                raise ContextBuilderError(
+                    "Retrieval query override must not be empty."
+                )
 
         model = self.chat_generation.select_model(requested_model_id)
         context_limit = self._resolve_context_limit(
@@ -161,10 +172,22 @@ class MemoryAugmentedChatService:
         )
         candidate_limit = min(200, max(40, max_context_items * 8))
         results = self.hybrid_retrieval.search(
-            content,
+            search_query,
             model_id=embedding_model.backend_model_id,
             limit=candidate_limit,
         )
+
+        if canonical_only_retrieval:
+            results = tuple(
+                item
+                for item in results
+                if item.entity_type
+                in {
+                    SearchEntityType.KNOWLEDGE,
+                    SearchEntityType.CLAIM,
+                }
+            )
+
         evidence_selection = self.evidence_policy.classify(results)
 
         context: ContextBundle | None = None
@@ -236,6 +259,7 @@ class MemoryAugmentedChatService:
             "safety_margin": safety_margin,
             "embedding_model_id": embedding_model.backend_model_id,
             "evidence_policy_id": evidence_selection.policy_id,
+            "canonical_only_retrieval": canonical_only_retrieval,
             "allow_model_prior": allow_model_prior,
         }
         signature = self.model_runs.get_or_create_signature(
@@ -288,11 +312,19 @@ class MemoryAugmentedChatService:
 
         if user_message.actor_id is None:
             raise RuntimeError("Persisted user message has no actor for ProcessingRun.")
+
+        run_snapshot = package.run_snapshot()
+        if retrieval_query is not None:
+            run_snapshot = {
+                **run_snapshot,
+                "retrieval_query_override": search_query,
+            }
+
         processing_run = self.model_runs.start_run(
             run_type="chat.memory_context_package",
             trigger_actor_id=user_message.actor_id,
             pipeline_version="memory-chat-context-package-v1",
-            input_snapshot=package.run_snapshot(),
+            input_snapshot=run_snapshot,
             configuration=context_configuration,
             model_signature_id=signature.model_signature_id,
             prompt_template_id="memory-grounding",

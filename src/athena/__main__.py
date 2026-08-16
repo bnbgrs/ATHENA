@@ -9,6 +9,7 @@ import uuid
 from collections.abc import Sequence
 from pathlib import Path
 
+from athena.chat.adaptive import AdaptiveChatResult
 from athena.chat.generation import ModelSelectionError, UnsupportedChatHistoryError
 from athena.chat.memory import MemoryChatGenerationResult
 from athena.chat.models import ChatThread
@@ -262,6 +263,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Retrieve imported Raw Archive sources, materialize persistent "
             "SourceAnchors, and require source-grounded citations."
+        ),
+    )
+    send_parser.add_argument(
+        "--adaptive",
+        action="store_true",
+        help=(
+            "Automatically choose the smallest mature local chat path: direct, "
+            "Memory/Knowledge, Raw Archive, or unified local retrieval. "
+            "Planner v1 performs no additional model call."
         ),
     )
     send_parser.add_argument(
@@ -1334,34 +1344,52 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
         return 0
 
     if args.chat_command == "send":
+        if args.adaptive and (args.memory or args.sources):
+            print(
+                "ATHENA chat error: --adaptive cannot be combined with "
+                "manual --memory or --sources routing.",
+                file=sys.stderr,
+            )
+            return 2
         if (
-            args.memory
-            and args.sources
+            ((args.memory and args.sources) or args.adaptive)
             and args.memory_allow_model_prior is not None
             and args.source_allow_model_prior is not None
             and args.memory_allow_model_prior != args.source_allow_model_prior
         ):
             print(
-                "ATHENA chat error: combined --memory --sources received "
+                "ATHENA chat error: combined/adaptive retrieval received "
                 "conflicting model-prior policies.",
                 file=sys.stderr,
             )
             return 2
-        if not (args.memory or args.sources) and args.embedding_model_id is not None:
+        if (
+            not (args.memory or args.sources or args.adaptive)
+            and args.embedding_model_id is not None
+        ):
             print(
-                "ATHENA chat error: --embedding-model requires --memory or --sources.",
+                "ATHENA chat error: --embedding-model requires --memory, "
+                "--sources, or --adaptive.",
                 file=sys.stderr,
             )
             return 2
-        if not args.memory and args.memory_allow_model_prior is not None:
+        if (
+            not (args.memory or args.adaptive)
+            and args.memory_allow_model_prior is not None
+        ):
             print(
-                "ATHENA chat error: memory model-prior options require --memory.",
+                "ATHENA chat error: memory model-prior options require "
+                "--memory or --adaptive.",
                 file=sys.stderr,
             )
             return 2
-        if not args.sources and args.source_allow_model_prior is not None:
+        if (
+            not (args.sources or args.adaptive)
+            and args.source_allow_model_prior is not None
+        ):
             print(
-                "ATHENA chat error: source model-prior options require --sources.",
+                "ATHENA chat error: source model-prior options require "
+                "--sources or --adaptive.",
                 file=sys.stderr,
             )
             return 2
@@ -1425,11 +1453,38 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
                 return 2
 
         print("Assistant: ", end="", flush=True)
+        adaptive_result: AdaptiveChatResult | None = None
         memory_result: MemoryChatGenerationResult | None = None
         source_result: SourceGroundedChatResult | None = None
         unified_result: UnifiedLocalChatResult | None = None
         try:
-            if args.memory and args.sources:
+            if args.adaptive:
+                adaptive_allow_model_prior = True
+                if args.memory_allow_model_prior is not None:
+                    adaptive_allow_model_prior = args.memory_allow_model_prior
+                if args.source_allow_model_prior is not None:
+                    adaptive_allow_model_prior = args.source_allow_model_prior
+
+                adaptive_result = app.adaptive_chat.send_message(
+                    chat_id=args.chat_id,
+                    content=args.content,
+                    requested_model_id=args.model_id,
+                    requested_embedding_model_id=args.embedding_model_id,
+                    max_memory_context_tokens=args.memory_max_tokens,
+                    max_memory_context_items=args.memory_max_items,
+                    max_memory_items=args.memory_max_preferences,
+                    max_source_context_tokens=args.source_max_tokens,
+                    max_source_context_items=args.source_max_items,
+                    memory_scope_kind=args.memory_scope_kind,
+                    memory_scope_entity_id=args.memory_scope_id,
+                    effective_context_limit=args.memory_context_limit,
+                    output_reserve=args.memory_output_reserve,
+                    safety_margin=args.memory_safety_margin,
+                    allow_model_prior=adaptive_allow_model_prior,
+                    on_delta=lambda chunk: print(chunk, end="", flush=True),
+                )
+                result = adaptive_result.generation
+            elif args.memory and args.sources:
                 unified_allow_model_prior = True
                 if args.memory_allow_model_prior is not None:
                     unified_allow_model_prior = args.memory_allow_model_prior
@@ -1511,6 +1566,43 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
             return 130
         print()
         print(f"Model: {result.model.backend_model_id}")
+        if adaptive_result is not None:
+            plan = adaptive_result.plan
+            print(
+                "Adaptive retrieval: "
+                f"mode={plan.mode.value} "
+                f"reason={plan.reason.value} "
+                f"probe={'yes' if plan.probe_query is not None else 'no'} "
+                f"canonical_hit={plan.canonical_probe_hit} "
+                f"archive_hit={plan.archive_probe_hit} "
+                f"contextualized={adaptive_result.contextualized} "
+                f"anchor="
+                f"{adaptive_result.context_anchor_message_id or '<none>'}"
+            )
+            for warning in plan.warnings:
+                print(
+                    f"Adaptive retrieval warning: {warning}",
+                    file=sys.stderr,
+                )
+
+            grounding = result.grounding_report
+            if grounding is not None:
+                cited = ", ".join(
+                    grounding.cited_context_ids
+                ) or "<none>"
+                print(
+                    "Grounding: "
+                    f"cited={cited} "
+                    f"canonical={len(grounding.canonical_context_ids)} "
+                    f"user_statements="
+                    f"{len(grounding.user_statement_context_ids)} "
+                    f"conversation="
+                    f"{len(grounding.conversation_context_ids)} "
+                    f"sources={len(grounding.source_context_ids)} "
+                    f"inference={grounding.uses_inference} "
+                    f"model_prior={grounding.uses_model_prior} "
+                    f"unknown={grounding.uses_unknown}"
+                )
         if unified_result is not None:
             print(
                 "Unified local context: "

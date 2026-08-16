@@ -175,3 +175,149 @@ def test_user_commit_guard_rejects_intervening_canonical_write(tmp_path) -> None
             service.assert_user_commit_follows(snapshot, current)
     finally:
         database.stop()
+
+
+
+def test_context_package_removes_turn_local_markers_only_from_prior_conversation(
+    tmp_path,
+) -> None:
+    database = _database(tmp_path)
+
+    try:
+        chat = ChatService(
+            ChatRepository(database)
+        )
+
+        chat_id = chat.create_chat()
+
+        prior_user = chat.add_user_message(
+            chat_id=chat_id,
+            content="Earlier user reference [CTX-777].",
+        )
+
+        prior_assistant = chat.add_assistant_message(
+            chat_id=chat_id,
+            content=(
+                "Earlier answer used 7319 [CTX-001], "
+                "[SOURCE:CTX-002].\n\n"
+                'ATHENA_PROVENANCE '
+                '{"athena_provenance_version":3,"evidence":[]}'
+            ),
+            provider_id="lm_studio",
+            model_id="primary",
+        )
+
+        service = ContextPackageService(
+            database
+        )
+
+        retrieval_snapshot = (
+            service.current_commit_seq()
+        )
+
+        context = (
+            ContextBuilderService()
+            .build_from_ranked(
+                query="Current request",
+                results=(),
+                max_estimated_tokens=800,
+            )
+        )
+
+        current = chat.add_user_message(
+            chat_id=chat_id,
+            content="Current request [CTX-999].",
+        )
+
+        package_snapshot = (
+            service.assert_user_commit_follows(
+                retrieval_snapshot,
+                current,
+            )
+        )
+
+        package = service.build(
+            model_signature=_signature(),
+            context=context,
+            system_text=(
+                "GROUNDING\n"
+                + context.rendered_text
+            ),
+            prior_messages=(
+                prior_user,
+                prior_assistant,
+            ),
+            current_user_message=current,
+            budget=ContextPackageBudget(
+                effective_context_limit=4096,
+                context_budget=800,
+                output_reserve=1000,
+                safety_margin=200,
+            ),
+            token_estimates=ContextTokenEstimates(
+                conversation_tokens=100,
+                current_user_tokens=20,
+                system_tokens=100,
+                context_tokens=(
+                    context.estimated_tokens
+                ),
+                estimated_input_tokens=220,
+                estimated_total_tokens=1420,
+            ),
+            snapshot_commit_seq=(
+                package_snapshot
+            ),
+            retrieval_candidate_count=0,
+            memory_candidate_count=0,
+        )
+
+        messages = package.model_messages()
+
+        assert [
+            item.role
+            for item in messages
+        ] == [
+            "system",
+            "user",
+            "assistant",
+            "user",
+        ]
+
+        assert (
+            messages[1].content
+            == "Earlier user reference."
+        )
+
+        assert (
+            messages[2].content
+            == "Earlier answer used 7319."
+        )
+
+        # CURRENT-USER is not rewritten.
+        assert (
+            messages[3].content
+            == "Current request [CTX-999]."
+        )
+
+        # Canonical persisted history is untouched.
+        thread = chat.load_chat(
+            chat_id
+        )
+
+        assert (
+            thread.messages[0].content
+            == "Earlier user reference [CTX-777]."
+        )
+
+        assert (
+            thread.messages[1].content
+            == (
+                "Earlier answer used 7319 [CTX-001], "
+                "[SOURCE:CTX-002].\n\n"
+                'ATHENA_PROVENANCE '
+                '{"athena_provenance_version":3,"evidence":[]}'
+            )
+        )
+
+    finally:
+        database.stop()

@@ -9,7 +9,10 @@ from dataclasses import dataclass
 from typing import Any, Literal, Mapping
 
 from athena.chat.models import ChatMessage, MessageType
-from athena.chat.provenance import strip_durable_provenance_manifest
+from athena.chat.provenance import (
+    strip_model_facing_assistant_trace,
+    strip_turn_local_grounding_markers,
+)
 from athena.common.ids import new_uuid7, uuid_to_blob
 from athena.model.domain import ModelChatMessage
 from athena.model.provenance import ModelSignature
@@ -584,9 +587,9 @@ def _model_message_payload(message: ChatMessage) -> tuple[str, ContextRole]:
             "Protected or unavailable chat content cannot enter this ContextPackage."
         )
     if message.message_type is MessageType.USER:
-        return message.content, "user"
+        return strip_turn_local_grounding_markers(message.content), "user"
     if message.message_type is MessageType.ASSISTANT:
-        return strip_durable_provenance_manifest(message.content), "assistant"
+        return strip_model_facing_assistant_trace(message.content), "assistant"
     raise ContextPackageError(
         f"Unsupported conversation message type {message.message_type.value!r}."
     )

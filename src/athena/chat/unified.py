@@ -228,6 +228,7 @@ class UnifiedLocalChatService:
         *,
         chat_id: uuid.UUID,
         content: str,
+        retrieval_query: str | None = None,
         requested_model_id: str | None = None,
         requested_embedding_model_id: str | None = None,
         max_memory_context_tokens: int = 1200,
@@ -254,6 +255,14 @@ class UnifiedLocalChatService:
             output_reserve=output_reserve,
             safety_margin=safety_margin,
         )
+
+        search_query = content
+        if retrieval_query is not None:
+            search_query = retrieval_query.strip()
+            if not search_query:
+                raise ContextBuilderError(
+                    "Retrieval query override must not be empty."
+                )
 
         model = self.chat_generation.select_model(requested_model_id)
         context_limit = _resolve_context_limit(
@@ -326,7 +335,7 @@ class UnifiedLocalChatService:
             max(40, max_source_context_items * 8),
         )
         source_results = self.archive_retrieval.search(
-            content,
+            search_query,
             model_id=embedding_model.backend_model_id,
             limit=source_candidate_limit,
         )
@@ -371,13 +380,13 @@ class UnifiedLocalChatService:
         # They must not compete with Canonical Knowledge for the bounded
         # Knowledge portion of an explicitly combined --memory --sources turn.
         knowledge_results = self.hybrid_retrieval.search(
-            content,
+            search_query,
             model_id=embedding_model.backend_model_id,
             limit=memory_candidate_limit,
             entity_type=SearchEntityType.KNOWLEDGE,
         )
         claim_results = self.hybrid_retrieval.search(
-            content,
+            search_query,
             model_id=embedding_model.backend_model_id,
             limit=memory_candidate_limit,
             entity_type=SearchEntityType.CLAIM,
@@ -560,11 +569,18 @@ class UnifiedLocalChatService:
                 "Persisted user message has no actor for ProcessingRun."
             )
 
+        run_snapshot = package.run_snapshot()
+        if retrieval_query is not None:
+            run_snapshot = {
+                **run_snapshot,
+                "retrieval_query_override": search_query,
+            }
+
         processing_run = self.model_runs.start_run(
             run_type="chat.unified_local_context_package",
             trigger_actor_id=user_message.actor_id,
             pipeline_version="unified-local-chat-context-package-v1",
-            input_snapshot=package.run_snapshot(),
+            input_snapshot=run_snapshot,
             configuration=context_configuration,
             model_signature_id=signature.model_signature_id,
             prompt_template_id="unified-local-grounding",

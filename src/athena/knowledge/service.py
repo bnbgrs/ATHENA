@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import uuid
 
+from athena.chat.models import MessageType
+from athena.chat.provenance import strip_canonical_promotion_trace
 from athena.chat.service import ChatService
 from athena.knowledge.models import (
     EpistemicStatus,
@@ -40,11 +42,12 @@ class KnowledgeService:
         title: str | None = None,
         epistemic_status: EpistemicStatus = EpistemicStatus.ASSERTED,
     ) -> KnowledgeUnitRevision:
-        """Promote one exact chat message via an explicit user semantic commit.
+        """Promote one chat message via an explicit user semantic commit.
 
-        No model interprets or rewrites the message in this use case. The exact
-        visible message text becomes the first KnowledgeUnit body and its stable
-        message revision becomes provenance input ordinal 0.
+        No model interprets or rewrites the message in this use case. User-authored
+        text remains exact at the Knowledge draft boundary. Assistant-authored text
+        is projected deterministically without ephemeral grounding annotations.
+        The stable original message revision remains provenance input ordinal 0.
         """
         if sequence_no < 1:
             raise ChatMessageSequenceError("Chat message sequence must be at least 1.")
@@ -63,13 +66,23 @@ class KnowledgeService:
                 "Protected chat content cannot be promoted through the unprotected VS2 path."
             )
 
+        body = message.content
+        if message.message_type is MessageType.ASSISTANT:
+            body = strip_canonical_promotion_trace(body)
+
+        if not body.strip():
+            raise UnsupportedKnowledgeSourceError(
+                "Assistant chat content contains no promotable semantic text after "
+                "removing technical grounding annotations."
+            )
+
         actor_id = self.chat.ensure_local_user()
         return self.repository.create_knowledge_unit(
             actor_id=actor_id,
             draft=KnowledgeUnitDraft(
                 knowledge_kind=knowledge_kind,
                 title=title,
-                body=message.content,
+                body=body,
                 epistemic_status=epistemic_status,
             ),
             source_entity_id=message.message_id,

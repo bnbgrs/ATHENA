@@ -446,6 +446,143 @@ def test_memory_chat_retrieves_and_passes_typed_bounded_ephemeral_context() -> N
     assert generation.calls[0]["reasoning_mode"] == "off"
 
 
+def test_memory_chat_retrieval_override_preserves_current_user_semantics() -> None:
+    generation = FakeChatGeneration()
+    hybrid = FakeHybrid()
+    service = _service(
+        generation,
+        hybrid,
+    )
+
+    retrieval_query = (
+        "Welche Hauptstadt hat Deutschland?\n"
+        "Und warum?"
+    )
+
+    result = service.send_message(
+        chat_id=uuid.uuid4(),
+        content="Und warum?",
+        retrieval_query=retrieval_query,
+        requested_model_id="primary",
+        requested_embedding_model_id="embed",
+        max_context_tokens=800,
+        output_reserve=1000,
+        safety_margin=200,
+    )
+
+    assert hybrid.queries == [
+        retrieval_query
+    ]
+
+    payload = json.loads(
+        result.context.rendered_text
+    )
+
+    # Model-facing context still reflects the exact current user turn.
+    assert payload["query"] == "Und warum?"
+    assert (
+        result.generation.user_message.content
+        == "Und warum?"
+    )
+
+    run_snapshot = json.loads(
+        result.processing_run.input_snapshot_json
+    )
+
+    # Technical retrieval expansion is durable and auditable separately.
+    assert (
+        run_snapshot["retrieval_query_override"]
+        == retrieval_query
+    )
+
+
+def test_memory_chat_canonical_only_retrieval_filters_chat_messages() -> None:
+    generation = FakeChatGeneration()
+    hybrid = FakeHybrid()
+
+    hybrid.result = replace(
+        hybrid.result,
+        entity_type=SearchEntityType.CHAT_MESSAGE,
+        title=None,
+        text="Earlier assistant answer about Athenafalke 7319.",
+    )
+
+    service = _service(
+        generation,
+        hybrid,
+    )
+
+    result = service.send_message(
+        chat_id=uuid.uuid4(),
+        content="Welche Kennzahl verwendet Athenafalke?",
+        canonical_only_retrieval=True,
+        requested_model_id="primary",
+        requested_embedding_model_id="embed",
+        max_context_tokens=800,
+        max_context_items=4,
+        output_reserve=1000,
+        safety_margin=200,
+    )
+
+    assert len(result.evidence_selection.results) == 0
+    assert result.context.items == ()
+
+    configuration = json.loads(
+        result.context_package.model_signature.context_configuration_json
+        or "{}"
+    )
+
+    assert (
+        configuration["canonical_only_retrieval"]
+        is True
+    )
+
+
+def test_memory_chat_default_retrieval_preserves_chat_message_candidates() -> None:
+    generation = FakeChatGeneration()
+    hybrid = FakeHybrid()
+
+    hybrid.result = replace(
+        hybrid.result,
+        entity_type=SearchEntityType.CHAT_MESSAGE,
+        title=None,
+        text="Earlier conversation record.",
+    )
+
+    service = _service(
+        generation,
+        hybrid,
+    )
+
+    result = service.send_message(
+        chat_id=uuid.uuid4(),
+        content="Was haben wir im Chat besprochen?",
+        requested_model_id="primary",
+        requested_embedding_model_id="embed",
+        max_context_tokens=800,
+        max_context_items=4,
+        output_reserve=1000,
+        safety_margin=200,
+    )
+
+    assert len(result.evidence_selection.results) == 1
+
+    assert (
+        result.evidence_selection.results[0].entity_type
+        is SearchEntityType.CHAT_MESSAGE
+    )
+
+    configuration = json.loads(
+        result.context_package.model_signature.context_configuration_json
+        or "{}"
+    )
+
+    assert (
+        configuration["canonical_only_retrieval"]
+        is False
+    )
+
+
 def test_memory_chat_includes_personal_memory_as_user_preference() -> None:
     generation = FakeChatGeneration()
     hybrid = FakeHybrid()

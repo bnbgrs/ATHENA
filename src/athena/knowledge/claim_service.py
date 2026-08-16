@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import uuid
 
+from athena.chat.models import MessageType
+from athena.chat.provenance import strip_canonical_promotion_trace
 from athena.chat.service import ChatService
 from athena.knowledge.claim_repository import ClaimRepository
 from athena.knowledge.models import (
@@ -38,7 +40,12 @@ class ClaimService:
         valid_from_us: int | None = None,
         valid_to_us: int | None = None,
     ) -> ClaimRevision:
-        """Promote one exact chat-message revision to a canonical Claim."""
+        """Promote one chat-message revision to a canonical Claim.
+
+        User-authored text remains exact at the Claim draft boundary. Assistant
+        grounding annotations are removed deterministically while the original
+        chat revision remains the stable provenance and evidence source.
+        """
         if sequence_no < 1:
             raise ChatMessageSequenceError("Chat message sequence must be at least 1.")
 
@@ -56,12 +63,22 @@ class ClaimService:
                 "Protected chat content cannot be promoted through the unprotected VS2 path."
             )
 
+        statement = message.content
+        if message.message_type is MessageType.ASSISTANT:
+            statement = strip_canonical_promotion_trace(statement)
+
+        if not statement.strip():
+            raise UnsupportedKnowledgeSourceError(
+                "Assistant chat content contains no promotable semantic text after "
+                "removing technical grounding annotations."
+            )
+
         actor_id = self.chat.ensure_local_user()
         return self.repository.create_claim(
             actor_id=actor_id,
             draft=ClaimDraft(
                 claim_kind=claim_kind,
-                statement=message.content,
+                statement=statement,
                 epistemic_status=epistemic_status,
                 valid_from_us=valid_from_us,
                 valid_to_us=valid_to_us,

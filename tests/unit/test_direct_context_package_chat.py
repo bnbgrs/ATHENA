@@ -98,10 +98,18 @@ def test_direct_chat_is_bounded_and_provider_receives_only_package(tmp_path) -> 
             provider_id="lm_studio",
             model_id="primary",
         )
-        recent_user = chat.add_user_message(chat_id=chat_id, content="recent user")
+        recent_user = chat.add_user_message(
+            chat_id=chat_id,
+            content="recent user [CTX-777]",
+        )
         recent_assistant = chat.add_assistant_message(
             chat_id=chat_id,
-            content="recent assistant",
+            content=(
+                "recent assistant [CTX-001], "
+                "[SOURCE:CTX-002].\n\n"
+                'ATHENA_PROVENANCE '
+                '{"athena_provenance_version":3,"evidence":[]}'
+            ),
             provider_id="lm_studio",
             model_id="primary",
         )
@@ -119,8 +127,34 @@ def test_direct_chat_is_bounded_and_provider_receives_only_package(tmp_path) -> 
         sent = provider.requests[0]
         assert tuple((item.role, item.content) for item in sent) == (
             ("user", "recent user"),
-            ("assistant", "recent assistant"),
+            ("assistant", "recent assistant."),
             ("user", "current user"),
+        )
+
+        assert all(
+            "CTX-" not in item.content
+            for item in sent[:-1]
+        )
+        assert all(
+            "ATHENA_PROVENANCE" not in item.content
+            for item in sent[:-1]
+        )
+
+        persisted = chat.load_chat(chat_id).messages
+
+        assert (
+            persisted[2].content
+            == "recent user [CTX-777]"
+        )
+
+        assert (
+            persisted[3].content
+            == (
+                "recent assistant [CTX-001], "
+                "[SOURCE:CTX-002].\n\n"
+                'ATHENA_PROVENANCE '
+                '{"athena_provenance_version":3,"evidence":[]}'
+            )
         )
         assert tuple(
             (item.role, item.content)

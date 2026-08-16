@@ -8,7 +8,10 @@ from dataclasses import dataclass
 
 from athena.chat.generation import ChatGenerationResult, ChatGenerationService
 from athena.chat.models import ChatMessage, MessageType
-from athena.chat.provenance import strip_durable_provenance_manifest
+from athena.chat.provenance import (
+    strip_model_facing_assistant_trace,
+    strip_turn_local_grounding_markers,
+)
 from athena.model.domain import ModelInfo
 from athena.model.provenance import ModelRunRepository, ProcessingRun
 from athena.retrieval.context import ContextBuilderError, estimate_tokens
@@ -261,10 +264,14 @@ def _prior_chat_sections(
         role: ContextRole
         if message.message_type is MessageType.USER:
             role = "user"
-            content = message.content
+            content = strip_turn_local_grounding_markers(
+                message.content
+            )
         elif message.message_type is MessageType.ASSISTANT:
             role = "assistant"
-            content = strip_durable_provenance_manifest(message.content)
+            content = strip_model_facing_assistant_trace(
+                message.content
+            )
         else:
             raise ContextBuilderError(
                 f"Unsupported conversation message type {message.message_type.value!r}."

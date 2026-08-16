@@ -578,6 +578,73 @@ def test_unified_local_chat_composes_memory_and_source_evidence_once() -> None:
 
 
 
+def test_unified_retrieval_override_preserves_current_user_semantics() -> None:
+    source = archive_result()
+    generation = FakeChatGeneration()
+    embedding = FakeEmbeddingProvider()
+    memory_hybrid = FakeMemoryHybrid()
+    archive = FakeArchiveRetrieval(source)
+    anchors = FakeAnchors(source)
+    packages = FakeContextPackages()
+    runs = FakeModelRuns()
+
+    service = UnifiedLocalChatService(
+        chat_generation=generation,  # type: ignore[arg-type]
+        embedding_provider=embedding,  # type: ignore[arg-type]
+        hybrid_retrieval=memory_hybrid,  # type: ignore[arg-type]
+        memory_context_builder=ContextBuilderService(),
+        evidence_policy=FakeEvidencePolicy(),  # type: ignore[arg-type]
+        personal_memory=FakePersonalMemory(),  # type: ignore[arg-type]
+        archive_retrieval=archive,  # type: ignore[arg-type]
+        source_context_builder=SourceContextBuilderService(anchors),  # type: ignore[arg-type]
+        context_packages=packages,  # type: ignore[arg-type]
+        model_runs=runs,  # type: ignore[arg-type]
+    )
+
+    retrieval_query = (
+        "What do local knowledge and imported sources "
+        "say about Berlin?\n"
+        "And why?"
+    )
+
+    result = service.send_message(
+        chat_id=uuid.uuid4(),
+        content="And why?",
+        retrieval_query=retrieval_query,
+        requested_model_id="primary",
+        requested_embedding_model_id="embed-model",
+        max_memory_context_tokens=500,
+        max_source_context_tokens=500,
+        output_reserve=1000,
+        safety_margin=100,
+    )
+
+    assert archive.calls[0][0] == retrieval_query
+
+    assert all(
+        call[0] == retrieval_query
+        for call in memory_hybrid.calls
+    )
+
+    # Both model-facing context bundles preserve the real current turn.
+    assert result.memory_context.query == "And why?"
+    assert result.source_context.query == "And why?"
+
+    assert (
+        result.generation.user_message.content
+        == "And why?"
+    )
+
+    run_snapshot = json.loads(
+        result.processing_run.input_snapshot_json
+    )
+
+    assert (
+        run_snapshot["retrieval_query_override"]
+        == retrieval_query
+    )
+
+
 def test_unified_canonical_merge_preserves_contradictions_and_deduplicates() -> None:
     from athena.chat.unified import _merge_canonical_results
 

@@ -6,6 +6,10 @@ import logging
 from enum import Enum
 
 from athena.backup.service import BackupService
+from athena.chat.adaptive import (
+    AdaptiveChatService,
+    AdaptiveRetrievalPlanner,
+)
 from athena.chat.direct import DirectChatService
 from athena.chat.generation import ChatGenerationService
 from athena.chat.memory import MemoryAugmentedChatService
@@ -396,6 +400,18 @@ class AthenaApplication:
             source_context_builder=self.source_context_builder,
             context_packages=self.context_packages,
             model_runs=self.model_runs,
+        )
+        self.adaptive_retrieval_planner = AdaptiveRetrievalPlanner(
+            local_search=self.search,
+            archive_search=self.archive_search,
+        )
+        self.adaptive_chat = AdaptiveChatService(
+            chat=self.chat,
+            planner=self.adaptive_retrieval_planner,
+            direct_chat=self.direct_chat,
+            memory_chat=self.memory_chat,
+            source_grounded_chat=self.source_grounded_chat,
+            unified_local_chat=self.unified_local_chat,
         )
         self.proposal_acceptance = ProposalAcceptanceService(
             database=self.database,

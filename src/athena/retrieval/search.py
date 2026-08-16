@@ -8,7 +8,10 @@ import uuid
 from dataclasses import dataclass
 from enum import Enum
 
-from athena.chat.provenance import strip_durable_provenance_manifest
+from athena.chat.provenance import (
+    strip_model_facing_assistant_trace,
+    strip_turn_local_grounding_markers,
+)
 from athena.common.time import utc_now_us
 from athena.storage.database import SQLiteDatabase
 
@@ -232,10 +235,9 @@ class LocalSearchService:
                     str(row["entity_id"]),
                     str(row["revision_id"]),
                     str(row["title"]),
-                    (
-                        strip_durable_provenance_manifest(str(row["body"]))
-                        if str(row["message_type"]) == "assistant"
-                        else str(row["body"])
+                    _searchable_chat_text(
+                        str(row["message_type"]),
+                        str(row["body"]),
                     ),
                 )
                 for row in chat_rows
@@ -278,6 +280,16 @@ class LocalSearchService:
             score=float(row["score"]),
             contradiction_count=int(row["contradiction_count"]),
         )
+
+
+def _searchable_chat_text(
+    message_type: str,
+    text: str,
+) -> str:
+    if message_type == "assistant":
+        return strip_model_facing_assistant_trace(text)
+
+    return strip_turn_local_grounding_markers(text)
 
 
 def _safe_fts_query(query: str) -> str:

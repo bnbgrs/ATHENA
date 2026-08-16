@@ -94,6 +94,7 @@ class SourceGroundedChatService:
         *,
         chat_id: uuid.UUID,
         content: str,
+        retrieval_query: str | None = None,
         requested_model_id: str | None = None,
         requested_embedding_model_id: str | None = None,
         max_context_tokens: int = 1200,
@@ -120,6 +121,14 @@ class SourceGroundedChatService:
         if safety_margin < 0:
             raise ContextBuilderError("Safety margin must not be negative.")
 
+        search_query = content
+        if retrieval_query is not None:
+            search_query = retrieval_query.strip()
+            if not search_query:
+                raise ContextBuilderError(
+                    "Retrieval query override must not be empty."
+                )
+
         model = self.chat_generation.select_model(requested_model_id)
         context_limit = _resolve_context_limit(
             model=model,
@@ -130,7 +139,7 @@ class SourceGroundedChatService:
         )
         candidate_limit = min(200, max(40, max_context_items * 8))
         results = self.archive_retrieval.search(
-            content,
+            search_query,
             model_id=embedding_model.backend_model_id,
             limit=candidate_limit,
         )
@@ -306,11 +315,19 @@ class SourceGroundedChatService:
 
         if user_message.actor_id is None:
             raise RuntimeError("Persisted user message has no actor for ProcessingRun.")
+
+        run_snapshot = package.run_snapshot()
+        if retrieval_query is not None:
+            run_snapshot = {
+                **run_snapshot,
+                "retrieval_query_override": search_query,
+            }
+
         processing_run = self.model_runs.start_run(
             run_type="chat.source_context_package",
             trigger_actor_id=user_message.actor_id,
             pipeline_version="source-chat-context-package-v1",
-            input_snapshot=package.run_snapshot(),
+            input_snapshot=run_snapshot,
             configuration=context_configuration,
             model_signature_id=signature.model_signature_id,
             prompt_template_id="source-grounding",
