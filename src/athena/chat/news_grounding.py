@@ -12,7 +12,11 @@ from athena.chat.direct import (
     _resolve_context_limit,
     _select_recent_conversation_window,
 )
-from athena.chat.generation import ChatGenerationResult, ChatGenerationService
+from athena.chat.generation import (
+    GROUNDING_RETRY_POLICY,
+    ChatGenerationResult,
+    ChatGenerationService,
+)
 from athena.chat.grounding import (
     GroundingContract,
     GroundingEvidenceRef,
@@ -228,6 +232,7 @@ class NewsGroundedChatService:
             recent_messages = _select_recent_conversation_window(
                 thread.messages,
                 max_turns=max_recent_conversation_turns,
+                include_assistant=False,
             )
 
             (
@@ -314,6 +319,8 @@ class NewsGroundedChatService:
                 max_recent_conversation_turns
             ),
             "safety_margin": safety_margin,
+            "conversation_history_policy": "grounded_user_only",
+            "grounding_retry_policy": GROUNDING_RETRY_POLICY,
             "allow_model_prior": allow_model_prior,
         }
 

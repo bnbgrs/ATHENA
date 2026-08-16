@@ -366,3 +366,442 @@ def test_source_grounded_generation_persists_anchor_provenance_without_chunk_id(
         assert "chunk_id" not in content
     finally:
         database.stop()
+
+
+class SequencedGroundingProvider:
+    provider_id = "lm_studio"
+
+    def __init__(
+        self,
+        responses: tuple[
+            tuple[str, ...],
+            ...,
+        ],
+    ) -> None:
+        self.responses = responses
+        self.requests: list[
+            tuple[
+                str,
+                tuple[ModelChatMessage, ...],
+            ]
+        ] = []
+        self.controls: list[
+            tuple[
+                int | None,
+                str | None,
+            ]
+        ] = []
+
+    def health(
+        self,
+    ) -> ProviderHealth:
+        return ProviderHealth(
+            ProviderHealthStatus.READY
+        )
+
+    def discover_models(
+        self,
+    ) -> tuple[ModelInfo, ...]:
+        return (
+            _model(),
+        )
+
+    def stream_chat(
+        self,
+        *,
+        model_id: str,
+        messages: Sequence[ModelChatMessage],
+        max_output_tokens: int | None = None,
+        reasoning_mode: str | None = None,
+    ) -> Iterator[str]:
+        index = len(
+            self.requests
+        )
+
+        if index >= len(
+            self.responses
+        ):
+            raise AssertionError(
+                "Unexpected extra model attempt."
+            )
+
+        self.requests.append(
+            (
+                model_id,
+                tuple(
+                    messages
+                ),
+            )
+        )
+
+        self.controls.append(
+            (
+                max_output_tokens,
+                reasoning_mode,
+            )
+        )
+
+        yield from self.responses[
+            index
+        ]
+
+
+def _single_canonical_grounding_contract() -> GroundingContract:
+    return GroundingContract(
+        evidence_refs=(
+            GroundingEvidenceRef(
+                context_id="CTX-001",
+                entity_type="knowledge",
+                entity_id=uuid.uuid4(),
+                revision_id=uuid.uuid4(),
+            ),
+        ),
+        allow_model_prior=False,
+    )
+
+
+def test_grounded_generation_retries_once_without_exposing_invalid_candidate(
+    tmp_path,
+) -> None:
+    database, chat = _chat_service(
+        tmp_path
+    )
+
+    try:
+        chat_id = chat.create_chat()
+
+        provider = SequencedGroundingProvider(
+            responses=(
+                (
+                    "Project Atlas has a code.\n"
+                    "The code is 1101 [CTX-001].",
+                ),
+                (
+                    "Project Atlas has code 1101 [CTX-001].",
+                ),
+            )
+        )
+
+        service = ChatGenerationService(
+            chat,
+            provider,
+        )
+
+        visible: list[str] = []
+
+        result = service.send_message(
+            chat_id=chat_id,
+            content=(
+                "What is the Project Atlas code?"
+            ),
+            requested_model_id="example/model",
+            on_delta=visible.append,
+            retrieved_context=(
+                '{"items":[{"context_id":"CTX-001",'
+                '"text":"Project Atlas has code 1101."}]}'
+            ),
+            grounding_contract=(
+                _single_canonical_grounding_contract()
+            ),
+            max_output_tokens=1000,
+            reasoning_mode="off",
+        )
+
+        assert len(
+            provider.requests
+        ) == 2
+
+        first_model, first_messages = (
+            provider.requests[0]
+        )
+
+        second_model, second_messages = (
+            provider.requests[1]
+        )
+
+        assert first_model == "example/model"
+        assert second_model == "example/model"
+
+        first_flattened = "\n".join(
+            item.content
+            for item
+            in first_messages
+        )
+
+        second_flattened = "\n".join(
+            item.content
+            for item
+            in second_messages
+        )
+
+        assert (
+            "ATHENA GROUNDING VALIDATION RETRY"
+            not in first_flattened
+        )
+
+        assert (
+            "ATHENA GROUNDING VALIDATION RETRY"
+            in second_flattened
+        )
+
+        assert (
+            "Grounded answer contains substantive lines "
+            "without provenance markers"
+            in second_flattened
+        )
+
+        # The rejected candidate never reaches the user-facing callback.
+        assert all(
+            "Project Atlas has a code."
+            not in item
+            for item
+            in visible
+        )
+
+        assert any(
+            "Project Atlas has code 1101 [CTX-001]."
+            in item
+            for item
+            in visible
+        )
+
+        assert any(
+            "ATHENA_PROVENANCE"
+            in item
+            for item
+            in visible
+        )
+
+        persisted = (
+            result.assistant_message
+            .content
+        )
+
+        assert persisted is not None
+
+        assert (
+            "Project Atlas has a code."
+            not in persisted
+        )
+
+        assert (
+            "Project Atlas has code 1101 [CTX-001]."
+            in persisted
+        )
+
+        thread = chat.load_chat(
+            chat_id
+        )
+
+        assert [
+            item.message_type
+            for item
+            in thread.messages
+        ] == [
+            MessageType.USER,
+            MessageType.ASSISTANT,
+        ]
+
+    finally:
+        database.stop()
+
+
+def test_grounded_generation_retry_remains_fail_closed_after_retry_exhaustion(
+    tmp_path,
+) -> None:
+    database, chat = _chat_service(
+        tmp_path
+    )
+
+    try:
+        chat_id = chat.create_chat()
+
+        provider = SequencedGroundingProvider(
+            responses=(
+                (
+                    "Uncited first candidate.",
+                ),
+                (
+                    "Still uncited after first retry.",
+                ),
+                (
+                    "Still uncited after final retry.",
+                ),
+            )
+        )
+
+        service = ChatGenerationService(
+            chat,
+            provider,
+        )
+
+        visible: list[str] = []
+
+        with pytest.raises(
+            GroundingViolation
+        ):
+            service.send_message(
+                chat_id=chat_id,
+                content="What is remembered?",
+                requested_model_id="example/model",
+                on_delta=visible.append,
+                retrieved_context=(
+                    '{"items":[{"context_id":"CTX-001"}]}'
+                ),
+                grounding_contract=(
+                    _single_canonical_grounding_contract()
+                ),
+                max_output_tokens=1000,
+                reasoning_mode="off",
+            )
+
+        assert len(
+            provider.requests
+        ) == 3
+
+        assert visible == []
+
+        thread = chat.load_chat(
+            chat_id
+        )
+
+        assert [
+            item.message_type
+            for item
+            in thread.messages
+        ] == [
+            MessageType.USER,
+        ]
+
+    finally:
+        database.stop()
+
+
+def test_grounded_generation_can_recover_on_final_retry(
+    tmp_path,
+) -> None:
+    database, chat = _chat_service(
+        tmp_path
+    )
+
+    try:
+        chat_id = chat.create_chat()
+
+        provider = SequencedGroundingProvider(
+            responses=(
+                (
+                    "Uncited first candidate.",
+                ),
+                (
+                    "Based on the retrieved evidence:\n"
+                    "Project Atlas has code 1101 [CTX-001].",
+                ),
+                (
+                    "Project Atlas has code 1101 [CTX-001].",
+                ),
+            )
+        )
+
+        service = ChatGenerationService(
+            chat,
+            provider,
+        )
+
+        visible: list[str] = []
+
+        result = service.send_message(
+            chat_id=chat_id,
+            content=(
+                "What is the exact "
+                "Project Atlas code?"
+            ),
+            requested_model_id="example/model",
+            on_delta=visible.append,
+            retrieved_context=(
+                '{"items":[{"context_id":"CTX-001",'
+                '"text":"Project Atlas has code 1101."}]}'
+            ),
+            grounding_contract=(
+                _single_canonical_grounding_contract()
+            ),
+            max_output_tokens=1000,
+            reasoning_mode="off",
+        )
+
+        assert len(
+            provider.requests
+        ) == 3
+
+        assert all(
+            (
+                "Uncited first candidate."
+                not in item
+            )
+            for item
+            in visible
+        )
+
+        assert all(
+            (
+                "Based on the retrieved evidence:"
+                not in item
+            )
+            for item
+            in visible
+        )
+
+        assert any(
+            (
+                "Project Atlas has code "
+                "1101 [CTX-001]."
+                in item
+            )
+            for item
+            in visible
+        )
+
+        assert any(
+            "ATHENA_PROVENANCE"
+            in item
+            for item
+            in visible
+        )
+
+        persisted = (
+            result.assistant_message
+            .content
+        )
+
+        assert persisted is not None
+
+        assert (
+            "Project Atlas has code "
+            "1101 [CTX-001]."
+            in persisted
+        )
+
+        assert (
+            "Uncited first candidate."
+            not in persisted
+        )
+
+        assert (
+            "Based on the retrieved evidence:"
+            not in persisted
+        )
+
+        thread = chat.load_chat(
+            chat_id
+        )
+
+        assert [
+            item.message_type
+            for item
+            in thread.messages
+        ] == [
+            MessageType.USER,
+            MessageType.ASSISTANT,
+        ]
+
+    finally:
+        database.stop()

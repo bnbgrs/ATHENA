@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import pytest
+
 from athena.chat.repository import ChatRepository
 from athena.chat.service import ChatService
 from athena.knowledge.models import KnowledgeKind
 from athena.knowledge.repository import KnowledgeRepository
 from athena.knowledge.service import KnowledgeService
+from athena.model.adapters.lm_studio import ModelProviderError
+from athena.retrieval.degradation import SemanticRetrievalUnavailableError
 from athena.retrieval.hybrid import HybridRetrievalService
 from athena.retrieval.ranking import RetrievalRankingService
 from athena.retrieval.search import LocalSearchService, SearchEntityType
@@ -118,5 +122,74 @@ def test_hybrid_duplicate_count_does_not_double_count_same_entities(tmp_path) ->
             if item.text == "Berlin ist die Hauptstadt von Deutschland."
         )
         assert hybrid_berlin.duplicate_count == lexical_berlin.duplicate_count
+    finally:
+        database.stop()
+
+
+@dataclass
+class FailingEmbeddingProvider:
+    def embed(self, *, model_id: str, texts):
+        del model_id, texts
+        raise ModelProviderError("synthetic embedding outage")
+
+
+def test_hybrid_retrieval_exposes_safe_lexical_fallback_after_semantic_outage(
+    tmp_path,
+) -> None:
+    database = SQLiteDatabase(tmp_path / "athena.db")
+    database.start()
+    try:
+        chat = ChatService(ChatRepository(database))
+        knowledge = KnowledgeService(
+            KnowledgeRepository(database),
+            chat,
+        )
+
+        chat_id = chat.create_chat()
+        message = chat.add_user_message(
+            chat_id=chat_id,
+            content="Project Borealis has assigned code 2202.",
+        )
+        promoted = knowledge.promote_chat_message(
+            chat_id=chat_id,
+            sequence_no=message.sequence_no,
+            knowledge_kind=KnowledgeKind.FACT,
+        )
+
+        lexical = RetrievalRankingService(
+            LocalSearchService(database)
+        )
+        semantic = LocalSemanticSearchService(
+            database,
+            FailingEmbeddingProvider(),
+        )
+        hybrid = HybridRetrievalService(
+            lexical,
+            semantic,
+        )
+
+        with pytest.raises(
+            SemanticRetrievalUnavailableError,
+            match="knowledge_semantic_unavailable",
+        ):
+            hybrid.search(
+                "Borealis code",
+                model_id="broken-embed",
+                limit=10,
+            )
+
+        fallback = hybrid.search_lexical(
+            "Borealis code",
+            limit=10,
+        )
+
+        assert fallback
+        result = next(
+            item
+            for item in fallback
+            if item.entity_id == promoted.knowledge_id
+        )
+        assert result.lexical_score > 0.0
+        assert result.semantic_score == 0.0
     finally:
         database.stop()

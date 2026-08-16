@@ -13,7 +13,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from athena.common.time import utc_now_us
+from athena.model.adapters.lm_studio import ModelProviderError
 from athena.model.adapters.lm_studio_embeddings import LMStudioEmbeddingProvider
+from athena.retrieval.degradation import SemanticRetrievalUnavailableError
 from athena.retrieval.fusion import DEFAULT_RRF_K, reciprocal_rank_contribution
 from athena.retrieval.hnsw import HnswIndexError, HnswIndexStore
 from athena.source.chunk_store import SourceChunkRecord, SourceChunkStore
@@ -999,7 +1001,7 @@ class ArchiveSemanticSearchService:
 
 
 class ArchiveHybridRetrievalService:
-    """Fuse archive FTS and semantic candidates without promoting chunk authority."""
+    """Fuse archive FTS and semantic candidates with safe lexical degradation."""
 
     def __init__(
         self,
@@ -1014,6 +1016,52 @@ class ArchiveHybridRetrievalService:
         self.semantic = semantic
         self.rrf_k = rrf_k
 
+    @staticmethod
+    def _validate_limit(limit: int) -> None:
+        if not 1 <= limit <= 200:
+            raise ArchiveSearchError(
+                "Archive hybrid limit must be between 1 and 200."
+            )
+
+    def _lexical_results(
+        self,
+        query: str,
+        *,
+        limit: int,
+        source_id: uuid.UUID | None,
+        representation_id: uuid.UUID | None,
+    ) -> tuple[ArchiveSearchResult, ...]:
+        candidate_limit = min(500, max(80, limit * 8))
+        return self.lexical.search(
+            query,
+            limit=min(200, candidate_limit),
+            source_id=source_id,
+            representation_id=representation_id,
+        )
+
+    def search_lexical(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+        source_id: uuid.UUID | None = None,
+        representation_id: uuid.UUID | None = None,
+    ) -> tuple[ArchiveHybridSearchResult, ...]:
+        """Return the normal archive result contract using verified FTS only."""
+
+        self._validate_limit(limit)
+        lexical = self._lexical_results(
+            query,
+            limit=limit,
+            source_id=source_id,
+            representation_id=representation_id,
+        )
+        return self._fuse(
+            lexical=lexical,
+            semantic=(),
+            limit=limit,
+        )
+
     def search(
         self,
         query: str,
@@ -1023,43 +1071,93 @@ class ArchiveHybridRetrievalService:
         source_id: uuid.UUID | None = None,
         representation_id: uuid.UUID | None = None,
     ) -> tuple[ArchiveHybridSearchResult, ...]:
-        if not 1 <= limit <= 200:
-            raise ArchiveSearchError("Archive hybrid limit must be between 1 and 200.")
-        candidate_limit = min(500, max(80, limit * 8))
-        lexical = self.lexical.search(
+        self._validate_limit(limit)
+
+        # FTS also verifies SourceChunk and authoritative Source visibility.
+        # Never mask a failure from this stage as an embedding outage.
+        lexical = self._lexical_results(
             query,
-            limit=min(200, candidate_limit),
-            source_id=source_id,
-            representation_id=representation_id,
-        )
-        semantic = self.semantic.search(
-            query,
-            model_id=model_id,
-            limit=candidate_limit,
+            limit=limit,
             source_id=source_id,
             representation_id=representation_id,
         )
 
-        candidates: dict[uuid.UUID, _ArchiveCandidate] = {}
-        for rank, lexical_item in enumerate(lexical, start=1):
-            candidates[lexical_item.chunk_id] = _ArchiveCandidate.from_lexical(
-                lexical_item,
-                lexical_score=reciprocal_rank_contribution(rank, k=self.rrf_k),
+        candidate_limit = min(500, max(80, limit * 8))
+        try:
+            semantic = self.semantic.search(
+                query,
+                model_id=model_id,
+                limit=candidate_limit,
+                source_id=source_id,
+                representation_id=representation_id,
             )
-        for rank, semantic_item in enumerate(semantic, start=1):
-            semantic_score = reciprocal_rank_contribution(rank, k=self.rrf_k)
-            existing = candidates.get(semantic_item.chunk_id)
+        except (ArchiveSearchError, ModelProviderError) as exc:
+            raise SemanticRetrievalUnavailableError(
+                "archive_semantic_unavailable"
+            ) from exc
+
+        return self._fuse(
+            lexical=lexical,
+            semantic=semantic,
+            limit=limit,
+        )
+
+    def _fuse(
+        self,
+        *,
+        lexical: tuple[ArchiveSearchResult, ...],
+        semantic: tuple[ArchiveSemanticSearchResult, ...],
+        limit: int,
+    ) -> tuple[ArchiveHybridSearchResult, ...]:
+        candidates: dict[uuid.UUID, _ArchiveCandidate] = {}
+
+        for rank, lexical_item in enumerate(
+            lexical,
+            start=1,
+        ):
+            candidates[
+                lexical_item.chunk_id
+            ] = _ArchiveCandidate.from_lexical(
+                lexical_item,
+                lexical_score=reciprocal_rank_contribution(
+                    rank,
+                    k=self.rrf_k,
+                ),
+            )
+
+        for rank, semantic_item in enumerate(
+            semantic,
+            start=1,
+        ):
+            semantic_score = reciprocal_rank_contribution(
+                rank,
+                k=self.rrf_k,
+            )
+            existing = candidates.get(
+                semantic_item.chunk_id
+            )
+
             if existing is None:
-                candidates[semantic_item.chunk_id] = _ArchiveCandidate.from_semantic(
+                candidates[
+                    semantic_item.chunk_id
+                ] = _ArchiveCandidate.from_semantic(
                     semantic_item,
                     semantic_score=semantic_score,
                 )
             else:
-                existing.semantic_score = max(existing.semantic_score, semantic_score)
+                existing.semantic_score = max(
+                    existing.semantic_score,
+                    semantic_score,
+                )
 
-        scored = [_candidate_to_result(item) for item in candidates.values()]
-        return _diversify_archive(scored, limit=limit)
-
+        scored = [
+            _candidate_to_result(item)
+            for item in candidates.values()
+        ]
+        return _diversify_archive(
+            scored,
+            limit=limit,
+        )
 
 @dataclass(slots=True)
 class _ArchiveCandidate:

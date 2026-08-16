@@ -12,6 +12,7 @@ from typing import Any
 
 from athena.common.ids import uuid_from_blob, uuid_to_blob
 from athena.retrieval.context import ContextBuilderError, estimate_tokens
+from athena.retrieval.lexical_relevance import required_term_matches
 from athena.storage.database import SQLiteDatabase
 
 _MAX_SEARCH_LIMIT = 100
@@ -32,6 +33,7 @@ _QUERY_STOPWORDS = frozenset(
         "aktuellen",
         "aktuelles",
         "and",
+        "are",
         "aus",
         "bei",
         "current",
@@ -40,29 +42,36 @@ _QUERY_STOPWORDS = frozenset(
         "den",
         "der",
         "die",
+        "do",
+        "does",
         "ein",
         "eine",
         "entwicklung",
         "entwicklungen",
         "for",
         "gibt",
+        "has",
+        "have",
         "heute",
         "im",
         "in",
+        "is",
         "ist",
         "latest",
         "meldung",
         "meldungen",
         "nachricht",
         "nachrichten",
-        "news",
         "neu",
         "neue",
         "neuen",
         "neues",
         "neueste",
         "neuesten",
+        "news",
         "of",
+        "project",
+        "projekt",
         "recent",
         "schlagzeilen",
         "the",
@@ -270,10 +279,8 @@ LIMIT ?
                 if term in tokens
             )
 
-            required = (
-                1
-                if len(query_terms) == 1
-                else 2
+            required = required_term_matches(
+                len(query_terms)
             )
 
             if matched < required:

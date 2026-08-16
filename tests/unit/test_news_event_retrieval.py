@@ -629,3 +629,136 @@ def test_news_context_builder_reverifies_event_before_use(
 
     finally:
         app.stop()
+
+
+def test_news_search_does_not_select_wrong_named_entity_from_generic_terms(
+    tmp_path: Path,
+) -> None:
+    app = _app(
+        tmp_path
+    )
+
+    try:
+        (
+            wrong_event_id,
+            _wrong_result_id,
+            _wrong_finding_hash,
+        ) = _insert_news_event(
+            app,
+            target_date="2026-08-15",
+            title="Project Atlas update",
+            summary=(
+                "Project Atlas has "
+                "assigned code 1101."
+            ),
+        )
+
+        (
+            target_event_id,
+            _target_result_id,
+            _target_finding_hash,
+        ) = _insert_news_event(
+            app,
+            target_date="2026-08-16",
+            title="Project Borealis update",
+            summary=(
+                "Project Borealis has "
+                "assigned code 2202."
+            ),
+        )
+
+        search = (
+            NewsEventSearchService(
+                app.database
+            )
+        )
+
+        results = search.search(
+            (
+                "Project Borealis "
+                "assigned code"
+            ),
+            limit=5,
+        )
+
+        assert results
+        assert (
+            results[0].event_id
+            == target_event_id
+        )
+        assert all(
+            item.event_id
+            != wrong_event_id
+            for item in results
+        )
+
+    finally:
+        app.stop()
+
+
+def test_news_natural_question_rejects_wrong_named_entity(
+    tmp_path: Path,
+) -> None:
+    app = _app(
+        tmp_path
+    )
+
+    try:
+        (
+            wrong_event_id,
+            _wrong_result_id,
+            _wrong_hash,
+        ) = _insert_news_event(
+            app,
+            target_date="2026-08-15",
+            title="Project Atlas update",
+            summary=(
+                "Project Atlas is "
+                "assigned code 1101."
+            ),
+        )
+
+        (
+            target_event_id,
+            _target_result_id,
+            _target_hash,
+        ) = _insert_news_event(
+            app,
+            target_date="2026-08-16",
+            title="Project Borealis update",
+            summary=(
+                "Project Borealis is "
+                "assigned code 2202."
+            ),
+        )
+
+        search = (
+            NewsEventSearchService(
+                app.database
+            )
+        )
+
+        results = search.search(
+            (
+                "What code is assigned "
+                "to Project Borealis?"
+            ),
+            limit=5,
+        )
+
+        assert results
+        assert [
+            item.event_id
+            for item in results
+        ] == [
+            target_event_id,
+        ]
+
+        assert all(
+            item.event_id
+            != wrong_event_id
+            for item in results
+        )
+
+    finally:
+        app.stop()

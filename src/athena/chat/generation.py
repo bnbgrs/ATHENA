@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from athena.chat.grounding import (
     GroundingContract,
     GroundingReport,
+    GroundingViolation,
     render_durable_provenance_manifest,
     render_grounding_instructions,
     validate_grounded_answer,
@@ -48,6 +49,75 @@ class ChatGenerationResult:
     assistant_message: ChatMessage
     model: ModelInfo
     grounding_report: GroundingReport | None = None
+
+
+GROUNDING_RETRY_POLICY = "validate_before_display_same_primary_v2_max_2_retries"
+_GROUNDING_GENERATION_ATTEMPTS = 3
+
+
+def _grounding_retry_history(
+    history: tuple[ModelChatMessage, ...],
+    *,
+    violation: GroundingViolation,
+) -> tuple[ModelChatMessage, ...]:
+    """Add deterministic repair guidance without reusing rejected prose."""
+
+    detail = str(violation).strip()
+
+    if len(detail) > 1200:
+        detail = detail[:1200] + "..."
+
+    instruction = (
+        "ATHENA GROUNDING VALIDATION RETRY\n\n"
+        "Your previous candidate answer was rejected by ATHENA's "
+        "deterministic grounding validator. Generate a completely new "
+        "answer from the ORIGINAL retrieved evidence only. The rejected "
+        "candidate is not evidence and is not included here.\n\n"
+        f"Validation error: {detail}\n\n"
+        "CRITICAL OUTPUT FORMAT:\n"
+        "- Start immediately with the actual answer.\n"
+        "- Do NOT write a preamble, framing sentence, lead-in, summary "
+        "introduction, or conclusion.\n"
+        "- In particular, do not write uncited phrases such as "
+        "'Based on the retrieved evidence', 'According to the context', "
+        "or similar framing.\n"
+        "- Every substantive non-heading line and every bullet MUST carry "
+        "at least one VALID supplied provenance marker on that SAME line.\n"
+        "- Prefer no headings.\n"
+        "- If the user's request is a short factual question or follow-up "
+        "that can be fully answered in one line, output exactly one "
+        "direct cited answer line.\n"
+        "- Never invent, renumber, reinterpret, or alter CTX identifiers.\n"
+        "- Do not use facts outside the original grounding contract.\n"
+        "- If evidence is insufficient, obey the original [UNKNOWN] rule.\n"
+        "- Return only the corrected final answer."
+    )
+
+    if (
+        history
+        and history[0].role == "system"
+    ):
+        repaired_system = ModelChatMessage(
+            role="system",
+            content=(
+                history[0].content
+                + "\n\n"
+                + instruction
+            ),
+        )
+
+        return (
+            repaired_system,
+            *history[1:],
+        )
+
+    return (
+        ModelChatMessage(
+            role="system",
+            content=instruction,
+        ),
+        *history,
+    )
 
 
 class ChatGenerationService:
@@ -391,65 +461,113 @@ class ChatGenerationService:
     ) -> ChatGenerationResult:
         if max_output_tokens is not None and max_output_tokens < 1:
             raise ValueError("max_output_tokens must be positive when provided.")
+
         if reasoning_mode not in {None, "off"}:
             raise ValueError("reasoning_mode must be None or 'off'.")
 
-        if on_before_provider_call is not None:
-            on_before_provider_call()
-
-        chunks: list[str] = []
-        if reasoning_mode is not None:
-            stream = self.provider.stream_chat(
-                model_id=model.backend_model_id,
-                messages=history,
-                max_output_tokens=max_output_tokens,
-                reasoning_mode=reasoning_mode,
-            )
-        elif max_output_tokens is not None:
-            stream = self.provider.stream_chat(
-                model_id=model.backend_model_id,
-                messages=history,
-                max_output_tokens=max_output_tokens,
-            )
-        else:
-            stream = self.provider.stream_chat(
-                model_id=model.backend_model_id,
-                messages=history,
-            )
-        for chunk in stream:
-            chunks.append(chunk)
-            if on_delta is not None:
-                on_delta(chunk)
-
-        assistant_text = "".join(chunks)
-        if not assistant_text.strip():
-            raise ValueError("The model completed without returning assistant text.")
-
-        grounding_report = None
-        if grounding_contract is not None:
-            grounding_report = validate_grounded_answer(
-                assistant_text,
-                contract=grounding_contract,
-            )
-            provenance_manifest = render_durable_provenance_manifest(
-                contract=grounding_contract,
-                report=grounding_report,
-            )
-            assistant_text += provenance_manifest
-            if on_delta is not None:
-                on_delta(provenance_manifest)
-
-        assistant_message = self.chat.add_assistant_message(
-            chat_id=chat_id,
-            content=assistant_text,
-            provider_id=model.provider,
-            model_id=model.backend_model_id,
+        attempt_limit = (
+            _GROUNDING_GENERATION_ATTEMPTS
+            if grounding_contract is not None
+            else 1
         )
-        return ChatGenerationResult(
-            user_message=user_message,
-            assistant_message=assistant_message,
-            model=model,
-            grounding_report=grounding_report,
+
+        attempt_history = history
+
+        for attempt_index in range(attempt_limit):
+            if on_before_provider_call is not None:
+                on_before_provider_call()
+
+            chunks: list[str] = []
+
+            if reasoning_mode is not None:
+                stream = self.provider.stream_chat(
+                    model_id=model.backend_model_id,
+                    messages=attempt_history,
+                    max_output_tokens=max_output_tokens,
+                    reasoning_mode=reasoning_mode,
+                )
+            elif max_output_tokens is not None:
+                stream = self.provider.stream_chat(
+                    model_id=model.backend_model_id,
+                    messages=attempt_history,
+                    max_output_tokens=max_output_tokens,
+                )
+            else:
+                stream = self.provider.stream_chat(
+                    model_id=model.backend_model_id,
+                    messages=attempt_history,
+                )
+
+            for chunk in stream:
+                chunks.append(chunk)
+
+                # Direct chat retains live streaming behavior. Grounded output
+                # is withheld until deterministic validation succeeds.
+                if (
+                    grounding_contract is None
+                    and on_delta is not None
+                ):
+                    on_delta(chunk)
+
+            assistant_text = "".join(chunks)
+
+            if not assistant_text.strip():
+                raise ValueError(
+                    "The model completed without returning assistant text."
+                )
+
+            grounding_report = None
+
+            if grounding_contract is not None:
+                try:
+                    grounding_report = validate_grounded_answer(
+                        assistant_text,
+                        contract=grounding_contract,
+                    )
+                except GroundingViolation as exc:
+                    if attempt_index + 1 >= attempt_limit:
+                        raise
+
+                    attempt_history = _grounding_retry_history(
+                        history,
+                        violation=exc,
+                    )
+
+                    continue
+
+                provenance_manifest = render_durable_provenance_manifest(
+                    contract=grounding_contract,
+                    report=grounding_report,
+                )
+
+                # Never expose the rejected first candidate. Only validated
+                # grounded text reaches the UI/CLI callback.
+                if on_delta is not None:
+                    on_delta(
+                        assistant_text
+                    )
+                    on_delta(
+                        provenance_manifest
+                    )
+
+                assistant_text += provenance_manifest
+
+            assistant_message = self.chat.add_assistant_message(
+                chat_id=chat_id,
+                content=assistant_text,
+                provider_id=model.provider,
+                model_id=model.backend_model_id,
+            )
+
+            return ChatGenerationResult(
+                user_message=user_message,
+                assistant_message=assistant_message,
+                model=model,
+                grounding_report=grounding_report,
+            )
+
+        raise RuntimeError(
+            "Grounded generation exhausted attempts without a terminal result."
         )
 
     def select_model(self, requested_model_id: str | None = None) -> ModelInfo:

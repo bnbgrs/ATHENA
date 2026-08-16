@@ -13,7 +13,11 @@ from athena.chat.direct import (
     _resolve_context_limit,
     _select_recent_conversation_window,
 )
-from athena.chat.generation import ChatGenerationResult, ChatGenerationService
+from athena.chat.generation import (
+    GROUNDING_RETRY_POLICY,
+    ChatGenerationResult,
+    ChatGenerationService,
+)
 from athena.chat.grounding import (
     GroundingContract,
     GroundingEvidenceRef,
@@ -39,6 +43,11 @@ from athena.retrieval.context_package import (
     ContextSection,
     ContextTokenEstimates,
     ExcludedCandidateSummary,
+)
+from athena.retrieval.degradation import (
+    LEXICAL_FALLBACK_RETRIEVAL_MODE,
+    SemanticRetrievalUnavailableError,
+    resolve_embedding_model_for_retrieval,
 )
 from athena.retrieval.evidence import (
     EvidenceClass,
@@ -85,7 +94,7 @@ class UnifiedLocalChatResult:
     source_context: SourceContextBundle
     context_package: ContextPackage
     processing_run: ProcessingRun
-    embedding_model: ModelInfo
+    embedding_model: ModelInfo | None
     evidence_selection: MemoryEvidenceSelection
     budget: UnifiedLocalBudgetReport
 
@@ -269,9 +278,15 @@ class UnifiedLocalChatService:
             model=model,
             requested_limit=effective_context_limit,
         )
-        embedding_model = self.embedding_provider.resolve_model(
-            requested_embedding_model_id
+        embedding_resolution = resolve_embedding_model_for_retrieval(
+            self.embedding_provider,
+            requested_embedding_model_id,
         )
+        embedding_model = embedding_resolution.model
+        source_retrieval_mode = embedding_resolution.mode
+        source_retrieval_warning = embedding_resolution.warning
+        memory_retrieval_mode = embedding_resolution.mode
+        memory_retrieval_warning = embedding_resolution.warning
 
         # This first history read is budget planning only. The authoritative
         # history is loaded again after SourceAnchor materialization and pinning.
@@ -279,6 +294,7 @@ class UnifiedLocalChatService:
         preflight_recent = _select_recent_conversation_window(
             preflight_thread.messages,
             max_turns=max_recent_conversation_turns,
+            include_assistant=False,
         )
         preflight_conversation_tokens = _estimate_persisted_messages(
             preflight_recent
@@ -334,11 +350,25 @@ class UnifiedLocalChatService:
             200,
             max(40, max_source_context_items * 8),
         )
-        source_results = self.archive_retrieval.search(
-            search_query,
-            model_id=embedding_model.backend_model_id,
-            limit=source_candidate_limit,
-        )
+        if embedding_model is None:
+            source_results = self.archive_retrieval.search_lexical(
+                search_query,
+                limit=source_candidate_limit,
+            )
+        else:
+            try:
+                source_results = self.archive_retrieval.search(
+                    search_query,
+                    model_id=embedding_model.backend_model_id,
+                    limit=source_candidate_limit,
+                )
+            except SemanticRetrievalUnavailableError as exc:
+                source_retrieval_mode = LEXICAL_FALLBACK_RETRIEVAL_MODE
+                source_retrieval_warning = exc.reason_code
+                source_results = self.archive_retrieval.search_lexical(
+                    search_query,
+                    limit=source_candidate_limit,
+                )
         source_context = self.source_context_builder.build_from_hybrid(
             query=content,
             results=source_results,
@@ -355,6 +385,7 @@ class UnifiedLocalChatService:
         recent_messages = _select_recent_conversation_window(
             thread.messages,
             max_turns=max_recent_conversation_turns,
+            include_assistant=False,
         )
         prior_sections, prior_refs = _prior_chat_sections(recent_messages)
         conversation_tokens = _estimate_persisted_messages(recent_messages)
@@ -379,22 +410,62 @@ class UnifiedLocalChatService:
         # Memory Chat path and, later, through an adaptive retrieval planner.
         # They must not compete with Canonical Knowledge for the bounded
         # Knowledge portion of an explicitly combined --memory --sources turn.
-        knowledge_results = self.hybrid_retrieval.search(
-            search_query,
-            model_id=embedding_model.backend_model_id,
-            limit=memory_candidate_limit,
-            entity_type=SearchEntityType.KNOWLEDGE,
-        )
-        claim_results = self.hybrid_retrieval.search(
-            search_query,
-            model_id=embedding_model.backend_model_id,
-            limit=memory_candidate_limit,
-            entity_type=SearchEntityType.CLAIM,
-        )
+        if embedding_model is None:
+            knowledge_results = self.hybrid_retrieval.search_lexical(
+                search_query,
+                limit=memory_candidate_limit,
+                entity_type=SearchEntityType.KNOWLEDGE,
+            )
+            claim_results = self.hybrid_retrieval.search_lexical(
+                search_query,
+                limit=memory_candidate_limit,
+                entity_type=SearchEntityType.CLAIM,
+            )
+        else:
+            try:
+                knowledge_results = self.hybrid_retrieval.search(
+                    search_query,
+                    model_id=embedding_model.backend_model_id,
+                    limit=memory_candidate_limit,
+                    entity_type=SearchEntityType.KNOWLEDGE,
+                )
+                claim_results = self.hybrid_retrieval.search(
+                    search_query,
+                    model_id=embedding_model.backend_model_id,
+                    limit=memory_candidate_limit,
+                    entity_type=SearchEntityType.CLAIM,
+                )
+            except SemanticRetrievalUnavailableError as exc:
+                # Recompute both canonical types lexically. Do not leave one
+                # half of a single domain on semantic ranking and the other
+                # half on lexical ranking.
+                memory_retrieval_mode = LEXICAL_FALLBACK_RETRIEVAL_MODE
+                memory_retrieval_warning = exc.reason_code
+                knowledge_results = self.hybrid_retrieval.search_lexical(
+                    search_query,
+                    limit=memory_candidate_limit,
+                    entity_type=SearchEntityType.KNOWLEDGE,
+                )
+                claim_results = self.hybrid_retrieval.search_lexical(
+                    search_query,
+                    limit=memory_candidate_limit,
+                    entity_type=SearchEntityType.CLAIM,
+                )
         memory_results = _merge_canonical_results(
             knowledge_results,
             claim_results,
             limit=memory_candidate_limit,
+        )
+
+        retrieval_warnings = tuple(
+            dict.fromkeys(
+                warning
+                for warning in (
+                    memory_retrieval_warning,
+                    source_retrieval_warning,
+                )
+                if warning is not None
+            )
         )
 
         evidence_selection = self.evidence_policy.classify(memory_results)
@@ -466,7 +537,16 @@ class UnifiedLocalChatService:
             "max_source_context_items": max_source_context_items,
             "max_recent_conversation_turns": max_recent_conversation_turns,
             "safety_margin": safety_margin,
-            "embedding_model_id": embedding_model.backend_model_id,
+            "conversation_history_policy": "grounded_user_only",
+            "grounding_retry_policy": GROUNDING_RETRY_POLICY,
+            "embedding_model_id": (
+                None
+                if embedding_model is None
+                else embedding_model.backend_model_id
+            ),
+            "memory_retrieval_mode": memory_retrieval_mode,
+            "source_retrieval_mode": source_retrieval_mode,
+            "retrieval_warnings": retrieval_warnings,
             "evidence_policy_id": evidence_selection.policy_id,
             "allow_model_prior": allow_model_prior,
         }

@@ -494,9 +494,13 @@ def test_news_grounded_chat_uses_typed_news_evidence_and_clean_history(
         )
 
         assert any(
-            item.role == "assistant"
-            and item.content
-            == "old News answer."
+            item.role == "user"
+            and item.content == "Earlier question"
+            for item in sent
+        )
+
+        assert all(
+            item.role != "assistant"
             for item in sent
         )
 

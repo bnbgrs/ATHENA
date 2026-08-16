@@ -232,23 +232,60 @@ def _select_recent_conversation_window(
     messages: tuple[ChatMessage, ...],
     *,
     max_turns: int,
+    include_assistant: bool = True,
 ) -> tuple[ChatMessage, ...]:
+    """Select recent conversation with optional Assistant projection.
+
+    Direct chat retains complete conversational history by default.
+
+    Grounded paths exclude historical Assistant prose so a prior generated
+    answer cannot silently become evidence under a later grounding contract.
+    Historical User turns remain available for conversational continuity.
+    """
+
     if not 1 <= max_turns <= _MAX_RECENT_CONVERSATION_TURNS:
         raise ContextBuilderError(
             "Recent conversation turns must be between 1 and 100."
         )
+
     if not messages:
         return ()
 
     selected_reversed: list[ChatMessage] = []
     user_turns = 0
+
     for message in reversed(messages):
-        selected_reversed.append(message)
         if message.message_type is MessageType.USER:
+            selected_reversed.append(
+                message
+            )
+
             user_turns += 1
+
             if user_turns >= max_turns:
                 break
-    return tuple(reversed(selected_reversed))
+
+            continue
+
+        if message.message_type is MessageType.ASSISTANT:
+            if include_assistant:
+                selected_reversed.append(
+                    message
+                )
+
+            continue
+
+        # Preserve unexpected message kinds so downstream validation
+        # continues to fail closed rather than hiding invalid state.
+        selected_reversed.append(
+            message
+        )
+
+    return tuple(
+        reversed(
+            selected_reversed
+        )
+    )
 
 
 def _prior_chat_sections(

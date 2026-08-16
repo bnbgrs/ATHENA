@@ -6,7 +6,11 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from athena.chat.generation import ChatGenerationResult, ChatGenerationService
+from athena.chat.generation import (
+    GROUNDING_RETRY_POLICY,
+    ChatGenerationResult,
+    ChatGenerationService,
+)
 from athena.chat.grounding import (
     GroundingContract,
     GroundingEvidenceRef,
@@ -29,6 +33,11 @@ from athena.retrieval.context_package import (
     ContextPackageBudget,
     ContextPackageService,
     ContextTokenEstimates,
+)
+from athena.retrieval.degradation import (
+    LEXICAL_FALLBACK_RETRIEVAL_MODE,
+    SemanticRetrievalUnavailableError,
+    resolve_embedding_model_for_retrieval,
 )
 from athena.retrieval.evidence import MemoryEvidencePolicy, MemoryEvidenceSelection
 from athena.retrieval.hybrid import HybridRetrievalService
@@ -67,7 +76,7 @@ class MemoryChatGenerationResult:
     context: ContextBundle
     context_package: ContextPackage
     processing_run: ProcessingRun
-    embedding_model: ModelInfo
+    embedding_model: ModelInfo | None
     evidence_selection: MemoryEvidenceSelection
     budget: ContextBudgetReport
 
@@ -147,6 +156,7 @@ class MemoryAugmentedChatService:
         recent_messages = _select_recent_conversation_window(
             thread.messages,
             max_turns=max_recent_conversation_turns,
+            include_assistant=False,
         )
         conversation_tokens = _estimate_persisted_messages(recent_messages)
         current_user_tokens = estimate_tokens(content) + _MESSAGE_WRAPPER_ESTIMATE
@@ -167,15 +177,35 @@ class MemoryAugmentedChatService:
             limit=max(32, max_memory_items),
         )
 
-        embedding_model = self.embedding_provider.resolve_model(
-            requested_embedding_model_id
+        embedding_resolution = resolve_embedding_model_for_retrieval(
+            self.embedding_provider,
+            requested_embedding_model_id,
         )
+        embedding_model = embedding_resolution.model
+        retrieval_mode = embedding_resolution.mode
+        retrieval_warning = embedding_resolution.warning
+
         candidate_limit = min(200, max(40, max_context_items * 8))
-        results = self.hybrid_retrieval.search(
-            search_query,
-            model_id=embedding_model.backend_model_id,
-            limit=candidate_limit,
-        )
+
+        if embedding_model is None:
+            results = self.hybrid_retrieval.search_lexical(
+                search_query,
+                limit=candidate_limit,
+            )
+        else:
+            try:
+                results = self.hybrid_retrieval.search(
+                    search_query,
+                    model_id=embedding_model.backend_model_id,
+                    limit=candidate_limit,
+                )
+            except SemanticRetrievalUnavailableError as exc:
+                retrieval_mode = LEXICAL_FALLBACK_RETRIEVAL_MODE
+                retrieval_warning = exc.reason_code
+                results = self.hybrid_retrieval.search_lexical(
+                    search_query,
+                    limit=candidate_limit,
+                )
 
         if canonical_only_retrieval:
             results = tuple(
@@ -257,7 +287,15 @@ class MemoryAugmentedChatService:
             "max_memory_items": max_memory_items,
             "max_recent_conversation_turns": max_recent_conversation_turns,
             "safety_margin": safety_margin,
-            "embedding_model_id": embedding_model.backend_model_id,
+            "conversation_history_policy": "grounded_user_only",
+            "grounding_retry_policy": GROUNDING_RETRY_POLICY,
+            "embedding_model_id": (
+                None
+                if embedding_model is None
+                else embedding_model.backend_model_id
+            ),
+            "retrieval_mode": retrieval_mode,
+            "retrieval_warning": retrieval_warning,
             "evidence_policy_id": evidence_selection.policy_id,
             "canonical_only_retrieval": canonical_only_retrieval,
             "allow_model_prior": allow_model_prior,
@@ -468,25 +506,60 @@ def _select_recent_conversation_window(
     messages: tuple[ChatMessage, ...],
     *,
     max_turns: int,
+    include_assistant: bool = True,
 ) -> tuple[ChatMessage, ...]:
-    """Keep only the newest complete-ish user turns for direct model context."""
+    """Select recent conversation with optional Assistant projection.
+
+    Direct chat retains complete conversational history by default.
+
+    Grounded paths exclude historical Assistant prose so a prior generated
+    answer cannot silently become evidence under a later grounding contract.
+    Historical User turns remain available for conversational continuity.
+    """
+
     if not 1 <= max_turns <= _MAX_RECENT_CONVERSATION_TURNS:
         raise ContextBuilderError(
             "Recent conversation turns must be between 1 and 100."
         )
+
     if not messages:
         return ()
 
     selected_reversed: list[ChatMessage] = []
     user_turns = 0
+
     for message in reversed(messages):
-        selected_reversed.append(message)
         if message.message_type is MessageType.USER:
+            selected_reversed.append(
+                message
+            )
+
             user_turns += 1
+
             if user_turns >= max_turns:
                 break
 
-    return tuple(reversed(selected_reversed))
+            continue
+
+        if message.message_type is MessageType.ASSISTANT:
+            if include_assistant:
+                selected_reversed.append(
+                    message
+                )
+
+            continue
+
+        # Preserve unexpected message kinds so downstream validation
+        # continues to fail closed rather than hiding invalid state.
+        selected_reversed.append(
+            message
+        )
+
+    return tuple(
+        reversed(
+            selected_reversed
+        )
+    )
 
 
 def _estimate_persisted_messages(messages: tuple[ChatMessage, ...]) -> int:

@@ -344,3 +344,329 @@ def test_context_builder_reverifies_durable_result(
 
     finally:
         app.database.stop()
+
+
+def test_daily_and_period_news_research_never_appears_as_prior_research(
+    tmp_path: Path,
+) -> None:
+    app = AthenaApplication(
+        settings=AthenaSettings(
+            local_root=(
+                tmp_path
+                / "runtime"
+            )
+        )
+    )
+
+    app.start()
+
+    try:
+        (
+            daily_result_id,
+            daily_scope,
+        ) = _insert_completed_result(
+            app,
+            query=(
+                "Investigate "
+                "DailyBorealis "
+                "assigned code"
+            ),
+            summary=(
+                "DailyBorealis has "
+                "assigned code 4404."
+            ),
+        )
+
+        (
+            period_result_id,
+            period_scope,
+        ) = _insert_completed_result(
+            app,
+            query=(
+                "Investigate "
+                "PeriodBorealis "
+                "assigned code"
+            ),
+            summary=(
+                "PeriodBorealis has "
+                "assigned code 5505."
+            ),
+        )
+
+        (
+            normal_result_id,
+            _normal_scope,
+        ) = _insert_completed_result(
+            app,
+            query=(
+                "Investigate "
+                "NormalBorealis "
+                "assigned code"
+            ),
+            summary=(
+                "NormalBorealis has "
+                "assigned code 6606."
+            ),
+        )
+
+        daily_parent_job_id = (
+            app.news.queue_date(
+                "2026-08-15"
+            )
+        )
+
+        period_parent_job_id = (
+            app.news._ensure_period_job(
+                "weekly",
+                "2026-08-03",
+                "2026-08-09",
+            )
+        )
+
+        assert (
+            period_parent_job_id
+            is not None
+        )
+
+        # Race-window state:
+        # News owns the Research job,
+        # but result IDs are not yet
+        # materialized onto News runs.
+        with (
+            app.database
+            .write_transaction()
+        ) as connection:
+            connection.execute(
+                """
+                UPDATE news_runs
+                SET research_job_id = ?
+                WHERE job_id = ?
+                """,
+                (
+                    uuid_to_blob(
+                        daily_scope.job_id
+                    ),
+                    uuid_to_blob(
+                        daily_parent_job_id
+                    ),
+                ),
+            )
+
+            connection.execute(
+                """
+                UPDATE news_period_runs
+                SET research_job_id = ?
+                WHERE job_id = ?
+                """,
+                (
+                    uuid_to_blob(
+                        period_scope.job_id
+                    ),
+                    uuid_to_blob(
+                        period_parent_job_id
+                    ),
+                ),
+            )
+
+        search = (
+            PriorResearchSearchService(
+                app.database
+            )
+        )
+
+        assert (
+            search.search(
+                (
+                    "DailyBorealis "
+                    "assigned code"
+                ),
+                limit=5,
+            )
+            == ()
+        )
+
+        assert (
+            search.search(
+                (
+                    "PeriodBorealis "
+                    "assigned code"
+                ),
+                limit=5,
+            )
+            == ()
+        )
+
+        normal = search.search(
+            (
+                "NormalBorealis "
+                "assigned code"
+            ),
+            limit=5,
+        )
+
+        assert normal
+        assert (
+            normal[0].result_id
+            == normal_result_id
+        )
+
+        # Post-materialization ownership:
+        # both result links now exist.
+        with (
+            app.database
+            .write_transaction()
+        ) as connection:
+            connection.execute(
+                """
+                UPDATE news_runs
+                SET research_result_id = ?
+                WHERE job_id = ?
+                """,
+                (
+                    uuid_to_blob(
+                        daily_result_id
+                    ),
+                    uuid_to_blob(
+                        daily_parent_job_id
+                    ),
+                ),
+            )
+
+            connection.execute(
+                """
+                UPDATE news_period_runs
+                SET research_result_id = ?
+                WHERE job_id = ?
+                """,
+                (
+                    uuid_to_blob(
+                        period_result_id
+                    ),
+                    uuid_to_blob(
+                        period_parent_job_id
+                    ),
+                ),
+            )
+
+        assert (
+            search.search(
+                (
+                    "DailyBorealis "
+                    "assigned code"
+                ),
+                limit=5,
+            )
+            == ()
+        )
+
+        assert (
+            search.search(
+                (
+                    "PeriodBorealis "
+                    "assigned code"
+                ),
+                limit=5,
+            )
+            == ()
+        )
+
+        with pytest.raises(
+            PriorResearchSearchError,
+            match="does not exist",
+        ):
+            search.get_result(
+                daily_result_id
+            )
+
+        with pytest.raises(
+            PriorResearchSearchError,
+            match="does not exist",
+        ):
+            search.get_result(
+                period_result_id
+            )
+
+        normal_loaded = (
+            search.get_result(
+                normal_result_id
+            )
+        )
+
+        assert (
+            normal_loaded.result_id
+            == normal_result_id
+        )
+
+    finally:
+        app.stop()
+
+
+def test_prior_research_natural_question_rejects_wrong_named_entity(
+    tmp_path: Path,
+) -> None:
+    app = _runtime(
+        tmp_path
+        / "runtime"
+    )
+
+    try:
+        (
+            wrong_result_id,
+            _wrong_scope,
+        ) = _insert_completed_result(
+            app,
+            query=(
+                "Project Atlas "
+                "assigned code"
+            ),
+            summary=(
+                "Project Atlas is "
+                "assigned code 1101."
+            ),
+        )
+
+        (
+            target_result_id,
+            _target_scope,
+        ) = _insert_completed_result(
+            app,
+            query=(
+                "Project Borealis "
+                "assigned code"
+            ),
+            summary=(
+                "Project Borealis is "
+                "assigned code 2202."
+            ),
+        )
+
+        search = (
+            PriorResearchSearchService(
+                app.database
+            )
+        )
+
+        results = search.search(
+            (
+                "What code is assigned "
+                "to Project Borealis?"
+            ),
+            limit=5,
+        )
+
+        assert results
+        assert [
+            item.result_id
+            for item in results
+        ] == [
+            target_result_id,
+        ]
+
+        assert all(
+            item.result_id
+            != wrong_result_id
+            for item in results
+        )
+
+    finally:
+        app.database.stop()

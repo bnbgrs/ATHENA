@@ -12,7 +12,11 @@ from athena.chat.direct import (
     _resolve_context_limit,
     _select_recent_conversation_window,
 )
-from athena.chat.generation import ChatGenerationResult, ChatGenerationService
+from athena.chat.generation import (
+    GROUNDING_RETRY_POLICY,
+    ChatGenerationResult,
+    ChatGenerationService,
+)
 from athena.chat.grounding import (
     GroundingContract,
     GroundingEvidenceRef,
@@ -32,6 +36,11 @@ from athena.retrieval.context_package import (
     ContextSection,
     ContextTokenEstimates,
     ExcludedCandidateSummary,
+)
+from athena.retrieval.degradation import (
+    LEXICAL_FALLBACK_RETRIEVAL_MODE,
+    SemanticRetrievalUnavailableError,
+    resolve_embedding_model_for_retrieval,
 )
 from athena.retrieval.evidence import EvidenceClass
 from athena.retrieval.source_context import (
@@ -65,7 +74,7 @@ class SourceGroundedChatResult:
     context: SourceContextBundle
     context_package: ContextPackage
     processing_run: ProcessingRun
-    embedding_model: ModelInfo
+    embedding_model: ModelInfo | None
     budget: SourceContextBudgetReport
 
 
@@ -134,15 +143,35 @@ class SourceGroundedChatService:
             model=model,
             requested_limit=effective_context_limit,
         )
-        embedding_model = self.embedding_provider.resolve_model(
-            requested_embedding_model_id
+        embedding_resolution = resolve_embedding_model_for_retrieval(
+            self.embedding_provider,
+            requested_embedding_model_id,
         )
+        embedding_model = embedding_resolution.model
+        retrieval_mode = embedding_resolution.mode
+        retrieval_warning = embedding_resolution.warning
+
         candidate_limit = min(200, max(40, max_context_items * 8))
-        results = self.archive_retrieval.search(
-            search_query,
-            model_id=embedding_model.backend_model_id,
-            limit=candidate_limit,
-        )
+
+        if embedding_model is None:
+            results = self.archive_retrieval.search_lexical(
+                search_query,
+                limit=candidate_limit,
+            )
+        else:
+            try:
+                results = self.archive_retrieval.search(
+                    search_query,
+                    model_id=embedding_model.backend_model_id,
+                    limit=candidate_limit,
+                )
+            except SemanticRetrievalUnavailableError as exc:
+                retrieval_mode = LEXICAL_FALLBACK_RETRIEVAL_MODE
+                retrieval_warning = exc.reason_code
+                results = self.archive_retrieval.search_lexical(
+                    search_query,
+                    limit=candidate_limit,
+                )
 
         context_budget = max_context_tokens
         context: SourceContextBundle | None = None
@@ -174,6 +203,7 @@ class SourceGroundedChatService:
             recent_messages = _select_recent_conversation_window(
                 thread.messages,
                 max_turns=max_recent_conversation_turns,
+                include_assistant=False,
             )
             prior_sections, prior_refs = _prior_chat_sections(recent_messages)
             conversation_tokens = _estimate_persisted_messages(recent_messages)
@@ -222,7 +252,15 @@ class SourceGroundedChatService:
             "max_context_items": max_context_items,
             "max_recent_conversation_turns": max_recent_conversation_turns,
             "safety_margin": safety_margin,
-            "embedding_model_id": embedding_model.backend_model_id,
+            "conversation_history_policy": "grounded_user_only",
+            "grounding_retry_policy": GROUNDING_RETRY_POLICY,
+            "embedding_model_id": (
+                None
+                if embedding_model is None
+                else embedding_model.backend_model_id
+            ),
+            "retrieval_mode": retrieval_mode,
+            "retrieval_warning": retrieval_warning,
             "allow_model_prior": allow_model_prior,
         }
         signature = self.model_runs.get_or_create_signature(

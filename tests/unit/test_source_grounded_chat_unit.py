@@ -20,6 +20,7 @@ from athena.model.domain import (
 from athena.model.provenance import ModelRunRepository
 from athena.retrieval.archive import ArchiveHybridSearchResult
 from athena.retrieval.context_package import ContextPackageService
+from athena.retrieval.degradation import SemanticRetrievalUnavailableError
 from athena.retrieval.source_context import SourceContextBuilderService
 from athena.source.models import SourceAnchorRecord, SourceAnchorType
 from athena.storage.database import SQLiteDatabase
@@ -86,12 +87,27 @@ class FakeEmbeddingProvider:
 
 
 class FakeArchiveRetrieval:
-    def __init__(self, result: ArchiveHybridSearchResult) -> None:
+    def __init__(
+        self,
+        result: ArchiveHybridSearchResult,
+        *,
+        fail_semantic: bool = False,
+    ) -> None:
         self.result = result
+        self.fail_semantic = fail_semantic
         self.calls: list[tuple[str, str, int]] = []
+        self.lexical_calls: list[tuple[str, int]] = []
 
     def search(self, query: str, *, model_id: str, limit: int):
         self.calls.append((query, model_id, limit))
+        if self.fail_semantic:
+            raise SemanticRetrievalUnavailableError(
+                "archive_semantic_unavailable"
+            )
+        return (self.result,)
+
+    def search_lexical(self, query: str, *, limit: int):
+        self.lexical_calls.append((query, limit))
         return (self.result,)
 
 
@@ -164,14 +180,22 @@ def _archive_result() -> ArchiveHybridSearchResult:
     )
 
 
-def _runtime(tmp_path, archive_result: ArchiveHybridSearchResult):
+def _runtime(
+    tmp_path,
+    archive_result: ArchiveHybridSearchResult,
+    *,
+    semantic_fail: bool = False,
+):
     database = SQLiteDatabase(tmp_path / "athena.db")
     database.start()
     chat = ChatService(ChatRepository(database))
     provider = FakeProvider()
     anchors = FakeAnchors(archive_result)
     embedding = FakeEmbeddingProvider()
-    retrieval = FakeArchiveRetrieval(archive_result)
+    retrieval = FakeArchiveRetrieval(
+        archive_result,
+        fail_semantic=semantic_fail,
+    )
     runs = ModelRunRepository(database)
     service = SourceGroundedChatService(
         chat_generation=ChatGenerationService(chat, provider),
@@ -344,3 +368,52 @@ def test_source_grounded_cli_arguments_are_explicit_and_separate_from_memory() -
     assert args.source_max_tokens == 2400
     assert args.source_max_items == 12
     assert args.source_allow_model_prior is False
+
+
+def test_source_chat_uses_verified_lexical_fallback_on_semantic_outage(
+    tmp_path,
+) -> None:
+    archive_result = _archive_result()
+    (
+        database,
+        chat,
+        _provider,
+        _anchors,
+        _embedding,
+        retrieval,
+        service,
+    ) = _runtime(
+        tmp_path,
+        archive_result,
+        semantic_fail=True,
+    )
+
+    try:
+        chat_id = chat.create_chat()
+        result = service.send_message(
+            chat_id=chat_id,
+            content="What code is assigned to Project Borealis?",
+            requested_model_id="primary",
+            requested_embedding_model_id="embed-model",
+            output_reserve=1000,
+            safety_margin=100,
+        )
+
+        assert len(retrieval.calls) == 1
+        assert len(retrieval.lexical_calls) == 1
+        assert len(result.context.items) == 1
+        assert result.embedding_model is not None
+        assert result.embedding_model.backend_model_id == "embed-model"
+
+        configuration = json.loads(
+            result.context_package.model_signature.context_configuration_json
+            or "{}"
+        )
+        assert configuration["retrieval_mode"] == "lexical_fallback"
+        assert (
+            configuration["retrieval_warning"]
+            == "archive_semantic_unavailable"
+        )
+        assert configuration["embedding_model_id"] == "embed-model"
+    finally:
+        database.stop()

@@ -303,8 +303,13 @@ def test_research_grounded_chat_uses_typed_research_evidence_and_clean_history(
         )
 
         assert any(
-            item.role == "assistant"
-            and item.content == "old research answer."
+            item.role == "user"
+            and item.content == "Earlier question"
+            for item in sent
+        )
+
+        assert all(
+            item.role != "assistant"
             for item in sent
         )
 

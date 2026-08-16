@@ -12,6 +12,7 @@ from typing import Any, Mapping
 
 from athena.common.ids import uuid_from_blob, uuid_to_blob
 from athena.retrieval.context import ContextBuilderError, estimate_tokens
+from athena.retrieval.lexical_relevance import required_term_matches
 from athena.storage.database import SQLiteDatabase
 
 _MAX_SEARCH_LIMIT = 100
@@ -30,6 +31,7 @@ _QUERY_STOPWORDS = frozenset(
         "again",
         "all",
         "and",
+        "are",
         "aus",
         "bei",
         "das",
@@ -37,14 +39,16 @@ _QUERY_STOPWORDS = frozenset(
         "dem",
         "den",
         "der",
-        "die",
         "did",
+        "die",
+        "do",
+        "does",
         "earlier",
         "ein",
         "eine",
+        "ergab",
         "ergebnis",
         "ergebnisse",
-        "ergab",
         "find",
         "findings",
         "for",
@@ -53,10 +57,13 @@ _QUERY_STOPWORDS = frozenset(
         "fruehere",
         "frueheren",
         "haben",
+        "has",
         "hatten",
+        "have",
         "herausgefunden",
         "im",
         "in",
+        "is",
         "ist",
         "mit",
         "noch",
@@ -66,9 +73,9 @@ _QUERY_STOPWORDS = frozenset(
         "project",
         "projekt",
         "recherche",
-        "recherchen",
         "rechercheergebnis",
         "rechercheergebnisse",
+        "recherchen",
         "research",
         "result",
         "results",
@@ -82,9 +89,9 @@ _QUERY_STOPWORDS = frozenset(
         "uns",
         "unser",
         "unsere",
-        "unserer",
         "unserem",
         "unseren",
+        "unserer",
         "was",
         "we",
         "welche",
@@ -197,8 +204,30 @@ class PriorResearchSearchService:
             FROM research_results AS rr
             JOIN research_scopes AS rs
               ON rs.scope_id = rr.scope_id
-            WHERE rs.state = 'completed'
-            ORDER BY
+WHERE rs.state = 'completed'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM news_runs AS nr
+      WHERE nr.research_job_id = rs.job_id
+         OR nr.research_result_id = rr.result_id
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM news_period_runs AS npr
+      WHERE npr.research_job_id = rs.job_id
+         OR npr.research_result_id = rr.result_id
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM news_finding_assessments AS nfa
+      WHERE nfa.research_result_id = rr.result_id
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM news_events AS ne
+      WHERE ne.research_result_id = rr.result_id
+  )
+ORDER BY
                 rr.created_at_us DESC,
                 rr.result_id DESC
             LIMIT ?
@@ -225,10 +254,8 @@ class PriorResearchSearchService:
                 if term in candidate_tokens
             )
 
-            required = (
-                1
-                if len(query_terms) == 1
-                else 2
+            required = required_term_matches(
+                len(query_terms)
             )
 
             if matched < required:
@@ -280,7 +307,29 @@ class PriorResearchSearchService:
             JOIN research_scopes AS rs
               ON rs.scope_id = rr.scope_id
             WHERE rr.result_id = ?
-              AND rs.state = 'completed'
+AND rs.state = 'completed'
+AND NOT EXISTS (
+    SELECT 1
+    FROM news_runs AS nr
+    WHERE nr.research_job_id = rs.job_id
+       OR nr.research_result_id = rr.result_id
+)
+AND NOT EXISTS (
+    SELECT 1
+    FROM news_period_runs AS npr
+    WHERE npr.research_job_id = rs.job_id
+       OR npr.research_result_id = rr.result_id
+)
+AND NOT EXISTS (
+    SELECT 1
+    FROM news_finding_assessments AS nfa
+    WHERE nfa.research_result_id = rr.result_id
+)
+AND NOT EXISTS (
+    SELECT 1
+    FROM news_events AS ne
+    WHERE ne.research_result_id = rr.result_id
+)
             """,
             (
                 uuid_to_blob(

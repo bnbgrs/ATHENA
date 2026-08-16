@@ -24,6 +24,7 @@ from athena.model.domain import ModelInfo
 from athena.model.provenance import ModelSignature, ProcessingRun
 from athena.retrieval.context import ContextBuilderService
 from athena.retrieval.context_package import ContextPackageService
+from athena.retrieval.degradation import SemanticRetrievalUnavailableError
 from athena.retrieval.evidence import (
     EvidenceClass,
     MemoryEvidenceClassification,
@@ -49,8 +50,10 @@ class FakeEmbeddingProvider:
 
 
 class FakeHybrid:
-    def __init__(self) -> None:
+    def __init__(self, *, fail_semantic: bool = False) -> None:
         self.queries: list[str] = []
+        self.lexical_queries: list[str] = []
+        self.fail_semantic = fail_semantic
         self.result = HybridSearchResult(
             entity_id=uuid.uuid4(),
             revision_id=uuid.uuid4(),
@@ -66,8 +69,29 @@ class FakeHybrid:
         )
 
     def search(self, query: str, *, model_id: str, limit: int):
+        del model_id, limit
         self.queries.append(query)
+        if self.fail_semantic:
+            raise SemanticRetrievalUnavailableError(
+                "knowledge_semantic_unavailable"
+            )
         return (self.result,)
+
+    def search_lexical(
+        self,
+        query: str,
+        *,
+        limit: int,
+        entity_type: SearchEntityType | None = None,
+    ):
+        del limit, entity_type
+        self.lexical_queries.append(query)
+        return (
+            replace(
+                self.result,
+                semantic_score=0.0,
+            ),
+        )
 
 
 class FakeEvidencePolicy:
@@ -391,10 +415,14 @@ def _service(
     generation: FakeChatGeneration,
     hybrid: FakeHybrid,
     memory: FakePersonalMemory | None = None,
+    *,
+    embedding_provider=None,
 ):
     return MemoryAugmentedChatService(
         chat_generation=generation,  # type: ignore[arg-type]
-        embedding_provider=FakeEmbeddingProvider(),  # type: ignore[arg-type]
+        embedding_provider=(
+            embedding_provider or FakeEmbeddingProvider()
+        ),  # type: ignore[arg-type]
         hybrid_retrieval=hybrid,  # type: ignore[arg-type]
         context_builder=ContextBuilderService(),
         context_packages=FakeContextPackages(),  # type: ignore[arg-type]
@@ -687,3 +715,175 @@ def test_memory_chat_fails_closed_when_fixed_input_leaves_no_context_room() -> N
 
     assert hybrid.queries == []
     assert generation.calls == []
+
+
+def test_memory_chat_uses_lexical_fallback_when_semantic_runtime_fails() -> None:
+    generation = FakeChatGeneration()
+    hybrid = FakeHybrid(
+        fail_semantic=True
+    )
+    service = _service(
+        generation,
+        hybrid,
+    )
+
+    result = service.send_message(
+        chat_id=uuid.uuid4(),
+        content="What code is assigned to Project Borealis?",
+        requested_model_id="primary",
+        requested_embedding_model_id="embed-model",
+        max_context_tokens=800,
+        max_context_items=4,
+        output_reserve=1000,
+        safety_margin=200,
+    )
+
+    assert hybrid.queries == [
+        "What code is assigned to Project Borealis?"
+    ]
+    assert hybrid.lexical_queries == [
+        "What code is assigned to Project Borealis?"
+    ]
+    assert result.embedding_model is not None
+    assert result.embedding_model.backend_model_id == "embed-model"
+    assert len(result.context.items) == 1
+    assert len(generation.calls) == 1
+
+    configuration = json.loads(
+        result.context_package.model_signature.context_configuration_json
+        or "{}"
+    )
+    assert configuration["retrieval_mode"] == "lexical_fallback"
+    assert (
+        configuration["retrieval_warning"]
+        == "knowledge_semantic_unavailable"
+    )
+    assert configuration["embedding_model_id"] == "embed-model"
+
+
+def test_memory_grounded_history_excludes_prior_assistant_evidence_text() -> None:
+    generation = FakeChatGeneration()
+    hybrid = FakeHybrid()
+
+    chat_id = uuid.uuid4()
+
+    earlier_user = ChatMessage(
+        message_id=uuid.uuid4(),
+        chat_id=chat_id,
+        sequence_no=1,
+        message_type=MessageType.USER,
+        actor_id=uuid.uuid4(),
+        created_at_us=1,
+        revision_id=uuid.uuid4(),
+        content="Earlier Project Atlas question",
+        content_format="text/plain",
+    )
+
+    earlier_assistant = ChatMessage(
+        message_id=uuid.uuid4(),
+        chat_id=chat_id,
+        sequence_no=2,
+        message_type=MessageType.ASSISTANT,
+        actor_id=None,
+        created_at_us=2,
+        revision_id=uuid.uuid4(),
+        content=(
+            "Project Atlas has News code 1301 "
+            "[NEWS:CTX-001].\n\n"
+            "ATHENA_PROVENANCE "
+            '{"athena_provenance_version":3,'
+            '"evidence":[]}'
+        ),
+        content_format="text/plain",
+    )
+
+    generation.chat.messages = (
+        earlier_user,
+        earlier_assistant,
+    )
+
+    service = _service(
+        generation,
+        hybrid,
+    )
+
+    result = service.send_message(
+        chat_id=chat_id,
+        content=(
+            "Was weisst du noch "
+            "ueber Project Atlas?"
+        ),
+        requested_model_id="primary",
+        requested_embedding_model_id="embed",
+        max_context_tokens=800,
+        max_context_items=4,
+        output_reserve=1000,
+        safety_margin=200,
+        allow_model_prior=False,
+    )
+
+    model_messages = (
+        result.context_package
+        .model_messages()
+    )
+
+    assert any(
+        item.role == "user"
+        and item.content
+        == "Earlier Project Atlas question"
+        for item in model_messages
+    )
+
+    assert all(
+        item.role != "assistant"
+        for item in model_messages
+    )
+
+    assert all(
+        "1301" not in item.content
+        for item in model_messages
+    )
+
+    config = json.loads(
+        result.context_package
+        .model_signature
+        .context_configuration_json
+        or "{}"
+    )
+
+    assert (
+        config[
+            "conversation_history_policy"
+        ]
+        == "grounded_user_only"
+    )
+
+    snapshot = json.loads(
+        result.processing_run
+        .input_snapshot_json
+    )
+
+    counts = snapshot[
+        "excluded_candidate_summary"
+    ]
+
+    assert (
+        counts[
+            "conversation_candidate_count"
+        ]
+        == 2
+    )
+
+    assert (
+        counts[
+            "conversation_included_count"
+        ]
+        == 1
+    )
+
+    assert (
+        counts[
+            "conversation_excluded_count"
+        ]
+        == 1
+    )

@@ -10,11 +10,13 @@ import pytest
 
 from athena.config.settings import AthenaSettings
 from athena.core.application import AthenaApplication
+from athena.model.adapters.lm_studio import ModelProviderError
 from athena.retrieval.archive import (
     ArchiveHybridRetrievalService,
     ArchiveSearchError,
     ArchiveSemanticSearchService,
 )
+from athena.retrieval.degradation import SemanticRetrievalUnavailableError
 from athena.source.chunk_store import SourceChunkStore
 
 
@@ -383,5 +385,59 @@ def test_archive_hnsw_sidecar_rebuilds_without_reembedding(tmp_path) -> None:
         assert restored.current
         assert restored.hnsw_ready
         assert provider.calls == calls_after_embedding_rebuild
+    finally:
+        app.stop()
+
+
+@dataclass
+class FailingArchiveEmbeddingProvider:
+    def embed(self, *, model_id: str, texts):
+        del model_id, texts
+        raise ModelProviderError("synthetic archive embedding outage")
+
+
+def test_archive_hybrid_degrades_only_after_verified_lexical_path_succeeds(
+    tmp_path,
+) -> None:
+    app = _started_app(tmp_path)
+    try:
+        source, _representation, _built = _build_chunks(
+            app,
+            tmp_path,
+            "fallback.txt",
+            "Project Borealis has assigned code 3303.\n",
+        )
+        semantic = ArchiveSemanticSearchService(
+            lexical=app.archive_search,
+            provider=FailingArchiveEmbeddingProvider(),
+        )
+        hybrid = ArchiveHybridRetrievalService(
+            app.archive_search,
+            semantic,
+        )
+
+        with pytest.raises(
+            SemanticRetrievalUnavailableError,
+            match="archive_semantic_unavailable",
+        ):
+            hybrid.search(
+                "Borealis code",
+                model_id="broken-embed",
+                limit=10,
+            )
+
+        fallback = hybrid.search_lexical(
+            "Borealis code",
+            limit=10,
+        )
+
+        assert fallback
+        result = next(
+            item
+            for item in fallback
+            if item.source_id == source.source_id
+        )
+        assert result.lexical_score > 0.0
+        assert result.semantic_score == 0.0
     finally:
         app.stop()

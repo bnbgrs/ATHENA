@@ -1609,14 +1609,18 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
                     f"unknown={grounding.uses_unknown}"
                 )
         if unified_result is not None:
+            unified_embedding_label = (
+                unified_result.embedding_model.backend_model_id
+                if unified_result.embedding_model is not None
+                else "<lexical-fallback>"
+            )
             print(
                 "Unified local context: "
                 f"memory_items={len(unified_result.memory_context.items)} "
                 f"memory_preferences="
                 f"{len(unified_result.memory_context.memory_items)} "
                 f"source_items={len(unified_result.source_context.items)} "
-                f"embedding_model="
-                f"{unified_result.embedding_model.backend_model_id}"
+                f"embedding_model={unified_embedding_label}"
             )
             print(
                 "Unified context budgets: "
@@ -1668,6 +1672,11 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
                 )
 
         if memory_result is not None:
+            memory_embedding_label = (
+                memory_result.embedding_model.backend_model_id
+                if memory_result.embedding_model is not None
+                else "<lexical-fallback>"
+            )
             print(
                 "Memory context: "
                 f"preferences={len(memory_result.context.memory_items)} "
@@ -1676,7 +1685,7 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
                 f"omitted={memory_result.context.omitted_count} "
                 f"estimated_tokens={memory_result.context.estimated_tokens}/"
                 f"{memory_result.context.max_estimated_tokens} "
-                f"embedding_model={memory_result.embedding_model.backend_model_id}"
+                f"embedding_model={memory_embedding_label}"
             )
             print(
                 "Context budget: "
@@ -1715,13 +1724,18 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
                     f"unknown={grounding.uses_unknown}"
                 )
         if source_result is not None:
+            source_embedding_label = (
+                source_result.embedding_model.backend_model_id
+                if source_result.embedding_model is not None
+                else "<lexical-fallback>"
+            )
             print(
                 "Source context: "
                 f"items={len(source_result.context.items)} "
                 f"omitted={source_result.context.omitted_count} "
                 f"estimated_tokens={source_result.context.estimated_tokens}/"
                 f"{source_result.context.max_estimated_tokens} "
-                f"embedding_model={source_result.embedding_model.backend_model_id}"
+                f"embedding_model={source_embedding_label}"
             )
             if source_result.context.items:
                 refs = ", ".join(

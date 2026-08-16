@@ -187,12 +187,13 @@ def test_recent_conversation_window_is_turn_bounded_and_accounted(tmp_path) -> N
         )
         assert tuple(section.content for section in conversation_sections) == (
             "user-4",
-            "assistant-4",
             "user-5",
-            "assistant-5",
         )
 
-        expected_ids = {message.message_id for message in history[-4:]}
+        expected_ids = {
+            history[-4].message_id,
+            history[-2].message_id,
+        }
         included_history_ids = {
             item.entity_id
             for item in package.included_refs
@@ -202,14 +203,14 @@ def test_recent_conversation_window_is_turn_bounded_and_accounted(tmp_path) -> N
 
         summary = package.excluded_candidate_summary
         assert summary.conversation_candidate_count == 12
-        assert summary.conversation_included_count == 4
-        assert summary.conversation_excluded_count == 8
+        assert summary.conversation_included_count == 2
+        assert summary.conversation_excluded_count == 10
 
         snapshot = json.loads(result.processing_run.input_snapshot_json)
         snapshot_summary = snapshot["excluded_candidate_summary"]
         assert snapshot_summary["conversation_candidate_count"] == 12
-        assert snapshot_summary["conversation_included_count"] == 4
-        assert snapshot_summary["conversation_excluded_count"] == 8
+        assert snapshot_summary["conversation_included_count"] == 2
+        assert snapshot_summary["conversation_excluded_count"] == 10
 
         assert provider.requests == [
             ("primary-test", package.model_messages())
@@ -217,6 +218,8 @@ def test_recent_conversation_window_is_turn_bounded_and_accounted(tmp_path) -> N
         flattened = "\n".join(message.content for message in provider.requests[0][1])
         assert "user-0" not in flattened
         assert "assistant-0" not in flattened
+        assert "assistant-4" not in flattened
+        assert "assistant-5" not in flattened
     finally:
         database.stop()
 
@@ -271,13 +274,15 @@ def test_large_old_chat_does_not_consume_direct_context_budget(tmp_path) -> None
 
         summary = result.context_package.excluded_candidate_summary
         assert summary.conversation_candidate_count == 24
-        assert summary.conversation_included_count == 4
-        assert summary.conversation_excluded_count == 20
+        assert summary.conversation_included_count == 2
+        assert summary.conversation_excluded_count == 22
 
         sent = "\n".join(message.content for message in provider.requests[0][1])
         assert "OLD-ARCHIVE" not in sent
         assert "recent-user-0" in sent
         assert "recent-user-1" in sent
+        assert "recent-assistant-0" not in sent
+        assert "recent-assistant-1" not in sent
     finally:
         database.stop()
 
@@ -358,8 +363,8 @@ def test_older_turn_can_return_via_retrieval_without_direct_window_replay(tmp_pa
 
         summary = result.context_package.excluded_candidate_summary
         assert summary.conversation_candidate_count == 8
-        assert summary.conversation_included_count == 2
-        assert summary.conversation_excluded_count == 6
+        assert summary.conversation_included_count == 1
+        assert summary.conversation_excluded_count == 7
 
         sent = provider.requests[0][1]
         system_text = sent[0].content
@@ -370,6 +375,7 @@ def test_older_turn_can_return_via_retrieval_without_direct_window_replay(tmp_pa
             if section.name == "conversation"
         )
         assert "ORION-17" not in direct_conversation_text
+        assert "recent-assistant-2" not in direct_conversation_text
     finally:
         database.stop()
 

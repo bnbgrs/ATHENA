@@ -10,6 +10,7 @@ from athena.chat.generation import ChatGenerationResult
 from athena.chat.grounding import GroundingContract
 from athena.chat.models import ChatMessage, ChatThread, MessageType
 from athena.chat.unified import UnifiedLocalChatService
+from athena.model.adapters.lm_studio import ModelProviderError
 from athena.model.domain import ModelInfo
 from athena.model.provenance import ModelSignature, ProcessingRun
 from athena.retrieval.archive import ArchiveHybridSearchResult
@@ -31,11 +32,16 @@ from athena.source.models import SourceAnchorRecord, SourceAnchorType
 
 
 class FakeEmbeddingProvider:
-    def __init__(self) -> None:
+    def __init__(self, *, fail: bool = False) -> None:
         self.requests: list[str | None] = []
+        self.fail = fail
 
     def resolve_model(self, requested_model_id: str | None = None) -> ModelInfo:
         self.requests.append(requested_model_id)
+        if self.fail:
+            raise ModelProviderError(
+                "synthetic embedding discovery failure"
+            )
         return ModelInfo(
             provider="lm_studio",
             backend_model_id=requested_model_id or "embed",
@@ -55,6 +61,13 @@ class FakeMemoryHybrid:
         self.calls: list[
             tuple[
                 str,
+                str,
+                int,
+                SearchEntityType | None,
+            ]
+        ] = []
+        self.lexical_calls: list[
+            tuple[
                 str,
                 int,
                 SearchEntityType | None,
@@ -138,6 +151,33 @@ class FakeMemoryHybrid:
             self.duplicate_claim,
         )
 
+    def search_lexical(
+        self,
+        query: str,
+        *,
+        limit: int,
+        entity_type: SearchEntityType | None = None,
+    ):
+        self.lexical_calls.append(
+            (
+                query,
+                limit,
+                entity_type,
+            )
+        )
+
+        if entity_type is SearchEntityType.KNOWLEDGE:
+            return (self.knowledge_result,)
+
+        if entity_type is SearchEntityType.CLAIM:
+            return (self.duplicate_claim,)
+
+        return (
+            self.irrelevant_chat,
+            self.knowledge_result,
+            self.duplicate_claim,
+        )
+
 
 class FakeEvidencePolicy:
     def classify(
@@ -197,9 +237,14 @@ class FakeArchiveRetrieval:
     def __init__(self, result: ArchiveHybridSearchResult) -> None:
         self.result = result
         self.calls: list[tuple[str, str, int]] = []
+        self.lexical_calls: list[tuple[str, int]] = []
 
     def search(self, query: str, *, model_id: str, limit: int):
         self.calls.append((query, model_id, limit))
+        return (self.result,)
+
+    def search_lexical(self, query: str, *, limit: int):
+        self.lexical_calls.append((query, limit))
         return (self.result,)
 
 
@@ -846,3 +891,82 @@ def test_source_context_verifier_rejects_ctx_1000_after_999() -> None:
         raise AssertionError(
             "Source context verifier accepted CTX-1000."
         )
+
+
+def test_unified_chat_degrades_both_domains_when_embedding_model_is_unavailable() -> None:
+    source = archive_result()
+    generation = FakeChatGeneration()
+    embedding = FakeEmbeddingProvider(
+        fail=True
+    )
+    memory_hybrid = FakeMemoryHybrid()
+    archive = FakeArchiveRetrieval(
+        source
+    )
+    anchors = FakeAnchors(
+        source
+    )
+    packages = FakeContextPackages()
+    runs = FakeModelRuns()
+
+    service = UnifiedLocalChatService(
+        chat_generation=generation,  # type: ignore[arg-type]
+        embedding_provider=embedding,  # type: ignore[arg-type]
+        hybrid_retrieval=memory_hybrid,  # type: ignore[arg-type]
+        memory_context_builder=ContextBuilderService(),
+        evidence_policy=FakeEvidencePolicy(),  # type: ignore[arg-type]
+        personal_memory=FakePersonalMemory(),  # type: ignore[arg-type]
+        archive_retrieval=archive,  # type: ignore[arg-type]
+        source_context_builder=SourceContextBuilderService(
+            anchors
+        ),  # type: ignore[arg-type]
+        context_packages=packages,  # type: ignore[arg-type]
+        model_runs=runs,  # type: ignore[arg-type]
+    )
+
+    result = service.send_message(
+        chat_id=uuid.uuid4(),
+        content="What code is assigned to Project Borealis?",
+        requested_model_id="primary",
+        requested_embedding_model_id="missing-embed",
+        max_memory_context_tokens=500,
+        max_source_context_tokens=500,
+        output_reserve=1000,
+        safety_margin=100,
+    )
+
+    assert embedding.requests == [
+        "missing-embed"
+    ]
+    assert archive.calls == []
+    assert len(
+        archive.lexical_calls
+    ) == 1
+    assert memory_hybrid.calls == []
+    assert {
+        call[2]
+        for call in memory_hybrid.lexical_calls
+    } == {
+        SearchEntityType.KNOWLEDGE,
+        SearchEntityType.CLAIM,
+    }
+    assert result.embedding_model is None
+    assert len(generation.calls) == 1
+
+    configuration = json.loads(
+        result.context_package.model_signature.context_configuration_json
+        or "{}"
+    )
+    assert (
+        configuration["memory_retrieval_mode"]
+        == "lexical_fallback"
+    )
+    assert (
+        configuration["source_retrieval_mode"]
+        == "lexical_fallback"
+    )
+    assert (
+        configuration["retrieval_warnings"]
+        == ["embedding_model_unavailable"]
+    )
+    assert configuration["embedding_model_id"] is None

@@ -1552,3 +1552,563 @@ def test_followup_inherits_explicit_news_domain() -> None:
 
     assert local.calls == []
     assert archive.calls == []
+
+
+def test_named_entity_mismatch_does_not_let_canonical_shadow_research() -> None:
+    planned, _local, _archive = planner(
+        knowledge_texts=(
+            "Project Atlas has assigned code 1101.",
+        ),
+        research_texts=(
+            "Project Borealis has assigned code 2202.",
+        ),
+    )
+
+    result = planned.plan(
+        "What code is assigned to Project Borealis?"
+    )
+
+    assert result.mode is AdaptiveRetrievalMode.RESEARCH
+    assert result.reason is AdaptivePlanReason.RESEARCH_LEXICAL_HIT
+    assert result.canonical_probe_hit is False
+    assert result.research_probe_hit is True
+
+
+def test_named_entity_mismatch_does_not_let_research_shadow_news() -> None:
+    planned, _local, _archive = planner(
+        research_texts=(
+            "Project Atlas has assigned code 1101.",
+        ),
+        news_texts=(
+            "Project Borealis has assigned code 2202.",
+        ),
+    )
+
+    result = planned.plan(
+        "What code is assigned to Project Borealis?"
+    )
+
+    assert result.mode is AdaptiveRetrievalMode.NEWS
+    assert result.reason is AdaptivePlanReason.NEWS_LEXICAL_HIT
+    assert result.research_probe_hit is False
+    assert result.news_probe_hit is True
+
+
+def test_named_entity_mismatch_does_not_let_news_shadow_archive() -> None:
+    planned, _local, _archive = planner(
+        news_texts=(
+            "Project Atlas has assigned code 1101.",
+        ),
+        archive_texts=(
+            "Project Borealis has assigned code 2202.",
+        ),
+    )
+
+    result = planned.plan(
+        "What code is assigned to Project Borealis?"
+    )
+
+    assert result.mode is AdaptiveRetrievalMode.SOURCES
+    assert result.reason is AdaptivePlanReason.ARCHIVE_LEXICAL_HIT
+    assert result.news_probe_hit is False
+    assert result.archive_probe_hit is True
+
+
+
+
+@pytest.mark.parametrize(
+    ("switch_content", "expected_mode"),
+    (
+        (
+            (
+                "And according to this document, "
+                "what code is assigned to Project Atlas?"
+            ),
+            AdaptiveRetrievalMode.SOURCES,
+        ),
+        (
+            (
+                "And what did our previous research "
+                "find about Project Atlas assigned code?"
+            ),
+            AdaptiveRetrievalMode.RESEARCH,
+        ),
+        (
+            (
+                "And remember Project Atlas "
+                "and its assigned code."
+            ),
+            AdaptiveRetrievalMode.MEMORY,
+        ),
+        (
+            (
+                "And remember Project Atlas, "
+                "and according to this document "
+                "what code is assigned?"
+            ),
+            AdaptiveRetrievalMode.UNIFIED,
+        ),
+    ),
+)
+def test_self_contained_explicit_followup_switch_becomes_content_and_domain_anchor(
+    switch_content: str,
+    expected_mode: AdaptiveRetrievalMode,
+) -> None:
+    chat_id = uuid.uuid4()
+
+    older_topic = _chat_message(
+        chat_id=chat_id,
+        sequence_no=1,
+        message_type=MessageType.USER,
+        content=(
+            "What is the latest news "
+            "about Project Atlas?"
+        ),
+    )
+
+    intermediate_followup = _chat_message(
+        chat_id=chat_id,
+        sequence_no=2,
+        message_type=MessageType.USER,
+        content="And the exact code?",
+    )
+
+    explicit_switch = _chat_message(
+        chat_id=chat_id,
+        sequence_no=3,
+        message_type=MessageType.USER,
+        content=switch_content,
+    )
+
+    planned, local, archive = planner()
+
+    (
+        service,
+        _direct,
+        _memory,
+        _source,
+        _unified,
+    ) = _adaptive_runtime(
+        planned=planned,
+        chat=FakeChatHistory(
+            (
+                older_topic,
+                intermediate_followup,
+                explicit_switch,
+            )
+        ),
+    )
+
+    current = "And the exact code?"
+
+    result = service.send_message(
+        chat_id=chat_id,
+        content=current,
+    )
+
+    assert result.contextualized is True
+
+    # The explicit switch is self-contained enough to replace the old
+    # topic anchor as well as the inherited domain.
+    assert (
+        result.context_anchor_message_id
+        == explicit_switch.message_id
+    )
+
+    assert (
+        result.retrieval_query
+        == explicit_switch.content
+        + "\n"
+        + current
+    )
+
+    assert result.plan.mode is expected_mode
+
+    assert (
+        result.plan.reason
+        is AdaptivePlanReason.FOLLOWUP_INHERITED_DOMAIN
+    )
+
+    # Route inheritance itself performs no lexical routing probe.
+    assert local.calls == []
+    assert archive.calls == []
+
+
+def test_stale_explicit_domain_before_new_substantive_anchor_is_not_inherited() -> None:
+    chat_id = uuid.uuid4()
+
+    stale_news = _chat_message(
+        chat_id=chat_id,
+        sequence_no=1,
+        message_type=MessageType.USER,
+        content="What is the latest news about Project Atlas?",
+    )
+
+    newer_substantive = _chat_message(
+        chat_id=chat_id,
+        sequence_no=2,
+        message_type=MessageType.USER,
+        content="What code is assigned to Project Borealis?",
+    )
+
+    planned, _local, _archive = planner(
+        research_texts=(
+            "Project Borealis is assigned research code 2202.",
+        ),
+    )
+
+    (
+        service,
+        _direct,
+        _memory,
+        _source,
+        _unified,
+    ) = _adaptive_runtime(
+        planned=planned,
+        chat=FakeChatHistory(
+            (
+                stale_news,
+                newer_substantive,
+            )
+        ),
+    )
+
+    result = service.send_message(
+        chat_id=chat_id,
+        content="And the exact code?",
+    )
+
+    assert result.contextualized is True
+    assert (
+        result.context_anchor_message_id
+        == newer_substantive.message_id
+    )
+
+    assert (
+        result.plan.mode
+        is AdaptiveRetrievalMode.RESEARCH
+    )
+
+    assert (
+        result.plan.reason
+        is AdaptivePlanReason.RESEARCH_LEXICAL_HIT
+    )
+
+    assert (
+        result.plan.reason
+        is not AdaptivePlanReason.FOLLOWUP_INHERITED_DOMAIN
+    )
+
+
+def test_latest_explicit_anaphoric_turn_becomes_content_anchor_fallback() -> None:
+    chat_id = uuid.uuid4()
+
+    older_source = _chat_message(
+        chat_id=chat_id,
+        sequence_no=1,
+        message_type=MessageType.USER,
+        content=(
+            "According to this document, "
+            "what code is assigned to Project Atlas?"
+        ),
+    )
+
+    intermediate_followup = _chat_message(
+        chat_id=chat_id,
+        sequence_no=2,
+        message_type=MessageType.USER,
+        content="And the exact code?",
+    )
+
+    explicit_news = _chat_message(
+        chat_id=chat_id,
+        sequence_no=3,
+        message_type=MessageType.USER,
+        content=(
+            "And what is the latest news "
+            "about Project Atlas?"
+        ),
+    )
+
+    planned, local, archive = planner()
+
+    (
+        service,
+        _direct,
+        _memory,
+        _source,
+        _unified,
+    ) = _adaptive_runtime(
+        planned=planned,
+        chat=FakeChatHistory(
+            (
+                older_source,
+                intermediate_followup,
+                explicit_news,
+            )
+        ),
+    )
+
+    current = "And the exact code?"
+
+    result = service.send_message(
+        chat_id=chat_id,
+        content=current,
+    )
+
+    assert result.contextualized is True
+
+    # All three historical turns look anaphoric. The newest explicit
+    # routing turn therefore becomes the safe content fallback.
+    assert (
+        result.context_anchor_message_id
+        == explicit_news.message_id
+    )
+
+    assert (
+        result.retrieval_query
+        == explicit_news.content
+        + "\n"
+        + current
+    )
+
+    assert (
+        result.plan.mode
+        is AdaptiveRetrievalMode.NEWS
+    )
+
+    assert (
+        result.plan.reason
+        is AdaptivePlanReason.FOLLOWUP_INHERITED_DOMAIN
+    )
+
+    assert local.calls == []
+    assert archive.calls == []
+
+
+def test_anaphoric_explicit_source_can_anchor_followup_without_older_topic() -> None:
+    chat_id = uuid.uuid4()
+
+    source_turn = _chat_message(
+        chat_id=chat_id,
+        sequence_no=1,
+        message_type=MessageType.USER,
+        content=(
+            "According to this document, "
+            "what code is assigned to Project Atlas?"
+        ),
+    )
+
+    planned, local, archive = planner()
+
+    (
+        service,
+        _direct,
+        _memory,
+        source,
+        _unified,
+    ) = _adaptive_runtime(
+        planned=planned,
+        chat=FakeChatHistory(
+            (
+                source_turn,
+            )
+        ),
+    )
+
+    current = "And the exact code?"
+
+    result = service.send_message(
+        chat_id=chat_id,
+        content=current,
+    )
+
+    assert result.contextualized is True
+
+    assert (
+        result.context_anchor_message_id
+        == source_turn.message_id
+    )
+
+    assert (
+        result.retrieval_query
+        == source_turn.content
+        + "\n"
+        + current
+    )
+
+    assert (
+        result.plan.mode
+        is AdaptiveRetrievalMode.SOURCES
+    )
+
+    assert (
+        result.plan.reason
+        is AdaptivePlanReason.FOLLOWUP_INHERITED_DOMAIN
+    )
+
+    assert len(source.calls) == 1
+    assert local.calls == []
+    assert archive.calls == []
+
+
+def test_cross_topic_explicit_source_switch_replaces_old_topic_anchor() -> None:
+    chat_id = uuid.uuid4()
+
+    old_news_topic = _chat_message(
+        chat_id=chat_id,
+        sequence_no=1,
+        message_type=MessageType.USER,
+        content=(
+            "What is the latest news "
+            "about Project Atlas?"
+        ),
+    )
+
+    source_borealis = _chat_message(
+        chat_id=chat_id,
+        sequence_no=2,
+        message_type=MessageType.USER,
+        content=(
+            "And according to this document, "
+            "what code is assigned to Project Borealis?"
+        ),
+    )
+
+    planned, local, archive = planner()
+
+    (
+        service,
+        _direct,
+        _memory,
+        source,
+        _unified,
+    ) = _adaptive_runtime(
+        planned=planned,
+        chat=FakeChatHistory(
+            (
+                old_news_topic,
+                source_borealis,
+            )
+        ),
+    )
+
+    current = "And the exact code?"
+
+    result = service.send_message(
+        chat_id=chat_id,
+        content=current,
+    )
+
+    assert result.contextualized is True
+
+    assert (
+        result.context_anchor_message_id
+        == source_borealis.message_id
+    )
+
+    assert (
+        result.retrieval_query
+        == source_borealis.content
+        + "\n"
+        + current
+    )
+
+    assert (
+        "Project Borealis"
+        in result.retrieval_query
+    )
+
+    assert (
+        "Project Atlas"
+        not in result.retrieval_query
+    )
+
+    assert (
+        result.plan.mode
+        is AdaptiveRetrievalMode.SOURCES
+    )
+
+    assert (
+        result.plan.reason
+        is AdaptivePlanReason.FOLLOWUP_INHERITED_DOMAIN
+    )
+
+    assert len(source.calls) == 1
+    assert local.calls == []
+    assert archive.calls == []
+
+
+def test_weak_explicit_domain_switch_keeps_older_substantive_topic_anchor() -> None:
+    chat_id = uuid.uuid4()
+
+    substantive_topic = _chat_message(
+        chat_id=chat_id,
+        sequence_no=1,
+        message_type=MessageType.USER,
+        content=(
+            "What code is assigned "
+            "to Project Borealis?"
+        ),
+    )
+
+    weak_news_switch = _chat_message(
+        chat_id=chat_id,
+        sequence_no=2,
+        message_type=MessageType.USER,
+        content="And what about the news?",
+    )
+
+    planned, local, archive = planner()
+
+    (
+        service,
+        _direct,
+        _memory,
+        _source,
+        _unified,
+    ) = _adaptive_runtime(
+        planned=planned,
+        chat=FakeChatHistory(
+            (
+                substantive_topic,
+                weak_news_switch,
+            )
+        ),
+    )
+
+    current = "And the exact code?"
+
+    result = service.send_message(
+        chat_id=chat_id,
+        content=current,
+    )
+
+    assert result.contextualized is True
+
+    # The weak News switch changes domain state, but it does not contain
+    # enough independent topic information to replace Borealis.
+    assert (
+        result.context_anchor_message_id
+        == substantive_topic.message_id
+    )
+
+    assert (
+        result.retrieval_query
+        == substantive_topic.content
+        + "\n"
+        + current
+    )
+
+    assert (
+        result.plan.mode
+        is AdaptiveRetrievalMode.NEWS
+    )
+
+    assert (
+        result.plan.reason
+        is AdaptivePlanReason.FOLLOWUP_INHERITED_DOMAIN
+    )
+
+    assert local.calls == []
+    assert archive.calls == []

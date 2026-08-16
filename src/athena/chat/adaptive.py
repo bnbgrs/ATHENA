@@ -41,6 +41,7 @@ from athena.retrieval.archive import (
     ArchiveSearchError,
     ArchiveSearchService,
 )
+from athena.retrieval.lexical_relevance import required_term_matches
 from athena.retrieval.news_events import (
     NewsEventSearchError,
     NewsEventSearchService,
@@ -610,8 +611,13 @@ class AdaptiveRetrievalPlanner:
                     limit=5,
                 )
 
-                research_hit = bool(
-                    research
+                research_hit = any(
+                    _supports_probe_terms(
+                        probe_terms,
+                        title=None,
+                        text=item.text,
+                    )
+                    for item in research
                 )
 
             except PriorResearchSearchError as exc:
@@ -639,8 +645,13 @@ class AdaptiveRetrievalPlanner:
                     probe_query,
                     limit=5,
                 )
-                news_hit = bool(
-                    news
+                news_hit = any(
+                    _supports_probe_terms(
+                        probe_terms,
+                        title=None,
+                        text=item.text,
+                    )
+                    for item in news
                 )
             except NewsEventSearchError as exc:
                 warnings.append(
@@ -786,8 +797,9 @@ class AdaptiveChatService:
                 if explicit_current is not None:
                     plan = explicit_current
                 else:
-                    inherited = self.planner.explicit_plan(
-                        anchor_content
+                    inherited = self._select_followup_domain_plan(
+                        thread.messages,
+                        anchor=anchor,
                     )
 
                     if inherited is not None:
@@ -996,11 +1008,70 @@ class AdaptiveChatService:
             f"Unsupported adaptive retrieval mode: {plan.mode!r}"
         )
 
+    def _select_followup_domain_plan(
+        self,
+        messages: tuple[ChatMessage, ...],
+        *,
+        anchor: ChatMessage,
+    ) -> AdaptiveRetrievalPlan | None:
+        """Return the newest explicit domain selection for this topic.
+
+        Content anchoring and domain inheritance are intentionally separate.
+
+        The substantive content anchor may predate one or more short
+        follow-ups. An explicit domain switch inside those follow-ups must
+        become authoritative for subsequent route inheritance, but an
+        explicit route from an older topic must never leak across a newer
+        substantive anchor.
+        """
+
+        for message in reversed(messages):
+            if message.message_type is not MessageType.USER:
+                continue
+
+            if message.sequence_no < anchor.sequence_no:
+                break
+
+            content = message.content
+
+            if content is None:
+                continue
+
+            normalized = content.strip()
+
+            if not normalized:
+                continue
+
+            explicit = self.planner.explicit_plan(
+                normalized
+            )
+
+            if explicit is not None:
+                return explicit
+
+        return None
+
     def _select_followup_anchor(
         self,
         messages: tuple[ChatMessage, ...],
     ) -> ChatMessage | None:
+        """Return the best topic anchor for one anaphoric follow-up.
+
+        Content anchoring and domain inheritance are independent.
+
+        A normal substantive user turn is a valid topic anchor. An explicit
+        routing turn that is linguistically a follow-up can also become the
+        new topic anchor when it contains at least three informative probe
+        terms. This prevents a self-contained cross-topic domain switch from
+        inheriting an older topic accidentally.
+
+        Weak explicit routing turns keep the older substantive topic anchor.
+        If no substantive topic exists, the newest explicit turn is retained
+        as a last-resort content anchor.
+        """
+
         user_turns = 0
+        explicit_fallback: ChatMessage | None = None
 
         for message in reversed(messages):
             if message.message_type is not MessageType.USER:
@@ -1021,21 +1092,38 @@ class AdaptiveChatService:
             if not normalized:
                 continue
 
+            explicit = self.planner.explicit_plan(
+                normalized
+            )
+
+            probe_terms = _probe_terms(
+                normalized
+            )
+
+            if (
+                explicit is not None
+                and explicit_fallback is None
+            ):
+                explicit_fallback = message
+
             if _looks_like_followup(
                 normalized
             ):
+                if (
+                    explicit is not None
+                    and len(probe_terms) >= 3
+                ):
+                    return message
+
                 continue
 
             if (
-                self.planner.explicit_plan(
-                    normalized
-                )
-                is not None
-                or _probe_terms(normalized)
+                explicit is not None
+                or probe_terms
             ):
                 return message
 
-        return None
+        return explicit_fallback
 
 
 def _requires_conversation_record_retrieval(
@@ -1251,10 +1339,8 @@ def _supports_probe_terms(
         if term in candidate
     )
 
-    required = (
-        1
-        if len(probe_terms) == 1
-        else 2
+    required = required_term_matches(
+        len(probe_terms)
     )
 
     return matched >= required
