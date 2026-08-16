@@ -11,12 +11,19 @@ from athena.common.time import utc_now_us
 from athena.config.settings import AthenaSettings
 from athena.core.application import AthenaApplication
 from athena.jobs.models import JobState
+from athena.model.adapters.lm_studio import ProviderOutputLimitError
 from athena.model.domain import ModelChatMessage, ModelInfo
-from athena.research.models import ResearchScopeState
+from athena.research.models import (
+    ResearchScopeState,
+    ResearchSynthesisStage,
+    ResearchSynthesisWorkState,
+)
 
 
 @dataclass
 class _WorkerProvider:
+    research_output_limit_failures: int = 0
+    research_validation_output_limit_failures: int = 0
     calls: list[tuple[str, tuple[ModelChatMessage, ...]]] = field(
         default_factory=list
     )
@@ -55,8 +62,36 @@ class _WorkerProvider:
         self.calls.append((schema_id, messages))
         text = "\n".join(message.content for message in messages)
         if schema_id.startswith("athena_research_synthesis_"):
-            refs = sorted(set(re.findall(r"INPUT-\d{3}", text)))
+            if self.research_output_limit_failures > 0:
+                self.research_output_limit_failures -= 1
+                raise ProviderOutputLimitError(
+                    "configured output-token limit reached"
+                )
+            granular_refs = re.findall(
+                r"INPUT-\d{3}-(?:FINDING|CONTRADICTION)-\d{3}",
+                text,
+            )
+            direct_refs = re.findall(
+                r"(INPUT-\d{3}) kind=source_analysis_artifact",
+                text,
+            )
+            refs = sorted(
+                set(granular_refs + direct_refs)
+            )
             assert refs
+            if self.research_validation_output_limit_failures > 0:
+                self.research_validation_output_limit_failures -= 1
+                return {
+                    "summary": "x" * 4000,
+                    "findings": [
+                        {
+                            "text": "bounded research finding",
+                            "evidence_refs": refs,
+                        }
+                    ],
+                    "contradictions": [],
+                    "uncertainty": "",
+                }
             return {
                 "summary": "worker research synthesis",
                 "findings": [
@@ -214,6 +249,138 @@ def test_scheduler_only_research_reaches_result_with_context_provenance(
         for schema_id, _messages in provider.calls
     )
     assert app.research_repository.current_commit_seq() == commit_before_synthesis
+    app.stop()
+
+
+def test_research_output_token_limit_splits_and_recovers(
+    tmp_path: Path,
+) -> None:
+    app, provider = _app(tmp_path / "runtime")
+    for index in range(4):
+        _capture(
+            app,
+            tmp_path / f"source-{index}.txt",
+            f"relevant research evidence {index}",
+        )
+
+    job = app.research.enqueue_local(
+        query="Aggregate all relevant evidence."
+    )
+    _run_to_synthesis_wait(app, job.job_id)
+    provider.research_output_limit_failures = 1
+
+    completed = _run_to_terminal(app, job.job_id)
+
+    assert completed.state is JobState.COMPLETED
+    assert provider.research_output_limit_failures == 0
+
+    scope = app.research_repository.get_scope_for_job(job.job_id)
+    assert scope is not None
+    synthesis_work = app.research_repository.list_synthesis_work_items(
+        scope.scope_id
+    )
+    assert any(
+        item.state is ResearchSynthesisWorkState.SPLIT
+        for item in synthesis_work
+    )
+    assert any(
+        item.stage is ResearchSynthesisStage.REDUCE
+        and item.state is ResearchSynthesisWorkState.COMPLETED
+        for item in synthesis_work
+    )
+
+    result = app.research_repository.get_result_for_scope(scope.scope_id)
+    assert result is not None
+    assert result.final_artifact_id is not None
+    app.stop()
+
+
+def test_research_valid_complete_output_above_estimator_reserve_is_accepted(
+    tmp_path: Path,
+) -> None:
+    app, provider = _app(tmp_path / "runtime")
+    for index in range(4):
+        _capture(
+            app,
+            tmp_path / f"validation-source-{index}.txt",
+            f"relevant validation evidence {index}",
+        )
+
+    job = app.research.enqueue_local(
+        query="Aggregate all relevant evidence."
+    )
+    _run_to_synthesis_wait(app, job.job_id)
+    provider.research_validation_output_limit_failures = 1
+
+    completed = _run_to_terminal(app, job.job_id)
+
+    assert completed.state is JobState.COMPLETED
+    assert provider.research_validation_output_limit_failures == 0
+
+    scope = app.research_repository.get_scope_for_job(job.job_id)
+    assert scope is not None
+    synthesis_work = app.research_repository.list_synthesis_work_items(
+        scope.scope_id
+    )
+    assert not any(
+        item.state is ResearchSynthesisWorkState.SPLIT
+        for item in synthesis_work
+    )
+
+    result = app.research_repository.get_result_for_scope(scope.scope_id)
+    assert result is not None
+    assert result.final_artifact_id is not None
+    app.stop()
+
+
+def test_research_two_input_output_limit_uses_singleton_compression_and_recovers(
+    tmp_path: Path,
+) -> None:
+    app, provider = _app(tmp_path / "runtime")
+    for index in range(2):
+        _capture(
+            app,
+            tmp_path / f"two-input-source-{index}.txt",
+            f"relevant two-input evidence {index}",
+        )
+
+    job = app.research.enqueue_local(
+        query="Aggregate both relevant evidence sources."
+    )
+    _run_to_synthesis_wait(app, job.job_id)
+    provider.research_output_limit_failures = 1
+
+    completed = _run_to_terminal(app, job.job_id)
+
+    assert completed.state is JobState.COMPLETED
+    assert provider.research_output_limit_failures == 0
+
+    scope = app.research_repository.get_scope_for_job(job.job_id)
+    assert scope is not None
+    synthesis_work = app.research_repository.list_synthesis_work_items(
+        scope.scope_id
+    )
+
+    singleton_reduces = [
+        item
+        for item in synthesis_work
+        if item.stage is ResearchSynthesisStage.REDUCE
+        and len(
+            app.research_repository.synthesis_inputs_for_work_item(
+                item.work_item_id
+            )
+        )
+        == 1
+    ]
+    assert len(singleton_reduces) == 2
+    assert all(
+        item.state is ResearchSynthesisWorkState.COMPLETED
+        for item in singleton_reduces
+    )
+
+    result = app.research_repository.get_result_for_scope(scope.scope_id)
+    assert result is not None
+    assert result.final_artifact_id is not None
     app.stop()
 
 

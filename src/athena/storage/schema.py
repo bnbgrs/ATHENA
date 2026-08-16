@@ -42,7 +42,8 @@ CONSOLIDATED_OPERATIONS_SCHEMA_VERSION = 25
 NEWS_SYSTEM_SCHEMA_VERSION = 26
 NEWS_EVENT_STRUCTURE_SCHEMA_VERSION = 27
 NEWS_OPERATIONAL_SCHEMA_VERSION = 28
-SCHEMA_VERSION = NEWS_OPERATIONAL_SCHEMA_VERSION
+PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION = 29
+SCHEMA_VERSION = PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
@@ -72,6 +73,9 @@ CONSOLIDATED_OPERATIONS_MIGRATION_ID = "0025_consolidated_operational_capabiliti
 NEWS_SYSTEM_MIGRATION_ID = "0026_news_system"
 NEWS_EVENT_STRUCTURE_MIGRATION_ID = "0027_news_event_structure"
 NEWS_OPERATIONAL_MIGRATION_ID = "0028_news_operational_completion"
+PRECISE_RESEARCH_PROVENANCE_MIGRATION_ID = (
+    "0029_precise_research_synthesis_provenance"
+)
 
 
 class DatabaseCompatibilityError(RuntimeError):
@@ -164,6 +168,7 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         CONSOLIDATED_OPERATIONS_SCHEMA_VERSION,
         NEWS_SYSTEM_SCHEMA_VERSION,
         NEWS_EVENT_STRUCTURE_SCHEMA_VERSION,
+        NEWS_OPERATIONAL_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -297,9 +302,14 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
             schema_version=NEWS_OPERATIONAL_SCHEMA_VERSION,
             migration_id=NEWS_OPERATIONAL_MIGRATION_ID,
         )
+        existing_user_version = NEWS_OPERATIONAL_SCHEMA_VERSION
+
+    if existing_user_version == NEWS_OPERATIONAL_SCHEMA_VERSION:
+        _migrate_schema_v28_to_v29(connection)
+        existing_user_version = PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION
 
     _configure_connection(connection)
-    _verify_schema_v28(connection)
+    _verify_schema_v29(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -2508,6 +2518,155 @@ def _migrate_schema_v24_to_v25(connection: sqlite3.Connection) -> None:
 
 
 
+
+
+def _migrate_schema_v28_to_v29(
+    connection: sqlite3.Connection,
+) -> None:
+    """Add exact terminal-source backlinks for hierarchical synthesis outputs."""
+    if connection.in_transaction:
+        raise RuntimeError(
+            "Precise Research provenance migration requires no active transaction."
+        )
+
+    _verify_schema_v28(connection)
+
+    try:
+        connection.executescript(
+            f"""
+            BEGIN IMMEDIATE;
+
+            CREATE TABLE research_synthesis_output_source_evidence (
+                artifact_id BLOB(16) NOT NULL
+                    CHECK(length(artifact_id) = 16),
+                output_kind TEXT NOT NULL
+                    CHECK(output_kind IN ('finding', 'contradiction')),
+                output_ordinal INTEGER NOT NULL
+                    CHECK(output_ordinal >= 0),
+                source_analysis_artifact_id BLOB(16) NOT NULL
+                    CHECK(length(source_analysis_artifact_id) = 16),
+                PRIMARY KEY(
+                    artifact_id,
+                    output_kind,
+                    output_ordinal,
+                    source_analysis_artifact_id
+                ),
+                FOREIGN KEY(artifact_id)
+                    REFERENCES research_synthesis_artifacts(artifact_id),
+                FOREIGN KEY(source_analysis_artifact_id)
+                    REFERENCES source_analysis_artifacts(artifact_id)
+            ) WITHOUT ROWID;
+
+            CREATE INDEX idx_research_synthesis_source_evidence_source
+                ON research_synthesis_output_source_evidence(
+                    source_analysis_artifact_id,
+                    artifact_id,
+                    output_kind,
+                    output_ordinal
+                );
+
+            UPDATE schema_metadata
+            SET schema_version = {
+                    PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION
+                },
+                last_migration_id = '{
+                    PRECISE_RESEARCH_PROVENANCE_MIGRATION_ID
+                }',
+                minimum_reader_version = {
+                    PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION
+                }
+            WHERE singleton_id = 1;
+
+            PRAGMA user_version = {
+                PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION
+            };
+
+            COMMIT;
+            """
+        )
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def _verify_schema_v29(connection: sqlite3.Connection) -> None:
+    application_id = int(
+        connection.execute("PRAGMA application_id").fetchone()[0]
+    )
+    user_version = int(
+        connection.execute("PRAGMA user_version").fetchone()[0]
+    )
+
+    if application_id != ATHENA_APPLICATION_ID:
+        raise DatabaseCompatibilityError(
+            "ATHENA application_id verification failed."
+        )
+
+    if user_version != PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION:
+        raise DatabaseCompatibilityError(
+            "ATHENA schema version verification failed."
+        )
+
+    metadata = connection.execute(
+        "SELECT schema_version, storage_layout_version, "
+        "blob_format_version, last_migration_id, "
+        "minimum_reader_version "
+        "FROM schema_metadata WHERE singleton_id = 1"
+    ).fetchone()
+
+    expected = (
+        PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION,
+        STORAGE_LAYOUT_VERSION,
+        BLOB_FORMAT_VERSION,
+        PRECISE_RESEARCH_PROVENANCE_MIGRATION_ID,
+        PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION,
+    )
+
+    if metadata is None or tuple(metadata) != expected:
+        raise DatabaseCompatibilityError(
+            "ATHENA schema_metadata verification failed."
+        )
+
+    _verify_schema_v24_compatible(connection)
+
+    if (
+        "research_synthesis_output_source_evidence"
+        not in _user_tables(connection)
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA precise Research synthesis provenance table is missing."
+        )
+
+    columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info("
+            "research_synthesis_output_source_evidence"
+            ")"
+        )
+    }
+
+    required_columns = {
+        "artifact_id",
+        "output_kind",
+        "output_ordinal",
+        "source_analysis_artifact_id",
+    }
+
+    if not required_columns.issubset(columns):
+        raise DatabaseCompatibilityError(
+            "ATHENA precise Research synthesis provenance is incomplete."
+        )
+
+    try:
+        verify_news_schema_v28(connection)
+    except RuntimeError as exc:
+        raise DatabaseCompatibilityError(str(exc)) from exc
+
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise DatabaseCompatibilityError(
+            "ATHENA foreign-key verification failed."
+        )
 
 
 def _verify_schema_v28(connection: sqlite3.Connection) -> None:

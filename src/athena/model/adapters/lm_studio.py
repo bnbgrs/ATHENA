@@ -29,6 +29,10 @@ class ProviderContextLimitError(ModelProviderError):
     """Raised when the backend rejects a request for exceeding context capacity."""
 
 
+class ProviderOutputLimitError(ModelProviderError):
+    """Raised when structured generation exhausts its output-token budget."""
+
+
 @dataclass(frozen=True, slots=True)
 class LMStudioProvider:
     """LM Studio adapter.
@@ -266,6 +270,11 @@ class LMStudioProvider:
         if not isinstance(choice, Mapping):
             raise ProviderProtocolError(
                 "LM Studio returned an invalid structured choice."
+            )
+        if choice.get("finish_reason") == "length":
+            raise ProviderOutputLimitError(
+                "LM Studio structured generation reached the configured "
+                "output-token limit."
             )
         message = choice.get("message")
         if not isinstance(message, Mapping):

@@ -11,6 +11,7 @@ from typing import Any, cast
 
 from athena.chat.generation import ModelSelectionError
 from athena.chat.service import ChatService
+from athena.jobs.lease_guard import blocking_operation_lease_seconds
 from athena.jobs.models import JobPriority, JobRecord
 from athena.jobs.repository import JobLeaseError
 from athena.jobs.service import DurableJobService
@@ -602,6 +603,21 @@ class SourceAnalysisService:
             )
             structured_schema = package.structured_schema()
             assert structured_schema is not None
+
+            provider_lease_seconds = blocking_operation_lease_seconds(
+                timeout_seconds=getattr(
+                    self.provider,
+                    "generation_timeout_seconds",
+                    None,
+                ),
+                base_extend_seconds=extend_seconds,
+            )
+            self.jobs.heartbeat(
+                job.job_id,
+                lease_token=lease_token,
+                extend_seconds=provider_lease_seconds,
+            )
+
             output = self.provider.generate_structured(
                 model_id=model.backend_model_id,
                 messages=package.model_messages(),
@@ -701,12 +717,11 @@ class SourceAnalysisService:
         )
         if len(canonical.encode("utf-8")) > _MAX_STRUCTURED_OUTPUT_BYTES:
             raise SourceAnalysisOutputError("Structured analysis output exceeds the hard byte limit.")
-        # A persisted artifact must itself fit inside the output reservation it
-        # was generated under so one child result cannot poison later reduce calls.
-        if estimate_text_tokens(canonical) > output_reserve:
-            raise SourceAnalysisOutputError(
-                "Structured analysis output exceeds the pinned output token reserve."
-            )
+        # max_output_tokens is enforced by the provider. A schema-valid,
+        # completely returned result must not be rejected afterwards merely
+        # because the conservative local token estimator is higher than the
+        # provider's actual token count. Later context pressure is handled by
+        # the existing input-budget/splitting path.
         return dict(output)
 
     def split_map_work(

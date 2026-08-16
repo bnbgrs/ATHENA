@@ -64,7 +64,13 @@ class NewsMixinContext:
     ) -> None:
         raise NotImplementedError
 
-    def _materialize_research(self, run: Any, research_job_id: uuid.UUID) -> None:
+    def _materialize_research(
+        self,
+        run: Any,
+        research_job_id: uuid.UUID,
+        *,
+        parent_job: JobRecord | None = None,
+    ) -> None:
         raise NotImplementedError
 
     def _finish_without_research(self, run: Any, *, state: str, reason: str) -> None:
@@ -142,5 +148,6 @@ class NewsMixinContext:
         scope: ResearchScopeRecord,
         result: ResearchResultRecord,
         findings: tuple[str, ...],
+        parent_job: JobRecord | None = None,
     ) -> tuple[NewsEventMetadata, ...]:
         raise NotImplementedError

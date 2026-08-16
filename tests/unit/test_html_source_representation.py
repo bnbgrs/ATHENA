@@ -19,6 +19,7 @@ from athena.source.models import (
     SourceAnchorType,
     SourceRepresentationStructureType,
     SourceRepresentationType,
+    SourceType,
 )
 
 _HTML = """<!doctype html>
@@ -71,8 +72,8 @@ def test_html_cleaned_text_and_dom_structure_are_retained_after_original_is_remo
 
     assert representation.representation_type is SourceRepresentationType.NORMALIZED_TEXT
     assert representation.parser_id == "athena.native_html"
-    assert representation.parser_version == "1"
-    assert built.processing_run.pipeline_version == "native-html-text-v1"
+    assert representation.parser_version == "2"
+    assert built.processing_run.pipeline_version == "native-html-text-v2"
     assert built.processing_run.status == "succeeded"
     assert text == (
         "ATHENA HTML Report\n\nQuarterly Report\n\n"
@@ -98,6 +99,317 @@ def test_html_cleaned_text_and_dom_structure_are_retained_after_original_is_remo
     assert app.source_html.verify_structure_map(representation.representation_id) == built.structures
     assert archived.read_bytes() == original
     assert not path.exists()
+    app.stop()
+
+
+def test_web_snapshot_html_keeps_only_primary_editorial_article(
+    tmp_path: Path,
+) -> None:
+    html = """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Primary Investigation</title>
+</head>
+<body>
+  <header>
+    <p>SITE_HEADER_TOKEN</p>
+    <nav>NAVIGATION_TOKEN</nav>
+  </header>
+
+  <main>
+    <article id="primary-story">
+      <header>
+        <h1>Primary Investigation</h1>
+        <p>By Example Reporter</p>
+      </header>
+
+      <p>PRIMARY_ARTICLE_TOKEN_ONE</p>
+
+      <section>
+        <h2>Analysis</h2>
+        <p>PRIMARY_ARTICLE_TOKEN_TWO</p>
+      </section>
+
+      <section class="most-popular">
+        <h2>Most Popular</h2>
+        <p>MOST_POPULAR_TOKEN</p>
+      </section>
+
+      <section>
+        <h2>Most Popular</h2>
+        <p>HEADING_ONLY_POPULAR_TOKEN</p>
+      </section>
+
+      <div data-component="related-stories">
+        <p>RELATED_STORY_TOKEN</p>
+      </div>
+
+      <div data-testid="nativeAd">
+        <p>NATIVE_AD_TOKEN</p>
+      </div>
+
+      <div class="advertiser-content">
+        <p>ADVERTISER_CONTENT_TOKEN</p>
+      </div>
+
+      <div class="newsletter-signup">
+        <p>NEWSLETTER_TOKEN</p>
+      </div>
+
+      <div class="share-tools">
+        <p>SHARE_TOKEN</p>
+      </div>
+
+      <aside>
+        <p>SIDEBAR_TOKEN</p>
+      </aside>
+
+      <footer>
+        <p>ARTICLE_FOOTER_TOKEN</p>
+      </footer>
+    </article>
+
+    <article class="related-card">
+      <h2>Unrelated story</h2>
+      <p>UNRELATED_ARTICLE_TOKEN</p>
+    </article>
+  </main>
+
+  <footer>
+    SITE_FOOTER_TOKEN
+  </footer>
+</body>
+</html>
+"""
+
+    path = (
+        tmp_path
+        / "primary-article.html"
+    )
+
+    original = html.encode(
+        "utf-8"
+    )
+
+    path.write_bytes(original)
+
+    app = _app(tmp_path)
+
+    captured = (
+        app.sources
+        .capture_external_snapshot(
+            path,
+            source_uri=(
+                "https://example.test/"
+                "primary-investigation"
+            ),
+            original_name=(
+                "primary-investigation.html"
+            ),
+        )
+    )
+
+    assert (
+        captured.source.source_type
+        is SourceType.WEB_SNAPSHOT
+    )
+
+    archived = app.sources.verify(
+        captured.source.source_id
+    )
+
+    built = app.source_html.build(
+        captured.source.source_id
+    )
+
+    representation = (
+        built.result.representation
+    )
+
+    text = app.source_text.read_text(
+        representation.representation_id
+    )
+
+    assert (
+        representation.parser_version
+        == "2"
+    )
+
+    assert (
+        built.processing_run.pipeline_version
+        == "native-html-text-v2"
+    )
+
+    run_snapshot = json.loads(
+        built.processing_run.input_snapshot_json
+    )
+
+    assert (
+        run_snapshot["source_type"]
+        == "web_snapshot"
+    )
+
+    assert (
+        run_snapshot["extraction_mode"]
+        == "primary_article"
+    )
+
+    options = json.loads(
+        representation.options_json
+    )
+
+    assert (
+        options["readable_text"]
+        == "primary-article-flow-v2"
+    )
+
+    assert (
+        options["flow_root_policy"]
+        == (
+            "web-snapshot-primary-article-"
+            "else-full-document-v1"
+        )
+    )
+
+    assert (
+        options["boilerplate_filter"]
+        == (
+            "web-snapshot-semantic-and-"
+            "marker-v1"
+        )
+    )
+
+    assert (
+        "Primary Investigation"
+        in text
+    )
+
+    assert (
+        "By Example Reporter"
+        in text
+    )
+
+    assert (
+        "PRIMARY_ARTICLE_TOKEN_ONE"
+        in text
+    )
+
+    assert (
+        "PRIMARY_ARTICLE_TOKEN_TWO"
+        in text
+    )
+
+    assert "Analysis" in text
+
+    forbidden = (
+        "SITE_HEADER_TOKEN",
+        "NAVIGATION_TOKEN",
+        "MOST_POPULAR_TOKEN",
+        "HEADING_ONLY_POPULAR_TOKEN",
+        "RELATED_STORY_TOKEN",
+        "NATIVE_AD_TOKEN",
+        "ADVERTISER_CONTENT_TOKEN",
+        "NEWSLETTER_TOKEN",
+        "SHARE_TOKEN",
+        "SIDEBAR_TOKEN",
+        "ARTICLE_FOOTER_TOKEN",
+        "UNRELATED_ARTICLE_TOKEN",
+        "SITE_FOOTER_TOKEN",
+    )
+
+    for token in forbidden:
+        assert token not in text
+
+    # Raw Archive remains byte-for-byte
+    # immutable evidence.
+    assert (
+        archived.read_bytes()
+        == original
+    )
+
+    app.stop()
+
+
+def test_local_html_file_remains_full_document_in_parser_v2(
+    tmp_path: Path,
+) -> None:
+    html = """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Local HTML Archive</title>
+</head>
+<body>
+  <article>
+    <h1>Section A</h1>
+    <p>LOCAL_ARTICLE_A_TOKEN</p>
+  </article>
+
+  <article>
+    <h1>Section B</h1>
+    <p>LOCAL_ARTICLE_B_TOKEN</p>
+  </article>
+</body>
+</html>
+"""
+
+    path = tmp_path / "local.html"
+    path.write_text(
+        html,
+        encoding="utf-8",
+    )
+
+    app = _app(tmp_path)
+
+    captured = app.sources.capture_file(
+        path
+    )
+
+    assert (
+        captured.source.source_type
+        is SourceType.FILE
+    )
+
+    built = app.source_html.build(
+        captured.source.source_id
+    )
+
+    text = app.source_text.read_text(
+        built.result.representation
+        .representation_id
+    )
+
+    assert (
+        built.result.representation
+        .parser_version
+        == "2"
+    )
+
+    run_snapshot = json.loads(
+        built.processing_run.input_snapshot_json
+    )
+
+    assert (
+        run_snapshot["source_type"]
+        == "file"
+    )
+
+    assert (
+        run_snapshot["extraction_mode"]
+        == "full_document"
+    )
+
+    assert (
+        "LOCAL_ARTICLE_A_TOKEN"
+        in text
+    )
+
+    assert (
+        "LOCAL_ARTICLE_B_TOKEN"
+        in text
+    )
+
     app.stop()
 
 

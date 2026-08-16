@@ -18,7 +18,12 @@ from datetime import date, datetime
 from typing import Any, Mapping
 
 from athena.common.ids import uuid_to_blob
-from athena.model.adapters.lm_studio import ModelProviderError
+from athena.jobs.lease_guard import blocking_operation_lease_seconds
+from athena.jobs.models import JobRecord
+from athena.model.adapters.lm_studio import (
+    ModelProviderError,
+    ProviderOutputLimitError,
+)
 from athena.model.domain import ModelChatMessage
 from athena.news.context import NewsMixinContext
 from athena.research.models import ResearchResultRecord, ResearchScopeRecord
@@ -34,10 +39,12 @@ from athena.source.analysis_service import (
     estimate_text_tokens,
 )
 
-PIPELINE_VERSION = "news-event-structuring-v1"
+PIPELINE_VERSION = "news-event-structuring-v3"
 PROMPT_TEMPLATE_ID = "athena.news_event_structuring"
 PROMPT_TEMPLATE_VERSION = "1"
 SCHEMA_ID = "athena_news_event_metadata_v1"
+EVENT_BATCH_POLICY_ID = "max-8-recursive-output-overflow-v1"
+_MAX_EVENT_FINDINGS_PER_BATCH = 8
 
 _EVENT_ITEM_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -96,8 +103,30 @@ Return only the JSON object required by the supplied structured-output schema.
 """
 
 
+def _event_batch_ranges(
+    finding_count: int,
+) -> tuple[tuple[int, int], ...]:
+    if finding_count < 0:
+        raise ValueError("finding_count must not be negative.")
+    return tuple(
+        (
+            start,
+            min(start + _MAX_EVENT_FINDINGS_PER_BATCH, finding_count),
+        )
+        for start in range(
+            0,
+            finding_count,
+            _MAX_EVENT_FINDINGS_PER_BATCH,
+        )
+    )
+
+
 class NewsEventStructuringError(RuntimeError):
     """Raised when event metadata cannot be validated safely."""
+
+
+class NewsEventStructuringCapacityError(NewsEventStructuringError):
+    """Raised when one News metadata batch exceeds its context budget."""
 
 
 class NewsEventStructuringRetryable(NewsEventStructuringError):
@@ -128,6 +157,7 @@ class NewsEventStructuringMixin(NewsMixinContext):
         scope: ResearchScopeRecord,
         result: ResearchResultRecord,
         findings: tuple[str, ...],
+        parent_job: JobRecord | None = None,
     ) -> tuple[NewsEventMetadata, ...]:
         if not findings:
             return ()
@@ -141,52 +171,228 @@ class NewsEventStructuringMixin(NewsMixinContext):
                 "News ResearchResult ModelSignature differs from its ResearchScope."
             )
         self.app.research_synthesis.assert_model_unchanged(scope)
-        signature = self.app.model_runs.load_signature(config.model_signature_id)
+        signature = self.app.model_runs.load_signature(
+            config.model_signature_id
+        )
 
         evidence: list[dict[str, object]] = []
-        time_bounds: list[tuple[int | None, int | None, int | None, int | None]] = []
+        time_bounds: list[
+            tuple[int | None, int | None, int | None, int | None]
+        ] = []
+
         for ordinal, finding in enumerate(findings):
-            source_ids = self._finding_source_ids(result.final_artifact_id, ordinal)
-            bounds = self._source_time_bounds(run["run_id"], source_ids)
+            source_ids = self._finding_source_ids(
+                result.final_artifact_id,
+                ordinal,
+            )
+            bounds = self._source_time_bounds(
+                run["run_id"],
+                source_ids,
+            )
             time_bounds.append(bounds)
             evidence.append(
                 {
                     "finding_ordinal": ordinal,
                     "finding": finding,
-                    "supporting_source_ids": [str(item) for item in source_ids],
+                    "supporting_source_ids": [
+                        str(item) for item in source_ids
+                    ],
                     "publication_time_min_us": bounds[0],
                     "publication_time_max_us": bounds[1],
                     "retrieval_time_min_us": bounds[2],
                     "retrieval_time_max_us": bounds[3],
                 }
             )
+
+        structured: list[
+            tuple[dict[str, Any], uuid.UUID]
+        ] = []
+
+        for batch_start, batch_end in _event_batch_ranges(
+            len(findings)
+        ):
+            structured.extend(
+                self._structure_event_batch_resilient(
+                    run=run,
+                    result=result,
+                    config=config,
+                    signature=signature,
+                    evidence=tuple(
+                        evidence[batch_start:batch_end]
+                    ),
+                    expected_ordinals=tuple(
+                        range(batch_start, batch_end)
+                    ),
+                    parent_job=parent_job,
+                )
+            )
+
+        structured.sort(
+            key=lambda pair: int(
+                pair[0]["finding_ordinal"]
+            )
+        )
+
+        if [
+            int(item["finding_ordinal"])
+            for item, _run_id in structured
+        ] != list(range(len(findings))):
+            raise NewsEventStructuringError(
+                "Batched News event structuring lost or duplicated "
+                "a Research finding."
+            )
+
+        output: list[NewsEventMetadata] = []
+
+        for item, structuring_run_id in structured:
+            ordinal = int(item["finding_ordinal"])
+            bounds = time_bounds[ordinal]
+            output.append(
+                NewsEventMetadata(
+                    finding_ordinal=ordinal,
+                    event_time_start=item["event_time_start"],
+                    event_time_end=item["event_time_end"],
+                    event_time_precision=item[
+                        "event_time_precision"
+                    ],
+                    location=item["location"],
+                    actors=item["actors"],
+                    core_action=item["core_action"],
+                    publication_time_min_us=bounds[0],
+                    publication_time_max_us=bounds[1],
+                    retrieval_time_min_us=bounds[2],
+                    retrieval_time_max_us=bounds[3],
+                    structuring_run_id=structuring_run_id,
+                )
+            )
+
+        return tuple(output)
+
+    def _structure_event_batch_resilient(
+        self,
+        *,
+        run: Any,
+        result: ResearchResultRecord,
+        config: Any,
+        signature: Any,
+        evidence: tuple[dict[str, object], ...],
+        expected_ordinals: tuple[int, ...],
+        parent_job: JobRecord | None,
+    ) -> tuple[tuple[dict[str, Any], uuid.UUID], ...]:
+        try:
+            return self._structure_event_batch(
+                run=run,
+                result=result,
+                config=config,
+                signature=signature,
+                evidence=evidence,
+                expected_ordinals=expected_ordinals,
+                parent_job=parent_job,
+            )
+        except (
+            ProviderOutputLimitError,
+            NewsEventStructuringCapacityError,
+        ) as exc:
+            if len(expected_ordinals) <= 1:
+                raise NewsEventStructuringError(
+                    "A single News finding cannot fit inside the "
+                    "pinned event-structuring capacity."
+                ) from exc
+
+            midpoint = len(expected_ordinals) // 2
+
+            left = self._structure_event_batch_resilient(
+                run=run,
+                result=result,
+                config=config,
+                signature=signature,
+                evidence=evidence[:midpoint],
+                expected_ordinals=expected_ordinals[:midpoint],
+                parent_job=parent_job,
+            )
+            right = self._structure_event_batch_resilient(
+                run=run,
+                result=result,
+                config=config,
+                signature=signature,
+                evidence=evidence[midpoint:],
+                expected_ordinals=expected_ordinals[midpoint:],
+                parent_job=parent_job,
+            )
+            return left + right
+
+    def _structure_event_batch(
+        self,
+        *,
+        run: Any,
+        result: ResearchResultRecord,
+        config: Any,
+        signature: Any,
+        evidence: tuple[dict[str, object], ...],
+        expected_ordinals: tuple[int, ...],
+        parent_job: JobRecord | None,
+    ) -> tuple[tuple[dict[str, Any], uuid.UUID], ...]:
+        if not evidence or not expected_ordinals:
+            raise NewsEventStructuringError(
+                "News event metadata batch must not be empty."
+            )
+        if len(evidence) != len(expected_ordinals):
+            raise NewsEventStructuringError(
+                "News event metadata batch ordinal mapping drifted."
+            )
+
         user_text = (
-            "Structure the following completed News findings without changing their semantic "
-            "content. The timestamp fields labeled publication/retrieval are provenance only.\n"
+            "Structure the following completed News findings without "
+            "changing their semantic content. The timestamp fields "
+            "labeled publication/retrieval are provenance only.\n"
             f"Target news day: {run['target_date']}\n"
             "<NEWS_RESEARCH_RESULT_UNTRUSTED>\n"
-            + json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
+            + json.dumps(
+                evidence,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
             + "\n</NEWS_RESEARCH_RESULT_UNTRUSTED>"
         )
+
         messages = (
-            ModelChatMessage(role="system", content=_SYSTEM_POLICY),
-            ModelChatMessage(role="user", content=user_text),
+            ModelChatMessage(
+                role="system",
+                content=_SYSTEM_POLICY,
+            ),
+            ModelChatMessage(
+                role="user",
+                content=user_text,
+            ),
         )
+
         estimated_input = estimate_structured_request_tokens(
             messages,
             SCHEMA_ID,
             _EVENT_SCHEMA,
         )
-        estimated_total = estimated_input + config.output_reserve + config.safety_margin
+        estimated_total = (
+            estimated_input
+            + config.output_reserve
+            + config.safety_margin
+        )
+
         if estimated_total > config.effective_context_limit:
-            raise NewsEventStructuringError(
-                "News event metadata request exceeds the pinned Research context budget."
+            raise NewsEventStructuringCapacityError(
+                "News event metadata batch exceeds the pinned "
+                "Research context budget."
             )
-        snapshot_commit_seq = self.app.context_packages.current_commit_seq()
+
+        snapshot_commit_seq = (
+            self.app.context_packages.current_commit_seq()
+        )
+
         package = ContextPackageService.build_from_sections(
             model_signature=signature,
             budget=ContextPackageBudget(
-                effective_context_limit=config.effective_context_limit,
+                effective_context_limit=(
+                    config.effective_context_limit
+                ),
                 context_budget=(
                     config.effective_context_limit
                     - config.output_reserve
@@ -210,21 +416,27 @@ class NewsEventStructuringMixin(NewsMixinContext):
                 ),
             ),
             included_refs=(),
-            excluded_candidate_summary=ExcludedCandidateSummary(
-                retrieval_candidate_count=0,
-                retrieval_included_count=0,
-                retrieval_excluded_count=0,
-                memory_candidate_count=0,
-                memory_included_count=0,
-                memory_excluded_count=0,
-                conversation_candidate_count=0,
-                conversation_included_count=0,
-                conversation_excluded_count=0,
+            excluded_candidate_summary=(
+                ExcludedCandidateSummary(
+                    retrieval_candidate_count=0,
+                    retrieval_included_count=0,
+                    retrieval_excluded_count=0,
+                    memory_candidate_count=0,
+                    memory_included_count=0,
+                    memory_excluded_count=0,
+                    conversation_candidate_count=0,
+                    conversation_included_count=0,
+                    conversation_excluded_count=0,
+                )
             ),
             token_estimates=ContextTokenEstimates(
                 conversation_tokens=0,
-                current_user_tokens=estimate_text_tokens(user_text),
-                system_tokens=estimate_text_tokens(_SYSTEM_POLICY),
+                current_user_tokens=(
+                    estimate_text_tokens(user_text)
+                ),
+                system_tokens=(
+                    estimate_text_tokens(_SYSTEM_POLICY)
+                ),
                 context_tokens=0,
                 estimated_input_tokens=estimated_input,
                 estimated_total_tokens=estimated_total,
@@ -233,32 +445,90 @@ class NewsEventStructuringMixin(NewsMixinContext):
             structured_schema_id=SCHEMA_ID,
             structured_schema=_EVENT_SCHEMA,
         )
+
         self.app.context_packages.assert_snapshot_current(
             snapshot_commit_seq,
             phase="pre-news-event-structuring",
         )
+
+        if parent_job is not None:
+            if parent_job.lease_token is None:
+                raise NewsEventStructuringError(
+                    "News event structuring requires a live "
+                    "parent-job lease."
+                )
+
+            provider_lease_seconds = (
+                blocking_operation_lease_seconds(
+                    timeout_seconds=getattr(
+                        self.app.model_provider,
+                        "generation_timeout_seconds",
+                        None,
+                    ),
+                    base_extend_seconds=(
+                        self.app.job_scheduler.policy.lease_seconds
+                    ),
+                )
+            )
+
+            self.app.jobs.heartbeat(
+                parent_job.job_id,
+                lease_token=parent_job.lease_token,
+                extend_seconds=provider_lease_seconds,
+            )
+
         actor_id = self.app.chat.ensure_local_user()
+
         processing_run = self.app.model_runs.start_run(
             run_type="news_event_structuring",
             trigger_actor_id=actor_id,
             pipeline_version=PIPELINE_VERSION,
             input_snapshot={
                 "research_result_id": str(result.result_id),
-                "research_result_content_hash": result.content_hash.hex(),
-                "news_run_id": str(uuid.UUID(bytes=bytes(run["run_id"]))),
+                "research_result_content_hash": (
+                    result.content_hash.hex()
+                ),
+                "news_run_id": str(
+                    uuid.UUID(
+                        bytes=bytes(run["run_id"])
+                    )
+                ),
+                "finding_ordinals": list(
+                    expected_ordinals
+                ),
+                "event_batch_policy_id": (
+                    EVENT_BATCH_POLICY_ID
+                ),
                 "context_package": package.run_snapshot(),
             },
             configuration={
                 "schema_id": SCHEMA_ID,
                 "prompt_template_id": PROMPT_TEMPLATE_ID,
-                "prompt_template_version": PROMPT_TEMPLATE_VERSION,
-                "finding_count": len(findings),
+                "prompt_template_version": (
+                    PROMPT_TEMPLATE_VERSION
+                ),
+                "finding_count": len(expected_ordinals),
+                "max_output_tokens": (
+                    config.output_reserve
+                ),
+                "event_batch_policy_id": (
+                    EVENT_BATCH_POLICY_ID
+                ),
             },
             model_signature_id=config.model_signature_id,
             prompt_template_id=PROMPT_TEMPLATE_ID,
             prompt_template_version=PROMPT_TEMPLATE_VERSION,
         )
+
         try:
+            self.app.context_packages.assert_snapshot_current(
+                snapshot_commit_seq,
+                phase=(
+                    "immediately-before-news-event-"
+                    "structuring-model-call"
+                ),
+            )
+
             raw = self.app.model_provider.generate_structured(
                 model_id=config.model_id,
                 messages=package.model_messages(),
@@ -266,44 +536,57 @@ class NewsEventStructuringMixin(NewsMixinContext):
                 json_schema=_EVENT_SCHEMA,
                 max_output_tokens=config.output_reserve,
             )
-            validated = _validate_event_output(raw, findings)
+
+            validated = _validate_event_output(
+                raw,
+                expected_ordinals,
+            )
+
+        except ProviderOutputLimitError as exc:
+            self.app.model_runs.finish_run(
+                processing_run.processing_run_id,
+                status="failed",
+                error_detail=(
+                    f"{type(exc).__name__}: {exc}"
+                )[:2000],
+            )
+            raise
+
         except (ModelProviderError, OSError) as exc:
             self.app.model_runs.finish_run(
                 processing_run.processing_run_id,
                 status="failed",
-                error_detail=f"{type(exc).__name__}: {exc}"[:2000],
+                error_detail=(
+                    f"{type(exc).__name__}: {exc}"
+                )[:2000],
             )
             raise NewsEventStructuringRetryable(
-                "Primary Model is temporarily unavailable for News event structuring."
+                "Primary Model is temporarily unavailable "
+                "for News event structuring."
             ) from exc
+
         except BaseException as exc:
             self.app.model_runs.finish_run(
                 processing_run.processing_run_id,
                 status="failed",
-                error_detail=f"{type(exc).__name__}: {exc}"[:2000],
+                error_detail=(
+                    f"{type(exc).__name__}: {exc}"
+                )[:2000],
             )
             raise
-        self.app.model_runs.finish_run(processing_run.processing_run_id, status="succeeded")
 
-        output: list[NewsEventMetadata] = []
-        for item, bounds in zip(validated, time_bounds, strict=True):
-            output.append(
-                NewsEventMetadata(
-                    finding_ordinal=item["finding_ordinal"],
-                    event_time_start=item["event_time_start"],
-                    event_time_end=item["event_time_end"],
-                    event_time_precision=item["event_time_precision"],
-                    location=item["location"],
-                    actors=item["actors"],
-                    core_action=item["core_action"],
-                    publication_time_min_us=bounds[0],
-                    publication_time_max_us=bounds[1],
-                    retrieval_time_min_us=bounds[2],
-                    retrieval_time_max_us=bounds[3],
-                    structuring_run_id=processing_run.processing_run_id,
-                )
+        self.app.model_runs.finish_run(
+            processing_run.processing_run_id,
+            status="succeeded",
+        )
+
+        return tuple(
+            (
+                item,
+                processing_run.processing_run_id,
             )
-        return tuple(output)
+            for item in validated
+        )
 
     def _source_time_bounds(
         self,
@@ -337,17 +620,27 @@ class NewsEventStructuringMixin(NewsMixinContext):
 
 def _validate_event_output(
     raw: Mapping[str, Any],
-    findings: tuple[str, ...],
+    expected_ordinals: tuple[int, ...],
 ) -> tuple[dict[str, Any], ...]:
     if set(raw) != {"events"}:
-        raise NewsEventStructuringError("News event metadata output has unexpected keys.")
-    items = raw.get("events")
-    if not isinstance(items, list) or len(items) != len(findings):
         raise NewsEventStructuringError(
-            "News event metadata must contain exactly one item per Research finding."
+            "News event metadata output has unexpected keys."
         )
+
+    items = raw.get("events")
+    if (
+        not isinstance(items, list)
+        or len(items) != len(expected_ordinals)
+    ):
+        raise NewsEventStructuringError(
+            "News event metadata must contain exactly one "
+            "item per supplied Research finding."
+        )
+
+    expected = set(expected_ordinals)
     validated: list[dict[str, Any]] = []
     seen: set[int] = set()
+
     expected_keys = {
         "finding_ordinal",
         "event_time_start",
@@ -357,33 +650,108 @@ def _validate_event_output(
         "actors",
         "core_action",
     }
+
     for raw_item in items:
-        if not isinstance(raw_item, dict) or set(raw_item) != expected_keys:
-            raise NewsEventStructuringError("News event metadata item shape is invalid.")
+        if (
+            not isinstance(raw_item, dict)
+            or set(raw_item) != expected_keys
+        ):
+            raise NewsEventStructuringError(
+                "News event metadata item shape is invalid."
+            )
+
         ordinal = raw_item["finding_ordinal"]
-        if isinstance(ordinal, bool) or not isinstance(ordinal, int):
-            raise NewsEventStructuringError("News event finding_ordinal must be an integer.")
-        if ordinal < 0 or ordinal >= len(findings) or ordinal in seen:
-            raise NewsEventStructuringError("News event finding_ordinal is missing or duplicated.")
+
+        if (
+            isinstance(ordinal, bool)
+            or not isinstance(ordinal, int)
+        ):
+            raise NewsEventStructuringError(
+                "News event finding_ordinal must be an integer."
+            )
+
+        if ordinal not in expected or ordinal in seen:
+            raise NewsEventStructuringError(
+                "News event finding_ordinal is missing, "
+                "unexpected, or duplicated."
+            )
+
         seen.add(ordinal)
-        precision = _bounded_text(raw_item["event_time_precision"], 16, "event_time_precision")
-        if precision not in {"unknown", "instant", "day", "range"}:
-            raise NewsEventStructuringError("News event time precision is invalid.")
-        start = _bounded_text(raw_item["event_time_start"], 64, "event_time_start")
-        end = _bounded_text(raw_item["event_time_end"], 64, "event_time_end")
-        start_value, end_value = _validate_event_time(precision, start, end)
-        location = _optional_bounded_text(raw_item["location"], 500, "location")
-        core_action = _optional_bounded_text(raw_item["core_action"], 1000, "core_action")
+
+        precision = _bounded_text(
+            raw_item["event_time_precision"],
+            16,
+            "event_time_precision",
+        )
+
+        if precision not in {
+            "unknown",
+            "instant",
+            "day",
+            "range",
+        }:
+            raise NewsEventStructuringError(
+                "News event time precision is invalid."
+            )
+
+        start = _bounded_text(
+            raw_item["event_time_start"],
+            64,
+            "event_time_start",
+        )
+        end = _bounded_text(
+            raw_item["event_time_end"],
+            64,
+            "event_time_end",
+        )
+
+        (
+            precision,
+            start_value,
+            end_value,
+        ) = _normalize_event_time_metadata(
+            precision,
+            start,
+            end,
+        )
+
+        location = _optional_bounded_text(
+            raw_item["location"],
+            500,
+            "location",
+        )
+        core_action = _optional_bounded_text(
+            raw_item["core_action"],
+            1000,
+            "core_action",
+        )
+
         actors_raw = raw_item["actors"]
-        if not isinstance(actors_raw, list) or len(actors_raw) > 32:
-            raise NewsEventStructuringError("News event actors must be a bounded array.")
+        if (
+            not isinstance(actors_raw, list)
+            or len(actors_raw) > 32
+        ):
+            raise NewsEventStructuringError(
+                "News event actors must be a bounded array."
+            )
+
         actors: list[str] = []
+
         for value in actors_raw:
-            actor = _bounded_text(value, 200, "actor").strip()
+            actor = _bounded_text(
+                value,
+                200,
+                "actor",
+            ).strip()
+
             if not actor:
-                raise NewsEventStructuringError("News event actor must not be blank.")
+                raise NewsEventStructuringError(
+                    "News event actor must not be blank."
+                )
+
             if actor not in actors:
                 actors.append(actor)
+
         validated.append(
             {
                 "finding_ordinal": ordinal,
@@ -395,10 +763,47 @@ def _validate_event_output(
                 "core_action": core_action,
             }
         )
-    if seen != set(range(len(findings))):
-        raise NewsEventStructuringError("News event metadata omitted a Research finding.")
-    validated.sort(key=lambda item: int(item["finding_ordinal"]))
+
+    if seen != expected:
+        raise NewsEventStructuringError(
+            "News event metadata omitted a Research finding."
+        )
+
+    validated.sort(
+        key=lambda item: int(
+            item["finding_ordinal"]
+        )
+    )
+
     return tuple(validated)
+
+def _normalize_event_time_metadata(
+    precision: str,
+    start: str,
+    end: str,
+) -> tuple[str, str | None, str | None]:
+    """Normalize optional model-derived event time safely."""
+
+    try:
+        start_value, end_value = (
+            _validate_event_time(
+                precision,
+                start,
+                end,
+            )
+        )
+    except NewsEventStructuringError:
+        return (
+            "unknown",
+            None,
+            None,
+        )
+
+    return (
+        precision,
+        start_value,
+        end_value,
+    )
 
 
 def _validate_event_time(

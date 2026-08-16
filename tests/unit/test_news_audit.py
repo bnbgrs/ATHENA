@@ -14,8 +14,14 @@ from athena.config.settings import AthenaSettings
 from athena.core.application import AthenaApplication
 from athena.external.gateway import ExternalResponse
 from athena.jobs.models import JobState
+from athena.model.adapters.lm_studio import ProviderOutputLimitError
 from athena.news.common import _research_question
-from athena.news.event_structuring import NewsEventMetadata
+from athena.news.event_structuring import (
+    NewsEventMetadata,
+    NewsEventStructuringMixin,
+    _event_batch_ranges,
+    _validate_event_output,
+)
 from athena.news.feed import FeedItem, canonicalize_url
 from athena.news.service import NewsService
 
@@ -98,6 +104,145 @@ def _insert_completed_research_result(
             ),
         )
     return job.job_id, result_id
+
+
+def test_news_event_structuring_batches_large_result_sets() -> None:
+    assert _event_batch_ranges(30) == (
+        (0, 8),
+        (8, 16),
+        (16, 24),
+        (24, 30),
+    )
+
+
+def test_news_event_validator_preserves_global_batch_ordinals() -> None:
+    raw = {
+        "events": [
+            {
+                "finding_ordinal": ordinal,
+                "event_time_start": "",
+                "event_time_end": "",
+                "event_time_precision": "unknown",
+                "location": "",
+                "actors": [],
+                "core_action": f"Action {ordinal}",
+            }
+            for ordinal in (8, 9)
+        ]
+    }
+
+    validated = _validate_event_output(
+        raw,
+        (8, 9),
+    )
+
+    assert [
+        item["finding_ordinal"]
+        for item in validated
+    ] == [8, 9]
+
+
+def test_news_event_output_overflow_recursively_splits_batch() -> None:
+    class FakeStructurer(NewsEventStructuringMixin):
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, ...]] = []
+
+        def _structure_event_batch(self, **kwargs: object):
+            ordinals = kwargs["expected_ordinals"]
+            assert isinstance(ordinals, tuple)
+            self.calls.append(ordinals)
+
+            if len(ordinals) > 2:
+                raise ProviderOutputLimitError(
+                    "synthetic output overflow"
+                )
+
+            return tuple(
+                (
+                    {"finding_ordinal": ordinal},
+                    new_uuid7(),
+                )
+                for ordinal in ordinals
+            )
+
+    fake = FakeStructurer()
+
+    result = fake._structure_event_batch_resilient(
+        run={},
+        result=object(),
+        config=object(),
+        signature=object(),
+        evidence=tuple(
+            {"finding_ordinal": ordinal}
+            for ordinal in range(8)
+        ),
+        expected_ordinals=tuple(range(8)),
+        parent_job=None,
+    )
+
+    assert [
+        item["finding_ordinal"]
+        for item, _run_id in result
+    ] == list(range(8))
+
+    assert fake.calls[0] == tuple(range(8))
+    assert any(
+        len(call) == 4
+        for call in fake.calls
+    )
+    assert any(
+        len(call) == 2
+        for call in fake.calls
+    )
+
+
+def test_news_event_validator_runtime_wiring_uses_temporal_normalization() -> None:
+    import inspect
+
+    from athena.news.event_structuring import (
+        _normalize_event_time_metadata,
+        _validate_event_output,
+    )
+
+    validator_source = inspect.getsource(
+        _validate_event_output
+    )
+
+    assert (
+        "_normalize_event_time_metadata("
+        in validator_source
+    )
+
+    assert (
+        "_validate_event_time("
+        not in validator_source
+    )
+
+    assert (
+        _normalize_event_time_metadata(
+            "day",
+            "2026-07",
+            "",
+        )
+        == (
+            "unknown",
+            None,
+            None,
+        )
+    )
+
+    assert (
+        _normalize_event_time_metadata(
+            "day",
+            "2026-08-15",
+            "",
+        )
+        == (
+            "day",
+            "2026-08-15",
+            None,
+        )
+    )
 
 
 def test_research_contract_requires_event_clustering_attribution_and_disagreement() -> None:

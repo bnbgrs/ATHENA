@@ -16,6 +16,7 @@ from athena.jobs.source_processing import DurableSourceProcessingWorker
 from athena.model.adapters.lm_studio import (
     ModelProviderError,
     ProviderContextLimitError,
+    ProviderOutputLimitError,
     ProviderUnavailableError,
 )
 from athena.research.models import (
@@ -514,12 +515,20 @@ class DurableResearchWorker:
             raise ResearchJobError(str(exc)) from exc
 
         try:
-            artifact = self.synthesis.execute_call(
+            artifact = self.synthesis.execute_call_with_coverage_repair(
                 scope=refreshed_scope,
                 parent_job_id=job.job_id,
                 lease_token=lease_token,
                 prepared=prepared,
                 extend_seconds=extend_seconds,
+            )
+        except ResearchSynthesisInputTooLargeError:
+            return self._split_synthesis_boundary(
+                job,
+                lease_token,
+                refreshed_scope,
+                work,
+                reason="coverage_repair_context_overflow",
             )
         except ProviderContextLimitError:
             return self._split_synthesis_boundary(
@@ -528,6 +537,14 @@ class DurableResearchWorker:
                 refreshed_scope,
                 work,
                 reason="provider_context_overflow",
+            )
+        except ProviderOutputLimitError:
+            return self._split_synthesis_boundary(
+                job,
+                lease_token,
+                refreshed_scope,
+                work,
+                reason="provider_output_overflow",
             )
         except ProviderUnavailableError as exc:
             return self._wait_reason(

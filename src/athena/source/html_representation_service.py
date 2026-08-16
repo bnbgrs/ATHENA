@@ -21,6 +21,7 @@ from athena.source.models import (
     SourceRecord,
     SourceRepresentationStructureRecord,
     SourceRepresentationType,
+    SourceType,
     TextRepresentationResult,
 )
 from athena.source.repository import SourceRepository
@@ -30,19 +31,29 @@ _HTML_SUFFIXES = {".html", ".htm", ".xhtml"}
 _HTML_MIME_TYPES = {"text/html", "application/xhtml+xml"}
 _TEXTISH_MIME_TYPES = {"text/plain", "application/octet-stream", None}
 _PARSER_ID = "athena.native_html"
-_PARSER_VERSION = "1"
-_PIPELINE_VERSION = "native-html-text-v1"
+_PARSER_VERSION = "2"
+_PIPELINE_VERSION = "native-html-text-v2"
 _HTML_OPTIONS: dict[str, object] = {
     "engine": "stdlib-html.parser",
     "charset_policy": "bom-or-meta-allowlist-else-utf8-strict",
     "line_endings": "lf",
     "unicode_normalization": "none",
-    "readable_text": "html-flow-v1",
+    "readable_text": "primary-article-flow-v2",
+    "flow_root_policy": "web-snapshot-primary-article-else-full-document-v1",
+    "boilerplate_filter": "web-snapshot-semantic-and-marker-v1",
     "block_separator": "\\n\\n",
     "table_cell_separator": "\\t",
     "table_row_separator": "\\n",
     "structure_map": "dom-path-v1",
-    "excluded_elements": ["canvas", "noscript", "script", "style", "svg", "template"],
+    "excluded_elements": [
+        "canvas",
+        "iframe",
+        "noscript",
+        "script",
+        "style",
+        "svg",
+        "template",
+    ],
     "external_content_policy": "data-only-no-execution",
 }
 
@@ -99,6 +110,10 @@ class SourceHtmlRepresentationService:
     def build(self, source_id: uuid.UUID) -> HtmlRepresentationBuildResult:
         source, source_blob = self.sources.get(source_id)
         _require_supported_html_source(source)
+        primary_article = (
+            source.source_type
+            is SourceType.WEB_SNAPSHOT
+        )
         actor_id = self.chat.ensure_local_user()
         run = self.runs.start_run(
             run_type="source_html_native_text_representation",
@@ -112,6 +127,12 @@ class SourceHtmlRepresentationService:
                 "mime_type": source.mime_type,
                 "original_name": source.original_name,
                 "source_uri": source.source_uri,
+                "source_type": source.source_type.value,
+                "extraction_mode": (
+                    "primary_article"
+                    if primary_article
+                    else "full_document"
+                ),
             },
             configuration={
                 "representation_type": SourceRepresentationType.NORMALIZED_TEXT.value,
@@ -119,6 +140,11 @@ class SourceHtmlRepresentationService:
                 "parser_id": _PARSER_ID,
                 "parser_version": _PARSER_VERSION,
                 "options": _HTML_OPTIONS,
+                "extraction_mode": (
+                    "primary_article"
+                    if primary_article
+                    else "full_document"
+                ),
             },
             model_signature_id=None,
             prompt_template_id=None,
@@ -133,7 +159,10 @@ class SourceHtmlRepresentationService:
                 expected_sha256=source_blob.integrity_sha256,
                 expected_length=source_blob.byte_length,
             )
-            prepared = self.representation_store.extract(source_path)
+            prepared = self.representation_store.extract(
+                source_path,
+                primary_article=primary_article,
+            )
             content_hash = prepared.content_sha256
             existing_blob = self.sources.find_blob_by_integrity(
                 integrity_sha256=content_hash,

@@ -14,6 +14,7 @@ from athena.jobs.scheduler import DurableJobScheduler, SchedulerPolicy
 from athena.model.adapters.lm_studio import (
     ModelProviderError,
     ProviderContextLimitError,
+    ProviderOutputLimitError,
     ProviderUnavailableError,
 )
 from athena.model.domain import ModelChatMessage, ModelInfo
@@ -31,6 +32,8 @@ class FakePrimaryProvider:
     context_capacity: int = 2000
     quantization: str = "Q4"
     backend_context_failures: int = 0
+    output_limit_failures: int = 0
+    validation_output_limit_failures: int = 0
     generation_error: ModelProviderError | None = None
     output_mode: str = "valid"
     calls: list[tuple[str, tuple[ModelChatMessage, ...]]] = field(default_factory=list)
@@ -71,6 +74,25 @@ class FakePrimaryProvider:
         if self.backend_context_failures > 0:
             self.backend_context_failures -= 1
             raise ProviderContextLimitError("maximum context length exceeded")
+        if self.output_limit_failures > 0:
+            self.output_limit_failures -= 1
+            raise ProviderOutputLimitError("configured output-token limit reached")
+        if self.validation_output_limit_failures > 0:
+            self.validation_output_limit_failures -= 1
+            if "map" in schema_id:
+                return {
+                    "relevant": True,
+                    "summary": "x" * 600,
+                    "findings": ["bounded finding"],
+                    "contradictions": [],
+                    "uncertainty": "",
+                }
+            return {
+                "summary": "x" * 600,
+                "findings": ["bounded finding"],
+                "contradictions": [],
+                "uncertainty": "",
+            }
         if self.generation_error is not None:
             raise self.generation_error
         if self.output_mode == "invalid":
@@ -287,6 +309,76 @@ def test_backend_context_overflow_splits_and_resumes_without_losing_work(tmp_pat
         "SELECT COUNT(*) FROM processing_runs WHERE run_type = 'source_analysis_map' AND status = 'failed'"
     ).fetchone()[0]
     assert failed_runs == 1
+    app.stop()
+
+
+def test_output_token_limit_splits_and_resumes_without_losing_work(
+    tmp_path: Path,
+) -> None:
+    app = _app(tmp_path / "runtime")
+    source, _representation, _chunks = _prepare_source(
+        app,
+        tmp_path,
+        text=("alpha payload " * 150) + "\n\n" + ("beta payload " * 150),
+    )
+    provider = FakePrimaryProvider(
+        context_capacity=2000,
+        output_limit_failures=1,
+    )
+    _install_provider(app, provider)
+    job = _enqueue(app, source.source_id)
+
+    result = app.source_analysis.run_to_completion(
+        job.job_id,
+        worker_id="output-overflow",
+    )
+
+    assert result.analysis is not None
+    assert result.analysis.state is SourceAnalysisState.COMPLETED
+    map_work = app.source_analysis_repository.list_work_items(
+        result.analysis.analysis_id,
+        stage=AnalysisStage.MAP,
+    )
+    assert any(item.state is AnalysisWorkState.SPLIT for item in map_work)
+    assert provider.output_limit_failures == 0
+    failed_runs = app.database.connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM processing_runs
+        WHERE run_type = 'source_analysis_map'
+          AND status = 'failed'
+        """
+    ).fetchone()[0]
+    assert failed_runs == 1
+    app.stop()
+
+
+def test_valid_complete_output_above_estimator_reserve_is_accepted(
+    tmp_path: Path,
+) -> None:
+    app = _app(tmp_path / "runtime")
+    source, _representation, _chunks = _prepare_source(
+        app,
+        tmp_path,
+        text=("alpha payload " * 150) + "\n\n" + ("beta payload " * 150),
+    )
+    provider = FakePrimaryProvider(
+        context_capacity=2000,
+        validation_output_limit_failures=1,
+    )
+    _install_provider(app, provider)
+    job = _enqueue(app, source.source_id)
+
+    result = app.source_analysis.run_to_completion(
+        job.job_id,
+        worker_id="validated-output-overflow",
+    )
+
+    assert result.done is True
+    assert result.analysis is not None
+    assert result.analysis.state is SourceAnalysisState.COMPLETED
+    assert provider.validation_output_limit_failures == 0
+    assert result.job.blocked_reason is None
     app.stop()
 
 

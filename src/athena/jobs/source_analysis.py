@@ -13,6 +13,7 @@ from athena.jobs.service import DurableJobService
 from athena.model.adapters.lm_studio import (
     ModelProviderError,
     ProviderContextLimitError,
+    ProviderOutputLimitError,
     ProviderUnavailableError,
 )
 from athena.source.analysis_models import (
@@ -246,6 +247,8 @@ class DurableSourceAnalysisWorker:
                 extend_seconds=extend_seconds,
             )
         except ProviderContextLimitError:
+            return self._split_pending(job, lease_token, analysis, pending)
+        except ProviderOutputLimitError:
             return self._split_pending(job, lease_token, analysis, pending)
         except (ProviderUnavailableError, ModelProviderError, SourceAnalysisOutputError) as exc:
             return self._wait_user(job, lease_token, analysis, exc)

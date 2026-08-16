@@ -21,6 +21,7 @@ from athena.research.synthesis_service import (
     PIPELINE_VERSION,
     PROMPT_TEMPLATE_ID,
     PROMPT_TEMPLATE_VERSION,
+    ResearchSynthesisCoverageError,
     ResearchSynthesisInputTooLargeError,
     ResearchSynthesisOutputError,
     ResearchSynthesisService,
@@ -32,9 +33,15 @@ from athena.source.analysis_service import SourceAnalysisModelDriftError
 class _SynthesisProvider:
     quantization: str = "Q4"
     invalid_research_ref: bool = False
+    research_refs_override: list[str] | None = None
+    research_drop_refs_once: bool = False
+    research_split_refs_into_outputs: bool = False
     calls: list[tuple[str, tuple[ModelChatMessage, ...]]] = field(
         default_factory=list
     )
+    max_output_limits: list[int | None] = field(default_factory=list)
+    context_capacity: int = 4_000
+    generation_timeout_seconds: float = 300.0
 
     @property
     def provider_id(self) -> str:
@@ -47,8 +54,8 @@ class _SynthesisProvider:
                 backend_model_id="research-primary",
                 display_name="Research Primary",
                 model_type="llm",
-                context_capacity=4_000,
-                loaded_context_length=4_000,
+                context_capacity=self.context_capacity,
+                loaded_context_length=self.context_capacity,
                 quantization=self.quantization,
                 loaded=True,
                 vision=False,
@@ -65,14 +72,59 @@ class _SynthesisProvider:
         json_schema,
         max_output_tokens: int | None = None,
     ):
-        del json_schema, max_output_tokens
+        del json_schema
+        self.max_output_limits.append(max_output_tokens)
         assert model_id == "research-primary"
         self.calls.append((schema_id, messages))
         text = "\n".join(message.content for message in messages)
         if schema_id.startswith("athena_research_synthesis_"):
-            refs = sorted(set(re.findall(r"INPUT-\d{3}", text)))
+            granular_refs = re.findall(
+                r"INPUT-\d{3}-(?:FINDING|CONTRADICTION)-\d{3}",
+                text,
+            )
+            direct_refs = re.findall(
+                r"(INPUT-\d{3}) kind=source_analysis_artifact",
+                text,
+            )
+            refs = sorted(
+                set(granular_refs + direct_refs)
+            )
+            if self.research_refs_override is not None:
+                refs = list(self.research_refs_override)
+
+            if (
+                self.research_drop_refs_once
+                and len(refs) > 1
+            ):
+                refs = refs[:-1]
+                self.research_drop_refs_once = False
+
             if self.invalid_research_ref:
                 refs = ["INPUT-999"]
+
+            if self.research_split_refs_into_outputs:
+                return {
+                    "summary": (
+                        "research synthesis summary"
+                    ),
+                    "findings": [
+                        {
+                            "text": (
+                                "combined research "
+                                f"finding {index}"
+                            ),
+                            "evidence_refs": [ref],
+                        }
+                        for index, ref in enumerate(
+                            refs
+                        )
+                    ],
+                    "contradictions": [],
+                    "uncertainty": (
+                        "bounded to supplied artifacts"
+                    ),
+                }
+
             return {
                 "summary": "research synthesis summary",
                 "findings": [
@@ -109,10 +161,16 @@ class _SynthesisProvider:
         yield "unused"
 
 
-def _app(root: Path) -> tuple[AthenaApplication, _SynthesisProvider]:
+def _app(
+    root: Path,
+    *,
+    context_capacity: int = 4_000,
+) -> tuple[AthenaApplication, _SynthesisProvider]:
     app = AthenaApplication(settings=AthenaSettings(local_root=root))
     app.start()
-    provider = _SynthesisProvider()
+    provider = _SynthesisProvider(
+        context_capacity=context_capacity,
+    )
     app.source_analysis_service.provider = provider
     return app, provider
 
@@ -193,8 +251,12 @@ def _prepare_research(
     tmp_path: Path,
     *,
     source_count: int,
+    context_capacity: int = 4_000,
 ):
-    app, provider = _app(tmp_path / "runtime")
+    app, provider = _app(
+        tmp_path / "runtime",
+        context_capacity=context_capacity,
+    )
     for index in range(source_count):
         _capture(
             app,
@@ -237,6 +299,13 @@ def test_context_package_call_persists_output_evidence_and_no_canonical_write(
         "INPUT-001",
         "INPUT-002",
     )
+    assert tuple(
+        item.ref_id
+        for item in prepared.evidence_refs
+    ) == (
+        "INPUT-001",
+        "INPUT-002",
+    )
 
     artifact = service.execute_call(
         scope=scope,
@@ -272,7 +341,25 @@ def test_context_package_call_persists_output_evidence_and_no_canonical_write(
             output_kind="finding",
             output_ordinal=0,
         )
-        == tuple(sorted(source_artifacts, key=lambda item: item.bytes))
+        == tuple(
+            sorted(
+                source_artifacts,
+                key=lambda item: item.bytes,
+            )
+        )
+    )
+    assert (
+        app.research_repository.precise_source_analysis_artifact_ids_for_synthesis_output(
+            artifact.artifact_id,
+            output_kind="finding",
+            output_ordinal=0,
+        )
+        == tuple(
+            sorted(
+                source_artifacts,
+                key=lambda item: item.bytes,
+            )
+        )
     )
 
     run = app.model_runs.load_run(artifact.processing_run_id)
@@ -297,6 +384,518 @@ def test_context_package_call_persists_output_evidence_and_no_canonical_write(
     assert app.research_repository.current_commit_seq() == commit_before
 
     app.jobs.yield_job(job.job_id, lease_token=lease_token)
+    app.stop()
+
+
+def test_final_synthesis_uses_adaptive_capacity_and_matching_signature(
+    tmp_path: Path,
+) -> None:
+    app, provider, job, scope, lease_token, service = _prepare_research(
+        tmp_path,
+        source_count=2,
+        context_capacity=32_256,
+    )
+
+    assert scope.effective_context_limit == 32_256
+    assert scope.output_reserve == 2_048
+    assert scope.safety_margin == 512
+
+    work = service.plan_next_synthesis(
+        scope,
+        parent_job_id=job.job_id,
+        lease_token=lease_token,
+    )
+    assert work.stage is ResearchSynthesisStage.FINAL
+
+    prepared = service.prepare_call(scope, work)
+    artifact = service.execute_call(
+        scope=scope,
+        parent_job_id=job.job_id,
+        lease_token=lease_token,
+        prepared=prepared,
+        extend_seconds=120,
+    )
+
+    assert provider.max_output_limits[-1] == 8_064
+
+    run = app.model_runs.load_run(
+        artifact.processing_run_id
+    )
+    assert run.model_signature_id is not None
+    assert run.model_signature_id != scope.model_signature_id
+
+    snapshot = json.loads(run.input_snapshot_json)
+
+    assert snapshot["base_output_reserve"] == 2_048
+    assert snapshot["output_reserve"] == 8_064
+    assert snapshot["provider_max_output_tokens"] == 8_064
+    assert snapshot["capacity_policy_id"] == (
+        "final-quarter-context-max-8192-v1"
+    )
+
+    package = snapshot["context_package"]
+    assert package["budget"]["effective_context_limit"] == 32_256
+    assert package["budget"]["output_reserve"] == 8_064
+    assert package["budget"]["safety_margin"] == 512
+    assert package["budget"]["context_budget"] == 23_680
+    assert (
+        package["token_estimates"]["estimated_total_tokens"]
+        <= 32_256
+    )
+
+    signature = app.model_runs.load_signature(
+        run.model_signature_id
+    )
+    generation = json.loads(
+        signature.generation_parameters_json
+    )
+    context = json.loads(
+        signature.context_configuration_json or "{}"
+    )
+
+    assert generation["max_output_tokens"] == 8_064
+    assert context["output_reserve"] == 8_064
+    assert context["base_output_reserve"] == 2_048
+    assert context["base_model_signature_id"] == str(
+        scope.model_signature_id
+    )
+    assert context["capacity_policy_id"] == (
+        "final-quarter-context-max-8192-v1"
+    )
+
+    app.jobs.yield_job(
+        job.job_id,
+        lease_token=lease_token,
+    )
+    app.stop()
+
+
+def test_research_synthesis_extends_lease_before_provider_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _provider, job, scope, lease_token, service = _prepare_research(
+        tmp_path,
+        source_count=2,
+        context_capacity=32_256,
+    )
+
+    heartbeat_extensions: list[int] = []
+    original_heartbeat = app.jobs.heartbeat
+
+    def recording_heartbeat(
+        job_id,
+        *,
+        lease_token,
+        extend_seconds=60,
+        now_us=None,
+    ):
+        heartbeat_extensions.append(extend_seconds)
+        return original_heartbeat(
+            job_id,
+            lease_token=lease_token,
+            extend_seconds=extend_seconds,
+            now_us=now_us,
+        )
+
+    monkeypatch.setattr(
+        app.jobs,
+        "heartbeat",
+        recording_heartbeat,
+    )
+
+    work = service.plan_next_synthesis(
+        scope,
+        parent_job_id=job.job_id,
+        lease_token=lease_token,
+    )
+    prepared = service.prepare_call(scope, work)
+
+    service.execute_call(
+        scope=scope,
+        parent_job_id=job.job_id,
+        lease_token=lease_token,
+        prepared=prepared,
+        extend_seconds=120,
+    )
+
+    assert heartbeat_extensions[0] == 420
+    assert heartbeat_extensions[-1] == 120
+
+    app.jobs.yield_job(
+        job.job_id,
+        lease_token=lease_token,
+    )
+    app.stop()
+
+
+def test_nested_synthesis_preserves_finding_specific_terminal_sources(
+    tmp_path: Path,
+) -> None:
+    (
+        app,
+        provider,
+        job,
+        scope,
+        lease_token,
+        service,
+    ) = _prepare_research(
+        tmp_path,
+        source_count=4,
+    )
+
+    all_source_artifacts = (
+        app.research_repository
+        .successful_source_analysis_final_artifact_ids(
+            scope.scope_id
+        )
+    )
+    assert len(all_source_artifacts) == 4
+
+    first_final = service.plan_next_synthesis(
+        scope,
+        parent_job_id=job.job_id,
+        lease_token=lease_token,
+    )
+
+    children = service.split_synthesis_work(
+        scope,
+        first_final,
+        parent_job_id=job.job_id,
+        lease_token=lease_token,
+    )
+
+    assert len(children) == 2
+
+    for child in children:
+        prepared_child = service.prepare_call(
+            scope,
+            child,
+        )
+        service.execute_call(
+            scope=scope,
+            parent_job_id=job.job_id,
+            lease_token=lease_token,
+            prepared=prepared_child,
+            extend_seconds=120,
+        )
+
+    next_final = service.plan_next_synthesis(
+        scope,
+        parent_job_id=job.job_id,
+        lease_token=lease_token,
+    )
+    prepared_final = service.prepare_call(
+        scope,
+        next_final,
+    )
+
+    evidence_by_label = {
+        item.ref_id: item
+        for item in prepared_final.evidence_refs
+    }
+
+    assert set(evidence_by_label) == {
+        "INPUT-001-FINDING-000",
+        "INPUT-001-CONTRADICTION-000",
+        "INPUT-002-FINDING-000",
+        "INPUT-002-CONTRADICTION-000",
+    }
+
+    selected = evidence_by_label[
+        "INPUT-001-FINDING-000"
+    ]
+
+    assert len(
+        selected.source_analysis_artifact_ids
+    ) == 2
+
+    assert set(
+        selected.source_analysis_artifact_ids
+    ).issubset(set(all_source_artifacts))
+
+    assert set(
+        selected.source_analysis_artifact_ids
+    ) != set(all_source_artifacts)
+
+    remaining_refs = sorted(
+        ref_id
+        for ref_id in evidence_by_label
+        if ref_id != selected.ref_id
+    )
+
+    provider.research_refs_override = [
+        selected.ref_id,
+        *remaining_refs,
+    ]
+
+    provider.research_split_refs_into_outputs = True
+
+    assert set(
+        provider.research_refs_override
+    ) == set(evidence_by_label)
+
+    final_artifact = service.execute_call(
+        scope=scope,
+        parent_job_id=job.job_id,
+        lease_token=lease_token,
+        prepared=prepared_final,
+        extend_seconds=120,
+    )
+
+    precise_sources = (
+        app.research_repository
+        .precise_source_analysis_artifact_ids_for_synthesis_output(
+            final_artifact.artifact_id,
+            output_kind="finding",
+            output_ordinal=0,
+        )
+    )
+
+    assert precise_sources == tuple(
+        sorted(
+            selected.source_analysis_artifact_ids,
+            key=lambda item: item.bytes,
+        )
+    )
+
+    assert set(precise_sources) != set(
+        all_source_artifacts
+    )
+
+    rows = app.database.connection.execute(
+        """
+        SELECT source_analysis_artifact_id
+        FROM research_synthesis_output_source_evidence
+        WHERE artifact_id = ?
+          AND output_kind = 'finding'
+          AND output_ordinal = 0
+        ORDER BY source_analysis_artifact_id
+        """,
+        (final_artifact.artifact_id.bytes,),
+    ).fetchall()
+
+    assert len(rows) == 2
+
+    app.jobs.yield_job(
+        job.job_id,
+        lease_token=lease_token,
+    )
+    app.stop()
+
+
+def test_synthesis_coverage_gap_is_repaired_before_commit(
+    tmp_path: Path,
+) -> None:
+    (
+        app,
+        provider,
+        job,
+        scope,
+        lease_token,
+        service,
+    ) = _prepare_research(
+        tmp_path,
+        source_count=3,
+    )
+
+    work = service.plan_next_synthesis(
+        scope,
+        parent_job_id=job.job_id,
+        lease_token=lease_token,
+    )
+
+    prepared = service.prepare_call(
+        scope,
+        work,
+    )
+
+    assert len(
+        prepared.evidence_refs
+    ) == 3
+
+    expected_input_ordinals = {
+        item.input_ordinal
+        for item in prepared.evidence_refs
+    }
+
+    source_artifacts = (
+        app.research_repository
+        .successful_source_analysis_final_artifact_ids(
+            scope.scope_id
+        )
+    )
+
+    provider.research_drop_refs_once = True
+
+    calls_before = len(
+        [
+            schema_id
+            for schema_id, _messages
+            in provider.calls
+            if schema_id.startswith(
+                "athena_research_synthesis_"
+            )
+        ]
+    )
+
+    artifact = (
+        service.execute_call_with_coverage_repair(
+            scope=scope,
+            parent_job_id=job.job_id,
+            lease_token=lease_token,
+            prepared=prepared,
+            extend_seconds=120,
+        )
+    )
+
+    new_synthesis_calls = [
+        (
+            schema_id,
+            messages,
+        )
+        for schema_id, messages
+        in provider.calls
+        if schema_id.startswith(
+            "athena_research_synthesis_"
+        )
+    ][calls_before:]
+
+    assert len(
+        new_synthesis_calls
+    ) == 2
+
+    repair_messages = (
+        new_synthesis_calls[1][1]
+    )
+
+    repair_text = "\n".join(
+        message.content
+        for message in repair_messages
+    )
+
+    assert (
+        "COVERAGE REPAIR REQUIRED"
+        in repair_text
+    )
+
+    persisted_evidence = (
+        app.research_repository
+        .synthesis_evidence_for_artifact(
+            artifact.artifact_id
+        )
+    )
+
+    finding_input_ordinals = {
+        item.input_ordinal
+        for item in persisted_evidence
+        if item.output_kind == "finding"
+        and item.output_ordinal == 0
+    }
+
+    contradiction_input_ordinals = {
+        item.input_ordinal
+        for item in persisted_evidence
+        if (
+            item.output_kind
+            == "contradiction"
+            and item.output_ordinal == 0
+        )
+    }
+
+    assert (
+        finding_input_ordinals
+        == expected_input_ordinals
+    )
+
+    assert (
+        contradiction_input_ordinals
+        == expected_input_ordinals
+    )
+
+    precise_sources = (
+        app.research_repository
+        .precise_source_analysis_artifact_ids_for_synthesis_output(
+            artifact.artifact_id,
+            output_kind="finding",
+            output_ordinal=0,
+        )
+    )
+
+    assert precise_sources == tuple(
+        sorted(
+            source_artifacts,
+            key=lambda item: item.bytes,
+        )
+    )
+
+    app.jobs.yield_job(
+        job.job_id,
+        lease_token=lease_token,
+    )
+
+    app.stop()
+
+
+def test_synthesis_coverage_gap_fails_closed_after_bounded_repair(
+    tmp_path: Path,
+) -> None:
+    (
+        app,
+        provider,
+        job,
+        scope,
+        lease_token,
+        service,
+    ) = _prepare_research(
+        tmp_path,
+        source_count=2,
+    )
+
+    work = service.plan_next_synthesis(
+        scope,
+        parent_job_id=job.job_id,
+        lease_token=lease_token,
+    )
+
+    prepared = service.prepare_call(
+        scope,
+        work,
+    )
+
+    provider.research_refs_override = [
+        prepared.evidence_refs[0].ref_id
+    ]
+
+    with pytest.raises(
+        ResearchSynthesisCoverageError
+    ) as exc_info:
+        service.execute_call_with_coverage_repair(
+            scope=scope,
+            parent_job_id=job.job_id,
+            lease_token=lease_token,
+            prepared=prepared,
+            extend_seconds=120,
+        )
+
+    assert (
+        prepared.evidence_refs[1].ref_id
+        in exc_info.value.missing_refs
+    )
+
+    assert (
+        app.research_repository
+        .synthesis_artifact_for_work_item(
+            work.work_item_id
+        )
+        is None
+    )
+
+    app.jobs.yield_job(
+        job.job_id,
+        lease_token=lease_token,
+    )
+
     app.stop()
 
 
@@ -436,6 +1035,81 @@ def test_split_carries_singleton_leaf_into_next_final(
         ),
     }
     assert next_final.level > child.level
+
+    app.jobs.yield_job(job.job_id, lease_token=lease_token)
+    app.stop()
+
+
+def test_two_input_split_creates_singleton_compression_children(
+    tmp_path: Path,
+) -> None:
+    app, _provider, job, scope, lease_token, service = _prepare_research(
+        tmp_path,
+        source_count=2,
+    )
+
+    first_final = service.plan_next_synthesis(
+        scope,
+        parent_job_id=job.job_id,
+        lease_token=lease_token,
+    )
+    children = service.split_synthesis_work(
+        scope,
+        first_final,
+        parent_job_id=job.job_id,
+        lease_token=lease_token,
+    )
+
+    assert len(children) == 2
+    assert all(
+        child.stage is ResearchSynthesisStage.REDUCE
+        and child.state is ResearchSynthesisWorkState.PENDING
+        for child in children
+    )
+    assert all(
+        len(
+            app.research_repository.synthesis_inputs_for_work_item(
+                child.work_item_id
+            )
+        )
+        == 1
+        for child in children
+    )
+
+    child_artifacts = []
+    for child in children:
+        prepared = service.prepare_call(scope, child)
+        child_artifacts.append(
+            service.execute_call(
+                scope=scope,
+                parent_job_id=job.job_id,
+                lease_token=lease_token,
+                prepared=prepared,
+                extend_seconds=120,
+            )
+        )
+
+    next_final = service.plan_next_synthesis(
+        scope,
+        parent_job_id=job.job_id,
+        lease_token=lease_token,
+    )
+    next_inputs = app.research_repository.synthesis_inputs_for_work_item(
+        next_final.work_item_id
+    )
+
+    assert next_final.stage is ResearchSynthesisStage.FINAL
+    assert len(next_inputs) == 2
+    assert all(
+        item.input_kind
+        is ResearchSynthesisInputKind.RESEARCH_SYNTHESIS_ARTIFACT
+        for item in next_inputs
+    )
+    assert {
+        item.research_synthesis_artifact_id for item in next_inputs
+    } == {
+        artifact.artifact_id for artifact in child_artifacts
+    }
 
     app.jobs.yield_job(job.job_id, lease_token=lease_token)
     app.stop()

@@ -132,7 +132,11 @@ class NewsSchedulingMixin(NewsMixinContext):
                 )
                 return self.app.jobs.complete(job.job_id, lease_token=job.lease_token)
             try:
-                self._materialize_research(run, research_job_id)
+                self._materialize_research(
+                    run,
+                    research_job_id,
+                    parent_job=job,
+                )
             except NewsEventStructuringRetryable:
                 return self.app.jobs.wait(
                     job.job_id,

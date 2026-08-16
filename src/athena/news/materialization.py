@@ -9,6 +9,7 @@ from typing import Any, Iterable
 
 from athena.common.ids import new_uuid7, uuid_from_blob, uuid_to_blob
 from athena.common.time import utc_now_us
+from athena.jobs.models import JobRecord
 from athena.news.common import (
     _canonical_json,
     _default_profile_id,
@@ -24,7 +25,13 @@ from athena.research.models import ResearchScopeState
 
 
 class NewsMaterializationMixin(NewsMixinContext):
-    def _materialize_research(self, run: Any, research_job_id: uuid.UUID) -> None:
+    def _materialize_research(
+        self,
+        run: Any,
+        research_job_id: uuid.UUID,
+        *,
+        parent_job: JobRecord | None = None,
+    ) -> None:
         scope = self.app.research_repository.get_scope_for_job(research_job_id)
         if scope is None or scope.state is not ResearchScopeState.COMPLETED:
             raise NewsError("Completed research job has no completed ResearchScope.")
@@ -52,6 +59,7 @@ class NewsMaterializationMixin(NewsMixinContext):
                 scope=scope,
                 result=result,
                 findings=tuple(findings),
+                parent_job=parent_job,
             )
             if len(metadata) != len(findings):
                 raise NewsError("News event structuring omitted a Research finding.")

@@ -50,7 +50,7 @@ def test_html_scheduler_builds_dom_structure_chunks_search_and_table_anchor(tmp_
 
     queued = _run_cli(local_root, "job", "source-process", source_id, "--priority", "1")
     assert queued.returncode == 0, queued.stderr
-    assert '"html_parser":"athena.native_html@1"' in queued.stdout
+    assert '"html_parser":"athena.native_html@2"' in queued.stdout
     job_match = _UUID_RE.search(queued.stdout)
     assert job_match is not None
     job_id = job_match.group(0)

@@ -8,6 +8,7 @@ import json
 import os
 import re
 import secrets
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
@@ -28,7 +29,137 @@ _BLOCK_SEPARATOR = "\n\n"
 _CELL_BLOCK_SEPARATOR = "\n"
 _CELL_SEPARATOR = "\t"
 _ROW_SEPARATOR = "\n"
-_EXCLUDED_TAGS = frozenset({"script", "style", "template", "noscript", "svg", "canvas"})
+_EXCLUDED_TAGS = frozenset(
+    {
+        "script",
+        "style",
+        "template",
+        "noscript",
+        "svg",
+        "canvas",
+        "iframe",
+    }
+)
+
+_BOILERPLATE_TAGS = frozenset(
+    {
+        "aside",
+        "dialog",
+        "footer",
+        "form",
+        "nav",
+    }
+)
+
+_BOILERPLATE_ROLES = frozenset(
+    {
+        "complementary",
+        "contentinfo",
+        "navigation",
+        "search",
+    }
+)
+
+_BOILERPLATE_ATTR_NAMES = (
+    "id",
+    "class",
+    "aria-label",
+    "data-testid",
+    "data-component",
+    "data-module",
+    "data-content-name",
+    "data-cname",
+)
+
+_BOILERPLATE_TOKENS = frozenset(
+    {
+        "ad",
+        "ads",
+        "advert",
+        "advertisement",
+        "advertiser",
+        "affiliate",
+        "commerce",
+        "comment",
+        "comments",
+        "newsletter",
+        "popular",
+        "promo",
+        "promotion",
+        "recirc",
+        "recirculation",
+        "recommendation",
+        "recommended",
+        "related",
+        "share",
+        "sidebar",
+        "sponsor",
+        "sponsored",
+        "subscribe",
+        "subscription",
+    }
+)
+
+_BOILERPLATE_ATTR_PHRASES = (
+    "advertiser-content",
+    "advertiser content",
+    "from-our-sponsor",
+    "from our sponsor",
+    "most-popular",
+    "most popular",
+    "native-ad",
+    "native ad",
+    "more-stories",
+    "more stories",
+    "read-next",
+    "read next",
+    "related-stories",
+    "related stories",
+    "recommended-stories",
+    "recommended stories",
+    "sponsored-content",
+    "sponsored content",
+)
+
+_BOILERPLATE_COMPACT_PHRASES = (
+    "advertisercontent",
+    "mostpopular",
+    "nativead",
+    "morestories",
+    "readnext",
+    "relatedstories",
+    "recommendedstories",
+    "sponsoredcontent",
+)
+
+_BOILERPLATE_HEADINGS = frozenset(
+    {
+        "advertiser content",
+        "comments",
+        "from our sponsor",
+        "more stories",
+        "most popular",
+        "newsletter",
+        "recommended",
+        "recommended stories",
+        "related",
+        "related stories",
+        "sponsored content",
+    }
+)
+
+_BOILERPLATE_HEADING_PREFIXES = (
+    "also read",
+    "more from ",
+    "read next",
+    "recommended for ",
+    "you may also like",
+)
+
+_ATTR_TOKEN_RE = re.compile(
+    r"[^a-z0-9]+"
+)
+
 _VOID_TAGS = frozenset(
     {
         "area",
@@ -287,7 +418,12 @@ class HtmlNativeTextRepresentationStore:
         self.paths = paths
         self._text_store = TextRepresentationStore(paths)
 
-    def extract(self, source_path: Path) -> PreparedHtmlTextRepresentation:
+    def extract(
+        self,
+        source_path: Path,
+        *,
+        primary_article: bool = False,
+    ) -> PreparedHtmlTextRepresentation:
         staging_dir = self.paths.spool_root / "representations" / "staging"
         staging_dir.mkdir(parents=True, exist_ok=True)
         staging_path = staging_dir / f"html-text-{secrets.token_hex(16)}.partial"
@@ -323,8 +459,26 @@ class HtmlNativeTextRepresentationStore:
                 builder.end(title_index)
                 emitted = True
 
-            body = _first_element(parser.root, "body")
-            flow_root = body if body is not None else parser.root
+            body = _first_element(
+                parser.root,
+                "body",
+            )
+
+            if primary_article:
+                flow_root = (
+                    _select_primary_article_flow_root(
+                        parser.root
+                    )
+                )
+                _prune_article_boilerplate(
+                    flow_root
+                )
+            else:
+                flow_root = (
+                    body
+                    if body is not None
+                    else parser.root
+                )
             if emitted and _has_readable_flow(flow_root):
                 builder.append(_BLOCK_SEPARATOR)
             _render_flow_container(
@@ -452,6 +606,406 @@ def _document_title(root: _HtmlNode) -> tuple[_HtmlNode, str] | None:
     text, _links = _inline_text_and_links(title)
     cleaned = text.strip()
     return (title, cleaned) if cleaned else None
+
+
+def _node_has_attr(
+    node: _HtmlNode,
+    name: str,
+) -> bool:
+    lowered = name.lower()
+
+    return any(
+        key.lower() == lowered
+        for key, _value in node.attrs
+    )
+
+
+def _attr_value_has_boilerplate_marker(
+    value: str,
+) -> bool:
+    normalized = value.strip().lower()
+
+    if not normalized:
+        return False
+
+    if any(
+        phrase in normalized
+        for phrase in _BOILERPLATE_ATTR_PHRASES
+    ):
+        return True
+
+    compact = re.sub(
+        r"[^a-z0-9]+",
+        "",
+        normalized,
+    )
+
+    if any(
+        phrase in compact
+        for phrase in _BOILERPLATE_COMPACT_PHRASES
+    ):
+        return True
+
+    tokens = {
+        token
+        for token in _ATTR_TOKEN_RE.split(
+            normalized
+        )
+        if token
+    }
+
+    return bool(
+        tokens.intersection(
+            _BOILERPLATE_TOKENS
+        )
+    )
+
+
+def _plain_node_text(
+    node: _HtmlNode,
+) -> str:
+    parts: list[str] = []
+
+    def collect(
+        item: _HtmlNode | str,
+    ) -> None:
+        if isinstance(item, str):
+            parts.append(item)
+            return
+
+        if (
+            item.tag in _EXCLUDED_TAGS
+            or item.tag == "head"
+        ):
+            return
+
+        for child in item.children:
+            collect(child)
+
+    for child in node.children:
+        collect(child)
+
+    return re.sub(
+        r"\s+",
+        " ",
+        "".join(parts),
+    ).strip()
+
+
+def _first_heading_text(
+    node: _HtmlNode,
+) -> str | None:
+    for child in node.children:
+        if not isinstance(
+            child,
+            _HtmlNode,
+        ):
+            continue
+
+        if child.tag in _EXCLUDED_TAGS:
+            continue
+
+        if (
+            _heading_level(child.tag)
+            is not None
+        ):
+            text = _plain_node_text(child)
+
+            if text:
+                return text
+
+        nested = _first_heading_text(
+            child
+        )
+
+        if nested:
+            return nested
+
+    return None
+
+
+def _heading_marks_boilerplate(
+    node: _HtmlNode,
+) -> bool:
+    if node.tag not in {
+        "section",
+        "div",
+    }:
+        return False
+
+    heading = _first_heading_text(
+        node
+    )
+
+    if heading is None:
+        return False
+
+    normalized = (
+        heading
+        .casefold()
+        .strip()
+    )
+
+    if normalized in _BOILERPLATE_HEADINGS:
+        return True
+
+    return any(
+        normalized.startswith(prefix)
+        for prefix
+        in _BOILERPLATE_HEADING_PREFIXES
+    )
+
+
+def _is_article_boilerplate_node(
+    node: _HtmlNode,
+) -> bool:
+    if node.tag in _BOILERPLATE_TAGS:
+        return True
+
+    if _node_has_attr(
+        node,
+        "hidden",
+    ):
+        return True
+
+    aria_hidden = node.attr(
+        "aria-hidden"
+    )
+
+    if (
+        aria_hidden is not None
+        and aria_hidden.strip().lower()
+        == "true"
+    ):
+        return True
+
+    role = node.attr("role")
+
+    if (
+        role is not None
+        and role.strip().lower()
+        in _BOILERPLATE_ROLES
+    ):
+        return True
+
+    for attribute_name in (
+        _BOILERPLATE_ATTR_NAMES
+    ):
+        value = node.attr(
+            attribute_name
+        )
+
+        if (
+            value is not None
+            and _attr_value_has_boilerplate_marker(
+                value
+            )
+        ):
+            return True
+
+    return _heading_marks_boilerplate(
+        node
+    )
+
+
+def _iter_article_candidates(
+    root: _HtmlNode,
+    tag: str,
+) -> Iterator[_HtmlNode]:
+    for child in root.children:
+        if not isinstance(
+            child,
+            _HtmlNode,
+        ):
+            continue
+
+        if (
+            child.tag in _EXCLUDED_TAGS
+            or child.tag == "head"
+            or _is_article_boilerplate_node(
+                child
+            )
+        ):
+            continue
+
+        if child.tag == tag:
+            yield child
+
+        yield from _iter_article_candidates(
+            child,
+            tag,
+        )
+
+
+def _article_visible_character_count(
+    node: _HtmlNode,
+) -> int:
+    total = 0
+
+    for child in node.children:
+        if isinstance(child, str):
+            total += len(
+                re.sub(
+                    r"\s+",
+                    " ",
+                    child,
+                ).strip()
+            )
+            continue
+
+        if (
+            child.tag in _EXCLUDED_TAGS
+            or child.tag == "head"
+            or _is_article_boilerplate_node(
+                child
+            )
+        ):
+            continue
+
+        total += (
+            _article_visible_character_count(
+                child
+            )
+        )
+
+    return total
+
+
+def _article_contains_h1(
+    node: _HtmlNode,
+) -> bool:
+    for child in node.children:
+        if not isinstance(
+            child,
+            _HtmlNode,
+        ):
+            continue
+
+        if (
+            child.tag in _EXCLUDED_TAGS
+            or _is_article_boilerplate_node(
+                child
+            )
+        ):
+            continue
+
+        if child.tag == "h1":
+            return True
+
+        if _article_contains_h1(
+            child
+        ):
+            return True
+
+    return False
+
+
+def _article_root_score(
+    node: _HtmlNode,
+) -> tuple[int, int]:
+    return (
+        (
+            1
+            if _article_contains_h1(node)
+            else 0
+        ),
+        _article_visible_character_count(
+            node
+        ),
+    )
+
+
+def _best_article_candidate(
+    candidates: tuple[_HtmlNode, ...],
+) -> _HtmlNode:
+    if not candidates:
+        raise RuntimeError(
+            "Article candidate set is empty."
+        )
+
+    best_index, best = max(
+        enumerate(candidates),
+        key=lambda item: (
+            _article_root_score(
+                item[1]
+            ),
+            -item[0],
+        ),
+    )
+
+    del best_index
+    return best
+
+
+def _select_primary_article_flow_root(
+    root: _HtmlNode,
+) -> _HtmlNode:
+    body = _first_element(
+        root,
+        "body",
+    )
+
+    search_root = (
+        body
+        if body is not None
+        else root
+    )
+
+    articles = tuple(
+        _iter_article_candidates(
+            search_root,
+            "article",
+        )
+    )
+
+    if articles:
+        return _best_article_candidate(
+            articles
+        )
+
+    mains = tuple(
+        _iter_article_candidates(
+            search_root,
+            "main",
+        )
+    )
+
+    if mains:
+        return _best_article_candidate(
+            mains
+        )
+
+    return search_root
+
+
+def _prune_article_boilerplate(
+    node: _HtmlNode,
+) -> None:
+    retained: list[
+        _HtmlNode | str
+    ] = []
+
+    for child in node.children:
+        if isinstance(child, str):
+            retained.append(child)
+            continue
+
+        if (
+            child.tag in _EXCLUDED_TAGS
+            or child.tag == "head"
+            or _is_article_boilerplate_node(
+                child
+            )
+        ):
+            continue
+
+        _prune_article_boilerplate(
+            child
+        )
+
+        retained.append(child)
+
+    node.children = retained
 
 
 def _has_readable_flow(node: _HtmlNode) -> bool:

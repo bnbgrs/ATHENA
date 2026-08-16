@@ -8,6 +8,7 @@ import pytest
 from athena.model.adapters.lm_studio import (
     LMStudioProvider,
     ProviderContextLimitError,
+    ProviderOutputLimitError,
     ProviderProtocolError,
 )
 from athena.model.domain import ModelChatMessage
@@ -84,6 +85,36 @@ def test_lm_studio_rejects_non_json_structured_content() -> None:
                 messages=(ModelChatMessage(role="user", content="Extract."),),
                 schema_id="example_schema_v1",
                 json_schema={"type": "object"},
+            )
+
+
+def test_lm_studio_classifies_structured_output_token_limit() -> None:
+    response = FakeResponse(
+        {
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {
+                        "role": "assistant",
+                        "content": '{"items": [',
+                    },
+                }
+            ]
+        }
+    )
+    provider = LMStudioProvider("http://127.0.0.1:1234")
+
+    with patch("athena.model.adapters.lm_studio.urlopen", return_value=response):
+        with pytest.raises(
+            ProviderOutputLimitError,
+            match="output-token limit",
+        ):
+            provider.generate_structured(
+                model_id="example/model",
+                messages=(ModelChatMessage(role="user", content="Extract."),),
+                schema_id="example_schema_v1",
+                json_schema={"type": "object"},
+                max_output_tokens=100,
             )
 
 
