@@ -31,6 +31,7 @@ class DurableJobService:
 
     BUILTIN_JOB_TYPES = frozenset(
         {
+            "archive.replicate",
             "source.process",
             "source.analyze",
             "source.extract",
@@ -68,6 +69,23 @@ class DurableJobService:
             requested_scope_json=_canonical_json(requested_scope),
             pinned_configuration_json=_canonical_json(pinned_configuration),
             next_run_at_us=next_run_at_us,
+        )
+
+
+    def active_for_type(
+        self,
+        job_type: str,
+        *,
+        limit: int = 16,
+    ) -> tuple[JobRecord, ...]:
+        """Return nonterminal jobs for one registered durable job type."""
+        if job_type not in self.BUILTIN_JOB_TYPES:
+            raise UnsupportedJobTypeError(
+                f"Unregistered ATHENA job type {job_type!r}."
+            )
+        return self.repository.list_nonterminal_by_type(
+            job_type=job_type,
+            limit=limit,
         )
 
     def acquire(

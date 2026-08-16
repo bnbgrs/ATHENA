@@ -46,7 +46,8 @@ NEWS_EVENT_STRUCTURE_SCHEMA_VERSION = 27
 NEWS_OPERATIONAL_SCHEMA_VERSION = 28
 PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION = 29
 NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION = 30
-SCHEMA_VERSION = NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION
+ARCHIVE_REPLICATION_SCHEMA_VERSION = 31
+SCHEMA_VERSION = ARCHIVE_REPLICATION_SCHEMA_VERSION
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
@@ -81,6 +82,9 @@ PRECISE_RESEARCH_PROVENANCE_MIGRATION_ID = (
 )
 NEWS_EVENT_ELIGIBILITY_MIGRATION_ID = (
     "0030_news_event_eligibility"
+)
+ARCHIVE_REPLICATION_MIGRATION_ID = (
+    "0031_archive_replication_outbox"
 )
 
 
@@ -176,6 +180,7 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         NEWS_EVENT_STRUCTURE_SCHEMA_VERSION,
         NEWS_OPERATIONAL_SCHEMA_VERSION,
         PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION,
+        NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -335,8 +340,18 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
             NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION
         )
 
+    if (
+        existing_user_version
+        == NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION
+    ):
+        _verify_schema_v30(connection)
+        _migrate_schema_v30_to_v31(connection)
+        existing_user_version = (
+            ARCHIVE_REPLICATION_SCHEMA_VERSION
+        )
+
     _configure_connection(connection)
-    _verify_schema_v30(connection)
+    _verify_schema_v31(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -2614,6 +2629,326 @@ def _migrate_schema_v28_to_v29(
     except BaseException:
         connection.rollback()
         raise
+
+
+
+def _migrate_schema_v30_to_v31(
+    connection: sqlite3.Connection,
+) -> None:
+    """Add restart-safe Raw Archive replication outbox and watermark."""
+    if connection.in_transaction:
+        raise RuntimeError(
+            "Archive replication migration requires no active transaction."
+        )
+
+    _verify_schema_v30(connection)
+
+    try:
+        connection.executescript(
+            f"""
+            BEGIN IMMEDIATE;
+
+            CREATE TABLE archive_replication_outbox (
+                outbox_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                blob_id BLOB(16) NOT NULL UNIQUE
+                    CHECK(length(blob_id) = 16),
+                target_role TEXT NOT NULL
+                    CHECK(target_role = 'archive_root'),
+                state TEXT NOT NULL
+                    CHECK(state IN ('pending', 'verified')),
+                attempt_count INTEGER NOT NULL DEFAULT 0
+                    CHECK(attempt_count >= 0),
+                created_at_us INTEGER NOT NULL,
+                last_attempt_at_us INTEGER NULL,
+                last_error_code TEXT NULL,
+                last_error_detail TEXT NULL,
+                verified_at_us INTEGER NULL,
+                FOREIGN KEY(blob_id)
+                    REFERENCES blob_records(blob_id),
+                CHECK(
+                    (state = 'pending' AND verified_at_us IS NULL)
+                    OR
+                    (state = 'verified' AND verified_at_us IS NOT NULL)
+                )
+            );
+
+            CREATE INDEX idx_archive_replication_outbox_state
+                ON archive_replication_outbox(
+                    state,
+                    outbox_seq
+                );
+
+            CREATE TABLE archive_replication_watermark (
+                singleton_id INTEGER PRIMARY KEY
+                    CHECK(singleton_id = 1),
+                contiguous_verified_seq INTEGER NOT NULL
+                    CHECK(contiguous_verified_seq >= 0),
+                updated_at_us INTEGER NOT NULL
+            );
+
+            INSERT INTO archive_replication_watermark (
+                singleton_id,
+                contiguous_verified_seq,
+                updated_at_us
+            ) VALUES (
+                1,
+                0,
+                CAST(strftime('%s','now') AS INTEGER) * 1000000
+            );
+
+            CREATE TRIGGER trg_blob_records_archive_replication_outbox
+            AFTER INSERT ON blob_records
+            WHEN NEW.storage_area = 'spool'
+            BEGIN
+                INSERT OR IGNORE INTO archive_replication_outbox (
+                    blob_id,
+                    target_role,
+                    state,
+                    attempt_count,
+                    created_at_us,
+                    last_attempt_at_us,
+                    last_error_code,
+                    last_error_detail,
+                    verified_at_us
+                ) VALUES (
+                    NEW.blob_id,
+                    'archive_root',
+                    'pending',
+                    0,
+                    NEW.created_at_us,
+                    NULL,
+                    NULL,
+                    NULL,
+                    NULL
+                );
+            END;
+
+            INSERT OR IGNORE INTO archive_replication_outbox (
+                blob_id,
+                target_role,
+                state,
+                attempt_count,
+                created_at_us,
+                last_attempt_at_us,
+                last_error_code,
+                last_error_detail,
+                verified_at_us
+            )
+            SELECT
+                blob_id,
+                'archive_root',
+                'pending',
+                0,
+                created_at_us,
+                NULL,
+                NULL,
+                NULL,
+                NULL
+            FROM blob_records
+            WHERE storage_area = 'spool'
+            ORDER BY created_at_us, blob_id;
+
+            UPDATE schema_metadata
+            SET schema_version = {
+                    ARCHIVE_REPLICATION_SCHEMA_VERSION
+                },
+                last_migration_id = '{
+                    ARCHIVE_REPLICATION_MIGRATION_ID
+                }',
+                minimum_reader_version = {
+                    ARCHIVE_REPLICATION_SCHEMA_VERSION
+                }
+            WHERE singleton_id = 1;
+
+            PRAGMA user_version = {
+                ARCHIVE_REPLICATION_SCHEMA_VERSION
+            };
+
+            COMMIT;
+            """
+        )
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def _verify_schema_v31(
+    connection: sqlite3.Connection,
+) -> None:
+    application_id = int(
+        connection.execute(
+            "PRAGMA application_id"
+        ).fetchone()[0]
+    )
+    user_version = int(
+        connection.execute(
+            "PRAGMA user_version"
+        ).fetchone()[0]
+    )
+
+    if application_id != ATHENA_APPLICATION_ID:
+        raise DatabaseCompatibilityError(
+            "ATHENA application_id verification failed."
+        )
+
+    if user_version != ARCHIVE_REPLICATION_SCHEMA_VERSION:
+        raise DatabaseCompatibilityError(
+            "ATHENA schema version verification failed."
+        )
+
+    metadata = connection.execute(
+        "SELECT schema_version, "
+        "storage_layout_version, "
+        "blob_format_version, "
+        "last_migration_id, "
+        "minimum_reader_version "
+        "FROM schema_metadata "
+        "WHERE singleton_id = 1"
+    ).fetchone()
+
+    expected = (
+        ARCHIVE_REPLICATION_SCHEMA_VERSION,
+        STORAGE_LAYOUT_VERSION,
+        BLOB_FORMAT_VERSION,
+        ARCHIVE_REPLICATION_MIGRATION_ID,
+        ARCHIVE_REPLICATION_SCHEMA_VERSION,
+    )
+
+    if metadata is None or tuple(metadata) != expected:
+        raise DatabaseCompatibilityError(
+            "ATHENA schema_metadata verification failed."
+        )
+
+    _verify_schema_v24_compatible(connection)
+
+    required_tables = {
+        "research_synthesis_output_source_evidence",
+        "archive_replication_outbox",
+        "archive_replication_watermark",
+    }
+
+    missing_tables = required_tables.difference(
+        _user_tables(connection)
+    )
+
+    if missing_tables:
+        raise DatabaseCompatibilityError(
+            "ATHENA archive replication schema is incomplete: "
+            + ", ".join(sorted(missing_tables))
+            + "."
+        )
+
+    outbox_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(archive_replication_outbox)"
+        )
+    }
+
+    required_outbox_columns = {
+        "outbox_seq",
+        "blob_id",
+        "target_role",
+        "state",
+        "attempt_count",
+        "created_at_us",
+        "last_attempt_at_us",
+        "last_error_code",
+        "last_error_detail",
+        "verified_at_us",
+    }
+
+    if not required_outbox_columns.issubset(
+        outbox_columns
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA archive replication outbox is incomplete."
+        )
+
+    trigger = connection.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'trigger'
+          AND name = 'trg_blob_records_archive_replication_outbox'
+        """
+    ).fetchone()
+
+    if trigger is None:
+        raise DatabaseCompatibilityError(
+            "ATHENA archive replication enqueue trigger is missing."
+        )
+
+    watermark = connection.execute(
+        """
+        SELECT contiguous_verified_seq
+        FROM archive_replication_watermark
+        WHERE singleton_id = 1
+        """
+    ).fetchone()
+
+    if watermark is None:
+        raise DatabaseCompatibilityError(
+            "ATHENA archive replication watermark is missing."
+        )
+
+    invalid_state = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM archive_replication_outbox AS o
+        JOIN blob_records AS b
+          ON b.blob_id = o.blob_id
+        WHERE
+            (o.state = 'pending'
+             AND b.storage_area != 'spool')
+            OR
+            (o.state = 'verified'
+             AND b.storage_area != 'archive')
+        """
+    ).fetchone()
+
+    if (
+        invalid_state is None
+        or int(invalid_state[0]) != 0
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA archive replication state disagrees "
+            "with BlobRecord storage state."
+        )
+
+    precise_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info("
+            "research_synthesis_output_source_evidence"
+            ")"
+        )
+    }
+
+    if not {
+        "artifact_id",
+        "output_kind",
+        "output_ordinal",
+        "source_analysis_artifact_id",
+    }.issubset(precise_columns):
+        raise DatabaseCompatibilityError(
+            "ATHENA precise Research synthesis provenance "
+            "is incomplete."
+        )
+
+    try:
+        verify_news_schema_v30(connection)
+    except RuntimeError as exc:
+        raise DatabaseCompatibilityError(
+            str(exc)
+        ) from exc
+
+    if connection.execute(
+        "PRAGMA foreign_key_check"
+    ).fetchall():
+        raise DatabaseCompatibilityError(
+            "ATHENA foreign-key verification failed."
+        )
 
 
 def _verify_schema_v30(

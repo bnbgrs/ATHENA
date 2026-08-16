@@ -162,6 +162,46 @@ class JobRepository:
         ).fetchall()
         return tuple(_job_from_row(row) for row in rows)
 
+
+    def list_nonterminal_by_type(
+        self,
+        *,
+        job_type: str,
+        limit: int = 16,
+    ) -> tuple[JobRecord, ...]:
+        """Return durable nonterminal jobs of one exact registered type."""
+        normalized_type = job_type.strip()
+        if not normalized_type:
+            raise ValueError("job_type must not be empty.")
+        if limit <= 0:
+            raise ValueError("Job lookup limit must be positive.")
+
+        rows = self.database.connection.execute(
+            """
+            SELECT *
+            FROM jobs
+            WHERE job_type = ?
+              AND state IN (
+                  'queued',
+                  'waiting',
+                  'running',
+                  'paused',
+                  'cancel_requested'
+              )
+            ORDER BY created_at_us ASC, job_id ASC
+            LIMIT ?
+            """,
+            (
+                normalized_type,
+                limit,
+            ),
+        ).fetchall()
+
+        return tuple(
+            _job_from_row(row)
+            for row in rows
+        )
+
     def list_waiting(self, *, limit: int = 128) -> tuple[JobRecord, ...]:
         """Return waiting jobs in deterministic oldest-first order."""
         if limit <= 0:

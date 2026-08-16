@@ -10,6 +10,11 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from athena.common.time import utc_now_us
+from athena.jobs.archive_replication import (
+    ARCHIVE_REPLICATION_JOB_TYPE,
+    ArchiveReplicationJobError,
+    DurableArchiveReplicationWorker,
+)
 from athena.jobs.embedding_processing import (
     DurableEmbeddingRebuildWorker,
     EmbeddingRebuildJobError,
@@ -144,6 +149,7 @@ class DurableJobScheduler:
         analysis_worker: DurableSourceAnalysisWorker | None = None,
         extraction_worker: DurableSourceHierarchicalExtractionWorker | None = None,
         research_worker: DurableResearchWorker | None = None,
+        archive_replication_worker: DurableArchiveReplicationWorker | None = None,
         resources: ResourceManager | None = None,
         news_worker: DurableNewsSchedulerWorker | None = None,
         policy: SchedulerPolicy | None = None,
@@ -154,15 +160,42 @@ class DurableJobScheduler:
         self.analysis_worker = analysis_worker
         self.extraction_worker = extraction_worker
         self.research_worker = research_worker
+        self.archive_replication_worker = archive_replication_worker
         self.resources = resources
         self.news_worker = news_worker
         self.policy = policy or SchedulerPolicy()
 
     @property
-    def supported_job_types(self) -> frozenset[str]:
-        if self.news_worker is None:
-            return _SUPPORTED_JOB_TYPES
-        return _SUPPORTED_JOB_TYPES | frozenset({NEWS_JOB_TYPE, NEWS_PERIOD_JOB_TYPE})
+    def supported_job_types(
+        self,
+    ) -> frozenset[str]:
+        supported = _SUPPORTED_JOB_TYPES
+
+        if (
+            self.archive_replication_worker
+            is not None
+        ):
+            supported = (
+                supported
+                | frozenset(
+                    {
+                        ARCHIVE_REPLICATION_JOB_TYPE,
+                    }
+                )
+            )
+
+        if self.news_worker is not None:
+            supported = (
+                supported
+                | frozenset(
+                    {
+                        NEWS_JOB_TYPE,
+                        NEWS_PERIOD_JOB_TYPE,
+                    }
+                )
+            )
+
+        return supported
 
     def tick(
         self,
@@ -185,6 +218,10 @@ class DurableJobScheduler:
             news_woken = self.news_worker.reconcile_dependencies()
 
         recovered = self.jobs.recover_startup(now_us=now)
+
+        if self.archive_replication_worker is not None:
+            self.archive_replication_worker.reconcile_pending()
+
         scheduled_retries = self._schedule_orphaned_retry_waiters(now)
         woken = self.jobs.wake_due_waiting(now_us=now)
         legacy_research_woken = (
@@ -396,52 +433,177 @@ class DurableJobScheduler:
             idle=last_idle,
         )
 
-    def _dispatch(self, leased: JobRecord) -> tuple[str, JobRecord]:
+    def _dispatch(
+        self,
+        leased: JobRecord,
+    ) -> tuple[str, JobRecord]:
         lease_token = leased.lease_token
+
         if lease_token is None:
-            raise JobSchedulerError("Dispatch requires a live lease token.")
+            raise JobSchedulerError(
+                "Dispatch requires a live lease token."
+            )
+
         try:
+            if (
+                leased.job_type
+                == ARCHIVE_REPLICATION_JOB_TYPE
+            ):
+                return self._dispatch_archive_replication(
+                    leased.job_id,
+                    lease_token,
+                )
+
             if leased.job_type == "source.process":
-                return self._dispatch_source(leased.job_id, lease_token)
+                return self._dispatch_source(
+                    leased.job_id,
+                    lease_token,
+                )
+
             if leased.job_type == "embedding.rebuild":
-                return self._dispatch_embedding(leased.job_id, lease_token)
+                return self._dispatch_embedding(
+                    leased.job_id,
+                    lease_token,
+                )
+
             if leased.job_type == "source.analyze":
                 if self.analysis_worker is None:
-                    raise JobSchedulerError("No source.analyze worker is configured.")
-                return self._dispatch_analysis(leased.job_id, lease_token)
+                    raise JobSchedulerError(
+                        "No source.analyze worker is configured."
+                    )
+
+                return self._dispatch_analysis(
+                    leased.job_id,
+                    lease_token,
+                )
+
             if leased.job_type == "source.extract":
                 if self.extraction_worker is None:
-                    raise JobSchedulerError("No source.extract worker is configured.")
-                return self._dispatch_extraction(leased.job_id, lease_token)
-            if leased.job_type == "research.exhaustive":
+                    raise JobSchedulerError(
+                        "No source.extract worker is configured."
+                    )
+
+                return self._dispatch_extraction(
+                    leased.job_id,
+                    lease_token,
+                )
+
+            if (
+                leased.job_type
+                == "research.exhaustive"
+            ):
                 if self.research_worker is None:
-                    raise JobSchedulerError("No research.exhaustive worker is configured.")
-                return self._dispatch_research(leased.job_id, lease_token)
-            if leased.job_type in {NEWS_JOB_TYPE, NEWS_PERIOD_JOB_TYPE}:
-                return self._dispatch_news(leased)
+                    raise JobSchedulerError(
+                        "No research.exhaustive worker "
+                        "is configured."
+                    )
+
+                return self._dispatch_research(
+                    leased.job_id,
+                    lease_token,
+                )
+
+            if leased.job_type in {
+                NEWS_JOB_TYPE,
+                NEWS_PERIOD_JOB_TYPE,
+            }:
+                return self._dispatch_news(
+                    leased
+                )
+
             raise JobSchedulerError(
-                f"No scheduler dispatcher registered for {leased.job_type!r}."
+                "No scheduler dispatcher registered "
+                f"for {leased.job_type!r}."
             )
-        except (JobLeaseError, JobTransitionError):
-            raise
+
         except (
+            JobLeaseError,
+            JobTransitionError,
+        ):
+            raise
+
+        except (
+            ArchiveReplicationJobError,
             SourceProcessingJobError,
             EmbeddingRebuildJobError,
             SourceAnalysisJobError,
             SourceHierarchicalExtractionJobError,
             ResearchJobError,
         ) as exc:
-            return "failed", self._fail_if_still_leased(
-                leased.job_id,
-                lease_token,
-                reason=f"scheduler_dispatch:{type(exc).__name__}",
+            return (
+                "failed",
+                self._fail_if_still_leased(
+                    leased.job_id,
+                    lease_token,
+                    reason=(
+                        "scheduler_dispatch:"
+                        f"{type(exc).__name__}"
+                    ),
+                ),
             )
+
         except Exception as exc:
-            return "failed", self._fail_if_still_leased(
-                leased.job_id,
-                lease_token,
-                reason=f"scheduler_unexpected:{type(exc).__name__}",
+            return (
+                "failed",
+                self._fail_if_still_leased(
+                    leased.job_id,
+                    lease_token,
+                    reason=(
+                        "scheduler_unexpected:"
+                        f"{type(exc).__name__}"
+                    ),
+                ),
             )
+
+    def _dispatch_archive_replication(
+        self,
+        job_id: uuid.UUID,
+        lease_token: bytes,
+    ) -> tuple[str, JobRecord]:
+        worker = (
+            self.archive_replication_worker
+        )
+
+        if worker is None:
+            raise JobSchedulerError(
+                "No archive.replicate worker "
+                "is configured."
+            )
+
+        for _ in range(
+            self.policy.max_boundaries_per_dispatch
+        ):
+            result = worker.step(
+                job_id,
+                lease_token=lease_token,
+                extend_seconds=(
+                    self.policy.lease_seconds
+                ),
+            )
+
+            if result.done:
+                action = (
+                    "cancelled"
+                    if result.job.state
+                    is JobState.CANCELLED
+                    else "completed"
+                )
+
+                return (
+                    action,
+                    result.job,
+                )
+
+            if result.waiting:
+                return (
+                    "waiting",
+                    result.job,
+                )
+
+        return self._yield_at_boundary(
+            job_id,
+            lease_token,
+        )
 
     def _dispatch_news(self, leased: JobRecord) -> tuple[str, JobRecord]:
         if self.news_worker is None:
@@ -607,51 +769,149 @@ class DurableJobScheduler:
         job_id: uuid.UUID,
         lease_token: bytes,
     ) -> tuple[str, JobRecord]:
-        current = self.jobs.get(job_id)
-        if current.state is JobState.CANCEL_REQUESTED:
+        current = self.jobs.get(
+            job_id
+        )
+
+        if (
+            current.state
+            is JobState.CANCEL_REQUESTED
+        ):
+            if (
+                current.job_type
+                == ARCHIVE_REPLICATION_JOB_TYPE
+            ):
+                worker = (
+                    self.archive_replication_worker
+                )
+
+                if worker is None:
+                    raise JobSchedulerError(
+                        "No archive.replicate worker "
+                        "is configured."
+                    )
+
+                archive_result = worker.step(
+                    job_id,
+                    lease_token=lease_token,
+                    extend_seconds=(
+                        self.policy.lease_seconds
+                    ),
+                )
+
+                return (
+                    "cancelled",
+                    archive_result.job,
+                )
+
             if current.job_type == "source.process":
                 source_result = self.source_worker.step(
                     job_id,
                     lease_token=lease_token,
-                    extend_seconds=self.policy.lease_seconds,
+                    extend_seconds=(
+                        self.policy.lease_seconds
+                    ),
                 )
-                return "cancelled", source_result.job
+
+                return (
+                    "cancelled",
+                    source_result.job,
+                )
+
             if current.job_type == "embedding.rebuild":
-                embedding_result = self.embedding_worker.step(
-                    job_id,
-                    lease_token=lease_token,
-                    extend_seconds=self.policy.lease_seconds,
+                embedding_result = (
+                    self.embedding_worker.step(
+                        job_id,
+                        lease_token=lease_token,
+                        extend_seconds=(
+                            self.policy.lease_seconds
+                        ),
+                    )
                 )
-                return "cancelled", embedding_result.job
+
+                return (
+                    "cancelled",
+                    embedding_result.job,
+                )
+
             if current.job_type == "source.analyze":
                 if self.analysis_worker is None:
-                    raise JobSchedulerError("No source.analyze worker is configured.")
-                analysis_result = self.analysis_worker.step(
-                    job_id,
-                    lease_token=lease_token,
-                    extend_seconds=self.policy.lease_seconds,
+                    raise JobSchedulerError(
+                        "No source.analyze worker "
+                        "is configured."
+                    )
+
+                analysis_result = (
+                    self.analysis_worker.step(
+                        job_id,
+                        lease_token=lease_token,
+                        extend_seconds=(
+                            self.policy.lease_seconds
+                        ),
+                    )
                 )
-                return "cancelled", analysis_result.job
+
+                return (
+                    "cancelled",
+                    analysis_result.job,
+                )
+
             if current.job_type == "source.extract":
                 if self.extraction_worker is None:
-                    raise JobSchedulerError("No source.extract worker is configured.")
-                extraction_result = self.extraction_worker.step(
-                    job_id,
-                    lease_token=lease_token,
-                    extend_seconds=self.policy.lease_seconds,
+                    raise JobSchedulerError(
+                        "No source.extract worker "
+                        "is configured."
+                    )
+
+                extraction_result = (
+                    self.extraction_worker.step(
+                        job_id,
+                        lease_token=lease_token,
+                        extend_seconds=(
+                            self.policy.lease_seconds
+                        ),
+                    )
                 )
-                return "cancelled", extraction_result.job
-            if current.job_type == "research.exhaustive":
+
+                return (
+                    "cancelled",
+                    extraction_result.job,
+                )
+
+            if (
+                current.job_type
+                == "research.exhaustive"
+            ):
                 if self.research_worker is None:
-                    raise JobSchedulerError("No research.exhaustive worker is configured.")
-                research_result = self.research_worker.step(
-                    job_id,
-                    lease_token=lease_token,
-                    extend_seconds=self.policy.lease_seconds,
+                    raise JobSchedulerError(
+                        "No research.exhaustive worker "
+                        "is configured."
+                    )
+
+                research_result = (
+                    self.research_worker.step(
+                        job_id,
+                        lease_token=lease_token,
+                        extend_seconds=(
+                            self.policy.lease_seconds
+                        ),
+                    )
                 )
-                return "cancelled", research_result.job
-        yielded = self.jobs.yield_job(job_id, lease_token=lease_token)
-        return "yielded", yielded
+
+                return (
+                    "cancelled",
+                    research_result.job,
+                )
+
+        yielded = self.jobs.yield_job(
+            job_id,
+            lease_token=lease_token,
+        )
+
+        return (
+            "yielded",
+            yielded,
+        )
 
     def _fail_if_still_leased(
         self,

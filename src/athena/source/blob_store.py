@@ -6,6 +6,7 @@ import hashlib
 import mimetypes
 import os
 import secrets
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +30,10 @@ class SourceChangedDuringCaptureError(BlobStoreError):
 
 class BlobIntegrityError(BlobStoreError):
     """Raised when stored bytes do not match the expected integrity hash."""
+
+
+class ArchiveStorageUnavailableError(BlobStoreError):
+    """Raised when the configured long-term Archive Root is unavailable."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,17 +146,165 @@ class BlobStore:
         storage_locator: str,
         expected_sha256: bytes,
         expected_length: int,
+        progress_callback: Callable[[], None] | None = None,
     ) -> Path:
         path = self.resolve_blob_path(
             storage_area=storage_area,
             storage_locator=storage_locator,
         )
-        digest, byte_length = _hash_file(path)
-        if byte_length != expected_length or digest != expected_sha256:
+
+        digest, byte_length = _hash_file(
+            path,
+            progress_callback=progress_callback,
+        )
+
+        if (
+            byte_length != expected_length
+            or digest != expected_sha256
+        ):
             raise BlobIntegrityError(
-                f"Raw Archive blob integrity verification failed for {str(path)!r}."
+                "Raw Archive blob integrity verification "
+                f"failed for {str(path)!r}."
             )
+
         return path
+
+
+    def replicate_spool_blob_to_archive(
+        self,
+        *,
+        storage_locator: str,
+        expected_sha256: bytes,
+        expected_length: int,
+        progress_callback: Callable[[], None] | None = None,
+    ) -> Path:
+        """Copy one verified spool blob to the configured Archive Root."""
+        archive_root = self.paths.archive_root
+
+        if archive_root is None:
+            raise ArchiveStorageUnavailableError(
+                "No archive_root is configured."
+            )
+
+        if not archive_root.is_dir():
+            raise ArchiveStorageUnavailableError(
+                "Configured archive_root is unavailable."
+            )
+
+        source_path = self.verify_blob(
+            storage_area=BlobStorageArea.SPOOL,
+            storage_locator=storage_locator,
+            expected_sha256=expected_sha256,
+            expected_length=expected_length,
+            progress_callback=progress_callback,
+        )
+
+        try:
+            self._copy_into_root(
+                source_path,
+                root=archive_root,
+                locator=storage_locator,
+                expected_sha256=expected_sha256,
+                expected_length=expected_length,
+                progress_callback=progress_callback,
+            )
+        except BlobIntegrityError:
+            raise
+        except (BlobStoreError, OSError) as exc:
+            raise ArchiveStorageUnavailableError(
+                "Archive Root became unavailable "
+                "during replication."
+            ) from exc
+
+        target_path = (
+            archive_root
+            / Path(storage_locator)
+        )
+
+        try:
+            digest, length = _hash_file(
+                target_path,
+                progress_callback=progress_callback,
+            )
+        except BlobStoreError as exc:
+            raise ArchiveStorageUnavailableError(
+                "Replicated Archive blob cannot "
+                "be read back."
+            ) from exc
+
+        if (
+            digest != expected_sha256
+            or length != expected_length
+        ):
+            raise BlobIntegrityError(
+                "Replicated Archive blob failed "
+                "target verification."
+            )
+
+        return target_path
+
+    def cleanup_verified_spool_replica(
+        self,
+        *,
+        storage_locator: str,
+        expected_sha256: bytes,
+        expected_length: int,
+        progress_callback: Callable[[], None] | None = None,
+    ) -> bool:
+        """Delete transfer-only spool bytes only after Archive verification."""
+        spool_path = self.resolve_blob_path(
+            storage_area=BlobStorageArea.SPOOL,
+            storage_locator=storage_locator,
+        )
+
+        # Normal verified rows have already been cleaned. Do not re-hash
+        # long-term storage when there is no transfer-only local duplicate.
+        if not spool_path.exists():
+            return False
+
+        archive_path = self.verify_blob(
+            storage_area=BlobStorageArea.ARCHIVE,
+            storage_locator=storage_locator,
+            expected_sha256=expected_sha256,
+            expected_length=expected_length,
+            progress_callback=progress_callback,
+        )
+
+        if (
+            archive_path.resolve()
+            == spool_path.resolve()
+        ):
+            raise BlobStoreError(
+                "Archive Root and Durable Spool resolve to "
+                "the same physical blob path."
+            )
+
+        digest, length = _hash_file(
+            spool_path,
+            progress_callback=progress_callback,
+        )
+
+        if (
+            digest != expected_sha256
+            or length != expected_length
+        ):
+            raise BlobIntegrityError(
+                "Transfer-only spool replica failed integrity "
+                "verification before cleanup."
+            )
+
+        try:
+            spool_path.unlink()
+        except OSError as exc:
+            raise BlobStoreError(
+                "Verified transfer-only spool replica "
+                "could not be removed."
+            ) from exc
+
+        if progress_callback is not None:
+            progress_callback()
+
+        return True
 
     def _commit_staged_blob(
         self,
@@ -195,39 +348,91 @@ class BlobStore:
         locator: str,
         expected_sha256: bytes,
         expected_length: int,
+        progress_callback: Callable[[], None] | None = None,
     ) -> None:
-        final_path = root / Path(locator)
-        final_path.parent.mkdir(parents=True, exist_ok=True)
+        final_path = (
+            root
+            / Path(locator)
+        )
+
+        final_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
         if final_path.exists():
-            digest, length = _hash_file(final_path)
-            if digest != expected_sha256 or length != expected_length:
+            digest, length = _hash_file(
+                final_path,
+                progress_callback=progress_callback,
+            )
+
+            if (
+                digest != expected_sha256
+                or length != expected_length
+            ):
                 raise BlobIntegrityError(
-                    f"Existing content-addressed blob is corrupt: {str(final_path)!r}."
+                    "Existing content-addressed blob "
+                    f"is corrupt: {str(final_path)!r}."
                 )
+
             return
 
         temp_path = final_path.with_name(
-            f".{final_path.name}.{secrets.token_hex(8)}.partial"
+            f".{final_path.name}."
+            f"{secrets.token_hex(8)}.partial"
         )
+
         try:
-            with staging_path.open("rb") as source, temp_path.open("xb") as target:
+            with (
+                staging_path.open("rb") as source,
+                temp_path.open("xb") as target,
+            ):
                 while True:
-                    chunk = source.read(_COPY_BUFFER_SIZE)
+                    chunk = source.read(
+                        _COPY_BUFFER_SIZE
+                    )
+
                     if not chunk:
                         break
-                    target.write(chunk)
-                target.flush()
-                os.fsync(target.fileno())
 
-            digest, length = _hash_file(temp_path)
-            if digest != expected_sha256 or length != expected_length:
-                raise BlobIntegrityError(
-                    f"Blob changed before finalization: {str(temp_path)!r}."
+                    target.write(
+                        chunk
+                    )
+
+                    if progress_callback is not None:
+                        progress_callback()
+
+                target.flush()
+                os.fsync(
+                    target.fileno()
                 )
-            os.replace(temp_path, final_path)
+
+            digest, length = _hash_file(
+                temp_path,
+                progress_callback=progress_callback,
+            )
+
+            if (
+                digest != expected_sha256
+                or length != expected_length
+            ):
+                raise BlobIntegrityError(
+                    "Blob changed before finalization: "
+                    f"{str(temp_path)!r}."
+                )
+
+            os.replace(
+                temp_path,
+                final_path,
+            )
+
+            if progress_callback is not None:
+                progress_callback()
+
         finally:
-            temp_path.unlink(missing_ok=True)
+            temp_path.unlink(
+                missing_ok=True
+            )
 
 
 def _blob_locator(integrity_sha256: bytes) -> str:
@@ -235,20 +440,44 @@ def _blob_locator(integrity_sha256: bytes) -> str:
     return f"blobs/sha256/{value[:2]}/{value[2:4]}/{value}.blob"
 
 
-def _hash_file(path: Path) -> tuple[bytes, int]:
+def _hash_file(
+    path: Path,
+    *,
+    progress_callback: Callable[[], None] | None = None,
+) -> tuple[bytes, int]:
     digest = hashlib.sha256()
     byte_length = 0
+
     try:
         with path.open("rb") as handle:
             while True:
-                chunk = handle.read(_COPY_BUFFER_SIZE)
+                chunk = handle.read(
+                    _COPY_BUFFER_SIZE
+                )
+
                 if not chunk:
                     break
-                digest.update(chunk)
-                byte_length += len(chunk)
+
+                digest.update(
+                    chunk
+                )
+                byte_length += len(
+                    chunk
+                )
+
+                if progress_callback is not None:
+                    progress_callback()
+
     except OSError as exc:
-        raise BlobStoreError(f"Cannot read stored Raw Archive blob {str(path)!r}.") from exc
-    return digest.digest(), byte_length
+        raise BlobStoreError(
+            "Cannot read stored Raw Archive blob "
+            f"{str(path)!r}."
+        ) from exc
+
+    return (
+        digest.digest(),
+        byte_length,
+    )
 
 
 def _detect_media_type(path: Path) -> str | None:

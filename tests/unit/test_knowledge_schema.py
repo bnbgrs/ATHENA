@@ -3,6 +3,8 @@ import sqlite3
 from athena.common.ids import new_uuid7, uuid_to_blob
 from athena.storage.database import SQLiteDatabase
 from athena.storage.schema import (
+    ARCHIVE_REPLICATION_MIGRATION_ID,
+    ARCHIVE_REPLICATION_SCHEMA_VERSION,
     CONSOLIDATED_OPERATIONS_SCHEMA_VERSION,
     DURABLE_JOBS_SCHEMA_VERSION,
     EXHAUSTIVE_RESEARCH_SCHEMA_VERSION,
@@ -15,8 +17,6 @@ from athena.storage.schema import (
     MERGE_REVIEW_MULTI_TARGET_SCHEMA_VERSION,
     MERGE_REVIEW_SCHEMA_VERSION,
     MODEL_RUNS_SCHEMA_VERSION,
-    NEWS_EVENT_ELIGIBILITY_MIGRATION_ID,
-    NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION,
     NEWS_EVENT_STRUCTURE_MIGRATION_ID,
     NEWS_EVENT_STRUCTURE_SCHEMA_VERSION,
     NEWS_OPERATIONAL_MIGRATION_ID,
@@ -63,6 +63,8 @@ EXPECTED_SEMANTIC_TABLES = {
     "search_embeddings",
     "search_embedding_state",
     "blob_records",
+    "archive_replication_outbox",
+    "archive_replication_watermark",
     "sources",
     "source_representations",
     "source_representation_pages",
@@ -146,7 +148,7 @@ def test_fresh_database_contains_semantic_schema(tmp_path) -> None:
     ).fetchone()
     assert tuple(metadata) == (
         SCHEMA_VERSION,
-        NEWS_EVENT_ELIGIBILITY_MIGRATION_ID,
+        ARCHIVE_REPLICATION_MIGRATION_ID,
         SCHEMA_VERSION,
     )
 
@@ -679,7 +681,7 @@ def test_v14_database_is_upgraded_additively_to_durable_jobs(tmp_path) -> None:
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == NEWS_EVENT_ELIGIBILITY_MIGRATION_ID
+    assert metadata["last_migration_id"] == ARCHIVE_REPLICATION_MIGRATION_ID
     database.stop()
 
 
@@ -844,7 +846,7 @@ def test_v17_database_is_upgraded_additively_to_hierarchical_source_analysis(tmp
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == NEWS_EVENT_ELIGIBILITY_MIGRATION_ID
+    assert metadata["last_migration_id"] == ARCHIVE_REPLICATION_MIGRATION_ID
     database.stop()
 
 
@@ -903,7 +905,7 @@ def test_v18_database_is_upgraded_additively_to_source_knowledge_promotion(tmp_p
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == NEWS_EVENT_ELIGIBILITY_MIGRATION_ID
+    assert metadata["last_migration_id"] == ARCHIVE_REPLICATION_MIGRATION_ID
     database.stop()
 
 
@@ -969,7 +971,7 @@ def test_v19_database_is_upgraded_additively_to_hierarchical_source_extraction(t
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == NEWS_EVENT_ELIGIBILITY_MIGRATION_ID
+    assert metadata["last_migration_id"] == ARCHIVE_REPLICATION_MIGRATION_ID
     database.stop()
 
 
@@ -1038,7 +1040,7 @@ def test_v20_database_is_upgraded_additively_to_personal_memory(tmp_path) -> Non
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == NEWS_EVENT_ELIGIBILITY_MIGRATION_ID
+    assert metadata["last_migration_id"] == ARCHIVE_REPLICATION_MIGRATION_ID
     database.stop()
 
 
@@ -1116,7 +1118,7 @@ def test_v21_database_is_upgraded_additively_to_exhaustive_research(tmp_path) ->
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == NEWS_EVENT_ELIGIBILITY_MIGRATION_ID
+    assert metadata["last_migration_id"] == ARCHIVE_REPLICATION_MIGRATION_ID
     database.stop()
 
 
@@ -1210,7 +1212,7 @@ def test_v22_database_is_upgraded_additively_to_research_orchestration(
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == NEWS_EVENT_ELIGIBILITY_MIGRATION_ID
+    assert metadata["last_migration_id"] == ARCHIVE_REPLICATION_MIGRATION_ID
     database.stop()
 
 
@@ -1295,7 +1297,7 @@ def test_v23_database_is_upgraded_additively_to_research_synthesis(tmp_path) -> 
         "FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == NEWS_EVENT_ELIGIBILITY_MIGRATION_ID
+    assert metadata["last_migration_id"] == ARCHIVE_REPLICATION_MIGRATION_ID
     assert metadata["minimum_reader_version"] == SCHEMA_VERSION
     assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     database.stop()
@@ -1360,6 +1362,20 @@ def test_v28_database_is_upgraded_additively_to_precise_research_provenance(
         autocommit=True,
     )
     legacy.row_factory = sqlite3.Row
+
+    # This test creates the latest database first and then
+    # reconstructs an older schema boundary. Remove every
+    # additive v31 object before declaring the DB v28/v29.
+    legacy.execute(
+        "DROP TRIGGER "
+        "trg_blob_records_archive_replication_outbox"
+    )
+    legacy.execute(
+        "DROP TABLE archive_replication_watermark"
+    )
+    legacy.execute(
+        "DROP TABLE archive_replication_outbox"
+    )
 
     legacy.execute(
         "DROP TABLE news_finding_assessments"
@@ -1483,9 +1499,9 @@ def test_v28_database_is_upgraded_additively_to_precise_research_provenance(
     assert metadata is not None
 
     assert tuple(metadata) == (
-        NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION,
-        NEWS_EVENT_ELIGIBILITY_MIGRATION_ID,
-        NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION,
+        ARCHIVE_REPLICATION_SCHEMA_VERSION,
+        ARCHIVE_REPLICATION_MIGRATION_ID,
+        ARCHIVE_REPLICATION_SCHEMA_VERSION,
     )
 
     news_metadata = connection.execute(
@@ -1523,6 +1539,20 @@ def test_v29_database_is_upgraded_additively_to_news_event_eligibility(
         autocommit=True,
     )
     legacy.row_factory = sqlite3.Row
+
+    # This test creates the latest database first and then
+    # reconstructs an older schema boundary. Remove every
+    # additive v31 object before declaring the DB v28/v29.
+    legacy.execute(
+        "DROP TRIGGER "
+        "trg_blob_records_archive_replication_outbox"
+    )
+    legacy.execute(
+        "DROP TABLE archive_replication_watermark"
+    )
+    legacy.execute(
+        "DROP TABLE archive_replication_outbox"
+    )
 
     legacy.execute(
         "DROP TABLE news_finding_assessments"
@@ -1585,7 +1615,7 @@ def test_v29_database_is_upgraded_additively_to_news_event_eligibility(
         connection.execute(
             "PRAGMA user_version"
         ).fetchone()[0]
-        == NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION
+        == SCHEMA_VERSION
     )
 
     assert (
@@ -1616,9 +1646,9 @@ def test_v29_database_is_upgraded_additively_to_news_event_eligibility(
     assert metadata is not None
 
     assert tuple(metadata) == (
-        NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION,
-        NEWS_EVENT_ELIGIBILITY_MIGRATION_ID,
-        NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION,
+        ARCHIVE_REPLICATION_SCHEMA_VERSION,
+        ARCHIVE_REPLICATION_MIGRATION_ID,
+        ARCHIVE_REPLICATION_SCHEMA_VERSION,
     )
 
     news_metadata = connection.execute(

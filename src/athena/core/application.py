@@ -22,6 +22,7 @@ from athena.chat.unified import UnifiedLocalChatService
 from athena.config.settings import AthenaSettings
 from athena.core.services import LifecycleService, ServiceManager
 from athena.external.gateway import ExternalAccessGateway, ExternalResearchService
+from athena.jobs.archive_replication import DurableArchiveReplicationWorker
 from athena.jobs.embedding_processing import DurableEmbeddingRebuildWorker
 from athena.jobs.repository import JobRepository
 from athena.jobs.research import DurableResearchWorker
@@ -85,6 +86,10 @@ from athena.source.analysis_repository import SourceAnalysisRepository
 from athena.source.analysis_service import SourceAnalysisService
 from athena.source.anchor_repository import SourceAnchorRepository
 from athena.source.anchor_service import SourceAnchorService
+from athena.source.archive_replication import (
+    ArchiveReplicationRepository,
+    ArchiveReplicationService,
+)
 from athena.source.blob_store import BlobStore
 from athena.source.chunk_store import SourceChunkStore
 from athena.source.chunking_repository import ChunkingProfileRepository
@@ -138,6 +143,19 @@ class AthenaApplication:
         self.jobs = DurableJobService(self.job_repository, self.chat)
         self.research_repository = ResearchRepository(self.database)
         self.blob_store = BlobStore(self.paths)
+        self.archive_replication_repository = (
+            ArchiveReplicationRepository(
+                self.database
+            )
+        )
+        self.archive_replication = ArchiveReplicationService(
+            repository=self.archive_replication_repository,
+            blob_store=self.blob_store,
+        )
+        self.archive_replication_worker = DurableArchiveReplicationWorker(
+            jobs=self.jobs,
+            replication=self.archive_replication,
+        )
         self.source_repository = SourceRepository(self.database)
         self.source_representation_repository = SourceRepresentationRepository(self.database)
         self.source_anchor_repository = SourceAnchorRepository(self.database)
@@ -391,6 +409,7 @@ class AthenaApplication:
             analysis_worker=self.source_analysis,
             extraction_worker=self.source_hierarchical_extraction,
             research_worker=self.research_worker,
+            archive_replication_worker=self.archive_replication_worker,
             resources=self.resources,
             news_worker=self.news,
         )
