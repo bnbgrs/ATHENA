@@ -15,6 +15,8 @@ from athena.storage.schema import (
     MERGE_REVIEW_MULTI_TARGET_SCHEMA_VERSION,
     MERGE_REVIEW_SCHEMA_VERSION,
     MODEL_RUNS_SCHEMA_VERSION,
+    NEWS_EVENT_ELIGIBILITY_MIGRATION_ID,
+    NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION,
     NEWS_EVENT_STRUCTURE_MIGRATION_ID,
     NEWS_EVENT_STRUCTURE_SCHEMA_VERSION,
     NEWS_OPERATIONAL_MIGRATION_ID,
@@ -112,6 +114,7 @@ EXPECTED_SEMANTIC_TABLES = {
     "news_runs",
     "news_discoveries",
     "news_events",
+    "news_finding_assessments",
     "news_event_links",
     "news_period_runs",
     "news_digests",
@@ -143,7 +146,7 @@ def test_fresh_database_contains_semantic_schema(tmp_path) -> None:
     ).fetchone()
     assert tuple(metadata) == (
         SCHEMA_VERSION,
-        PRECISE_RESEARCH_PROVENANCE_MIGRATION_ID,
+        NEWS_EVENT_ELIGIBILITY_MIGRATION_ID,
         SCHEMA_VERSION,
     )
 
@@ -676,7 +679,7 @@ def test_v14_database_is_upgraded_additively_to_durable_jobs(tmp_path) -> None:
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == PRECISE_RESEARCH_PROVENANCE_MIGRATION_ID
+    assert metadata["last_migration_id"] == NEWS_EVENT_ELIGIBILITY_MIGRATION_ID
     database.stop()
 
 
@@ -841,7 +844,7 @@ def test_v17_database_is_upgraded_additively_to_hierarchical_source_analysis(tmp
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == PRECISE_RESEARCH_PROVENANCE_MIGRATION_ID
+    assert metadata["last_migration_id"] == NEWS_EVENT_ELIGIBILITY_MIGRATION_ID
     database.stop()
 
 
@@ -900,7 +903,7 @@ def test_v18_database_is_upgraded_additively_to_source_knowledge_promotion(tmp_p
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == PRECISE_RESEARCH_PROVENANCE_MIGRATION_ID
+    assert metadata["last_migration_id"] == NEWS_EVENT_ELIGIBILITY_MIGRATION_ID
     database.stop()
 
 
@@ -966,7 +969,7 @@ def test_v19_database_is_upgraded_additively_to_hierarchical_source_extraction(t
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == PRECISE_RESEARCH_PROVENANCE_MIGRATION_ID
+    assert metadata["last_migration_id"] == NEWS_EVENT_ELIGIBILITY_MIGRATION_ID
     database.stop()
 
 
@@ -1035,7 +1038,7 @@ def test_v20_database_is_upgraded_additively_to_personal_memory(tmp_path) -> Non
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == PRECISE_RESEARCH_PROVENANCE_MIGRATION_ID
+    assert metadata["last_migration_id"] == NEWS_EVENT_ELIGIBILITY_MIGRATION_ID
     database.stop()
 
 
@@ -1113,7 +1116,7 @@ def test_v21_database_is_upgraded_additively_to_exhaustive_research(tmp_path) ->
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == PRECISE_RESEARCH_PROVENANCE_MIGRATION_ID
+    assert metadata["last_migration_id"] == NEWS_EVENT_ELIGIBILITY_MIGRATION_ID
     database.stop()
 
 
@@ -1207,7 +1210,7 @@ def test_v22_database_is_upgraded_additively_to_research_orchestration(
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == PRECISE_RESEARCH_PROVENANCE_MIGRATION_ID
+    assert metadata["last_migration_id"] == NEWS_EVENT_ELIGIBILITY_MIGRATION_ID
     database.stop()
 
 
@@ -1292,7 +1295,7 @@ def test_v23_database_is_upgraded_additively_to_research_synthesis(tmp_path) -> 
         "FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == PRECISE_RESEARCH_PROVENANCE_MIGRATION_ID
+    assert metadata["last_migration_id"] == NEWS_EVENT_ELIGIBILITY_MIGRATION_ID
     assert metadata["minimum_reader_version"] == SCHEMA_VERSION
     assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     database.stop()
@@ -1331,13 +1334,14 @@ def test_v26_news_schema_preserves_v25_operational_foundation(tmp_path) -> None:
         "news_discoveries", "news_events", "news_event_links",
         "news_period_runs", "news_digests", "news_profile_categories",
         "news_source_states", "news_event_members", "news_digest_items",
+        "news_finding_assessments",
     }
     assert news_tables.issubset(_table_names(connection))
     news_meta = connection.execute(
         "SELECT schema_version, schema_id FROM news_schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert news_meta is not None
-    assert tuple(news_meta) == (3, "news-domain-v3")
+    assert tuple(news_meta) == (4, "news-domain-v4")
     assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     database.stop()
 
@@ -1351,12 +1355,37 @@ def test_v28_database_is_upgraded_additively_to_precise_research_provenance(
     latest.start()
     latest.stop()
 
-    legacy = sqlite3.connect(path, autocommit=True)
+    legacy = sqlite3.connect(
+        path,
+        autocommit=True,
+    )
     legacy.row_factory = sqlite3.Row
 
     legacy.execute(
-        "DROP TABLE research_synthesis_output_source_evidence"
+        "DROP TABLE news_finding_assessments"
     )
+    legacy.execute(
+        "DROP INDEX "
+        "uq_news_events_run_finding_ordinal"
+    )
+    legacy.execute(
+        "ALTER TABLE news_events "
+        "DROP COLUMN finding_ordinal"
+    )
+    legacy.execute(
+        """
+        UPDATE news_schema_metadata
+        SET schema_version = 3,
+            schema_id = 'news-domain-v3'
+        WHERE singleton_id = 1
+        """
+    )
+
+    legacy.execute(
+        "DROP TABLE "
+        "research_synthesis_output_source_evidence"
+    )
+
     legacy.execute(
         """
         UPDATE schema_metadata
@@ -1371,34 +1400,32 @@ def test_v28_database_is_upgraded_additively_to_precise_research_provenance(
             NEWS_OPERATIONAL_SCHEMA_VERSION,
         ),
     )
+
     legacy.execute(
-        f"PRAGMA user_version = {NEWS_OPERATIONAL_SCHEMA_VERSION}"
+        f"PRAGMA user_version = "
+        f"{NEWS_OPERATIONAL_SCHEMA_VERSION}"
     )
 
-    assert (
-        legacy.execute("PRAGMA user_version").fetchone()[0]
-        == NEWS_OPERATIONAL_SCHEMA_VERSION
-    )
-    assert (
-        "research_synthesis_output_source_evidence"
-        not in _table_names(legacy)
-    )
     legacy.close()
 
     upgraded = SQLiteDatabase(path)
     upgraded.start()
+
     connection = upgraded.connection
 
     assert (
-        connection.execute("PRAGMA user_version").fetchone()[0]
-        == PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION
+        connection.execute(
+            "PRAGMA user_version"
+        ).fetchone()[0]
+        == SCHEMA_VERSION
     )
+
     assert (
         "research_synthesis_output_source_evidence"
         in _table_names(connection)
     )
 
-    columns = {
+    provenance_columns = {
         str(row[1])
         for row in connection.execute(
             "PRAGMA table_info("
@@ -1406,7 +1433,8 @@ def test_v28_database_is_upgraded_additively_to_precise_research_provenance(
             ")"
         )
     }
-    assert columns == {
+
+    assert provenance_columns == {
         "artifact_id",
         "output_kind",
         "output_ordinal",
@@ -1421,21 +1449,190 @@ def test_v28_database_is_upgraded_additively_to_precise_research_provenance(
             ")"
         )
     }
+
     assert {
         "research_synthesis_artifacts",
         "source_analysis_artifacts",
     } <= referenced_tables
 
+    assert (
+        "news_finding_assessments"
+        in _table_names(connection)
+    )
+
+    event_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(news_events)"
+        )
+    }
+
+    assert "finding_ordinal" in event_columns
+
     metadata = connection.execute(
-        "SELECT schema_version, last_migration_id, "
-        "minimum_reader_version "
-        "FROM schema_metadata WHERE singleton_id = 1"
+        """
+        SELECT
+            schema_version,
+            last_migration_id,
+            minimum_reader_version
+        FROM schema_metadata
+        WHERE singleton_id = 1
+        """
     ).fetchone()
+
     assert metadata is not None
+
     assert tuple(metadata) == (
-        PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION,
-        PRECISE_RESEARCH_PROVENANCE_MIGRATION_ID,
-        PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION,
+        NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION,
+        NEWS_EVENT_ELIGIBILITY_MIGRATION_ID,
+        NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION,
+    )
+
+    news_metadata = connection.execute(
+        """
+        SELECT schema_version, schema_id
+        FROM news_schema_metadata
+        WHERE singleton_id = 1
+        """
+    ).fetchone()
+
+    assert news_metadata is not None
+    assert tuple(news_metadata) == (
+        4,
+        "news-domain-v4",
+    )
+
+    assert connection.execute(
+        "PRAGMA foreign_key_check"
+    ).fetchall() == []
+
+    upgraded.stop()
+
+
+def test_v29_database_is_upgraded_additively_to_news_event_eligibility(
+    tmp_path,
+) -> None:
+    path = tmp_path / "athena.db"
+
+    latest = SQLiteDatabase(path)
+    latest.start()
+    latest.stop()
+
+    legacy = sqlite3.connect(
+        path,
+        autocommit=True,
+    )
+    legacy.row_factory = sqlite3.Row
+
+    legacy.execute(
+        "DROP TABLE news_finding_assessments"
+    )
+    legacy.execute(
+        "DROP INDEX "
+        "uq_news_events_run_finding_ordinal"
+    )
+    legacy.execute(
+        "ALTER TABLE news_events "
+        "DROP COLUMN finding_ordinal"
+    )
+    legacy.execute(
+        """
+        UPDATE news_schema_metadata
+        SET schema_version = 3,
+            schema_id = 'news-domain-v3'
+        WHERE singleton_id = 1
+        """
+    )
+
+    legacy.execute(
+        """
+        UPDATE schema_metadata
+        SET schema_version = ?,
+            last_migration_id = ?,
+            minimum_reader_version = ?
+        WHERE singleton_id = 1
+        """,
+        (
+            PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION,
+            PRECISE_RESEARCH_PROVENANCE_MIGRATION_ID,
+            PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION,
+        ),
+    )
+
+    legacy.execute(
+        f"PRAGMA user_version = "
+        f"{PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION}"
+    )
+
+    assert (
+        "research_synthesis_output_source_evidence"
+        in _table_names(legacy)
+    )
+
+    assert (
+        "news_finding_assessments"
+        not in _table_names(legacy)
+    )
+
+    legacy.close()
+
+    upgraded = SQLiteDatabase(path)
+    upgraded.start()
+
+    connection = upgraded.connection
+
+    assert (
+        connection.execute(
+            "PRAGMA user_version"
+        ).fetchone()[0]
+        == NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION
+    )
+
+    assert (
+        "news_finding_assessments"
+        in _table_names(connection)
+    )
+
+    event_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(news_events)"
+        )
+    }
+
+    assert "finding_ordinal" in event_columns
+
+    metadata = connection.execute(
+        """
+        SELECT
+            schema_version,
+            last_migration_id,
+            minimum_reader_version
+        FROM schema_metadata
+        WHERE singleton_id = 1
+        """
+    ).fetchone()
+
+    assert metadata is not None
+
+    assert tuple(metadata) == (
+        NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION,
+        NEWS_EVENT_ELIGIBILITY_MIGRATION_ID,
+        NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION,
+    )
+
+    news_metadata = connection.execute(
+        """
+        SELECT schema_version, schema_id
+        FROM news_schema_metadata
+        WHERE singleton_id = 1
+        """
+    ).fetchone()
+
+    assert news_metadata is not None
+    assert tuple(news_metadata) == (
+        4,
+        "news-domain-v4",
     )
 
     assert connection.execute(

@@ -8,9 +8,11 @@ from athena.news.schema import (
     migrate_news_schema_v25_to_v26,
     migrate_news_schema_v26_to_v27,
     migrate_news_schema_v27_to_v28,
+    migrate_news_schema_v29_to_v30,
     verify_news_schema_v26,
     verify_news_schema_v27,
     verify_news_schema_v28,
+    verify_news_schema_v30,
 )
 
 ATHENA_APPLICATION_ID = 1_096_042_574  # ASCII "ATHN" / 0x4154484E
@@ -43,7 +45,8 @@ NEWS_SYSTEM_SCHEMA_VERSION = 26
 NEWS_EVENT_STRUCTURE_SCHEMA_VERSION = 27
 NEWS_OPERATIONAL_SCHEMA_VERSION = 28
 PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION = 29
-SCHEMA_VERSION = PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION
+NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION = 30
+SCHEMA_VERSION = NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
@@ -75,6 +78,9 @@ NEWS_EVENT_STRUCTURE_MIGRATION_ID = "0027_news_event_structure"
 NEWS_OPERATIONAL_MIGRATION_ID = "0028_news_operational_completion"
 PRECISE_RESEARCH_PROVENANCE_MIGRATION_ID = (
     "0029_precise_research_synthesis_provenance"
+)
+NEWS_EVENT_ELIGIBILITY_MIGRATION_ID = (
+    "0030_news_event_eligibility"
 )
 
 
@@ -169,6 +175,7 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         NEWS_SYSTEM_SCHEMA_VERSION,
         NEWS_EVENT_STRUCTURE_SCHEMA_VERSION,
         NEWS_OPERATIONAL_SCHEMA_VERSION,
+        PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -306,10 +313,30 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
 
     if existing_user_version == NEWS_OPERATIONAL_SCHEMA_VERSION:
         _migrate_schema_v28_to_v29(connection)
-        existing_user_version = PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION
+        existing_user_version = (
+            PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION
+        )
+
+    if (
+        existing_user_version
+        == PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION
+    ):
+        _verify_schema_v29(connection)
+        migrate_news_schema_v29_to_v30(
+            connection,
+            schema_version=(
+                NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION
+            ),
+            migration_id=(
+                NEWS_EVENT_ELIGIBILITY_MIGRATION_ID
+            ),
+        )
+        existing_user_version = (
+            NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION
+        )
 
     _configure_connection(connection)
-    _verify_schema_v29(connection)
+    _verify_schema_v30(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -2587,6 +2614,110 @@ def _migrate_schema_v28_to_v29(
     except BaseException:
         connection.rollback()
         raise
+
+
+def _verify_schema_v30(
+    connection: sqlite3.Connection,
+) -> None:
+    application_id = int(
+        connection.execute(
+            "PRAGMA application_id"
+        ).fetchone()[0]
+    )
+
+    user_version = int(
+        connection.execute(
+            "PRAGMA user_version"
+        ).fetchone()[0]
+    )
+
+    if application_id != ATHENA_APPLICATION_ID:
+        raise DatabaseCompatibilityError(
+            "ATHENA application_id verification failed."
+        )
+
+    if (
+        user_version
+        != NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA schema version verification failed."
+        )
+
+    metadata = connection.execute(
+        "SELECT schema_version, "
+        "storage_layout_version, "
+        "blob_format_version, "
+        "last_migration_id, "
+        "minimum_reader_version "
+        "FROM schema_metadata "
+        "WHERE singleton_id = 1"
+    ).fetchone()
+
+    expected = (
+        NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION,
+        STORAGE_LAYOUT_VERSION,
+        BLOB_FORMAT_VERSION,
+        NEWS_EVENT_ELIGIBILITY_MIGRATION_ID,
+        NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION,
+    )
+
+    if (
+        metadata is None
+        or tuple(metadata) != expected
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA schema_metadata verification failed."
+        )
+
+    _verify_schema_v24_compatible(connection)
+
+    if (
+        "research_synthesis_output_source_evidence"
+        not in _user_tables(connection)
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA precise Research synthesis "
+            "provenance table is missing."
+        )
+
+    provenance_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info("
+            "research_synthesis_output_source_evidence"
+            ")"
+        )
+    }
+
+    required_provenance_columns = {
+        "artifact_id",
+        "output_kind",
+        "output_ordinal",
+        "source_analysis_artifact_id",
+    }
+
+    if not required_provenance_columns.issubset(
+        provenance_columns
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA precise Research synthesis "
+            "provenance is incomplete."
+        )
+
+    try:
+        verify_news_schema_v30(connection)
+    except RuntimeError as exc:
+        raise DatabaseCompatibilityError(
+            str(exc)
+        ) from exc
+
+    if connection.execute(
+        "PRAGMA foreign_key_check"
+    ).fetchall():
+        raise DatabaseCompatibilityError(
+            "ATHENA foreign-key verification failed."
+        )
 
 
 def _verify_schema_v29(connection: sqlite3.Connection) -> None:

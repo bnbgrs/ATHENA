@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
+import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -24,6 +26,10 @@ from athena.news.event_structuring import (
 )
 from athena.news.feed import FeedItem, canonicalize_url
 from athena.news.service import NewsService
+from athena.storage.schema import (
+    PRECISE_RESEARCH_PROVENANCE_MIGRATION_ID,
+    PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION,
+)
 
 
 def _app(tmp_path: Path, *, root_name: str = "runtime") -> AthenaApplication:
@@ -120,6 +126,8 @@ def test_news_event_validator_preserves_global_batch_ordinals() -> None:
         "events": [
             {
                 "finding_ordinal": ordinal,
+                "eligibility": "event",
+                "eligibility_reason": "current_development",
                 "event_time_start": "",
                 "event_time_end": "",
                 "event_time_precision": "unknown",
@@ -729,3 +737,681 @@ def test_source_failure_backoff_and_success_cursor_are_persistent(tmp_path: Path
         assert int(state["last_published_at_us"]) == 123456
     finally:
         app.stop()
+
+def test_news_event_validator_keeps_context_out_of_event_metadata() -> None:
+    raw = {
+        "events": [
+            {
+                "finding_ordinal": 0,
+                "eligibility": "context",
+                "eligibility_reason": "background",
+                "event_time_start": "2026-08-15",
+                "event_time_end": "",
+                "event_time_precision": "day",
+                "location": "Berlin",
+                "actors": ["Example actor"],
+                "core_action": "Historical background",
+            }
+        ]
+    }
+
+    validated = _validate_event_output(
+        raw,
+        (0,),
+    )
+
+    item = validated[0]
+
+    assert item["eligibility"] == "context"
+    assert item["eligibility_reason"] == "background"
+    assert item["event_time_precision"] == "unknown"
+    assert item["event_time_start"] is None
+    assert item["event_time_end"] is None
+    assert item["location"] is None
+    assert item["actors"] == ()
+    assert item["core_action"] is None
+
+
+def test_durable_event_eligibility_filters_context_without_losing_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _app(tmp_path)
+
+    try:
+        news = NewsService(app)
+        news.start()
+
+        _news_job_id = news.queue_date(
+            "2026-08-15"
+        )
+
+        run_view = news.run_view(
+            "2026-08-15"
+        )
+        assert run_view is not None
+
+        run = news._run_row(
+            run_view.run_id
+        )
+
+        source_config_id = _news_source_id(
+            app
+        )
+
+        path = tmp_path / "eligibility.html"
+        path.write_text(
+            "<p>AMD development and background.</p>",
+            encoding="utf-8",
+        )
+
+        url = canonicalize_url(
+            "https://www.bbc.com/news/eligibility"
+        )
+
+        capture = app.sources.capture_external_snapshot(
+            path,
+            source_uri=url,
+        )
+
+        item = FeedItem(
+            url,
+            hashlib.sha256(
+                url.encode("utf-8")
+            ).digest(),
+            "Eligibility evidence",
+            "",
+            None,
+        )
+
+        discovery_id, was_new = (
+            news._record_discovery(
+                run["run_id"],
+                source_config_id,
+                item,
+                ("technology",),
+            )
+        )
+        assert was_new
+
+        news._mark_discovery_captured(
+            discovery_id,
+            capture.source.source_id,
+        )
+
+        findings = (
+            "AMD announced a new accelerator.",
+            (
+                "Background: accelerators use "
+                "parallel compute architectures."
+            ),
+        )
+
+        content = {
+            "summary": (
+                "One development plus background."
+            ),
+            "findings": list(findings),
+            "contradictions": [],
+            "uncertainty": "",
+            "coverage": {},
+            "problem_sources": [],
+            "snapshot_commit_seq": 0,
+        }
+
+        (
+            research_job_id,
+            _result_id,
+        ) = _insert_completed_research_result(
+            app,
+            content,
+        )
+
+        scope = (
+            app.research_repository
+            .get_scope_for_job(
+                research_job_id
+            )
+        )
+        assert scope is not None
+
+        result = (
+            app.research_repository
+            .get_result_for_scope(
+                scope.scope_id
+            )
+        )
+        assert result is not None
+
+        monkeypatch.setattr(
+            news,
+            "_finding_source_ids",
+            lambda _artifact_id, _ordinal: (
+                capture.source.source_id,
+            ),
+        )
+
+        monkeypatch.setattr(
+            news,
+            "_contradiction_source_ids",
+            lambda _artifact_id, _ordinal: (),
+        )
+
+        structuring_run_id = new_uuid7()
+        actor_id = app.chat.ensure_local_user()
+        now_us = utc_now_us()
+
+        with app.database.write_transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO processing_runs (
+                    processing_run_id,
+                    run_type,
+                    started_at_us,
+                    finished_at_us,
+                    status,
+                    trigger_actor_id,
+                    pipeline_version,
+                    input_snapshot_json,
+                    configuration_hash
+                ) VALUES (
+                    ?,
+                    'news.test.eligibility',
+                    ?,
+                    ?,
+                    'succeeded',
+                    ?,
+                    'test',
+                    '{}',
+                    ?
+                )
+                """,
+                (
+                    uuid_to_blob(
+                        structuring_run_id
+                    ),
+                    now_us,
+                    now_us,
+                    uuid_to_blob(actor_id),
+                    bytes(32),
+                ),
+            )
+
+        assessments = (
+            NewsEventMetadata(
+                finding_ordinal=0,
+                event_time_start=None,
+                event_time_end=None,
+                event_time_precision="unknown",
+                location=None,
+                actors=("AMD",),
+                core_action=(
+                    "announced a new accelerator"
+                ),
+                publication_time_min_us=None,
+                publication_time_max_us=None,
+                retrieval_time_min_us=None,
+                retrieval_time_max_us=None,
+                structuring_run_id=(
+                    structuring_run_id
+                ),
+                eligibility="event",
+                eligibility_reason=(
+                    "current_development"
+                ),
+            ),
+            NewsEventMetadata(
+                finding_ordinal=1,
+                event_time_start=None,
+                event_time_end=None,
+                event_time_precision="unknown",
+                location=None,
+                actors=(),
+                core_action=None,
+                publication_time_min_us=None,
+                publication_time_max_us=None,
+                retrieval_time_min_us=None,
+                retrieval_time_max_us=None,
+                structuring_run_id=(
+                    structuring_run_id
+                ),
+                eligibility="context",
+                eligibility_reason="background",
+            ),
+        )
+
+        news._persist_finding_assessments(
+            run,
+            result,
+            findings,
+            assessments,
+        )
+
+        def must_not_restructure(
+            **_kwargs: object,
+        ):
+            raise AssertionError(
+                "Persisted eligibility must be reused."
+            )
+
+        monkeypatch.setattr(
+            news,
+            "_structure_event_metadata",
+            must_not_restructure,
+        )
+
+        news._materialize_research(
+            run,
+            research_job_id,
+        )
+
+        persisted = (
+            app.database.connection.execute(
+                """
+                SELECT
+                    finding_ordinal,
+                    eligibility,
+                    eligibility_reason
+                FROM news_finding_assessments
+                WHERE run_id = ?
+                ORDER BY finding_ordinal
+                """,
+                (run["run_id"],),
+            ).fetchall()
+        )
+
+        assert [
+            tuple(row)
+            for row in persisted
+        ] == [
+            (
+                0,
+                "event",
+                "current_development",
+            ),
+            (
+                1,
+                "context",
+                "background",
+            ),
+        ]
+
+        events = (
+            app.database.connection.execute(
+                """
+                SELECT
+                    event_ordinal,
+                    finding_ordinal,
+                    summary
+                FROM news_events
+                WHERE run_id = ?
+                ORDER BY event_ordinal
+                """,
+                (run["run_id"],),
+            ).fetchall()
+        )
+
+        assert len(events) == 1
+        assert int(
+            events[0]["event_ordinal"]
+        ) == 0
+        assert int(
+            events[0]["finding_ordinal"]
+        ) == 0
+        assert str(
+            events[0]["summary"]
+        ) == findings[0]
+
+        digest = news.latest_digest()
+        assert digest is not None
+
+        digest_content = digest["content"]
+
+        assert (
+            digest_content[
+                "event_eligibility"
+            ]
+            == {
+                "assessed_finding_count": 2,
+                "event_count": 1,
+                "context_count": 1,
+            }
+        )
+
+        assert len(
+            digest_content["events"]
+        ) == 1
+
+        assert (
+            digest_content["events"][0][
+                "finding_ordinal"
+            ]
+            == 0
+        )
+
+        assert (
+            digest_content[
+                "context_findings"
+            ]
+            == [
+                {
+                    "finding_ordinal": 1,
+                    "text": findings[1],
+                    "eligibility_reason": (
+                        "background"
+                    ),
+                    "source_ids": [
+                        str(
+                            capture.source.source_id
+                        )
+                    ],
+                }
+            ]
+        )
+
+        assert (
+            app.database.connection.execute(
+                "SELECT COUNT(*) "
+                "FROM knowledge_units"
+            ).fetchone()[0]
+            == 0
+        )
+
+        assert (
+            app.database.connection.execute(
+                "SELECT COUNT(*) "
+                "FROM claims"
+            ).fetchone()[0]
+            == 0
+        )
+
+    finally:
+        app.stop()
+
+def test_v29_migration_backfills_legacy_event_assessment_without_model(
+    tmp_path: Path,
+) -> None:
+    root_name = "runtime-v29-event-backfill"
+
+    app = _app(
+        tmp_path,
+        root_name=root_name,
+    )
+
+    database_path = app.database.path
+
+    finding = (
+        "AMD announced a legacy accelerator "
+        "development."
+    )
+
+    try:
+        news = NewsService(app)
+        news.start()
+
+        news.queue_date("2026-08-15")
+
+        run_view = news.run_view(
+            "2026-08-15"
+        )
+        assert run_view is not None
+
+        run = news._run_row(
+            run_view.run_id
+        )
+
+        content = {
+            "summary": "Legacy migration fixture.",
+            "findings": [finding],
+            "contradictions": [],
+            "uncertainty": "",
+            "coverage": {},
+            "problem_sources": [],
+            "snapshot_commit_seq": 0,
+        }
+
+        (
+            research_job_id,
+            result_id,
+        ) = _insert_completed_research_result(
+            app,
+            content,
+        )
+
+        assert isinstance(
+            research_job_id,
+            uuid.UUID,
+        )
+        assert isinstance(
+            result_id,
+            uuid.UUID,
+        )
+
+        now_us = utc_now_us()
+
+        with app.database.write_transaction() as connection:
+            connection.execute(
+                """
+                UPDATE news_runs
+                SET research_job_id = ?,
+                    research_result_id = ?
+                WHERE run_id = ?
+                """,
+                (
+                    uuid_to_blob(
+                        research_job_id
+                    ),
+                    uuid_to_blob(
+                        result_id
+                    ),
+                    run["run_id"],
+                ),
+            )
+
+            connection.execute(
+                """
+                INSERT INTO news_events (
+                    event_id,
+                    run_id,
+                    event_ordinal,
+                    finding_ordinal,
+                    cluster_key,
+                    title,
+                    summary,
+                    categories_json,
+                    source_ids_json,
+                    contradictions_json,
+                    event_time_precision,
+                    actors_json,
+                    research_job_id,
+                    research_result_id,
+                    created_at_us
+                ) VALUES (
+                    ?, ?, 0, 0, ?, ?, ?,
+                    '[]', '[]', '[]',
+                    'unknown', '[]',
+                    ?, ?, ?
+                )
+                """,
+                (
+                    uuid_to_blob(
+                        new_uuid7()
+                    ),
+                    run["run_id"],
+                    hashlib.sha256(
+                        finding.encode("utf-8")
+                    ).digest(),
+                    "Legacy event",
+                    finding,
+                    uuid_to_blob(
+                        research_job_id
+                    ),
+                    uuid_to_blob(
+                        result_id
+                    ),
+                    now_us,
+                ),
+            )
+
+    finally:
+        app.stop()
+
+    legacy = sqlite3.connect(
+        database_path,
+        autocommit=True,
+    )
+    legacy.row_factory = sqlite3.Row
+
+    try:
+        legacy.execute(
+            "DROP TABLE "
+            "news_finding_assessments"
+        )
+
+        legacy.execute(
+            "DROP INDEX "
+            "uq_news_events_run_finding_ordinal"
+        )
+
+        legacy.execute(
+            "ALTER TABLE news_events "
+            "DROP COLUMN finding_ordinal"
+        )
+
+        legacy.execute(
+            """
+            UPDATE news_schema_metadata
+            SET schema_version = 3,
+                schema_id = 'news-domain-v3'
+            WHERE singleton_id = 1
+            """
+        )
+
+        legacy.execute(
+            """
+            UPDATE schema_metadata
+            SET schema_version = ?,
+                last_migration_id = ?,
+                minimum_reader_version = ?
+            WHERE singleton_id = 1
+            """,
+            (
+                PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION,
+                PRECISE_RESEARCH_PROVENANCE_MIGRATION_ID,
+                PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION,
+            ),
+        )
+
+        legacy.execute(
+            f"PRAGMA user_version = "
+            f"{PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION}"
+        )
+
+    finally:
+        legacy.close()
+
+    migrated = _app(
+        tmp_path,
+        root_name=root_name,
+    )
+
+    try:
+        assessment = (
+            migrated.database.connection.execute(
+                """
+                SELECT
+                    research_result_id,
+                    finding_ordinal,
+                    finding_sha256,
+                    eligibility,
+                    eligibility_reason,
+                    event_time_precision,
+                    actors_json,
+                    structuring_run_id
+                FROM news_finding_assessments
+                """
+            ).fetchone()
+        )
+
+        assert assessment is not None
+
+        assert (
+            bytes(
+                assessment[
+                    "research_result_id"
+                ]
+            )
+            == uuid_to_blob(result_id)
+        )
+
+        assert int(
+            assessment["finding_ordinal"]
+        ) == 0
+
+        assert (
+            bytes(
+                assessment["finding_sha256"]
+            )
+            == hashlib.sha256(
+                finding.encode("utf-8")
+            ).digest()
+        )
+
+        assert (
+            assessment["eligibility"]
+            == "event"
+        )
+
+        assert (
+            assessment["eligibility_reason"]
+            == "current_development"
+        )
+
+        assert (
+            assessment[
+                "event_time_precision"
+            ]
+            == "unknown"
+        )
+
+        assert (
+            assessment["actors_json"]
+            == "[]"
+        )
+
+        # No historical model reclassification occurred.
+        assert (
+            assessment["structuring_run_id"]
+            is None
+        )
+
+        event = (
+            migrated.database.connection.execute(
+                """
+                SELECT
+                    event_ordinal,
+                    finding_ordinal,
+                    summary
+                FROM news_events
+                """
+            ).fetchone()
+        )
+
+        assert event is not None
+        assert int(
+            event["event_ordinal"]
+        ) == 0
+        assert int(
+            event["finding_ordinal"]
+        ) == 0
+        assert event["summary"] == finding
+
+        assert (
+            migrated.database.connection.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchall()
+            == []
+        )
+
+    finally:
+        migrated.stop()

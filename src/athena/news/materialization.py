@@ -20,8 +20,12 @@ from athena.news.common import (
     _string_list,
 )
 from athena.news.context import NewsMixinContext
+from athena.news.event_structuring import NewsEventMetadata
 from athena.news.models import NewsError
-from athena.research.models import ResearchScopeState
+from athena.research.models import (
+    ResearchResultRecord,
+    ResearchScopeState,
+)
 
 
 class NewsMaterializationMixin(NewsMixinContext):
@@ -32,137 +36,382 @@ class NewsMaterializationMixin(NewsMixinContext):
         *,
         parent_job: JobRecord | None = None,
     ) -> None:
-        scope = self.app.research_repository.get_scope_for_job(research_job_id)
-        if scope is None or scope.state is not ResearchScopeState.COMPLETED:
-            raise NewsError("Completed research job has no completed ResearchScope.")
-        result = self.app.research_repository.get_result_for_scope(scope.scope_id)
+        scope = self.app.research_repository.get_scope_for_job(
+            research_job_id
+        )
+        if (
+            scope is None
+            or scope.state is not ResearchScopeState.COMPLETED
+        ):
+            raise NewsError(
+                "Completed research job has no completed ResearchScope."
+            )
+
+        result = self.app.research_repository.get_result_for_scope(
+            scope.scope_id
+        )
         if result is None:
-            raise NewsError("Completed News research has no ResearchResult.")
+            raise NewsError(
+                "Completed News research has no ResearchResult."
+            )
+
         content = _json_object(result.content_json)
         findings = _string_list(content.get("findings"))
-        contradictions = _string_list(content.get("contradictions"))
+        contradictions = _string_list(
+            content.get("contradictions")
+        )
 
         existing = self.database.connection.execute(
-            "SELECT * FROM news_events WHERE run_id = ? ORDER BY event_ordinal",
+            """
+            SELECT *
+            FROM news_events
+            WHERE run_id = ?
+            ORDER BY event_ordinal
+            """,
             (run["run_id"],),
         ).fetchall()
-        if existing:
-            if len(existing) != len(findings) or [
-                int(row["event_ordinal"]) for row in existing
-            ] != list(range(len(findings))):
-                raise NewsError(
-                    "Persisted News events disagree with completed Research findings."
-                )
-        elif findings:
-            metadata = self._structure_event_metadata(
+
+        assessments = self._load_finding_assessments(
+            run,
+            result,
+            tuple(findings),
+        )
+
+        # Compatibility path for events created before the v30
+        # eligibility schema. Historical ATHENA materialized every
+        # Research finding as an event, so that original decision can
+        # be preserved deterministically without another model call.
+        if not assessments and existing:
+            assessments = self._legacy_assessments_from_events(
+                existing,
+                tuple(findings),
+            )
+            self._persist_finding_assessments(
+                run,
+                result,
+                tuple(findings),
+                assessments,
+            )
+
+        if not assessments and findings:
+            assessments = self._structure_event_metadata(
                 run=run,
                 scope=scope,
                 result=result,
                 findings=tuple(findings),
                 parent_job=parent_job,
             )
-            if len(metadata) != len(findings):
-                raise NewsError("News event structuring omitted a Research finding.")
+            self._persist_finding_assessments(
+                run,
+                result,
+                tuple(findings),
+                assessments,
+            )
+
+        if len(assessments) != len(findings):
+            raise NewsError(
+                "Persisted News finding assessments disagree "
+                "with completed Research findings."
+            )
+
+        assessment_by_ordinal = {
+            item.finding_ordinal: item
+            for item in assessments
+        }
+
+        if set(assessment_by_ordinal) != set(
+            range(len(findings))
+        ):
+            raise NewsError(
+                "News finding assessments lost or duplicated "
+                "a Research finding ordinal."
+            )
+
+        eligible_ordinals = [
+            ordinal
+            for ordinal in range(len(findings))
+            if assessment_by_ordinal[ordinal].eligibility
+            == "event"
+        ]
+
+        if existing:
+            event_ordinals = [
+                int(row["event_ordinal"])
+                for row in existing
+            ]
+            finding_ordinals = [
+                int(row["finding_ordinal"])
+                for row in existing
+            ]
+
+            if event_ordinals != list(
+                range(len(existing))
+            ):
+                raise NewsError(
+                    "Persisted News event ordering is invalid."
+                )
+
+            if finding_ordinals != eligible_ordinals:
+                raise NewsError(
+                    "Persisted News events disagree with "
+                    "durable finding eligibility."
+                )
+
+        elif eligible_ordinals:
             prepared: list[tuple[object, ...]] = []
             cluster_keys: set[bytes] = set()
             now = utc_now_us()
-            for ordinal, finding in enumerate(findings):
-                item = metadata[ordinal]
-                if item.finding_ordinal != ordinal:
-                    raise NewsError("News event metadata ordinal drifted from Research.")
-                source_ids = self._finding_source_ids(result.final_artifact_id, ordinal)
+
+            for event_ordinal, finding_ordinal in enumerate(
+                eligible_ordinals
+            ):
+                finding = findings[finding_ordinal]
+                item = assessment_by_ordinal[finding_ordinal]
+
+                source_ids = self._finding_source_ids(
+                    result.final_artifact_id,
+                    finding_ordinal,
+                )
+
                 cluster_key = hashlib.sha256(
                     _normalize_text(finding).encode("utf-8")
                 ).digest()
+
                 if cluster_key in cluster_keys:
                     raise NewsError(
-                        "Research produced duplicate event findings instead of one cluster."
+                        "Research produced duplicate event findings "
+                        "instead of one cluster."
                     )
+
                 cluster_keys.add(cluster_key)
+
                 related_contradictions = [
                     text
-                    for index, text in enumerate(contradictions)
+                    for index, text in enumerate(
+                        contradictions
+                    )
                     if set(source_ids).intersection(
-                        self._contradiction_source_ids(result.final_artifact_id, index)
+                        self._contradiction_source_ids(
+                            result.final_artifact_id,
+                            index,
+                        )
                     )
                 ]
+
                 title = _event_title(finding)
-                categories = self._categories_for_article_sources(
-                    run["run_id"], source_ids
+
+                categories = (
+                    self._categories_for_article_sources(
+                        run["run_id"],
+                        source_ids,
+                    )
                 )
-                source_count, independent_count, relevance = self._event_source_metrics(
-                    run["run_id"], source_ids
+
+                (
+                    source_count,
+                    independent_count,
+                    relevance,
+                ) = self._event_source_metrics(
+                    run["run_id"],
+                    source_ids,
                 )
-                novelty, first_seen = self._event_novelty_and_first_seen(
-                    run["run_id"], title=title, summary=finding, categories=categories, now_us=now
+
+                (
+                    novelty,
+                    first_seen,
+                ) = self._event_novelty_and_first_seen(
+                    run["run_id"],
+                    title=title,
+                    summary=finding,
+                    categories=categories,
+                    now_us=now,
                 )
+
+                source_id_set = set(source_ids)
+
                 conflicting_ids = {
                     source_id
-                    for index, _text in enumerate(contradictions)
-                    for source_id in self._contradiction_source_ids(result.final_artifact_id, index)
-                    if source_id in set(source_ids)
+                    for index, _text in enumerate(
+                        contradictions
+                    )
+                    for source_id in (
+                        self._contradiction_source_ids(
+                            result.final_artifact_id,
+                            index,
+                        )
+                    )
+                    if source_id in source_id_set
                 }
-                breadth=min(1.0, independent_count/3.0)
-                importance=round(min(1.0, 0.50*relevance + 0.30*novelty + 0.20*breadth), 6)
+
+                breadth = min(
+                    1.0,
+                    independent_count / 3.0,
+                )
+
+                importance = round(
+                    min(
+                        1.0,
+                        0.50 * relevance
+                        + 0.30 * novelty
+                        + 0.20 * breadth,
+                    ),
+                    6,
+                )
+
                 prepared.append(
                     (
                         uuid_to_blob(new_uuid7()),
                         run["run_id"],
-                        ordinal,
+                        event_ordinal,
+                        finding_ordinal,
                         cluster_key,
                         title,
                         finding,
                         _canonical_json(categories),
-                        _canonical_json([str(value) for value in source_ids]),
-                        _canonical_json(related_contradictions),
+                        _canonical_json(
+                            [
+                                str(value)
+                                for value in source_ids
+                            ]
+                        ),
+                        _canonical_json(
+                            related_contradictions
+                        ),
                         item.event_time_start,
                         item.event_time_end,
                         item.event_time_precision,
                         item.location,
-                        _canonical_json(list(item.actors)),
+                        _canonical_json(
+                            list(item.actors)
+                        ),
                         item.core_action,
                         item.publication_time_min_us,
                         item.publication_time_max_us,
                         item.retrieval_time_min_us,
                         item.retrieval_time_max_us,
                         (
-                            uuid_to_blob(item.structuring_run_id)
-                            if item.structuring_run_id is not None
+                            uuid_to_blob(
+                                item.structuring_run_id
+                            )
+                            if item.structuring_run_id
+                            is not None
                             else None
                         ),
-                        first_seen, now, importance, relevance, novelty,
-                        source_count, independent_count, len(conflicting_ids),
-                        uuid_to_blob(research_job_id), uuid_to_blob(result.result_id), now,
+                        first_seen,
+                        now,
+                        importance,
+                        relevance,
+                        novelty,
+                        source_count,
+                        independent_count,
+                        len(conflicting_ids),
+                        uuid_to_blob(research_job_id),
+                        uuid_to_blob(result.result_id),
+                        now,
                     )
                 )
+
+            event_insert_sql = (
+                """
+                INSERT INTO news_events (
+                    event_id,
+                    run_id,
+                    event_ordinal,
+                    finding_ordinal,
+                    cluster_key,
+                    title,
+                    summary,
+                    categories_json,
+                    source_ids_json,
+                    contradictions_json,
+                    event_time_start,
+                    event_time_end,
+                    event_time_precision,
+                    location_text,
+                    actors_json,
+                    core_action,
+                    publication_time_min_us,
+                    publication_time_max_us,
+                    retrieval_time_min_us,
+                    retrieval_time_max_us,
+                    structuring_run_id,
+                    first_seen_us,
+                    last_updated_us,
+                    importance,
+                    relevance,
+                    novelty,
+                    source_count,
+                    independent_source_count,
+                    conflicting_source_count,
+                    research_job_id,
+                    research_result_id,
+                    created_at_us
+                ) VALUES (
+                """
+                + ",".join("?" for _ in range(32))
+                + ")"
+            )
+
             with self.database.write_transaction() as connection:
                 connection.executemany(
-                    """
-                    INSERT INTO news_events (
-                        event_id, run_id, event_ordinal, cluster_key, title, summary,
-                        categories_json, source_ids_json, contradictions_json,
-                        event_time_start, event_time_end, event_time_precision,
-                        location_text, actors_json, core_action,
-                        publication_time_min_us, publication_time_max_us,
-                        retrieval_time_min_us, retrieval_time_max_us,
-                        structuring_run_id, first_seen_us, last_updated_us,
-                        importance, relevance, novelty, source_count,
-                        independent_source_count, conflicting_source_count,
-                        research_job_id, research_result_id, created_at_us
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
+                    event_insert_sql,
                     prepared,
                 )
+
             existing = self.database.connection.execute(
-                "SELECT * FROM news_events WHERE run_id = ? ORDER BY event_ordinal",
+                """
+                SELECT *
+                FROM news_events
+                WHERE run_id = ?
+                ORDER BY event_ordinal
+                """,
                 (run["run_id"],),
             ).fetchall()
 
+        context_findings: list[dict[str, Any]] = []
+
+        for item in assessments:
+            if item.eligibility != "context":
+                continue
+
+            source_ids = self._finding_source_ids(
+                result.final_artifact_id,
+                item.finding_ordinal,
+            )
+
+            context_findings.append(
+                {
+                    "finding_ordinal": (
+                        item.finding_ordinal
+                    ),
+                    "text": findings[
+                        item.finding_ordinal
+                    ],
+                    "eligibility_reason": (
+                        item.eligibility_reason
+                    ),
+                    "source_ids": [
+                        str(source_id)
+                        for source_id in source_ids
+                    ],
+                }
+            )
+
         events: list[dict[str, Any]] = []
+
         for row in existing:
             self._ensure_event_members(row)
-            persisted_event_id = uuid_from_blob(bytes(row["event_id"]))
-            categories = _string_list(json.loads(str(row["categories_json"])))
+
+            persisted_event_id = uuid_from_blob(
+                bytes(row["event_id"])
+            )
+
+            categories = _string_list(
+                json.loads(
+                    str(row["categories_json"])
+                )
+            )
+
             related_event_ids = self._suggest_event_links(
                 run["run_id"],
                 persisted_event_id,
@@ -170,41 +419,107 @@ class NewsMaterializationMixin(NewsMixinContext):
                 summary=str(row["summary"]),
                 categories=list(categories),
             )
+
             events.append(
-                self._event_digest_payload(row, possible_continuations=related_event_ids)
+                self._event_digest_payload(
+                    row,
+                    possible_continuations=(
+                        related_event_ids
+                    ),
+                )
             )
-        events.sort(key=lambda event: (
-            -float(event["importance"]), -float(event["relevance"]),
-            -float(event["novelty"]), str(event["title"]), str(event["event_id"])
-        ))
+
+        events.sort(
+            key=lambda event: (
+                -float(event["importance"]),
+                -float(event["relevance"]),
+                -float(event["novelty"]),
+                str(event["title"]),
+                str(event["event_id"]),
+            )
+        )
 
         digest_id = new_uuid7()
-        category_index: dict[str, list[str]] = {}
+
+        category_index: dict[
+            str,
+            list[str],
+        ] = {}
+
         for event in events:
             for category in event["categories"]:
-                category_index.setdefault(str(category), []).append(str(event["event_id"]))
+                category_index.setdefault(
+                    str(category),
+                    [],
+                ).append(
+                    str(event["event_id"])
+                )
+
         digest_content = {
-            "summary": str(content.get("summary", "")),
+            "summary": str(
+                content.get("summary", "")
+            ),
             "events": events,
+            "context_findings": context_findings,
+            "event_eligibility": {
+                "assessed_finding_count": (
+                    len(assessments)
+                ),
+                "event_count": len(
+                    eligible_ordinals
+                ),
+                "context_count": len(
+                    context_findings
+                ),
+            },
             "events_by_category": category_index,
             "developments_since_previous_digest": [
-                str(event["event_id"]) for event in events if event["possible_continuations"]
+                str(event["event_id"])
+                for event in events
+                if event["possible_continuations"]
             ],
             "contradictions": contradictions,
-            "uncertainty": str(content.get("uncertainty", "")),
-            "coverage": content.get("coverage", {}),
-            "problem_sources": content.get("problem_sources", []),
-            "research_result_id": str(result.result_id),
-            "research_status": {"job_id": str(research_job_id), "result_id": str(result.result_id), "state": "completed"},
+            "uncertainty": str(
+                content.get("uncertainty", "")
+            ),
+            "coverage": content.get(
+                "coverage",
+                {},
+            ),
+            "problem_sources": content.get(
+                "problem_sources",
+                [],
+            ),
+            "research_result_id": str(
+                result.result_id
+            ),
+            "research_status": {
+                "job_id": str(
+                    research_job_id
+                ),
+                "result_id": str(
+                    result.result_id
+                ),
+                "state": "completed",
+            },
             "canonical_knowledge_written": False,
         }
+
         now = utc_now_us()
+
         with self.database.write_transaction() as connection:
             connection.execute(
                 """
                 INSERT INTO news_digests (
-                    digest_id, profile_id, period_kind, period_start, period_end,
-                    revision_no, content_json, research_result_ids_json, created_at_us
+                    digest_id,
+                    profile_id,
+                    period_kind,
+                    period_start,
+                    period_end,
+                    revision_no,
+                    content_json,
+                    research_result_ids_json,
+                    created_at_us
                 ) VALUES (?, ?, 'daily', ?, ?, 1, ?, ?, ?)
                 """,
                 (
@@ -212,37 +527,493 @@ class NewsMaterializationMixin(NewsMixinContext):
                     run["profile_id"],
                     run["target_date"],
                     run["target_date"],
-                    _canonical_json(digest_content),
-                    _canonical_json([str(result.result_id)]),
+                    _canonical_json(
+                        digest_content
+                    ),
+                    _canonical_json(
+                        [str(result.result_id)]
+                    ),
                     now,
                 ),
             )
-            final_state = "partial" if int(run["failed_count"]) > 0 else "completed"
+
+            final_state = (
+                "partial"
+                if int(run["failed_count"]) > 0
+                else "completed"
+            )
+
             connection.executemany(
                 """
-                INSERT INTO news_digest_items(digest_id, rank_no, event_id, importance, relevance, novelty)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO news_digest_items(
+                    digest_id,
+                    rank_no,
+                    event_id,
+                    importance,
+                    relevance,
+                    novelty
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                [(uuid_to_blob(digest_id), rank_no, uuid_to_blob(uuid.UUID(str(event["event_id"]))),
-                  float(event["importance"]), float(event["relevance"]), float(event["novelty"]))
-                 for rank_no, event in enumerate(events, start=1)],
+                [
+                    (
+                        uuid_to_blob(digest_id),
+                        rank_no,
+                        uuid_to_blob(
+                            uuid.UUID(
+                                str(
+                                    event["event_id"]
+                                )
+                            )
+                        ),
+                        float(event["importance"]),
+                        float(event["relevance"]),
+                        float(event["novelty"]),
+                    )
+                    for rank_no, event in enumerate(
+                        events,
+                        start=1,
+                    )
+                ],
             )
+
             connection.execute(
                 """
                 UPDATE news_runs
-                SET state = ?, research_result_id = ?, digest_id = ?,
-                    completed_at_us = ?, updated_at_us = ?
+                SET state = ?,
+                    research_result_id = ?,
+                    digest_id = ?,
+                    completed_at_us = ?,
+                    updated_at_us = ?
                 WHERE run_id = ?
                 """,
                 (
                     final_state,
-                    uuid_to_blob(result.result_id),
+                    uuid_to_blob(
+                        result.result_id
+                    ),
                     uuid_to_blob(digest_id),
                     now,
                     now,
                     run["run_id"],
                 ),
             )
+
+    def _load_finding_assessments(
+        self,
+        run: Any,
+        result: ResearchResultRecord,
+        findings: tuple[str, ...],
+    ) -> tuple[NewsEventMetadata, ...]:
+        rows = self.database.connection.execute(
+            """
+            SELECT *
+            FROM news_finding_assessments
+            WHERE run_id = ?
+            ORDER BY finding_ordinal
+            """,
+            (run["run_id"],),
+        ).fetchall()
+
+        if not rows:
+            return ()
+
+        if len(rows) != len(findings):
+            raise NewsError(
+                "Persisted News finding assessments are incomplete."
+            )
+
+        output: list[NewsEventMetadata] = []
+
+        for expected_ordinal, row in enumerate(rows):
+            ordinal = int(
+                row["finding_ordinal"]
+            )
+
+            if ordinal != expected_ordinal:
+                raise NewsError(
+                    "Persisted News finding assessment "
+                    "ordinals are not contiguous."
+                )
+
+            persisted_result_id = uuid_from_blob(
+                bytes(row["research_result_id"])
+            )
+
+            if persisted_result_id != result.result_id:
+                raise NewsError(
+                    "Persisted News finding assessment "
+                    "references another ResearchResult."
+                )
+
+            expected_hash = hashlib.sha256(
+                findings[ordinal].encode("utf-8")
+            ).digest()
+
+            if bytes(row["finding_sha256"]) != expected_hash:
+                raise NewsError(
+                    "Persisted News finding assessment "
+                    "does not match immutable finding text."
+                )
+
+            output.append(
+                NewsEventMetadata(
+                    finding_ordinal=ordinal,
+                    event_time_start=(
+                        str(row["event_time_start"])
+                        if row["event_time_start"]
+                        is not None
+                        else None
+                    ),
+                    event_time_end=(
+                        str(row["event_time_end"])
+                        if row["event_time_end"]
+                        is not None
+                        else None
+                    ),
+                    event_time_precision=str(
+                        row["event_time_precision"]
+                    ),
+                    location=(
+                        str(row["location_text"])
+                        if row["location_text"]
+                        is not None
+                        else None
+                    ),
+                    actors=tuple(
+                        _string_list(
+                            json.loads(
+                                str(
+                                    row[
+                                        "actors_json"
+                                    ]
+                                )
+                            )
+                        )
+                    ),
+                    core_action=(
+                        str(row["core_action"])
+                        if row["core_action"]
+                        is not None
+                        else None
+                    ),
+                    publication_time_min_us=(
+                        int(
+                            row[
+                                "publication_time_min_us"
+                            ]
+                        )
+                        if row[
+                            "publication_time_min_us"
+                        ]
+                        is not None
+                        else None
+                    ),
+                    publication_time_max_us=(
+                        int(
+                            row[
+                                "publication_time_max_us"
+                            ]
+                        )
+                        if row[
+                            "publication_time_max_us"
+                        ]
+                        is not None
+                        else None
+                    ),
+                    retrieval_time_min_us=(
+                        int(
+                            row[
+                                "retrieval_time_min_us"
+                            ]
+                        )
+                        if row[
+                            "retrieval_time_min_us"
+                        ]
+                        is not None
+                        else None
+                    ),
+                    retrieval_time_max_us=(
+                        int(
+                            row[
+                                "retrieval_time_max_us"
+                            ]
+                        )
+                        if row[
+                            "retrieval_time_max_us"
+                        ]
+                        is not None
+                        else None
+                    ),
+                    structuring_run_id=(
+                        uuid_from_blob(
+                            bytes(
+                                row[
+                                    "structuring_run_id"
+                                ]
+                            )
+                        )
+                        if row[
+                            "structuring_run_id"
+                        ]
+                        is not None
+                        else None
+                    ),
+                    eligibility=str(
+                        row["eligibility"]
+                    ),
+                    eligibility_reason=str(
+                        row["eligibility_reason"]
+                    ),
+                )
+            )
+
+        return tuple(output)
+
+    def _persist_finding_assessments(
+        self,
+        run: Any,
+        result: ResearchResultRecord,
+        findings: tuple[str, ...],
+        assessments: tuple[
+            NewsEventMetadata,
+            ...,
+        ],
+    ) -> None:
+        if len(assessments) != len(findings):
+            raise NewsError(
+                "News finding assessment count does not "
+                "match Research findings."
+            )
+
+        ordinals = [
+            item.finding_ordinal
+            for item in assessments
+        ]
+
+        if ordinals != list(
+            range(len(findings))
+        ):
+            raise NewsError(
+                "News finding assessments must preserve "
+                "all Research finding ordinals."
+            )
+
+        now = utc_now_us()
+
+        rows: list[tuple[object, ...]] = []
+
+        for item in assessments:
+            finding = findings[
+                item.finding_ordinal
+            ]
+
+            rows.append(
+                (
+                    run["run_id"],
+                    uuid_to_blob(
+                        result.result_id
+                    ),
+                    item.finding_ordinal,
+                    hashlib.sha256(
+                        finding.encode("utf-8")
+                    ).digest(),
+                    item.eligibility,
+                    item.eligibility_reason,
+                    item.event_time_start,
+                    item.event_time_end,
+                    item.event_time_precision,
+                    item.location,
+                    _canonical_json(
+                        list(item.actors)
+                    ),
+                    item.core_action,
+                    item.publication_time_min_us,
+                    item.publication_time_max_us,
+                    item.retrieval_time_min_us,
+                    item.retrieval_time_max_us,
+                    (
+                        uuid_to_blob(
+                            item.structuring_run_id
+                        )
+                        if item.structuring_run_id
+                        is not None
+                        else None
+                    ),
+                    now,
+                )
+            )
+
+        sql = (
+            """
+            INSERT INTO news_finding_assessments (
+                run_id,
+                research_result_id,
+                finding_ordinal,
+                finding_sha256,
+                eligibility,
+                eligibility_reason,
+                event_time_start,
+                event_time_end,
+                event_time_precision,
+                location_text,
+                actors_json,
+                core_action,
+                publication_time_min_us,
+                publication_time_max_us,
+                retrieval_time_min_us,
+                retrieval_time_max_us,
+                structuring_run_id,
+                created_at_us
+            ) VALUES (
+            """
+            + ",".join("?" for _ in range(18))
+            + ")"
+        )
+
+        with self.database.write_transaction() as connection:
+            connection.executemany(
+                sql,
+                rows,
+            )
+
+    def _legacy_assessments_from_events(
+        self,
+        rows: list[Any],
+        findings: tuple[str, ...],
+    ) -> tuple[NewsEventMetadata, ...]:
+        if len(rows) != len(findings):
+            raise NewsError(
+                "Legacy News events cannot be mapped "
+                "safely to Research findings."
+            )
+
+        output: list[NewsEventMetadata] = []
+
+        for ordinal, row in enumerate(rows):
+            if (
+                int(row["event_ordinal"])
+                != ordinal
+                or int(row["finding_ordinal"])
+                != ordinal
+                or str(row["summary"])
+                != findings[ordinal]
+            ):
+                raise NewsError(
+                    "Legacy News event/finding identity "
+                    "cannot be recovered safely."
+                )
+
+            output.append(
+                NewsEventMetadata(
+                    finding_ordinal=ordinal,
+                    event_time_start=(
+                        str(row["event_time_start"])
+                        if row["event_time_start"]
+                        is not None
+                        else None
+                    ),
+                    event_time_end=(
+                        str(row["event_time_end"])
+                        if row["event_time_end"]
+                        is not None
+                        else None
+                    ),
+                    event_time_precision=str(
+                        row["event_time_precision"]
+                    ),
+                    location=(
+                        str(row["location_text"])
+                        if row["location_text"]
+                        is not None
+                        else None
+                    ),
+                    actors=tuple(
+                        _string_list(
+                            json.loads(
+                                str(
+                                    row[
+                                        "actors_json"
+                                    ]
+                                )
+                            )
+                        )
+                    ),
+                    core_action=(
+                        str(row["core_action"])
+                        if row["core_action"]
+                        is not None
+                        else None
+                    ),
+                    publication_time_min_us=(
+                        int(
+                            row[
+                                "publication_time_min_us"
+                            ]
+                        )
+                        if row[
+                            "publication_time_min_us"
+                        ]
+                        is not None
+                        else None
+                    ),
+                    publication_time_max_us=(
+                        int(
+                            row[
+                                "publication_time_max_us"
+                            ]
+                        )
+                        if row[
+                            "publication_time_max_us"
+                        ]
+                        is not None
+                        else None
+                    ),
+                    retrieval_time_min_us=(
+                        int(
+                            row[
+                                "retrieval_time_min_us"
+                            ]
+                        )
+                        if row[
+                            "retrieval_time_min_us"
+                        ]
+                        is not None
+                        else None
+                    ),
+                    retrieval_time_max_us=(
+                        int(
+                            row[
+                                "retrieval_time_max_us"
+                            ]
+                        )
+                        if row[
+                            "retrieval_time_max_us"
+                        ]
+                        is not None
+                        else None
+                    ),
+                    structuring_run_id=(
+                        uuid_from_blob(
+                            bytes(
+                                row[
+                                    "structuring_run_id"
+                                ]
+                            )
+                        )
+                        if row[
+                            "structuring_run_id"
+                        ]
+                        is not None
+                        else None
+                    ),
+                    eligibility="event",
+                    eligibility_reason=(
+                        "current_development"
+                    ),
+                )
+            )
+
+        return tuple(output)
 
     def _event_digest_payload(
         self,
@@ -252,6 +1023,7 @@ class NewsMaterializationMixin(NewsMixinContext):
     ) -> dict[str, Any]:
         return {
             "event_id": str(uuid_from_blob(bytes(row["event_id"]))),
+            "finding_ordinal": int(row["finding_ordinal"]),
             "title": str(row["title"]),
             "summary": str(row["summary"]),
             "categories": list(_string_list(json.loads(str(row["categories_json"])))),

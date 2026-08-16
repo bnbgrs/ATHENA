@@ -2,14 +2,27 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
+
+
+def _require_active_transaction(
+    connection: sqlite3.Connection,
+    message: str,
+) -> None:
+    if not connection.in_transaction:
+        raise RuntimeError(message)
+
 
 NEWS_SCHEMA_V1_VERSION = 1
 NEWS_SCHEMA_V1_ID = "news-domain-v1"
 NEWS_EVENT_SCHEMA_VERSION = 2
 NEWS_EVENT_SCHEMA_ID = "news-domain-v2"
-NEWS_SCHEMA_VERSION = 3
-NEWS_SCHEMA_ID = "news-domain-v3"
+NEWS_OPERATIONAL_SCHEMA_VERSION = 3
+NEWS_OPERATIONAL_SCHEMA_ID = "news-domain-v3"
+NEWS_SCHEMA_VERSION = 4
+NEWS_SCHEMA_ID = "news-domain-v4"
 
 
 def _rollback_if_active(connection: sqlite3.Connection) -> None:
@@ -17,33 +30,101 @@ def _rollback_if_active(connection: sqlite3.Connection) -> None:
         connection.execute("ROLLBACK")
 
 
-def initialize_news_schema(connection: sqlite3.Connection) -> None:
+def initialize_news_schema(
+    connection: sqlite3.Connection,
+) -> None:
     """Initialize/advance News tables for isolated tooling."""
     if connection.in_transaction:
-        raise RuntimeError("News schema initialization requires no active transaction.")
+        raise RuntimeError(
+            "News schema initialization requires no active transaction."
+        )
+
     try:
-        connection.executescript("BEGIN IMMEDIATE;\n" + _NEWS_SCHEMA_V1_SQL + "\nCOMMIT;")
+        connection.executescript(
+            "BEGIN IMMEDIATE;\n"
+            + _NEWS_SCHEMA_V1_SQL
+            + "\nCOMMIT;"
+        )
+
         row = connection.execute(
-            "SELECT schema_version, schema_id FROM news_schema_metadata WHERE singleton_id = 1"
+            """
+            SELECT schema_version, schema_id
+            FROM news_schema_metadata
+            WHERE singleton_id = 1
+            """
         ).fetchone()
+
         if (
             row is not None
-            and int(row["schema_version"]) == NEWS_SCHEMA_V1_VERSION
-            and str(row["schema_id"]) == NEWS_SCHEMA_V1_ID
+            and int(row["schema_version"])
+            == NEWS_SCHEMA_V1_VERSION
+            and str(row["schema_id"])
+            == NEWS_SCHEMA_V1_ID
         ):
             connection.executescript(
-                "BEGIN IMMEDIATE;\n" + _NEWS_EVENT_STRUCTURE_V2_SQL + "\nCOMMIT;"
+                "BEGIN IMMEDIATE;\n"
+                + _NEWS_EVENT_STRUCTURE_V2_SQL
+                + "\nCOMMIT;"
             )
+
+        row = connection.execute(
+            """
+            SELECT schema_version, schema_id
+            FROM news_schema_metadata
+            WHERE singleton_id = 1
+            """
+        ).fetchone()
+
+        if (
+            row is not None
+            and int(row["schema_version"])
+            == NEWS_EVENT_SCHEMA_VERSION
+            and str(row["schema_id"])
+            == NEWS_EVENT_SCHEMA_ID
+        ):
+            connection.executescript(
+                "BEGIN IMMEDIATE;\n"
+                + _NEWS_OPERATIONAL_V3_SQL
+                + "\nCOMMIT;"
+            )
+
+        row = connection.execute(
+            """
+            SELECT schema_version, schema_id
+            FROM news_schema_metadata
+            WHERE singleton_id = 1
+            """
+        ).fetchone()
+
+        if (
+            row is not None
+            and int(row["schema_version"])
+            == NEWS_OPERATIONAL_SCHEMA_VERSION
+            and str(row["schema_id"])
+            == NEWS_OPERATIONAL_SCHEMA_ID
+        ):
+            connection.executescript(
+                "BEGIN IMMEDIATE;\n"
+                + _NEWS_FINDING_ELIGIBILITY_V4_SQL
+            )
+
+            _require_active_transaction(
+                connection,
+                "News v4 initialization transaction "
+                "ended before legacy backfill.",
+            )
+
+            _backfill_legacy_news_finding_assessments(
+                connection
+            )
+
+            connection.execute("COMMIT")
+
     except BaseException:
         _rollback_if_active(connection)
         raise
-    row = connection.execute(
-        "SELECT schema_version, schema_id FROM news_schema_metadata WHERE singleton_id = 1"
-    ).fetchone()
-    if (row is not None and int(row["schema_version"]) == NEWS_EVENT_SCHEMA_VERSION
-            and str(row["schema_id"]) == NEWS_EVENT_SCHEMA_ID):
-        connection.executescript("BEGIN IMMEDIATE;\n" + _NEWS_OPERATIONAL_V3_SQL + "\nCOMMIT;")
-    verify_news_schema_v28(connection)
+
+    verify_news_schema_v30(connection)
 
 
 def migrate_news_schema_v25_to_v26(
@@ -138,6 +219,357 @@ COMMIT;
         _rollback_if_active(connection)
         raise
 
+def _backfill_legacy_news_finding_assessments(
+    connection: sqlite3.Connection,
+) -> None:
+    """Preserve pre-v30 one-event-per-finding decisions durably."""
+    event_count = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM news_events"
+        ).fetchone()[0]
+    )
+
+    if event_count == 0:
+        return
+
+    research_results_exists = (
+        connection.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name = 'research_results'
+            """
+        ).fetchone()
+        is not None
+    )
+
+    if not research_results_exists:
+        raise RuntimeError(
+            "Legacy News events cannot be backfilled "
+            "without ResearchResult storage."
+        )
+
+    rows = connection.execute(
+        """
+        SELECT
+            event.run_id,
+            event.event_ordinal,
+            event.finding_ordinal,
+            event.summary,
+            event.event_time_start,
+            event.event_time_end,
+            event.event_time_precision,
+            event.location_text,
+            event.actors_json,
+            event.core_action,
+            event.publication_time_min_us,
+            event.publication_time_max_us,
+            event.retrieval_time_min_us,
+            event.retrieval_time_max_us,
+            event.structuring_run_id,
+            event.created_at_us,
+            COALESCE(
+                event.research_result_id,
+                run.research_result_id
+            ) AS effective_research_result_id,
+            result.content_json AS research_content_json
+        FROM news_events AS event
+        JOIN news_runs AS run
+          ON run.run_id = event.run_id
+        LEFT JOIN research_results AS result
+          ON result.result_id = COALESCE(
+              event.research_result_id,
+              run.research_result_id
+          )
+        ORDER BY
+            event.run_id,
+            event.event_ordinal
+        """
+    ).fetchall()
+
+    if len(rows) != event_count:
+        raise RuntimeError(
+            "Legacy News event backfill could not "
+            "resolve every persisted event."
+        )
+
+    run_state: dict[
+        bytes,
+        tuple[
+            bytes,
+            tuple[str, ...],
+            set[int],
+        ],
+    ] = {}
+
+    inserts: list[tuple[object, ...]] = []
+
+    for row in rows:
+        run_id = bytes(row["run_id"])
+
+        raw_result_id = row[
+            "effective_research_result_id"
+        ]
+        raw_content = row[
+            "research_content_json"
+        ]
+
+        if (
+            raw_result_id is None
+            or raw_content is None
+        ):
+            raise RuntimeError(
+                "Legacy News event has no recoverable "
+                "ResearchResult."
+            )
+
+        result_id = bytes(raw_result_id)
+
+        if len(result_id) != 16:
+            raise RuntimeError(
+                "Legacy News event has invalid "
+                "ResearchResult identity."
+            )
+
+        try:
+            content = json.loads(
+                str(raw_content)
+            )
+        except (
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
+            raise RuntimeError(
+                "Legacy News ResearchResult JSON "
+                "cannot be decoded."
+            ) from exc
+
+        if not isinstance(content, dict):
+            raise RuntimeError(
+                "Legacy News ResearchResult payload "
+                "is not an object."
+            )
+
+        raw_findings = content.get("findings")
+
+        if (
+            not isinstance(raw_findings, list)
+            or any(
+                not isinstance(item, str)
+                for item in raw_findings
+            )
+        ):
+            raise RuntimeError(
+                "Legacy News ResearchResult findings "
+                "are invalid."
+            )
+
+        findings = tuple(raw_findings)
+
+        event_ordinal = int(
+            row["event_ordinal"]
+        )
+        finding_ordinal = int(
+            row["finding_ordinal"]
+        )
+
+        if (
+            event_ordinal < 0
+            or finding_ordinal != event_ordinal
+            or finding_ordinal >= len(findings)
+        ):
+            raise RuntimeError(
+                "Legacy News event/finding ordinals "
+                "cannot be recovered safely."
+            )
+
+        finding = findings[
+            finding_ordinal
+        ]
+
+        if str(row["summary"]) != finding:
+            raise RuntimeError(
+                "Legacy News event text no longer "
+                "matches its Research finding."
+            )
+
+        state = run_state.get(run_id)
+
+        if state is None:
+            seen: set[int] = set()
+
+            run_state[run_id] = (
+                result_id,
+                findings,
+                seen,
+            )
+        else:
+            (
+                previous_result_id,
+                previous_findings,
+                seen,
+            ) = state
+
+            if (
+                previous_result_id != result_id
+                or previous_findings != findings
+            ):
+                raise RuntimeError(
+                    "Legacy News run references "
+                    "inconsistent ResearchResults."
+                )
+
+        if finding_ordinal in seen:
+            raise RuntimeError(
+                "Legacy News finding ordinal is duplicated."
+            )
+
+        seen.add(finding_ordinal)
+
+        inserts.append(
+            (
+                run_id,
+                result_id,
+                finding_ordinal,
+                hashlib.sha256(
+                    finding.encode("utf-8")
+                ).digest(),
+                "event",
+                "current_development",
+                row["event_time_start"],
+                row["event_time_end"],
+                str(
+                    row["event_time_precision"]
+                ),
+                row["location_text"],
+                str(row["actors_json"]),
+                row["core_action"],
+                row["publication_time_min_us"],
+                row["publication_time_max_us"],
+                row["retrieval_time_min_us"],
+                row["retrieval_time_max_us"],
+                row["structuring_run_id"],
+                int(row["created_at_us"]),
+            )
+        )
+
+    for (
+        _run_id,
+        (
+            _result_id,
+            findings,
+            seen,
+        ),
+    ) in run_state.items():
+        if seen != set(
+            range(len(findings))
+        ):
+            raise RuntimeError(
+                "Legacy News run does not preserve "
+                "the historical one-event-per-finding "
+                "invariant."
+            )
+
+    connection.executemany(
+        """
+        INSERT INTO news_finding_assessments (
+            run_id,
+            research_result_id,
+            finding_ordinal,
+            finding_sha256,
+            eligibility,
+            eligibility_reason,
+            event_time_start,
+            event_time_end,
+            event_time_precision,
+            location_text,
+            actors_json,
+            core_action,
+            publication_time_min_us,
+            publication_time_max_us,
+            retrieval_time_min_us,
+            retrieval_time_max_us,
+            structuring_run_id,
+            created_at_us
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
+        """,
+        inserts,
+    )
+
+
+def migrate_news_schema_v29_to_v30(
+    connection: sqlite3.Connection,
+    *,
+    schema_version: int,
+    migration_id: str,
+) -> None:
+    """Add durable finding eligibility and advance Core to v30."""
+    if connection.in_transaction:
+        raise RuntimeError(
+            "News finding eligibility migration "
+            "requires no active transaction."
+        )
+
+    if schema_version != 30:
+        raise RuntimeError(
+            "ATHENA News finding eligibility migration "
+            "is defined only for Core schema v30."
+        )
+
+    if not migration_id or "'" in migration_id:
+        raise RuntimeError(
+            "ATHENA News finding eligibility migration id is invalid."
+        )
+
+    verify_news_schema_v28(connection)
+
+    try:
+        connection.executescript(
+            "BEGIN IMMEDIATE;\n"
+            + _NEWS_FINDING_ELIGIBILITY_V4_SQL
+        )
+
+        _require_active_transaction(
+            connection,
+            "News v30 migration transaction ended "
+            "before legacy backfill.",
+        )
+
+        _backfill_legacy_news_finding_assessments(
+            connection
+        )
+
+        connection.execute(
+            """
+            UPDATE schema_metadata
+            SET schema_version = ?,
+                last_migration_id = ?,
+                minimum_reader_version = ?
+            WHERE singleton_id = 1
+            """,
+            (
+                schema_version,
+                migration_id,
+                schema_version,
+            ),
+        )
+
+        connection.execute(
+            f"PRAGMA user_version = {schema_version}"
+        )
+
+        connection.execute("COMMIT")
+
+    except BaseException:
+        _rollback_if_active(connection)
+        raise
+
+
 def _required_news_tables() -> set[str]:
     return {
         "news_schema_metadata",
@@ -224,50 +656,432 @@ def verify_news_schema_v27(connection: sqlite3.Connection) -> None:
 
 
 
-def verify_news_schema_v28(connection: sqlite3.Connection) -> None:
-    """Verify completed durable News operational state."""
-    row = connection.execute(
-        "SELECT schema_version, schema_id FROM news_schema_metadata WHERE singleton_id = 1"
-    ).fetchone()
-    if (row is None or int(row["schema_version"]) != NEWS_SCHEMA_VERSION
-            or str(row["schema_id"]) != NEWS_SCHEMA_ID):
-        raise RuntimeError("Unsupported ATHENA News v3 domain schema.")
+def _verify_news_operational_shape(
+    connection: sqlite3.Connection,
+) -> None:
     operational_tables = {
         "news_profile_categories",
         "news_source_states",
         "news_event_members",
         "news_digest_items",
     }
+
     actual_tables = {
         str(item[0])
         for item in connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name NOT LIKE 'sqlite_%'
+            """
         ).fetchall()
     }
-    missing_operational = operational_tables.difference(actual_tables)
+
+    missing_operational = (
+        operational_tables.difference(
+            actual_tables
+        )
+    )
+
     if missing_operational:
         raise RuntimeError(
             "ATHENA News operational schema is incomplete: "
-            + ", ".join(sorted(missing_operational))
+            + ", ".join(
+                sorted(missing_operational)
+            )
         )
-    _verify_news_tables_and_foreign_keys(connection)
-    discovery_columns = {str(x[1]) for x in connection.execute(
-        "PRAGMA table_info(news_discoveries)").fetchall()}
-    required_discovery = {"content_sha256", "dedup_state", "duplicate_of_discovery_id", "near_duplicate_score"}
-    if not required_discovery.issubset(discovery_columns):
-        raise RuntimeError("ATHENA News discovery dedup schema is incomplete.")
-    event_columns = {str(x[1]) for x in connection.execute(
-        "PRAGMA table_info(news_events)").fetchall()}
-    required_event = {
-        "event_time_start", "event_time_end", "event_time_precision", "location_text",
-        "actors_json", "core_action", "publication_time_min_us", "publication_time_max_us",
-        "retrieval_time_min_us", "retrieval_time_max_us", "structuring_run_id",
-        "first_seen_us", "last_updated_us", "importance", "relevance", "novelty",
-        "source_count", "independent_source_count", "conflicting_source_count",
-        "research_job_id", "research_result_id",
+
+    _verify_news_tables_and_foreign_keys(
+        connection
+    )
+
+    discovery_columns = {
+        str(item[1])
+        for item in connection.execute(
+            "PRAGMA table_info(news_discoveries)"
+        ).fetchall()
     }
-    if not required_event.issubset(event_columns):
-        raise RuntimeError("ATHENA News event ranking schema is incomplete.")
+
+    required_discovery = {
+        "content_sha256",
+        "dedup_state",
+        "duplicate_of_discovery_id",
+        "near_duplicate_score",
+    }
+
+    if not required_discovery.issubset(
+        discovery_columns
+    ):
+        raise RuntimeError(
+            "ATHENA News discovery dedup schema is incomplete."
+        )
+
+    event_columns = {
+        str(item[1])
+        for item in connection.execute(
+            "PRAGMA table_info(news_events)"
+        ).fetchall()
+    }
+
+    required_event = {
+        "event_time_start",
+        "event_time_end",
+        "event_time_precision",
+        "location_text",
+        "actors_json",
+        "core_action",
+        "publication_time_min_us",
+        "publication_time_max_us",
+        "retrieval_time_min_us",
+        "retrieval_time_max_us",
+        "structuring_run_id",
+        "first_seen_us",
+        "last_updated_us",
+        "importance",
+        "relevance",
+        "novelty",
+        "source_count",
+        "independent_source_count",
+        "conflicting_source_count",
+        "research_job_id",
+        "research_result_id",
+    }
+
+    if not required_event.issubset(
+        event_columns
+    ):
+        raise RuntimeError(
+            "ATHENA News event ranking schema is incomplete."
+        )
+
+
+def verify_news_schema_v28(
+    connection: sqlite3.Connection,
+) -> None:
+    """Verify completed durable News operational state."""
+    row = connection.execute(
+        """
+        SELECT schema_version, schema_id
+        FROM news_schema_metadata
+        WHERE singleton_id = 1
+        """
+    ).fetchone()
+
+    if (
+        row is None
+        or int(row["schema_version"])
+        != NEWS_OPERATIONAL_SCHEMA_VERSION
+        or str(row["schema_id"])
+        != NEWS_OPERATIONAL_SCHEMA_ID
+    ):
+        raise RuntimeError(
+            "Unsupported ATHENA News v3 domain schema."
+        )
+
+    _verify_news_operational_shape(connection)
+
+
+def verify_news_schema_v30(
+    connection: sqlite3.Connection,
+) -> None:
+    """Verify durable News finding eligibility state."""
+    row = connection.execute(
+        """
+        SELECT schema_version, schema_id
+        FROM news_schema_metadata
+        WHERE singleton_id = 1
+        """
+    ).fetchone()
+
+    if (
+        row is None
+        or int(row["schema_version"])
+        != NEWS_SCHEMA_VERSION
+        or str(row["schema_id"])
+        != NEWS_SCHEMA_ID
+    ):
+        raise RuntimeError(
+            "Unsupported ATHENA News v4 domain schema."
+        )
+
+    _verify_news_operational_shape(connection)
+
+    tables = {
+        str(item[0])
+        for item in connection.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name NOT LIKE 'sqlite_%'
+            """
+        ).fetchall()
+    }
+
+    if "news_finding_assessments" not in tables:
+        raise RuntimeError(
+            "ATHENA News finding assessment table is missing."
+        )
+
+    event_columns = {
+        str(item[1])
+        for item in connection.execute(
+            "PRAGMA table_info(news_events)"
+        ).fetchall()
+    }
+
+    if "finding_ordinal" not in event_columns:
+        raise RuntimeError(
+            "ATHENA News event/finding identity is incomplete."
+        )
+
+    if connection.execute(
+        """
+        SELECT 1
+        FROM news_events
+        WHERE finding_ordinal IS NULL
+        LIMIT 1
+        """
+    ).fetchone() is not None:
+        raise RuntimeError(
+            "ATHENA News contains an event without finding identity."
+        )
+
+    indexes = {
+        str(item[1])
+        for item in connection.execute(
+            "PRAGMA index_list(news_events)"
+        ).fetchall()
+    }
+
+    if (
+        "uq_news_events_run_finding_ordinal"
+        not in indexes
+    ):
+        raise RuntimeError(
+            "ATHENA News event/finding uniqueness index is missing."
+        )
+
+    assessment_columns = {
+        str(item[1])
+        for item in connection.execute(
+            """
+            PRAGMA table_info(
+                news_finding_assessments
+            )
+            """
+        ).fetchall()
+    }
+
+    required_assessment_columns = {
+        "run_id",
+        "research_result_id",
+        "finding_ordinal",
+        "finding_sha256",
+        "eligibility",
+        "eligibility_reason",
+        "event_time_start",
+        "event_time_end",
+        "event_time_precision",
+        "location_text",
+        "actors_json",
+        "core_action",
+        "publication_time_min_us",
+        "publication_time_max_us",
+        "retrieval_time_min_us",
+        "retrieval_time_max_us",
+        "structuring_run_id",
+        "created_at_us",
+    }
+
+    if not required_assessment_columns.issubset(
+        assessment_columns
+    ):
+        raise RuntimeError(
+            "ATHENA News finding assessment schema is incomplete."
+        )
+
+    event_without_assessment = connection.execute(
+        """
+        SELECT 1
+        FROM news_events AS event
+        LEFT JOIN news_finding_assessments AS assessment
+          ON assessment.run_id = event.run_id
+         AND assessment.finding_ordinal =
+             event.finding_ordinal
+        WHERE assessment.run_id IS NULL
+           OR assessment.eligibility != 'event'
+           OR (
+               event.research_result_id IS NOT NULL
+               AND event.research_result_id !=
+                   assessment.research_result_id
+           )
+        LIMIT 1
+        """
+    ).fetchone()
+
+    if event_without_assessment is not None:
+        raise RuntimeError(
+            "ATHENA News event has no matching "
+            "durable event-eligibility assessment."
+        )
+
+    if connection.execute(
+        "PRAGMA foreign_key_check"
+    ).fetchall():
+        raise RuntimeError(
+            "ATHENA News v4 foreign-key verification failed."
+        )
+
+
+_NEWS_FINDING_ELIGIBILITY_V4_SQL = """
+ALTER TABLE news_events
+ADD COLUMN finding_ordinal INTEGER NULL
+    CHECK(
+        finding_ordinal IS NULL
+        OR finding_ordinal >= 0
+    );
+
+UPDATE news_events
+SET finding_ordinal = event_ordinal
+WHERE finding_ordinal IS NULL;
+
+CREATE UNIQUE INDEX
+    uq_news_events_run_finding_ordinal
+ON news_events(
+    run_id,
+    finding_ordinal
+);
+
+CREATE TABLE news_finding_assessments (
+    run_id BLOB(16) NOT NULL
+        CHECK(length(run_id) = 16),
+    research_result_id BLOB(16) NOT NULL
+        CHECK(length(research_result_id) = 16),
+    finding_ordinal INTEGER NOT NULL
+        CHECK(finding_ordinal >= 0),
+    finding_sha256 BLOB(32) NOT NULL
+        CHECK(length(finding_sha256) = 32),
+    eligibility TEXT NOT NULL
+        CHECK(
+            eligibility IN (
+                'event',
+                'context'
+            )
+        ),
+    eligibility_reason TEXT NOT NULL
+        CHECK(
+            eligibility_reason IN (
+                'current_development',
+                'background',
+                'static_fact',
+                'historical_context',
+                'analysis',
+                'opinion',
+                'product_description',
+                'other_context'
+            )
+        ),
+    event_time_start TEXT NULL,
+    event_time_end TEXT NULL,
+    event_time_precision TEXT NOT NULL
+        CHECK(
+            event_time_precision IN (
+                'unknown',
+                'instant',
+                'day',
+                'range'
+            )
+        ),
+    location_text TEXT NULL,
+    actors_json TEXT NOT NULL
+        CHECK(json_valid(actors_json)),
+    core_action TEXT NULL,
+    publication_time_min_us INTEGER NULL
+        CHECK(
+            publication_time_min_us IS NULL
+            OR publication_time_min_us >= 0
+        ),
+    publication_time_max_us INTEGER NULL
+        CHECK(
+            publication_time_max_us IS NULL
+            OR publication_time_max_us >= 0
+        ),
+    retrieval_time_min_us INTEGER NULL
+        CHECK(
+            retrieval_time_min_us IS NULL
+            OR retrieval_time_min_us >= 0
+        ),
+    retrieval_time_max_us INTEGER NULL
+        CHECK(
+            retrieval_time_max_us IS NULL
+            OR retrieval_time_max_us >= 0
+        ),
+    structuring_run_id BLOB(16) NULL
+        CHECK(
+            structuring_run_id IS NULL
+            OR length(structuring_run_id) = 16
+        ),
+    created_at_us INTEGER NOT NULL
+        CHECK(created_at_us >= 0),
+
+    PRIMARY KEY(
+        run_id,
+        finding_ordinal
+    ),
+
+    FOREIGN KEY(run_id)
+        REFERENCES news_runs(run_id),
+
+    FOREIGN KEY(research_result_id)
+        REFERENCES research_results(result_id),
+
+    FOREIGN KEY(structuring_run_id)
+        REFERENCES processing_runs(
+            processing_run_id
+        ),
+
+    CHECK(
+        (
+            eligibility = 'event'
+            AND eligibility_reason =
+                'current_development'
+        )
+        OR
+        (
+            eligibility = 'context'
+            AND eligibility_reason !=
+                'current_development'
+        )
+    ),
+
+    CHECK(
+        eligibility = 'event'
+        OR (
+            event_time_start IS NULL
+            AND event_time_end IS NULL
+            AND event_time_precision =
+                'unknown'
+            AND location_text IS NULL
+            AND actors_json = '[]'
+            AND core_action IS NULL
+        )
+    )
+) WITHOUT ROWID;
+
+CREATE INDEX
+    idx_news_finding_assessments_result
+ON news_finding_assessments(
+    research_result_id,
+    finding_ordinal
+);
+
+UPDATE news_schema_metadata
+SET schema_version = 4,
+    schema_id = 'news-domain-v4'
+WHERE singleton_id = 1;
+"""
 
 
 _NEWS_OPERATIONAL_V3_SQL = """
