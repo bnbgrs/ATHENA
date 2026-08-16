@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from athena.chat.grounding import (
     GroundingContract,
@@ -20,6 +21,12 @@ from athena.chat.service import ChatService
 from athena.model.domain import ModelChatMessage, ModelInfo
 from athena.model.ports import ChatModelProvider
 from athena.retrieval.context_package import ContextPackage
+
+if TYPE_CHECKING:
+    from athena.resources.manager import (
+        InteractiveDemandLease,
+        ResourceManager,
+    )
 
 _RETRIEVED_CONTEXT_SYSTEM_PREFIX = """ATHENA RETRIEVED MEMORY
 
@@ -129,9 +136,16 @@ class ChatGenerationService:
     it never reloads hidden chat/archive content for the provider call.
     """
 
-    def __init__(self, chat: ChatService, provider: ChatModelProvider) -> None:
+    def __init__(
+        self,
+        chat: ChatService,
+        provider: ChatModelProvider,
+        *,
+        interactive_demand: ResourceManager | None = None,
+    ) -> None:
         self.chat = chat
         self.provider = provider
+        self.interactive_demand = interactive_demand
 
     def send_message(
         self,
@@ -434,6 +448,23 @@ class ChatGenerationService:
             )
         max_output_tokens, reasoning_mode = context_package.generation_controls()
 
+        if self.interactive_demand is not None:
+            with self.interactive_demand.interactive_session(
+                purpose="chat_generation"
+            ) as lease:
+                return self._generate_and_persist(
+                    chat_id=chat_id,
+                    user_message=user_message,
+                    model=model,
+                    history=history,
+                    on_delta=on_delta,
+                    grounding_contract=grounding_contract,
+                    max_output_tokens=max_output_tokens,
+                    reasoning_mode=reasoning_mode,
+                    on_before_provider_call=on_before_provider_call,
+                    interactive_lease=lease,
+                )
+
         return self._generate_and_persist(
             chat_id=chat_id,
             user_message=user_message,
@@ -444,6 +475,7 @@ class ChatGenerationService:
             max_output_tokens=max_output_tokens,
             reasoning_mode=reasoning_mode,
             on_before_provider_call=on_before_provider_call,
+            interactive_lease=None,
         )
 
     def _generate_and_persist(
@@ -458,6 +490,7 @@ class ChatGenerationService:
         max_output_tokens: int | None,
         reasoning_mode: str | None,
         on_before_provider_call: Callable[[], None] | None,
+        interactive_lease: InteractiveDemandLease | None,
     ) -> ChatGenerationResult:
         if max_output_tokens is not None and max_output_tokens < 1:
             raise ValueError("max_output_tokens must be positive when provided.")
@@ -474,6 +507,24 @@ class ChatGenerationService:
         attempt_history = history
 
         for attempt_index in range(attempt_limit):
+            if interactive_lease is not None:
+                demand = self.interactive_demand
+                if demand is None:
+                    raise RuntimeError(
+                        "Interactive lease exists without a "
+                        "ResourceManager."
+                    )
+
+                # Refresh before every provider attempt. This also covers
+                # grounded validation retries without allowing the lease to
+                # age between attempts.
+                interactive_lease = (
+                    demand.renew_interactive_demand(
+                        interactive_lease,
+                        force=True,
+                    )
+                )
+
             if on_before_provider_call is not None:
                 on_before_provider_call()
 
@@ -500,6 +551,22 @@ class ChatGenerationService:
 
             for chunk in stream:
                 chunks.append(chunk)
+
+                if interactive_lease is not None:
+                    demand = self.interactive_demand
+                    if demand is None:
+                        raise RuntimeError(
+                            "Interactive lease exists without a "
+                            "ResourceManager."
+                        )
+
+                    # Cheap on every token: ResourceManager only performs
+                    # durable I/O after half the lease lifetime has elapsed.
+                    interactive_lease = (
+                        demand.renew_interactive_demand(
+                            interactive_lease
+                        )
+                    )
 
                 # Direct chat retains live streaming behavior. Grounded output
                 # is withheld until deterministic validation succeeds.

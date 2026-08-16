@@ -8,6 +8,7 @@ from athena.config.settings import AthenaSettings
 from athena.core.application import AthenaApplication
 from athena.jobs.models import JobPriority, JobState, WaitingReason
 from athena.resources.manager import (
+    ResourceManager,
     ResourceMode,
     ResourceSnapshot,
     StaticResourceProbe,
@@ -154,4 +155,210 @@ def test_probe_failure_degrades_to_resource_wait_instead_of_scheduler_crash(
     ).fetchone()
     assert latest is not None
     assert "resource_probe" in str(latest["degraded_metrics_json"])
+    app.stop()
+
+def test_interactive_demand_lease_is_visible_and_released(tmp_path: Path) -> None:
+    app = AthenaApplication(
+        settings=AthenaSettings(local_root=tmp_path / "interactive-runtime")
+    )
+    app.start()
+
+    observer = ResourceManager(
+        database=app.database,
+        paths=app.paths,
+        chat=app.chat,
+        model_provider=app.model_provider,
+        interactive_lease_seconds=app.resources.interactive_lease_seconds,
+    )
+
+    assert not observer.interactive_demand_active()
+
+    with app.resources.interactive_session(
+        purpose="unit_test_chat"
+    ) as lease:
+        assert observer.interactive_demand_active()
+        lease_path = (
+            app.paths.state_root
+            / "interactive-demand"
+            / f"{lease.lease_id}.json"
+        )
+        assert lease_path.is_file()
+
+    assert not observer.interactive_demand_active()
+    app.stop()
+
+
+def test_expired_interactive_demand_does_not_block_background_work(
+    tmp_path: Path,
+) -> None:
+    app = AthenaApplication(
+        settings=AthenaSettings(local_root=tmp_path / "expiry-runtime")
+    )
+    app.start()
+
+    lease = app.resources.acquire_interactive_demand(
+        purpose="stale_test",
+        lease_seconds=1,
+        now_us=1_000_000,
+    )
+    assert app.resources.interactive_demand_active(
+        now_us=1_500_000
+    )
+    assert not app.resources.interactive_demand_active(
+        now_us=2_000_001
+    )
+
+    app.resources.release_interactive_demand(lease.lease_id)
+    app.stop()
+
+
+def test_interactive_chat_defers_background_gpu_job_but_not_data_safety(
+    tmp_path: Path,
+) -> None:
+    app = AthenaApplication(
+        settings=AthenaSettings(local_root=tmp_path / "priority-runtime")
+    )
+    app.start()
+
+    background = app.jobs.create(
+        job_type="research.exhaustive",
+        priority=JobPriority.BACKGROUND,
+        requested_scope={"sentinel": "background"},
+        pinned_configuration={"sentinel": "background"},
+    )
+    data_safety = app.jobs.create(
+        job_type="research.exhaustive",
+        priority=JobPriority.DATA_SAFETY,
+        requested_scope={"sentinel": "data-safety"},
+        pinned_configuration={"sentinel": "data-safety"},
+    )
+
+    with app.resources.interactive_session(purpose="priority_test"):
+        deferred = app.resources.admit(background)
+        protected = app.resources.admit(data_safety)
+
+    assert not deferred.admitted
+    assert deferred.reason == "interactive chat demand has priority"
+    assert deferred.retry_after_seconds == 5
+
+    assert protected.admitted
+    assert protected.reason is None
+    assert protected.retry_after_seconds == 0
+
+    app.stop()
+
+
+def test_interactive_demand_renewal_extends_live_lease(
+    tmp_path: Path,
+) -> None:
+    app = AthenaApplication(
+        settings=AthenaSettings(
+            local_root=tmp_path / "renew-runtime"
+        )
+    )
+    app.start()
+
+    lease = app.resources.acquire_interactive_demand(
+        purpose="renew-test",
+        lease_seconds=10,
+        now_us=1_000_000,
+    )
+
+    # Before half-life: no durable renewal needed.
+    same = app.resources.renew_interactive_demand(
+        lease,
+        now_us=5_000_000,
+    )
+    assert same == lease
+
+    # After half-life: extend ten seconds from renewal time.
+    renewed = app.resources.renew_interactive_demand(
+        same,
+        now_us=6_000_001,
+    )
+    assert renewed.lease_id == lease.lease_id
+    assert renewed.acquired_at_us == lease.acquired_at_us
+    assert renewed.lease_seconds == 10
+    assert renewed.expires_at_us == 16_000_001
+
+    # Original lease would already be expired here.
+    assert app.resources.interactive_demand_active(
+        now_us=12_000_000
+    )
+
+    app.resources.release_interactive_demand(
+        lease.lease_id
+    )
+    assert not app.resources.interactive_demand_active(
+        now_us=12_000_000
+    )
+
+    app.stop()
+
+
+def test_multiple_interactive_chat_leases_are_independent(
+    tmp_path: Path,
+) -> None:
+    app = AthenaApplication(
+        settings=AthenaSettings(
+            local_root=tmp_path / "multi-chat-runtime"
+        )
+    )
+    app.start()
+
+    first = app.resources.acquire_interactive_demand(
+        purpose="chat-one"
+    )
+    second = app.resources.acquire_interactive_demand(
+        purpose="chat-two"
+    )
+
+    assert first.lease_id != second.lease_id
+    assert app.resources.interactive_demand_active()
+
+    app.resources.release_interactive_demand(
+        first.lease_id
+    )
+
+    # Releasing one chat must not re-enable background work while
+    # another interactive chat is still active.
+    assert app.resources.interactive_demand_active()
+
+    app.resources.release_interactive_demand(
+        second.lease_id
+    )
+
+    assert not app.resources.interactive_demand_active()
+
+    app.stop()
+
+
+def test_forced_interactive_renewal_refreshes_before_retry(
+    tmp_path: Path,
+) -> None:
+    app = AthenaApplication(
+        settings=AthenaSettings(
+            local_root=tmp_path / "force-renew-runtime"
+        )
+    )
+    app.start()
+
+    lease = app.resources.acquire_interactive_demand(
+        purpose="retry-test",
+        lease_seconds=10,
+        now_us=1_000_000,
+    )
+
+    renewed = app.resources.renew_interactive_demand(
+        lease,
+        now_us=2_000_000,
+        force=True,
+    )
+
+    assert renewed.expires_at_us == 12_000_000
+    assert renewed.expires_at_us > lease.expires_at_us
+
+    app.resources.release_interactive_demand(
+        lease.lease_id
+    )
     app.stop()

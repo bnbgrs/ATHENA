@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,46 @@ from athena.chat.repository import ChatRepository
 from athena.chat.service import ChatService
 from athena.model.domain import ModelChatMessage, ModelInfo, ProviderHealth, ProviderHealthStatus
 from athena.storage.database import SQLiteDatabase
+
+
+class FakeInteractiveDemand:
+    def __init__(self) -> None:
+        self.active = False
+        self.entries = 0
+        self.exits = 0
+        self.purposes: list[str] = []
+        self.renewals = 0
+        self.forced_renewals = 0
+        self.lease = object()
+
+    @contextmanager
+    def interactive_session(
+        self,
+        *,
+        purpose: str = "chat_generation",
+    ) -> Iterator[object]:
+        assert not self.active
+        self.active = True
+        self.entries += 1
+        self.purposes.append(purpose)
+        try:
+            yield self.lease
+        finally:
+            self.active = False
+            self.exits += 1
+
+    def renew_interactive_demand(
+        self,
+        lease,
+        *,
+        force: bool = False,
+    ):
+        assert self.active
+        assert lease is self.lease
+        self.renewals += 1
+        if force:
+            self.forced_renewals += 1
+        return lease
 
 
 class FakeProvider:
@@ -803,5 +844,106 @@ def test_grounded_generation_can_recover_on_final_retry(
             MessageType.ASSISTANT,
         ]
 
+    finally:
+        database.stop()
+
+def test_provider_generation_runs_inside_interactive_demand_lease(
+    tmp_path: Path,
+) -> None:
+    database, chat = _chat_service(tmp_path)
+    try:
+        demand = FakeInteractiveDemand()
+
+        class GuardAwareProvider(FakeProvider):
+            def stream_chat(
+                self,
+                *,
+                model_id: str,
+                messages: Sequence[ModelChatMessage],
+                max_output_tokens: int | None = None,
+                reasoning_mode: str | None = None,
+            ) -> Iterator[str]:
+                assert demand.active
+                yield from super().stream_chat(
+                    model_id=model_id,
+                    messages=messages,
+                    max_output_tokens=max_output_tokens,
+                    reasoning_mode=reasoning_mode,
+                )
+
+        chat_id = chat.create_chat()
+        provider = GuardAwareProvider(
+            (_model(),),
+            ("interactive answer",),
+        )
+        service = ChatGenerationService(
+            chat,
+            provider,
+            interactive_demand=demand,
+        )
+
+        result = service.send_message(
+            chat_id=chat_id,
+            content="Interactive request",
+        )
+
+        assert result.assistant_message.content == "interactive answer"
+        assert demand.entries == 1
+        assert demand.exits == 1
+        assert demand.purposes == ["chat_generation"]
+        assert demand.forced_renewals == 1
+        assert demand.renewals >= 2
+        assert not demand.active
+    finally:
+        database.stop()
+
+
+def test_interactive_demand_lease_is_released_on_provider_failure(
+    tmp_path: Path,
+) -> None:
+    database, chat = _chat_service(tmp_path)
+    try:
+        demand = FakeInteractiveDemand()
+
+        class FailingProvider(FakeProvider):
+            def stream_chat(
+                self,
+                *,
+                model_id: str,
+                messages: Sequence[ModelChatMessage],
+                max_output_tokens: int | None = None,
+                reasoning_mode: str | None = None,
+            ) -> Iterator[str]:
+                del model_id, messages, max_output_tokens, reasoning_mode
+                assert demand.active
+                raise RuntimeError("synthetic provider failure")
+                yield  # pragma: no cover
+
+        chat_id = chat.create_chat()
+        provider = FailingProvider((_model(),), ())
+        service = ChatGenerationService(
+            chat,
+            provider,
+            interactive_demand=demand,
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="synthetic provider failure",
+        ):
+            service.send_message(
+                chat_id=chat_id,
+                content="Fail safely",
+            )
+
+        assert demand.entries == 1
+        assert demand.exits == 1
+        assert demand.forced_renewals == 1
+        assert demand.renewals == 1
+        assert not demand.active
+
+        thread = chat.load_chat(chat_id)
+        assert len(thread.messages) == 1
+        assert thread.messages[0].message_type is MessageType.USER
     finally:
         database.stop()

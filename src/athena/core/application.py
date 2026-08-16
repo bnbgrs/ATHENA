@@ -178,8 +178,16 @@ class AthenaApplication:
             paths=self.paths,
             chat=self.chat,
             model_provider=self.model_provider,
+            interactive_lease_seconds=max(
+                60,
+                int(self.settings.model_generation_timeout_seconds) + 60,
+            ),
         )
-        self.chat_generation = ChatGenerationService(self.chat, self.model_provider)
+        self.chat_generation = ChatGenerationService(
+            self.chat,
+            self.model_provider,
+            interactive_demand=self.resources,
+        )
         self.embedding_provider = LMStudioEmbeddingProvider(
             self.model_provider,
             generation_timeout_seconds=self.settings.model_generation_timeout_seconds,

@@ -339,7 +339,7 @@ class DurableJobScheduler:
                 waiting += 1
             elif result.final_state is JobState.FAILED:
                 failed += 1
-            elif result.action == "yielded":
+            elif result.action in {"yielded", "yielded_interactive"}:
                 yielded += 1
 
         return SchedulerRunResult(
@@ -383,7 +383,7 @@ class DurableJobScheduler:
                 waiting += 1
             elif result.final_state is JobState.FAILED:
                 failed += 1
-            elif result.action == "yielded":
+            elif result.action in {"yielded", "yielded_interactive"}:
                 yielded += 1
 
         return SchedulerRunResult(
@@ -487,6 +487,12 @@ class DurableJobScheduler:
                 return "completed", result.job
             if result.waiting:
                 return "waiting", result.job
+            interactive_yield = self._yield_for_interactive_if_requested(
+                job_id,
+                lease_token,
+            )
+            if interactive_yield is not None:
+                return interactive_yield
         return self._yield_at_boundary(job_id, lease_token)
 
     def _dispatch_analysis(
@@ -506,6 +512,12 @@ class DurableJobScheduler:
                 return "completed", result.job
             if result.waiting:
                 return "waiting", result.job
+            interactive_yield = self._yield_for_interactive_if_requested(
+                job_id,
+                lease_token,
+            )
+            if interactive_yield is not None:
+                return interactive_yield
         return self._yield_at_boundary(job_id, lease_token)
 
     def _dispatch_extraction(
@@ -525,6 +537,12 @@ class DurableJobScheduler:
                 return "completed", result.job
             if result.waiting:
                 return "waiting", result.job
+            interactive_yield = self._yield_for_interactive_if_requested(
+                job_id,
+                lease_token,
+            )
+            if interactive_yield is not None:
+                return interactive_yield
         return self._yield_at_boundary(job_id, lease_token)
 
     def _dispatch_research(
@@ -549,7 +567,40 @@ class DurableJobScheduler:
                 return action, result.job
             if result.waiting:
                 return "waiting", result.job
+            interactive_yield = self._yield_for_interactive_if_requested(
+                job_id,
+                lease_token,
+            )
+            if interactive_yield is not None:
+                return interactive_yield
         return self._yield_at_boundary(job_id, lease_token)
+
+    def _yield_for_interactive_if_requested(
+        self,
+        job_id: uuid.UUID,
+        lease_token: bytes,
+    ) -> tuple[str, JobRecord] | None:
+        if self.resources is None:
+            return None
+
+        current = self.jobs.get(job_id)
+        if not self.resources.should_yield_to_interactive(current):
+            return None
+
+        action, yielded = self._yield_at_boundary(job_id, lease_token)
+        if action != "yielded":
+            return action, yielded
+
+        logger.info(
+            "Scheduler yielded durable GPU job for interactive chat",
+            extra={
+                "event": "jobs.scheduler_interactive_yield",
+                "job_id": str(job_id),
+                "job_type": yielded.job_type,
+                "fencing_sequence": yielded.fencing_sequence,
+            },
+        )
+        return "yielded_interactive", yielded
 
     def _yield_at_boundary(
         self,

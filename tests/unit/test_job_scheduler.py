@@ -10,6 +10,7 @@ from athena.jobs.embedding_processing import DurableEmbeddingRebuildWorker
 from athena.jobs.models import JobPriority, JobState, WaitingReason
 from athena.jobs.scheduler import DurableJobScheduler, SchedulerPolicy
 from athena.model.adapters.lm_studio import ProviderUnavailableError
+from athena.resources.manager import AdmissionDecision
 from athena.retrieval.archive import ArchiveSemanticSearchService
 
 
@@ -30,6 +31,38 @@ class UnavailableEmbeddingProvider:
     def embed(self, *, model_id: str, texts):
         self.calls += 1
         raise ProviderUnavailableError("provider offline")
+
+
+@dataclass
+class ToggleInteractiveResources:
+    active: bool = False
+
+    def admit(self, job):
+        del job
+        return AdmissionDecision(True, None, 0)
+
+    def should_yield_to_interactive(self, job):
+        del job
+        return self.active
+
+
+@dataclass
+class InteractiveTriggerEmbeddingProvider:
+    resources: ToggleInteractiveResources
+    calls: list[tuple[str, ...]] = field(default_factory=list)
+    triggered: bool = False
+
+    def embed(self, *, model_id: str, texts):
+        del model_id
+        captured = tuple(texts)
+        self.calls.append(captured)
+        if not self.triggered:
+            self.triggered = True
+            self.resources.active = True
+        return tuple(
+            (1.0, float((len(text) % 7) + 1), 0.5)
+            for text in captured
+        )
 
 
 def _app(root: Path) -> AthenaApplication:
@@ -301,4 +334,63 @@ def test_due_dependency_parent_does_not_starve_queued_child(tmp_path) -> None:
     queued_parent = app.jobs.get(parent.job_id)
     assert queued_parent.state is JobState.QUEUED
     assert queued_parent.next_run_at_us == due_at
+    app.stop()
+
+def test_running_gpu_job_yields_at_next_boundary_for_interactive_chat(
+    tmp_path,
+) -> None:
+    app = _app(tmp_path / "interactive-yield-runtime")
+    source = _capture_source(
+        app,
+        tmp_path / "interactive-yield.md",
+        "Interactive priority boundary marker.\n\n"
+        + ("large background embedding payload " * 700),
+    )
+    represented = app.source_text.build(source.source_id)
+    built = app.source_chunks.build_default(
+        represented.result.representation.representation_id
+    )
+    assert len(built.chunks) >= 3
+
+    resources = ToggleInteractiveResources()
+    provider = InteractiveTriggerEmbeddingProvider(resources)
+    semantic = ArchiveSemanticSearchService(
+        lexical=app.archive_search,
+        provider=provider,
+        batch_size=1,
+    )
+    embedding = DurableEmbeddingRebuildWorker(
+        jobs=app.jobs,
+        semantic=semantic,
+    )
+    scheduler = DurableJobScheduler(
+        jobs=app.jobs,
+        source_worker=app.source_processing,
+        embedding_worker=embedding,
+        resources=resources,
+        policy=SchedulerPolicy(
+            max_boundaries_per_dispatch=8,
+        ),
+    )
+    job = embedding.enqueue(
+        "interactive-yield-embed",
+        batch_size=1,
+    )
+
+    first = scheduler.tick(worker_id="background-worker")
+
+    assert first.selected_job_id == job.job_id
+    assert first.action == "yielded_interactive"
+    assert first.final_state is JobState.QUEUED
+    assert len(provider.calls) == 1
+
+    resources.active = False
+
+    resumed = scheduler.drain(
+        worker_id="background-worker-resumed",
+        max_jobs=20,
+    )
+
+    assert resumed.completed_jobs == 1
+    assert app.jobs.get(job.job_id).state is JobState.COMPLETED
     app.stop()

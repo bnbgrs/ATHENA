@@ -7,8 +7,11 @@ import json
 import os
 import shutil
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from enum import Enum
+from pathlib import Path
 from typing import Protocol
 
 from athena.chat.service import ChatService
@@ -57,6 +60,15 @@ class AdmissionDecision:
     admitted: bool
     reason: str | None
     retry_after_seconds: int
+
+
+@dataclass(frozen=True, slots=True)
+class InteractiveDemandLease:
+    lease_id: uuid.UUID
+    purpose: str
+    acquired_at_us: int
+    expires_at_us: int
+    lease_seconds: int
 
 
 class ResourceProbe(Protocol):
@@ -130,12 +142,272 @@ class ResourceManager:
         chat: ChatService,
         model_provider: ChatModelProvider,
         probe: ResourceProbe | None = None,
+        interactive_lease_seconds: int = 360,
     ) -> None:
+        if interactive_lease_seconds <= 0:
+            raise ValueError(
+                "Interactive demand lease duration must be positive."
+            )
         self.database = database
         self.paths = paths
         self.chat = chat
         self.model_provider = model_provider
         self.probe = probe or PortableResourceProbe()
+        self.interactive_lease_seconds = interactive_lease_seconds
+
+    @property
+    def _interactive_lease_root(self) -> Path:
+        return self.paths.state_root / "interactive-demand"
+
+    def acquire_interactive_demand(
+        self,
+        *,
+        purpose: str = "chat_generation",
+        lease_seconds: int | None = None,
+        now_us: int | None = None,
+    ) -> InteractiveDemandLease:
+        normalized_purpose = purpose.strip()
+        if not normalized_purpose:
+            raise ValueError("Interactive demand purpose must not be empty.")
+
+        duration = (
+            self.interactive_lease_seconds
+            if lease_seconds is None
+            else lease_seconds
+        )
+        if duration <= 0:
+            raise ValueError(
+                "Interactive demand lease duration must be positive."
+            )
+
+        now = utc_now_us() if now_us is None else now_us
+        expires_at_us = now + duration * 1_000_000
+        lease_id = new_uuid7()
+
+        root = self._interactive_lease_root
+        root.mkdir(parents=True, exist_ok=True)
+        self._cleanup_expired_interactive_leases(now_us=now)
+
+        final_path = root / f"{lease_id}.json"
+        staging_path = root / f".{lease_id}.partial"
+        payload = json.dumps(
+            {
+                "lease_id": str(lease_id),
+                "purpose": normalized_purpose,
+                "owner_pid": os.getpid(),
+                "acquired_at_us": now,
+                "expires_at_us": expires_at_us,
+                "lease_seconds": duration,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        try:
+            with staging_path.open("xb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(staging_path, final_path)
+            self._fsync_directory(root)
+        finally:
+            staging_path.unlink(missing_ok=True)
+
+        return InteractiveDemandLease(
+            lease_id=lease_id,
+            purpose=normalized_purpose,
+            acquired_at_us=now,
+            expires_at_us=expires_at_us,
+            lease_seconds=duration,
+        )
+
+    def renew_interactive_demand(
+        self,
+        lease: InteractiveDemandLease,
+        *,
+        now_us: int | None = None,
+        force: bool = False,
+    ) -> InteractiveDemandLease:
+        if lease.lease_seconds <= 0:
+            raise ValueError(
+                "Interactive demand lease duration must be positive."
+            )
+
+        now = utc_now_us() if now_us is None else now_us
+        duration_us = lease.lease_seconds * 1_000_000
+
+        # Renewal is intentionally throttled. ChatGenerationService may call
+        # this for every streamed token, but the durable lease file is only
+        # rewritten after half of the current lease lifetime has elapsed.
+        renew_at_us = (
+            lease.expires_at_us
+            - max(1, duration_us // 2)
+        )
+
+        if not force and now < renew_at_us:
+            return lease
+
+        renewed = replace(
+            lease,
+            expires_at_us=now + duration_us,
+        )
+
+        root = self._interactive_lease_root
+        root.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        final_path = (
+            root
+            / f"{lease.lease_id}.json"
+        )
+
+        staging_path = (
+            root
+            / f".{lease.lease_id}.partial"
+        )
+
+        payload = json.dumps(
+            {
+                "lease_id": str(
+                    renewed.lease_id
+                ),
+                "purpose": (
+                    renewed.purpose
+                ),
+                "owner_pid": os.getpid(),
+                "acquired_at_us": (
+                    renewed.acquired_at_us
+                ),
+                "renewed_at_us": now,
+                "expires_at_us": (
+                    renewed.expires_at_us
+                ),
+                "lease_seconds": (
+                    renewed.lease_seconds
+                ),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        staging_path.unlink(
+            missing_ok=True
+        )
+
+        try:
+            with staging_path.open(
+                "xb"
+            ) as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(
+                    handle.fileno()
+                )
+
+            os.replace(
+                staging_path,
+                final_path,
+            )
+
+            self._fsync_directory(
+                root
+            )
+
+        finally:
+            staging_path.unlink(
+                missing_ok=True
+            )
+
+        return renewed
+
+    def release_interactive_demand(
+        self,
+        lease_id: uuid.UUID,
+    ) -> None:
+        root = self._interactive_lease_root
+        path = root / f"{lease_id}.json"
+        partial = root / f".{lease_id}.partial"
+        path.unlink(missing_ok=True)
+        partial.unlink(missing_ok=True)
+
+    @contextmanager
+    def interactive_session(
+        self,
+        *,
+        purpose: str = "chat_generation",
+    ) -> Iterator[InteractiveDemandLease]:
+        lease = self.acquire_interactive_demand(purpose=purpose)
+        try:
+            yield lease
+        finally:
+            self.release_interactive_demand(lease.lease_id)
+
+    def interactive_demand_active(
+        self,
+        *,
+        now_us: int | None = None,
+    ) -> bool:
+        now = utc_now_us() if now_us is None else now_us
+        self._cleanup_expired_interactive_leases(now_us=now)
+        root = self._interactive_lease_root
+        if not root.is_dir():
+            return False
+        return any(root.glob("*.json"))
+
+    def should_yield_to_interactive(
+        self,
+        job: JobRecord,
+        *,
+        now_us: int | None = None,
+    ) -> bool:
+        if job.priority <= JobPriority.INTERACTIVE:
+            return False
+        if job.job_type not in self._GPU_JOBS:
+            return False
+        return self.interactive_demand_active(now_us=now_us)
+
+    def _cleanup_expired_interactive_leases(
+        self,
+        *,
+        now_us: int,
+    ) -> None:
+        root = self._interactive_lease_root
+        if not root.is_dir():
+            return
+
+        fallback_ttl_us = self.interactive_lease_seconds * 1_000_000
+
+        for path in root.glob("*.json"):
+            expired = False
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                expires_at_us = int(payload["expires_at_us"])
+                expired = expires_at_us <= now_us
+            except (KeyError, OSError, TypeError, ValueError):
+                try:
+                    modified_at_us = path.stat().st_mtime_ns // 1_000
+                except OSError:
+                    continue
+                expired = modified_at_us + fallback_ttl_us <= now_us
+
+            if expired:
+                path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        try:
+            descriptor = os.open(path, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            try:
+                os.fsync(descriptor)
+            except OSError:
+                pass
+        finally:
+            os.close(descriptor)
 
     def policy(self) -> ResourcePolicy:
         row = self.database.connection.execute(
@@ -224,6 +496,12 @@ class ResourceManager:
         policy = self.policy()
         if job.priority is JobPriority.DATA_SAFETY:
             return AdmissionDecision(True, None, 0)
+        if self.should_yield_to_interactive(job):
+            return AdmissionDecision(
+                False,
+                "interactive chat demand has priority",
+                5,
+            )
         if (
             policy.mode is ResourceMode.PAUSE_BACKGROUND
             and job.priority >= JobPriority.BACKGROUND
