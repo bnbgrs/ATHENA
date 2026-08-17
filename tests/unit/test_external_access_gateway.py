@@ -318,3 +318,158 @@ def test_external_audit_order_is_strict_with_coarse_clock(
     assert "direct_approval_required" in str(events[1]["reason_code"])
     assert int(events[1]["created_at_us"]) > int(events[0]["created_at_us"])
     app.stop()
+
+
+
+def test_external_capture_finalization_rolls_back_source_audit_and_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = AthenaApplication(
+        settings=AthenaSettings(
+            local_root=tmp_path / "atomic-finalization-runtime"
+        )
+    )
+    app.start()
+
+    try:
+        app.external_access.transports[
+            "direct_explicit"
+        ] = _Transport()
+
+        authorization = app.external_access.authorize_explicit(
+            purpose="atomic external capture",
+            allowed_hosts=("example.com",),
+            privacy_route="direct_explicit",
+        )
+
+        tables = (
+            "blob_records",
+            "sources",
+            "commit_records",
+            "entity_registry",
+            "provenance_records",
+            "external_access_events",
+            "external_source_captures",
+        )
+
+        before = {
+            table: int(
+                app.database.connection.execute(
+                    f"SELECT COUNT(*) FROM {table}"
+                ).fetchone()[0]
+            )
+            for table in tables
+        }
+
+        def fail_external_source_link(
+            connection: object,
+            **kwargs: object,
+        ) -> None:
+            del connection, kwargs
+            raise RuntimeError(
+                "synthetic external capture link failure"
+            )
+
+        monkeypatch.setattr(
+            app.external_access,
+            "_insert_external_source_capture",
+            fail_external_source_link,
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="synthetic external capture link failure",
+        ):
+            app.external_access.capture_url(
+                authorization.authorization_id,
+                "https://example.com/atomic-finalization",
+            )
+
+        after = {
+            table: int(
+                app.database.connection.execute(
+                    f"SELECT COUNT(*) FROM {table}"
+                ).fetchone()[0]
+            )
+            for table in tables
+        }
+
+        assert after == before
+        assert app.database.connection.in_transaction is False
+
+        assert (
+            app.external_access.get_authorization(
+                authorization.authorization_id
+            ).authorization_id
+            == authorization.authorization_id
+        )
+
+    finally:
+        app.stop()
+
+
+def test_successful_external_capture_has_complete_atomic_provenance_triplet(
+    tmp_path: Path,
+) -> None:
+    app = AthenaApplication(
+        settings=AthenaSettings(
+            local_root=tmp_path / "atomic-success-runtime"
+        )
+    )
+    app.start()
+
+    try:
+        app.external_access.transports[
+            "direct_explicit"
+        ] = _Transport()
+
+        authorization = app.external_access.authorize_explicit(
+            purpose="complete external provenance",
+            allowed_hosts=("example.com",),
+            privacy_route="direct_explicit",
+        )
+
+        result = app.external_access.capture_url(
+            authorization.authorization_id,
+            "https://example.com/complete",
+        )
+
+        row = app.database.connection.execute(
+            """
+            SELECT
+                esc.authorization_id,
+                esc.access_event_id,
+                esc.provenance_url,
+                e.source_id,
+                e.outcome,
+                e.reason_code,
+                e.response_bytes
+            FROM external_source_captures AS esc
+            JOIN external_access_events AS e
+              ON e.event_id = esc.access_event_id
+            WHERE esc.source_id = ?
+            """,
+            (
+                result.source.source_id.bytes,
+            ),
+        ).fetchone()
+
+        assert row is not None
+        assert (
+            bytes(row["authorization_id"])
+            == authorization.authorization_id.bytes
+        )
+        assert (
+            bytes(row["source_id"])
+            == result.source.source_id.bytes
+        )
+        assert row["outcome"] == "captured"
+        assert row["reason_code"] is None
+        assert int(row["response_bytes"]) > 0
+        assert "example.com" in str(
+            row["provenance_url"]
+        )
+
+    finally:
+        app.stop()

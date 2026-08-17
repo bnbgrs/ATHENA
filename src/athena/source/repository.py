@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+from collections.abc import Callable
 
 from athena.common.ids import new_uuid7, uuid_from_blob, uuid_to_blob
 from athena.common.time import utc_now_us
@@ -40,6 +41,12 @@ class SourceProtectionTransitionPendingError(RuntimeError):
     """Raised while an existing Source has an active protection transition."""
 
 
+CaptureTransactionFinalizer = Callable[
+    [sqlite3.Connection, uuid.UUID],
+    None,
+]
+
+
 class SourceRepository:
     """Persist immutable source captures after physical bytes are verified."""
 
@@ -54,6 +61,7 @@ class SourceRepository:
         source_uri: str,
         prepared_blob: PreparedBlob,
         source_type: SourceType = SourceType.FILE,
+        transactional_finalize: CaptureTransactionFinalizer | None = None,
     ) -> SourceCaptureResult:
         now_us = utc_now_us()
         source_id = new_uuid7()
@@ -185,6 +193,16 @@ class SourceRepository:
                 commit_seq=commit_seq,
                 entity_id=source_id,
             )
+
+            # Allow narrowly scoped callers to append relational state
+            # to this exact Source transaction. Any exception rolls back
+            # Source, BlobRecord, entity, provenance, commit and finalizer
+            # writes together.
+            if transactional_finalize is not None:
+                transactional_finalize(
+                    connection,
+                    source_id,
+                )
 
         source = SourceRecord(
             source_id=source_id,

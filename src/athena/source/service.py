@@ -16,7 +16,11 @@ from athena.source.blob_store import BlobStore
 from athena.source.models import BlobRecord, SourceCaptureResult, SourceRecord, SourceType
 from athena.source.protected_blob import ProtectedBlobStore, ProtectedSourceMetadata
 from athena.source.protection_transition import SourceProtectionTransitionService
-from athena.source.repository import ProtectedSourceInvariantError, SourceRepository
+from athena.source.repository import (
+    CaptureTransactionFinalizer,
+    ProtectedSourceInvariantError,
+    SourceRepository,
+)
 
 
 class ProtectedSourcePersistentPathUnavailableError(RuntimeError):
@@ -114,6 +118,7 @@ class SourceCaptureService:
         *,
         source_uri: str,
         original_name: str | None = None,
+        transactional_finalize: CaptureTransactionFinalizer | None = None,
     ) -> SourceCaptureResult:
         """Capture already-fetched external bytes as immutable web_snapshot Source."""
         with runtime_data_lock(self.runtime_lock_root):
@@ -141,6 +146,7 @@ class SourceCaptureService:
                 source_uri=normalized_uri,
                 prepared_blob=prepared_blob,
                 source_type=SourceType.WEB_SNAPSHOT,
+                transactional_finalize=transactional_finalize,
             )
 
     def get(self, source_id: uuid.UUID) -> tuple[SourceRecord, BlobRecord]:

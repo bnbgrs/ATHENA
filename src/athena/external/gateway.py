@@ -9,6 +9,7 @@ import json
 import os
 import secrets
 import socket
+import sqlite3
 import ssl
 import struct
 import uuid
@@ -502,38 +503,41 @@ class ExternalAccessGateway:
                 handle.flush()
                 os.fsync(handle.fileno())
             source_uri = _provenance_url(response.final_url)
+
+            def finalize_external_capture(
+                connection: sqlite3.Connection,
+                source_id: uuid.UUID,
+            ) -> None:
+                event_id = self._insert_audit_event(
+                    connection,
+                    authorization,
+                    url=response.final_url,
+                    outcome="captured",
+                    reason_code=None,
+                    response_bytes=len(response.body),
+                    source_id=source_id,
+                )
+                self._insert_external_source_capture(
+                    connection,
+                    source_id=source_id,
+                    authorization_id=authorization.authorization_id,
+                    access_event_id=event_id,
+                    provenance_url=source_uri,
+                    captured_at_us=utc_now_us(),
+                )
+
             result = self.sources.capture_external_snapshot(
                 staging,
                 source_uri=source_uri,
-                original_name=_external_name(response.final_url, extension),
+                original_name=_external_name(
+                    response.final_url,
+                    extension,
+                ),
+                transactional_finalize=finalize_external_capture,
             )
         finally:
             staging.unlink(missing_ok=True)
 
-        event_id = self._audit(
-            authorization,
-            url=response.final_url,
-            outcome="captured",
-            reason_code=None,
-            response_bytes=len(response.body),
-            source_id=result.source.source_id,
-        )
-        with self.database.write_transaction() as connection:
-            connection.execute(
-                """
-                INSERT INTO external_source_captures (
-                    source_id, authorization_id, access_event_id,
-                    provenance_url, captured_at_us
-                ) VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    uuid_to_blob(result.source.source_id),
-                    uuid_to_blob(authorization.authorization_id),
-                    uuid_to_blob(event_id),
-                    _provenance_url(response.final_url),
-                    utc_now_us(),
-                ),
-            )
         return result
 
     def _fetch_authorized_url(
@@ -748,52 +752,141 @@ class ExternalAccessGateway:
         response_bytes: int | None,
         source_id: uuid.UUID | None,
     ) -> uuid.UUID:
+        """Persist one independently durable failed/denied audit event."""
+
+        with self.database.write_transaction() as connection:
+            return self._insert_audit_event(
+                connection,
+                authorization,
+                url=url,
+                outcome=outcome,
+                reason_code=reason_code,
+                response_bytes=response_bytes,
+                source_id=source_id,
+            )
+
+    def _insert_audit_event(
+        self,
+        connection: sqlite3.Connection,
+        authorization: ExternalAccessAuthorizationRecord,
+        *,
+        url: str,
+        outcome: str,
+        reason_code: str | None,
+        response_bytes: int | None,
+        source_id: uuid.UUID | None,
+    ) -> uuid.UUID:
+        """Insert one audit event in the caller-owned transaction."""
+
         event_id = new_uuid7()
         parsed = urlsplit(url)
         host = parsed.hostname or "<invalid>"
-        url_hash = hashlib.sha256(url.encode("utf-8")).digest()
+        url_hash = hashlib.sha256(
+            url.encode("utf-8")
+        ).digest()
         event_now_us = utc_now_us()
-        with self.database.write_transaction() as connection:
-            previous = connection.execute(
-                """
-                SELECT MAX(created_at_us) AS created_at_us
-                FROM external_access_events
-                WHERE authorization_id = ?
-                """,
-                (uuid_to_blob(authorization.authorization_id),),
-            ).fetchone()
-            previous_created_at_us = (
-                None
-                if previous is None or previous["created_at_us"] is None
-                else int(previous["created_at_us"])
-            )
-            event_created_at_us = (
-                event_now_us
-                if previous_created_at_us is None
-                else max(event_now_us, previous_created_at_us + 1)
-            )
-            connection.execute(
-                """
-                INSERT INTO external_access_events (
-                    event_id, authorization_id, request_url_hash,
-                    destination_host, method, privacy_route, outcome,
-                    reason_code, response_bytes, source_id, created_at_us
-                ) VALUES (?, ?, ?, ?, 'GET', ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    uuid_to_blob(event_id),
-                    uuid_to_blob(authorization.authorization_id),
-                    url_hash,
-                    host.lower(),
-                    authorization.privacy_route,
-                    outcome,
-                    reason_code,
-                    response_bytes,
-                    uuid_to_blob(source_id) if source_id is not None else None,
-                    event_created_at_us,
+
+        previous = connection.execute(
+            """
+            SELECT MAX(created_at_us) AS created_at_us
+            FROM external_access_events
+            WHERE authorization_id = ?
+            """,
+            (
+                uuid_to_blob(
+                    authorization.authorization_id
                 ),
+            ),
+        ).fetchone()
+
+        previous_created_at_us = (
+            None
+            if (
+                previous is None
+                or previous["created_at_us"] is None
             )
+            else int(
+                previous["created_at_us"]
+            )
+        )
+
+        event_created_at_us = (
+            event_now_us
+            if previous_created_at_us is None
+            else max(
+                event_now_us,
+                previous_created_at_us + 1,
+            )
+        )
+
+        connection.execute(
+            """
+            INSERT INTO external_access_events (
+                event_id,
+                authorization_id,
+                request_url_hash,
+                destination_host,
+                method,
+                privacy_route,
+                outcome,
+                reason_code,
+                response_bytes,
+                source_id,
+                created_at_us
+            ) VALUES (?, ?, ?, ?, 'GET', ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                uuid_to_blob(event_id),
+                uuid_to_blob(
+                    authorization.authorization_id
+                ),
+                url_hash,
+                host.lower(),
+                authorization.privacy_route,
+                outcome,
+                reason_code,
+                response_bytes,
+                (
+                    uuid_to_blob(source_id)
+                    if source_id is not None
+                    else None
+                ),
+                event_created_at_us,
+            ),
+        )
+
         return event_id
+
+    @staticmethod
+    def _insert_external_source_capture(
+        connection: sqlite3.Connection,
+        *,
+        source_id: uuid.UUID,
+        authorization_id: uuid.UUID,
+        access_event_id: uuid.UUID,
+        provenance_url: str,
+        captured_at_us: int,
+    ) -> None:
+        """Insert external Source provenance in the caller transaction."""
+
+        connection.execute(
+            """
+            INSERT INTO external_source_captures (
+                source_id,
+                authorization_id,
+                access_event_id,
+                provenance_url,
+                captured_at_us
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                uuid_to_blob(source_id),
+                uuid_to_blob(authorization_id),
+                uuid_to_blob(access_event_id),
+                provenance_url,
+                captured_at_us,
+            ),
+        )
 
 
 class ExternalResearchService:
