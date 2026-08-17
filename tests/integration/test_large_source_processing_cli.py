@@ -25,6 +25,38 @@ def _run_cli(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _neutralize_environmental_resource_headroom(
+    root: Path,
+) -> None:
+    """Keep pipeline integration tests independent of host RAM/disk fluctuations."""
+    database = (
+        root
+        / "state"
+        / "athena.db"
+    )
+
+    with sqlite3.connect(
+        database
+    ) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE resource_policy
+            SET ram_headroom_bytes = 0,
+                disk_headroom_bytes = 0
+            WHERE singleton_id = 1
+            """
+        )
+
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                "ATHENA resource_policy row "
+                "is missing from test runtime."
+            )
+
+        connection.commit()
+
+
+
 def _large_source(path: Path, *, sections: int = 140) -> None:
     blocks = [
         f"## Section {index:03d}\nATHENA_LARGE_CLI_SECTION_{index:03d} "
@@ -69,6 +101,12 @@ def test_large_source_scheduler_checkpoints_batches_and_publishes_atomically(
     initialized = _run_cli(local_root, "source", "search", "ATHENA_NO_MATCH")
     assert initialized.returncode == 0, initialized.stderr
     generation_before = _chunk_generation(local_root)
+
+    # This test validates source-processing/checkpoint semantics,
+    # not the machine's instantaneous free RAM/disk state.
+    _neutralize_environmental_resource_headroom(
+        local_root
+    )
 
     first = _run_cli(
         local_root,

@@ -11,10 +11,10 @@ from athena.jobs.models import JobPriority, JobState, WaitingReason
 from athena.source.models import BlobStorageArea
 from athena.storage.database import SQLiteDatabase
 from athena.storage.schema import (
+    BACKUP_RETENTION_MIGRATION_ID,
     NEWS_EVENT_ELIGIBILITY_MIGRATION_ID,
     NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION,
-    SOURCE_PROTECTION_TRANSITION_MIGRATION_ID,
-    SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
+    SCHEMA_VERSION,
 )
 
 
@@ -752,7 +752,7 @@ def test_v30_to_v31_migration_creates_replication_schema(
             connection.execute(
                 "PRAGMA user_version"
             ).fetchone()[0]
-            == SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION
+            == SCHEMA_VERSION
         )
 
         tables = {
@@ -797,9 +797,9 @@ def test_v30_to_v31_migration_creates_replication_schema(
         assert metadata is not None
 
         assert tuple(metadata) == (
-            SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
-            SOURCE_PROTECTION_TRANSITION_MIGRATION_ID,
-            SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
+            SCHEMA_VERSION,
+            BACKUP_RETENTION_MIGRATION_ID,
+            SCHEMA_VERSION,
         )
 
         assert connection.execute(

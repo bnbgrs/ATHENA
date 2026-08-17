@@ -50,7 +50,8 @@ ARCHIVE_REPLICATION_SCHEMA_VERSION = 31
 PROTECTED_CONTENT_SCHEMA_VERSION = 32
 PROTECTED_SOURCE_BLOB_SCHEMA_VERSION = 33
 SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION = 34
-SCHEMA_VERSION = SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION
+BACKUP_RETENTION_SCHEMA_VERSION = 35
+SCHEMA_VERSION = BACKUP_RETENTION_SCHEMA_VERSION
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
@@ -96,6 +97,7 @@ PROTECTED_SOURCE_BLOB_MIGRATION_ID = (
     "0033_protected_source_blob_storage"
 )
 SOURCE_PROTECTION_TRANSITION_MIGRATION_ID = "0034_source_protection_transition"
+BACKUP_RETENTION_MIGRATION_ID = "0035_backup_targets_retention"
 
 
 class DatabaseCompatibilityError(RuntimeError):
@@ -194,6 +196,7 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         ARCHIVE_REPLICATION_SCHEMA_VERSION,
         PROTECTED_CONTENT_SCHEMA_VERSION,
         PROTECTED_SOURCE_BLOB_SCHEMA_VERSION,
+        SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -393,8 +396,16 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
             SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION
         )
 
+    if (
+        existing_user_version
+        == SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION
+    ):
+        _verify_schema_v34(connection)
+        _migrate_schema_v34_to_v35(connection)
+        existing_user_version = BACKUP_RETENTION_SCHEMA_VERSION
+
     _configure_connection(connection)
-    _verify_schema_v34(connection)
+    _verify_schema_v35(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -3479,8 +3490,331 @@ def _migrate_schema_v33_to_v34(
         raise
 
 
+
+def _migrate_schema_v34_to_v35(
+    connection: sqlite3.Connection,
+) -> None:
+    """Add durable backup-target identity, retention, and verification state."""
+    if connection.in_transaction:
+        raise RuntimeError(
+            "Backup retention migration requires no active transaction."
+        )
+
+    _verify_schema_v34(connection)
+
+    duplicate_creating = connection.execute(
+        """
+        SELECT target_id
+        FROM backup_snapshots
+        WHERE state = 'creating'
+        GROUP BY target_id
+        HAVING COUNT(*) > 1
+        LIMIT 1
+        """
+    ).fetchone()
+
+    if duplicate_creating is not None:
+        raise DatabaseCompatibilityError(
+            "Multiple creating backup snapshots exist for one target."
+        )
+
+    target_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(backup_targets)"
+        )
+    }
+    snapshot_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(backup_snapshots)"
+        )
+    }
+
+    expected_target_additions = {
+        "identity_initialized",
+        "retention_daily",
+        "retention_weekly",
+        "retention_monthly",
+        "retention_yearly",
+    }
+    expected_snapshot_additions = {
+        "last_verified_at_us",
+        "pruned_at_us",
+    }
+
+    target_present = expected_target_additions & target_columns
+    snapshot_present = expected_snapshot_additions & snapshot_columns
+
+    if target_present and target_present != expected_target_additions:
+        raise DatabaseCompatibilityError(
+            "Backup target retention migration is partially present."
+        )
+
+    if snapshot_present and snapshot_present != expected_snapshot_additions:
+        raise DatabaseCompatibilityError(
+            "Backup snapshot retention migration is partially present."
+        )
+
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+
+        if not expected_target_additions.issubset(target_columns):
+            connection.execute(
+                """
+                ALTER TABLE backup_targets
+                ADD COLUMN identity_initialized INTEGER NOT NULL DEFAULT 0
+                CHECK(identity_initialized IN (0, 1))
+                """
+            )
+            connection.execute(
+                """
+                ALTER TABLE backup_targets
+                ADD COLUMN retention_daily INTEGER NOT NULL DEFAULT 7
+                CHECK(retention_daily >= 0)
+                """
+            )
+            connection.execute(
+                """
+                ALTER TABLE backup_targets
+                ADD COLUMN retention_weekly INTEGER NOT NULL DEFAULT 4
+                CHECK(retention_weekly >= 0)
+                """
+            )
+            connection.execute(
+                """
+                ALTER TABLE backup_targets
+                ADD COLUMN retention_monthly INTEGER NOT NULL DEFAULT 12
+                CHECK(retention_monthly >= 0)
+                """
+            )
+            connection.execute(
+                """
+                ALTER TABLE backup_targets
+                ADD COLUMN retention_yearly INTEGER NOT NULL DEFAULT 5
+                CHECK(retention_yearly >= 0)
+                """
+            )
+
+        if not expected_snapshot_additions.issubset(snapshot_columns):
+            connection.execute(
+                """
+                ALTER TABLE backup_snapshots
+                ADD COLUMN last_verified_at_us INTEGER NULL
+                """
+            )
+            connection.execute(
+                """
+                ALTER TABLE backup_snapshots
+                ADD COLUMN pruned_at_us INTEGER NULL
+                """
+            )
+
+        connection.execute(
+            """
+            UPDATE backup_snapshots
+            SET last_verified_at_us = completed_at_us
+            WHERE state = 'complete'
+              AND verification_status IN (
+                  'verified_light',
+                  'verified_deep'
+              )
+              AND last_verified_at_us IS NULL
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS
+                uq_backup_snapshots_one_creating_per_target
+            ON backup_snapshots(target_id)
+            WHERE state = 'creating'
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+                idx_backup_snapshots_target_retention
+            ON backup_snapshots(
+                target_id,
+                pruned_at_us,
+                completed_at_us DESC,
+                snapshot_id
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            UPDATE schema_metadata
+            SET schema_version = ?,
+                last_migration_id = ?,
+                minimum_reader_version = ?
+            WHERE singleton_id = 1
+            """,
+            (
+                BACKUP_RETENTION_SCHEMA_VERSION,
+                BACKUP_RETENTION_MIGRATION_ID,
+                BACKUP_RETENTION_SCHEMA_VERSION,
+            ),
+        )
+
+        connection.execute(
+            f"PRAGMA user_version = {BACKUP_RETENTION_SCHEMA_VERSION}"
+        )
+        connection.execute("COMMIT")
+
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def _verify_schema_v35(
+    connection: sqlite3.Connection,
+) -> None:
+    _verify_schema_v34(
+        connection,
+        schema_version=BACKUP_RETENTION_SCHEMA_VERSION,
+        migration_id=BACKUP_RETENTION_MIGRATION_ID,
+    )
+
+    target_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(backup_targets)"
+        )
+    }
+    snapshot_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(backup_snapshots)"
+        )
+    }
+
+    if not {
+        "identity_initialized",
+        "retention_daily",
+        "retention_weekly",
+        "retention_monthly",
+        "retention_yearly",
+    }.issubset(target_columns):
+        raise DatabaseCompatibilityError(
+            "ATHENA backup-target retention schema is incomplete."
+        )
+
+    if not {
+        "last_verified_at_us",
+        "pruned_at_us",
+    }.issubset(snapshot_columns):
+        raise DatabaseCompatibilityError(
+            "ATHENA backup-snapshot retention schema is incomplete."
+        )
+
+    indexes = {
+        str(row[0])
+        for row in connection.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'index'
+              AND name IN (
+                  'uq_backup_snapshots_one_creating_per_target',
+                  'idx_backup_snapshots_target_retention'
+              )
+            """
+        )
+    }
+
+    if indexes != {
+        "uq_backup_snapshots_one_creating_per_target",
+        "idx_backup_snapshots_target_retention",
+    }:
+        raise DatabaseCompatibilityError(
+            "ATHENA backup retention indexes are incomplete."
+        )
+
+    invalid_policy = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM backup_targets
+        WHERE identity_initialized NOT IN (0, 1)
+           OR retention_daily < 0
+           OR retention_weekly < 0
+           OR retention_monthly < 0
+           OR retention_yearly < 0
+        """
+    ).fetchone()
+
+    if invalid_policy is None or int(invalid_policy[0]) != 0:
+        raise DatabaseCompatibilityError(
+            "ATHENA backup target policy is invalid."
+        )
+
+    invalid_verified = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM backup_snapshots
+        WHERE state = 'complete'
+          AND verification_status IN (
+              'verified_light',
+              'verified_deep'
+          )
+          AND last_verified_at_us IS NULL
+        """
+    ).fetchone()
+
+    if invalid_verified is None or int(invalid_verified[0]) != 0:
+        raise DatabaseCompatibilityError(
+            "A completed backup lacks its verification timestamp."
+        )
+
+    invalid_pruned = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM backup_snapshots
+        WHERE pruned_at_us IS NOT NULL
+          AND (
+              completed_at_us IS NULL
+              OR pruned_at_us < completed_at_us
+          )
+        """
+    ).fetchone()
+
+    if invalid_pruned is None or int(invalid_pruned[0]) != 0:
+        raise DatabaseCompatibilityError(
+            "A pruned backup has an invalid prune timestamp."
+        )
+
+    duplicate_creating = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM (
+            SELECT target_id
+            FROM backup_snapshots
+            WHERE state = 'creating'
+            GROUP BY target_id
+            HAVING COUNT(*) > 1
+        )
+        """
+    ).fetchone()
+
+    if duplicate_creating is None or int(duplicate_creating[0]) != 0:
+        raise DatabaseCompatibilityError(
+            "Multiple creating backups exist for one target."
+        )
+
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise DatabaseCompatibilityError(
+            "ATHENA foreign-key verification failed."
+        )
+
+
 def _verify_schema_v34(
     connection: sqlite3.Connection,
+    *,
+    schema_version: int = SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
+    migration_id: str = SOURCE_PROTECTION_TRANSITION_MIGRATION_ID,
 ) -> None:
     application_id = int(
         connection.execute("PRAGMA application_id").fetchone()[0]
@@ -3490,7 +3824,7 @@ def _verify_schema_v34(
     )
     if (
         application_id != ATHENA_APPLICATION_ID
-        or user_version != SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION
+        or user_version != schema_version
     ):
         raise DatabaseCompatibilityError(
             "ATHENA Source protection transition schema version verification failed."
@@ -3506,11 +3840,11 @@ def _verify_schema_v34(
         "WHERE singleton_id = 1"
     ).fetchone()
     expected = (
-        SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
+        schema_version,
         STORAGE_LAYOUT_VERSION,
         BLOB_FORMAT_VERSION,
-        SOURCE_PROTECTION_TRANSITION_MIGRATION_ID,
-        SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
+        migration_id,
+        schema_version,
     )
     if metadata is None or tuple(metadata) != expected:
         raise DatabaseCompatibilityError(

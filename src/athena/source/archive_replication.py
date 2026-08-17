@@ -656,11 +656,8 @@ class ArchiveReplicationService:
 
             try:
                 was_cleaned = (
-                    self.blob_store
-                    .cleanup_verified_spool_replica(
-                        storage_locator=confirmed.blob.storage_locator,
-                        expected_sha256=confirmed.blob.integrity_sha256,
-                        expected_length=confirmed.blob.byte_length,
+                    self._cleanup_verified_spool_replica_if_unpinned(
+                        confirmed
                     )
                 )
             except BlobStoreError:
@@ -679,6 +676,47 @@ class ArchiveReplicationService:
             status=self.repository.status(),
         )
 
+    def _cleanup_verified_spool_replica_if_unpinned(
+        self,
+        record: ArchiveReplicationRecord,
+    ) -> bool:
+        """Delete a verified spool duplicate only while no backup pin can race in."""
+        # BEGIN IMMEDIATE serializes this check with BackupService's
+        # backup_snapshot_pins insertion transaction. Once a pin is committed,
+        # physical cleanup cannot pass this point until that pin is released.
+        with self.repository.database.write_transaction() as connection:
+            pinned = connection.execute(
+                """
+                SELECT 1
+                FROM backup_snapshot_pins
+                WHERE blob_id = ?
+                LIMIT 1
+                """,
+                (
+                    uuid_to_blob(
+                        record.blob.blob_id
+                    ),
+                ),
+            ).fetchone()
+
+            if pinned is not None:
+                return False
+
+            return (
+                self.blob_store
+                .cleanup_verified_spool_replica(
+                    storage_locator=(
+                        record.blob.storage_locator
+                    ),
+                    expected_sha256=(
+                        record.blob.integrity_sha256
+                    ),
+                    expected_length=(
+                        record.blob.byte_length
+                    ),
+                )
+            )
+
     def cleanup_verified_spool_duplicates(
         self,
         *,
@@ -693,11 +731,8 @@ class ArchiveReplicationService:
         ):
             try:
                 was_cleaned = (
-                    self.blob_store
-                    .cleanup_verified_spool_replica(
-                        storage_locator=record.blob.storage_locator,
-                        expected_sha256=record.blob.integrity_sha256,
-                        expected_length=record.blob.byte_length,
+                    self._cleanup_verified_spool_replica_if_unpinned(
+                        record
                     )
                 )
             except BlobStoreError:

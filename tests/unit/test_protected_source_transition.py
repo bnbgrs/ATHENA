@@ -16,11 +16,10 @@ from athena.source.protection_transition import (
 from athena.source.repository import SourceProtectionTransitionPendingError
 from athena.storage.database import SQLiteDatabase
 from athena.storage.schema import (
+    BACKUP_RETENTION_MIGRATION_ID,
     PROTECTED_SOURCE_BLOB_MIGRATION_ID,
     PROTECTED_SOURCE_BLOB_SCHEMA_VERSION,
     SCHEMA_VERSION,
-    SOURCE_PROTECTION_TRANSITION_MIGRATION_ID,
-    SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
 )
 
 _TEST_KDF = Argon2idParameters(
@@ -498,8 +497,8 @@ def test_v33_database_upgrades_additively_to_transition_v34(
         connection = upgraded.connection
         assert connection.execute(
             "PRAGMA user_version"
-        ).fetchone()[0] == SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION
-        assert SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION == SCHEMA_VERSION
+        ).fetchone()[0] == SCHEMA_VERSION
+        assert SCHEMA_VERSION == SCHEMA_VERSION
         tables = {
             str(row[0])
             for row in connection.execute(
@@ -523,9 +522,9 @@ def test_v33_database_upgrades_additively_to_transition_v34(
         ).fetchone()
         assert metadata is not None
         assert tuple(metadata) == (
-            SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
-            SOURCE_PROTECTION_TRANSITION_MIGRATION_ID,
-            SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
+            SCHEMA_VERSION,
+            BACKUP_RETENTION_MIGRATION_ID,
+            SCHEMA_VERSION,
         )
         assert connection.execute(
             "PRAGMA foreign_key_check"

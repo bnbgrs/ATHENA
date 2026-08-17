@@ -32,6 +32,7 @@ class DurableJobService:
     BUILTIN_JOB_TYPES = frozenset(
         {
             "archive.replicate",
+            "backup.create",
             "source.process",
             "source.analyze",
             "source.extract",

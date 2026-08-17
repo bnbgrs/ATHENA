@@ -18,9 +18,8 @@ from athena.storage.database import SQLiteDatabase
 from athena.storage.schema import (
     ARCHIVE_REPLICATION_MIGRATION_ID,
     ARCHIVE_REPLICATION_SCHEMA_VERSION,
+    BACKUP_RETENTION_MIGRATION_ID,
     SCHEMA_VERSION,
-    SOURCE_PROTECTION_TRANSITION_MIGRATION_ID,
-    SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
 )
 
 _TEST_KDF = Argon2idParameters(
@@ -88,7 +87,7 @@ def test_fresh_schema_has_v32_security_tables_without_persistent_unlock_state(
             connection.execute(
                 "PRAGMA user_version"
             ).fetchone()[0]
-            == SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION
+            == SCHEMA_VERSION
             == SCHEMA_VERSION
         )
 
@@ -158,9 +157,9 @@ def test_fresh_schema_has_v32_security_tables_without_persistent_unlock_state(
         assert tuple(
             metadata
         ) == (
-            SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
-            SOURCE_PROTECTION_TRANSITION_MIGRATION_ID,
-            SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
+            SCHEMA_VERSION,
+            BACKUP_RETENTION_MIGRATION_ID,
+            SCHEMA_VERSION,
         )
 
         assert connection.execute(
@@ -800,7 +799,7 @@ def test_v31_database_is_upgraded_additively_to_protected_content_v32(
             connection.execute(
                 "PRAGMA user_version"
             ).fetchone()[0]
-            == SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION
+            == SCHEMA_VERSION
         )
 
         tables = {
@@ -837,9 +836,9 @@ def test_v31_database_is_upgraded_additively_to_protected_content_v32(
         assert tuple(
             metadata
         ) == (
-            SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
-            SOURCE_PROTECTION_TRANSITION_MIGRATION_ID,
-            SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
+            SCHEMA_VERSION,
+            BACKUP_RETENTION_MIGRATION_ID,
+            SCHEMA_VERSION,
         )
 
         assert connection.execute(

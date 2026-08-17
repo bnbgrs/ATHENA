@@ -111,12 +111,25 @@ def add_operational_parsers(commands: Any) -> None:
 
     backup = commands.add_parser("backup", help="Verified backup and isolated restore.")
     backup_commands = backup.add_subparsers(dest="backup_command", required=True)
-    backup_create = backup_commands.add_parser("create", help="Create and verify a backup.")
-    backup_create.add_argument("--target", type=Path)
+    backup_create = backup_commands.add_parser(
+        "create",
+        help="Create and verify a backup.",
+    )
+    backup_create_target = backup_create.add_mutually_exclusive_group()
+    backup_create_target.add_argument("--target", type=Path)
+    backup_create_target.add_argument("--target-id", type=uuid.UUID)
     backup_list = backup_commands.add_parser("list", help="List backup snapshots.")
     backup_list.add_argument("--limit", type=int, default=50)
     backup_verify = backup_commands.add_parser("verify", help="Verify one backup snapshot.")
     backup_verify.add_argument("snapshot_id", type=uuid.UUID)
+    backup_verify.add_argument(
+        "--deep",
+        action="store_true",
+        help=(
+            "Hash every backup object and "
+            "perform an isolated restore smoke."
+        ),
+    )
     backup_restore = backup_commands.add_parser(
         "restore",
         help="Restore one snapshot into a new/empty isolated ATHENA root.",
@@ -129,6 +142,57 @@ def add_operational_parsers(commands: Any) -> None:
     )
     backup_restore_path.add_argument("snapshot_root", type=Path)
     backup_restore_path.add_argument("destination_root", type=Path)
+
+    backup_target = backup_commands.add_parser(
+        "target",
+        help="Manage durable backup targets.",
+    )
+    backup_target_commands = backup_target.add_subparsers(
+        dest="backup_target_command",
+        required=True,
+    )
+    backup_target_add = backup_target_commands.add_parser(
+        "add",
+        help="Register or reattach a backup target.",
+    )
+    backup_target_add.add_argument("root", type=Path)
+    backup_target_commands.add_parser(
+        "list",
+        help="List registered backup targets.",
+    )
+    backup_target_status = backup_target_commands.add_parser(
+        "status",
+        help="Refresh one backup target status.",
+    )
+    backup_target_status.add_argument("target_id", type=uuid.UUID)
+    backup_target_policy = backup_target_commands.add_parser(
+        "policy",
+        help="Set one target retention policy.",
+    )
+    backup_target_policy.add_argument("target_id", type=uuid.UUID)
+    backup_target_policy.add_argument("--daily", type=int, required=True)
+    backup_target_policy.add_argument("--weekly", type=int, required=True)
+    backup_target_policy.add_argument("--monthly", type=int, required=True)
+    backup_target_policy.add_argument("--yearly", type=int, required=True)
+
+    backup_retention = backup_commands.add_parser(
+        "retention",
+        help="Preview or apply deterministic backup retention.",
+    )
+    backup_retention_commands = backup_retention.add_subparsers(
+        dest="backup_retention_command",
+        required=True,
+    )
+    backup_retention_plan = backup_retention_commands.add_parser(
+        "plan",
+        help="Preview retention without deleting anything.",
+    )
+    backup_retention_plan.add_argument("target_id", type=uuid.UUID)
+    backup_retention_apply = backup_retention_commands.add_parser(
+        "apply",
+        help="Apply retention and safe backup-object GC.",
+    )
+    backup_retention_apply.add_argument("target_id", type=uuid.UUID)
 
 
 def run_operational_command(app: AthenaApplication, args: argparse.Namespace) -> int:
@@ -313,7 +377,10 @@ def _run_resource(app: AthenaApplication, args: argparse.Namespace) -> int:
 
 def _run_backup(app: AthenaApplication, args: argparse.Namespace) -> int:
     if args.backup_command == "create":
-        snapshot = app.backup.create_snapshot(target_root=args.target)
+        snapshot = app.backup.create_snapshot(
+            target_root=args.target,
+            target_id=args.target_id,
+        )
         _print_backup(snapshot)
         return 0
     if args.backup_command == "list":
@@ -321,7 +388,11 @@ def _run_backup(app: AthenaApplication, args: argparse.Namespace) -> int:
             _print_backup(snapshot)
         return 0
     if args.backup_command == "verify":
-        snapshot = app.backup.verify(args.snapshot_id)
+        snapshot = (
+            app.backup.verify_deep(args.snapshot_id)
+            if getattr(args, "deep", False)
+            else app.backup.verify_light(args.snapshot_id)
+        )
         _print_backup(snapshot)
         return 0
     if args.backup_command == "restore":
@@ -338,11 +409,146 @@ def _run_backup(app: AthenaApplication, args: argparse.Namespace) -> int:
             destination_root=args.destination_root,
         )
         print(f"Restored isolated ATHENA root: {destination}")
-        print("Restore used only the completed backup path, not live snapshot metadata.")
+        print(
+            "Restore used only the completed backup path, "
+            "not live snapshot metadata."
+        )
         return 0
+    if args.backup_command == "target":
+        return _run_backup_target(app, args)
+    if args.backup_command == "retention":
+        return _run_backup_retention(app, args)
     raise OperationalCommandError(
         f"Unsupported backup command: {args.backup_command!r}"
     )
+
+
+
+def _run_backup_target(
+    app: AthenaApplication,
+    args: argparse.Namespace,
+) -> int:
+    if args.backup_target_command == "add":
+        _print_backup_target(
+            app.backup.register_target(
+                args.root
+            )
+        )
+        return 0
+
+    if args.backup_target_command == "list":
+        for target in app.backup.list_targets():
+            _print_backup_target(target)
+        return 0
+
+    if args.backup_target_command == "status":
+        _print_backup_target(
+            app.backup.target_status(
+                args.target_id
+            )
+        )
+        return 0
+
+    if args.backup_target_command == "policy":
+        _print_backup_target(
+            app.backup.set_retention_policy(
+                args.target_id,
+                daily=args.daily,
+                weekly=args.weekly,
+                monthly=args.monthly,
+                yearly=args.yearly,
+            )
+        )
+        return 0
+
+    raise OperationalCommandError(
+        "Unsupported backup target command: "
+        f"{args.backup_target_command!r}"
+    )
+
+
+def _run_backup_retention(
+    app: AthenaApplication,
+    args: argparse.Namespace,
+) -> int:
+    if args.backup_retention_command == "plan":
+        plan = app.backup.plan_retention(
+            args.target_id
+        )
+        _print_retention_plan(plan)
+        return 0
+
+    if args.backup_retention_command == "apply":
+        result = app.backup.apply_retention(
+            args.target_id
+        )
+        _print_retention_plan(
+            result.plan
+        )
+        print(
+            "Pruned: "
+            f"{len(result.pruned_snapshot_ids)}"
+        )
+        print(
+            "Deleted backup objects: "
+            f"{result.deleted_object_count}"
+        )
+        return 0
+
+    raise OperationalCommandError(
+        "Unsupported backup retention command: "
+        f"{args.backup_retention_command!r}"
+    )
+
+
+def _print_backup_target(target: Any) -> None:
+    print(
+        f"{target.target_id} "
+        f"status={target.status} "
+        f"root={target.root_path}"
+    )
+    print(
+        "Retention: "
+        f"daily={target.policy.daily} "
+        f"weekly={target.policy.weekly} "
+        f"monthly={target.policy.monthly} "
+        f"yearly={target.policy.yearly}"
+    )
+    print(
+        "Last successful backup us: "
+        f"{target.last_successful_backup_at_us}"
+    )
+    print(
+        "Last verification us: "
+        f"{target.last_verified_at_us}"
+    )
+
+
+def _print_retention_plan(plan: Any) -> None:
+    print(
+        f"Target: {plan.target_id}"
+    )
+    print(
+        "Keep: "
+        + (
+            ",".join(
+                str(item)
+                for item in plan.keep_snapshot_ids
+            )
+            or "<none>"
+        )
+    )
+    print(
+        "Prune: "
+        + (
+            ",".join(
+                str(item)
+                for item in plan.prune_snapshot_ids
+            )
+            or "<none>"
+        )
+    )
+
 
 
 def _print_backup(snapshot: Any) -> None:

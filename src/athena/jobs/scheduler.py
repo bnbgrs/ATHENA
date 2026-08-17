@@ -15,6 +15,10 @@ from athena.jobs.archive_replication import (
     ArchiveReplicationJobError,
     DurableArchiveReplicationWorker,
 )
+from athena.jobs.backup import (
+    BACKUP_CREATE_JOB_TYPE,
+    DurableBackupWorker,
+)
 from athena.jobs.embedding_processing import (
     DurableEmbeddingRebuildWorker,
     EmbeddingRebuildJobError,
@@ -150,6 +154,7 @@ class DurableJobScheduler:
         extraction_worker: DurableSourceHierarchicalExtractionWorker | None = None,
         research_worker: DurableResearchWorker | None = None,
         archive_replication_worker: DurableArchiveReplicationWorker | None = None,
+        backup_worker: DurableBackupWorker | None = None,
         resources: ResourceManager | None = None,
         news_worker: DurableNewsSchedulerWorker | None = None,
         policy: SchedulerPolicy | None = None,
@@ -161,6 +166,7 @@ class DurableJobScheduler:
         self.extraction_worker = extraction_worker
         self.research_worker = research_worker
         self.archive_replication_worker = archive_replication_worker
+        self.backup_worker = backup_worker
         self.resources = resources
         self.news_worker = news_worker
         self.policy = policy or SchedulerPolicy()
@@ -180,6 +186,16 @@ class DurableJobScheduler:
                 | frozenset(
                     {
                         ARCHIVE_REPLICATION_JOB_TYPE,
+                    }
+                )
+            )
+
+        if self.backup_worker is not None:
+            supported = (
+                supported
+                | frozenset(
+                    {
+                        BACKUP_CREATE_JOB_TYPE,
                     }
                 )
             )
@@ -209,6 +225,11 @@ class DurableJobScheduler:
             raise ValueError("Scheduler worker_id must not be empty.")
         now = utc_now_us() if now_us is None else now_us
 
+        if self.backup_worker is not None:
+            self.backup_worker.schedule_due(
+                now_us=now,
+            )
+
         news_woken = 0
         if self.news_worker is not None:
             try:
@@ -236,69 +257,149 @@ class DurableJobScheduler:
         ranked = sorted(candidates, key=lambda job: self._rank_key(job, now))
 
         leased: JobRecord | None = None
+        deferred_backup_result: SchedulerTickResult | None = None
+
         for candidate in ranked:
             try:
-                leased = self.jobs.acquire(
+                candidate_lease = self.jobs.acquire(
                     candidate.job_id,
                     worker_id=normalized_worker_id,
                     lease_seconds=self.policy.lease_seconds,
                     now_us=now,
                 )
-                break
             except JobTransitionError:
-                # Another scheduler may have won the same persistent queue row.
+                # Another scheduler may have won the same
+                # persistent queue row.
                 continue
 
+            if candidate_lease.lease_token is None:
+                raise JobSchedulerError(
+                    f"Scheduler acquired job "
+                    f"{candidate_lease.job_id} "
+                    "without a lease token."
+                )
+
+            if self.resources is not None:
+                decision = self.resources.admit(
+                    candidate_lease
+                )
+
+                if not decision.admitted:
+                    resource_retry_at_us = (
+                        now
+                        + decision.retry_after_seconds
+                        * 1_000_000
+                    )
+
+                    current = self.jobs.wait(
+                        candidate_lease.job_id,
+                        lease_token=(
+                            candidate_lease.lease_token
+                        ),
+                        reason=WaitingReason.RESOURCE,
+                        next_run_at_us=(
+                            resource_retry_at_us
+                        ),
+                        now_us=now,
+                    )
+
+                    logger.info(
+                        "Scheduler deferred durable job "
+                        "for resource policy",
+                        extra={
+                            "event": (
+                                "jobs."
+                                "scheduler_resource_wait"
+                            ),
+                            "job_id": str(
+                                candidate_lease.job_id
+                            ),
+                            "job_type": (
+                                candidate_lease.job_type
+                            ),
+                            "reason": decision.reason,
+                            "retry_at_us": (
+                                resource_retry_at_us
+                            ),
+                        },
+                    )
+
+                    result = SchedulerTickResult(
+                        recovered_jobs=len(
+                            recovered
+                        ),
+                        scheduled_retries=(
+                            scheduled_retries
+                        ),
+                        woken_jobs=(
+                            len(woken)
+                            + legacy_research_woken
+                            + news_woken
+                        ),
+                        selected_job_id=(
+                            current.job_id
+                        ),
+                        selected_job_type=(
+                            current.job_type
+                        ),
+                        action="waiting_resource",
+                        final_state=current.state,
+                        fencing_sequence=(
+                            current.fencing_sequence
+                        ),
+                        retry_at_us=(
+                            resource_retry_at_us
+                        ),
+                    )
+
+                    # Backup is DATA_SAFETY priority, but a
+                    # resource-deferred backup must not starve
+                    # unrelated runnable durable work. Keep the
+                    # backup waiting and inspect the remaining
+                    # candidates in this same scheduler tick.
+                    if (
+                        candidate_lease.job_type
+                        == BACKUP_CREATE_JOB_TYPE
+                    ):
+                        if (
+                            deferred_backup_result
+                            is None
+                        ):
+                            deferred_backup_result = (
+                                result
+                            )
+
+                        continue
+
+                    return result
+
+            leased = candidate_lease
+            break
+
         if leased is None:
+            if deferred_backup_result is not None:
+                return deferred_backup_result
+
             return SchedulerTickResult(
                 recovered_jobs=len(recovered),
                 scheduled_retries=scheduled_retries,
-                woken_jobs=len(woken) + legacy_research_woken + news_woken,
+                woken_jobs=(
+                    len(woken)
+                    + legacy_research_woken
+                    + news_woken
+                ),
                 selected_job_id=None,
                 selected_job_type=None,
                 action="idle",
                 final_state=None,
                 fencing_sequence=None,
             )
+
         if leased.lease_token is None:
             raise JobSchedulerError(
-                f"Scheduler acquired job {leased.job_id} without a lease token."
+                f"Scheduler acquired job "
+                f"{leased.job_id} without a lease token."
             )
-
-        if self.resources is not None:
-            decision = self.resources.admit(leased)
-            if not decision.admitted:
-                resource_retry_at_us = (
-                    now + decision.retry_after_seconds * 1_000_000
-                )
-                current = self.jobs.wait(
-                    leased.job_id,
-                    lease_token=leased.lease_token,
-                    reason=WaitingReason.RESOURCE,
-                    next_run_at_us=resource_retry_at_us,
-                    now_us=now,
-                )
-                logger.info(
-                    "Scheduler deferred durable job for resource policy",
-                    extra={
-                        "event": "jobs.scheduler_resource_wait",
-                        "job_id": str(leased.job_id),
-                        "job_type": leased.job_type,
-                        "reason": decision.reason,
-                        "retry_at_us": resource_retry_at_us,
-                    },
-                )
-                return SchedulerTickResult(
-                    recovered_jobs=len(recovered),
-                    scheduled_retries=scheduled_retries,
-                    woken_jobs=len(woken) + legacy_research_woken + news_woken,
-                    selected_job_id=current.job_id,
-                    selected_job_type=current.job_type,
-                    action="waiting_resource",
-                    final_state=current.state,
-                    fencing_sequence=current.fencing_sequence,
-                    retry_at_us=resource_retry_at_us,
-                )
 
         logger.info(
             "Scheduler dispatched durable job",
@@ -445,6 +546,11 @@ class DurableJobScheduler:
             )
 
         try:
+            if leased.job_type == BACKUP_CREATE_JOB_TYPE:
+                return self._dispatch_backup(
+                    leased
+                )
+
             if (
                 leased.job_type
                 == ARCHIVE_REPLICATION_JOB_TYPE
@@ -554,6 +660,38 @@ class DurableJobScheduler:
                     ),
                 ),
             )
+
+    def _dispatch_backup(
+        self,
+        leased: JobRecord,
+    ) -> tuple[str, JobRecord]:
+        worker = self.backup_worker
+
+        if worker is None:
+            raise JobSchedulerError(
+                "No backup.create worker is configured."
+            )
+
+        current = worker.process_leased(
+            leased
+        )
+
+        if current.state is JobState.COMPLETED:
+            return "completed", current
+
+        if current.state is JobState.CANCELLED:
+            return "cancelled", current
+
+        if current.state is JobState.FAILED:
+            return "failed", current
+
+        if current.state is JobState.WAITING:
+            return "waiting", current
+
+        raise JobSchedulerError(
+            "Backup worker returned unsupported state "
+            f"{current.state.value!r}."
+        )
 
     def _dispatch_archive_replication(
         self,

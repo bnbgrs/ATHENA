@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +22,38 @@ def _run_cli(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
         env=env,
         check=False,
     )
+
+
+def _neutralize_environmental_resource_headroom(
+    root: Path,
+) -> None:
+    """Keep pipeline integration tests independent of host RAM/disk fluctuations."""
+    database = (
+        root
+        / "state"
+        / "athena.db"
+    )
+
+    with sqlite3.connect(
+        database
+    ) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE resource_policy
+            SET ram_headroom_bytes = 0,
+                disk_headroom_bytes = 0
+            WHERE singleton_id = 1
+            """
+        )
+
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                "ATHENA resource_policy row "
+                "is missing from test runtime."
+            )
+
+        connection.commit()
+
 
 
 def _native_text_pdf(pages: tuple[str, ...]) -> bytes:
@@ -94,6 +127,12 @@ def test_pdf_source_process_scheduler_builds_page_map_chunks_and_search(tmp_path
     assert job_match is not None
     job_id = job_match.group(0)
     assert '"pdf_parser":"athena.native_pdf@1+pypdf-' in queued.stdout
+
+    # Resource admission itself has deterministic unit coverage.
+    # This integration test isolates PDF/source processing semantics.
+    _neutralize_environmental_resource_headroom(
+        local_root
+    )
 
     scheduled = _run_cli(
         local_root,

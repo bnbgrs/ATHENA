@@ -23,6 +23,7 @@ from athena.config.settings import AthenaSettings
 from athena.core.services import LifecycleService, ServiceManager
 from athena.external.gateway import ExternalAccessGateway, ExternalResearchService
 from athena.jobs.archive_replication import DurableArchiveReplicationWorker
+from athena.jobs.backup import DurableBackupWorker
 from athena.jobs.embedding_processing import DurableEmbeddingRebuildWorker
 from athena.jobs.repository import JobRepository
 from athena.jobs.research import DurableResearchWorker
@@ -206,6 +207,10 @@ class AthenaApplication:
             blob_store=self.blob_store,
             paths=self.paths,
             chat=self.chat,
+        )
+        self.backup_worker = DurableBackupWorker(
+            jobs=self.jobs,
+            backup=self.backup,
         )
         self.external_access = ExternalAccessGateway(
             database=self.database,
@@ -451,6 +456,7 @@ class AthenaApplication:
             extraction_worker=self.source_hierarchical_extraction,
             research_worker=self.research_worker,
             archive_replication_worker=self.archive_replication_worker,
+            backup_worker=self.backup_worker,
             resources=self.resources,
             news_worker=self.news,
         )

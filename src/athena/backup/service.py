@@ -4,14 +4,30 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sqlite3
+import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from athena.backup.retention import (
+    BackupRetentionPlan,
+    BackupRetentionPolicy,
+    BackupRetentionResult,
+    BackupTargetRecord,
+    RetentionCandidate,
+)
+from athena.backup.retention import (
+    plan_retention as calculate_retention_plan,
+)
+from athena.backup.target_lock import (
+    BackupTargetBusyError,
+    backup_target_lock,
+)
 from athena.chat.service import ChatService
 from athena.common.ids import new_uuid7, uuid_from_blob, uuid_to_blob
 from athena.common.time import utc_now_us
@@ -19,8 +35,9 @@ from athena.source.blob_store import BlobStore
 from athena.source.models import BlobStorageArea
 from athena.storage.database import SQLiteDatabase
 from athena.storage.paths import RuntimePaths
-from athena.storage.schema import SCHEMA_VERSION
+from athena.storage.schema import SCHEMA_VERSION, initialize_schema
 
+logger = logging.getLogger(__name__)
 
 class BackupRestoreError(RuntimeError):
     """Raised when backup/restore cannot complete with verified integrity."""
@@ -40,12 +57,17 @@ class BackupSnapshotRecord:
     object_count: int
     created_at_us: int
     completed_at_us: int | None
+    last_verified_at_us: int | None
+    pruned_at_us: int | None
 
 
 class BackupService:
     """Create complete-marker backups and restore them only into a new root."""
 
     FORMAT_VERSION = 1
+    TARGET_FORMAT_VERSION = 1
+    TARGET_DESCRIPTOR_NAME = ".athena-backup-target.json"
+    RETENTION_TRASH_NAME = ".retention-trash"
 
     def __init__(
         self,
@@ -60,13 +82,36 @@ class BackupService:
         self.paths = paths
         self.chat = chat
 
-    def create_snapshot(self, *, target_root: Path | None = None) -> BackupSnapshotRecord:
-        # Resolve leftovers from a previous hard process/power interruption
-        # before publishing another restore point.
+    def create_snapshot(
+        self,
+        *,
+        target_root: Path | None = None,
+        target_id: uuid.UUID | None = None,
+    ) -> BackupSnapshotRecord:
         self.recover_incomplete()
         actor_id = self.chat.ensure_local_user()
-        target = self._target_root(target_root)
-        target_id = self._ensure_target(target, actor_id=actor_id)
+        target, resolved_target_id = self._resolve_target_for_create(
+            target_root=target_root,
+            target_id=target_id,
+            actor_id=actor_id,
+        )
+
+        with backup_target_lock(target):
+            self._recover_retention_locked(
+                target_id=resolved_target_id,
+                target=target,
+            )
+            return self._create_snapshot_locked(
+                target=target,
+                target_id=resolved_target_id,
+            )
+
+    def _create_snapshot_locked(
+        self,
+        *,
+        target: Path,
+        target_id: uuid.UUID,
+    ) -> BackupSnapshotRecord:
         snapshot_id = new_uuid7()
         created_at_us = utc_now_us()
         relative_path = f"snapshots/{snapshot_id}"
@@ -250,6 +295,7 @@ class BackupService:
                         manifest_sha256 = ?,
                         object_count = ?,
                         completed_at_us = ?,
+                        last_verified_at_us = ?,
                         failure_detail = NULL
                     WHERE snapshot_id = ?
                     """,
@@ -257,6 +303,7 @@ class BackupService:
                         db_sha256,
                         manifest_sha256,
                         len(object_entries),
+                        completed_at_us,
                         completed_at_us,
                         uuid_to_blob(snapshot_id),
                     ),
@@ -301,148 +348,785 @@ class BackupService:
             raise BackupRestoreError(f"Backup failed: {type(exc).__name__}: {exc}") from exc
 
     def recover_incomplete(self) -> tuple[uuid.UUID, ...]:
-        """Resolve creating backups left behind by hard process/power interruption."""
+        """Resolve interrupted backups without touching an active writer."""
         rows = self.database.connection.execute(
             """
-            SELECT snapshot.snapshot_id, snapshot.relative_path, target.root_path
+            SELECT
+                snapshot.snapshot_id,
+                snapshot.target_id,
+                snapshot.relative_path,
+                target.root_path
             FROM backup_snapshots AS snapshot
-            JOIN backup_targets AS target ON target.target_id = snapshot.target_id
+            JOIN backup_targets AS target
+              ON target.target_id = snapshot.target_id
             WHERE snapshot.state = 'creating'
             ORDER BY snapshot.created_at_us, snapshot.snapshot_id
             """
         ).fetchall()
+
         recovered: list[uuid.UUID] = []
+
         for row in rows:
-            snapshot_id = uuid_from_blob(bytes(row["snapshot_id"]))
-            target = Path(str(row["root_path"]))
-            # An offline backup target is not evidence of corruption. Keep the
-            # creating row and pins so a later recovery can decide safely.
+            snapshot_id = uuid_from_blob(
+                bytes(row["snapshot_id"])
+            )
+            target_id = uuid_from_blob(
+                bytes(row["target_id"])
+            )
+            target = Path(
+                str(row["root_path"])
+            )
+
             if not target.is_absolute() or not target.is_dir():
-                continue
-            snapshot_root = target / str(row["relative_path"])
-            staging_root = target / "snapshots" / f".{snapshot_id}.partial"
-            marker = snapshot_root / "complete.marker"
-            valid = False
-            manifest_sha256: bytes | None = None
-            db_sha256: bytes | None = None
-            snapshot_commit_seq: int | None = None
-            schema_version: int | None = None
-            objects: list[Any] | None = None
-            if marker.is_file():
-                try:
-                    manifest_sha256 = bytes.fromhex(
-                        marker.read_text(encoding="ascii").strip()
-                    )
-                except (OSError, ValueError):
-                    manifest_sha256 = None
-                if manifest_sha256 is not None and len(manifest_sha256) == 32:
-                    valid = self._verify_path(
-                        target=target,
-                        snapshot_root=snapshot_root,
-                        expected_manifest_sha256=manifest_sha256,
-                        expected_snapshot_id=snapshot_id,
-                    )
-            if valid and manifest_sha256 is not None:
-                manifest = _read_manifest(snapshot_root / "manifest.json")
-                database_meta = manifest.get("database")
-                raw_objects = manifest.get("objects")
-                if not isinstance(database_meta, dict) or not isinstance(raw_objects, list):
-                    valid = False
-                else:
-                    objects = raw_objects
-                    try:
-                        db_sha256 = bytes.fromhex(
-                            _required_str(database_meta, "sha256")
-                        )
-                        snapshot_commit_seq = _required_int(
-                            manifest, "snapshot_commit_seq"
-                        )
-                        schema_version = _required_int(manifest, "schema_version")
-                    except (BackupRestoreError, ValueError):
-                        valid = False
-            if (
-                valid
-                and manifest_sha256 is not None
-                and db_sha256 is not None
-                and snapshot_commit_seq is not None
-                and schema_version is not None
-                and objects is not None
-            ):
-                completed_at_us = utc_now_us()
-                with self.database.write_transaction() as connection:
-                    cursor = connection.execute(
-                        """
-                        UPDATE backup_snapshots
-                        SET state = 'complete',
-                            verification_status = 'verified_light',
-                            snapshot_commit_seq = ?,
-                            schema_version = ?,
-                            db_sha256 = ?,
-                            manifest_sha256 = ?,
-                            object_count = ?,
-                            completed_at_us = ?,
-                            failure_detail = NULL
-                        WHERE snapshot_id = ? AND state = 'creating'
-                        """,
-                        (
-                            snapshot_commit_seq,
-                            schema_version,
-                            db_sha256,
-                            manifest_sha256,
-                            len(objects),
-                            completed_at_us,
-                            uuid_to_blob(snapshot_id),
-                        ),
-                    )
-                    if cursor.rowcount == 1:
-                        connection.execute(
-                            "DELETE FROM backup_snapshot_pins WHERE snapshot_id = ?",
-                            (uuid_to_blob(snapshot_id),),
-                        )
-                        recovered.append(snapshot_id)
-                shutil.rmtree(staging_root, ignore_errors=True)
+                self._set_target_status(
+                    target_id,
+                    "offline",
+                )
                 continue
 
-            # No valid complete marker: this is not a restore point.
-            shutil.rmtree(staging_root, ignore_errors=True)
-            shutil.rmtree(snapshot_root, ignore_errors=True)
-            with self.database.write_transaction() as connection:
-                connection.execute(
-                    "DELETE FROM backup_snapshot_pins WHERE snapshot_id = ?",
-                    (uuid_to_blob(snapshot_id),),
-                )
-                connection.execute(
-                    """
-                    UPDATE backup_snapshots
-                    SET state = 'failed',
-                        verification_status = 'failed',
-                        failure_detail = 'startup recovery: incomplete or invalid backup'
-                    WHERE snapshot_id = ? AND state = 'creating'
-                    """,
-                    (uuid_to_blob(snapshot_id),),
-                )
+            try:
+                with backup_target_lock(target):
+                    try:
+                        record = self.get_target(target_id)
+                        self._assert_target_available(
+                            record,
+                            target,
+                        )
+                    except BackupRestoreError:
+                        continue
+
+                    if self._recover_incomplete_row_locked(
+                        row=row,
+                        target=target,
+                    ):
+                        recovered.append(snapshot_id)
+
+            except BackupTargetBusyError:
+                continue
+
         return tuple(recovered)
 
+    def _recover_incomplete_row_locked(
+        self,
+        *,
+        row: sqlite3.Row,
+        target: Path,
+    ) -> bool:
+        snapshot_id = uuid_from_blob(
+            bytes(row["snapshot_id"])
+        )
+        snapshot_root = target / str(
+            row["relative_path"]
+        )
+        staging_root = (
+            target
+            / "snapshots"
+            / f".{snapshot_id}.partial"
+        )
+        marker = snapshot_root / "complete.marker"
 
-    def verify(self, snapshot_id: uuid.UUID) -> BackupSnapshotRecord:
-        record = self.get_snapshot(snapshot_id)
-        if record.state != "complete" or record.verification_status not in {
-            "verified_light",
-            "verified_deep",
-        }:
-            raise BackupRestoreError("Backup snapshot is not a completed restore point.")
-        target = self._target_for_record(record)
-        snapshot_root = target / record.relative_path
+        valid = False
+        manifest_sha256: bytes | None = None
+        db_sha256: bytes | None = None
+        snapshot_commit_seq: int | None = None
+        schema_version: int | None = None
+        objects: list[Any] | None = None
+
+        if marker.is_file():
+            try:
+                manifest_sha256 = bytes.fromhex(
+                    marker.read_text(
+                        encoding="ascii"
+                    ).strip()
+                )
+            except (OSError, ValueError):
+                manifest_sha256 = None
+
+            if (
+                manifest_sha256 is not None
+                and len(manifest_sha256) == 32
+            ):
+                valid = self._verify_path(
+                    target=target,
+                    snapshot_root=snapshot_root,
+                    expected_manifest_sha256=(
+                        manifest_sha256
+                    ),
+                    expected_snapshot_id=snapshot_id,
+                )
+
+        if valid and manifest_sha256 is not None:
+            manifest = _read_manifest(
+                snapshot_root / "manifest.json"
+            )
+            database_meta = manifest.get(
+                "database"
+            )
+            raw_objects = manifest.get(
+                "objects"
+            )
+
+            if (
+                not isinstance(database_meta, dict)
+                or not isinstance(raw_objects, list)
+            ):
+                valid = False
+            else:
+                objects = raw_objects
+
+                try:
+                    db_sha256 = bytes.fromhex(
+                        _required_str(
+                            database_meta,
+                            "sha256",
+                        )
+                    )
+                    snapshot_commit_seq = (
+                        _required_int(
+                            manifest,
+                            "snapshot_commit_seq",
+                        )
+                    )
+                    schema_version = _required_int(
+                        manifest,
+                        "schema_version",
+                    )
+                except (
+                    BackupRestoreError,
+                    ValueError,
+                ):
+                    valid = False
+
+        if (
+            valid
+            and manifest_sha256 is not None
+            and db_sha256 is not None
+            and snapshot_commit_seq is not None
+            and schema_version is not None
+            and objects is not None
+        ):
+            completed_at_us = utc_now_us()
+
+            with self.database.write_transaction() as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE backup_snapshots
+                    SET state = 'complete',
+                        verification_status = 'verified_light',
+                        snapshot_commit_seq = ?,
+                        schema_version = ?,
+                        db_sha256 = ?,
+                        manifest_sha256 = ?,
+                        object_count = ?,
+                        completed_at_us = ?,
+                        last_verified_at_us = ?,
+                        failure_detail = NULL
+                    WHERE snapshot_id = ?
+                      AND state = 'creating'
+                    """,
+                    (
+                        snapshot_commit_seq,
+                        schema_version,
+                        db_sha256,
+                        manifest_sha256,
+                        len(objects),
+                        completed_at_us,
+                        completed_at_us,
+                        uuid_to_blob(snapshot_id),
+                    ),
+                )
+
+                if cursor.rowcount == 1:
+                    connection.execute(
+                        """
+                        DELETE FROM backup_snapshot_pins
+                        WHERE snapshot_id = ?
+                        """,
+                        (
+                            uuid_to_blob(
+                                snapshot_id
+                            ),
+                        ),
+                    )
+
+            shutil.rmtree(
+                staging_root,
+                ignore_errors=True,
+            )
+
+            return cursor.rowcount == 1
+
+        shutil.rmtree(
+            staging_root,
+            ignore_errors=True,
+        )
+        shutil.rmtree(
+            snapshot_root,
+            ignore_errors=True,
+        )
+
+        with self.database.write_transaction() as connection:
+            connection.execute(
+                """
+                DELETE FROM backup_snapshot_pins
+                WHERE snapshot_id = ?
+                """,
+                (
+                    uuid_to_blob(
+                        snapshot_id
+                    ),
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE backup_snapshots
+                SET state = 'failed',
+                    verification_status = 'failed',
+                    failure_detail =
+                        'startup recovery: incomplete or invalid backup'
+                WHERE snapshot_id = ?
+                  AND state = 'creating'
+                """,
+                (
+                    uuid_to_blob(
+                        snapshot_id
+                    ),
+                ),
+            )
+
+        return False
+
+
+    def verify_light(
+        self,
+        snapshot_id: uuid.UUID,
+    ) -> BackupSnapshotRecord:
+        """Run routine inexpensive verification of a completed restore point."""
+        record = self.get_snapshot(
+            snapshot_id
+        )
+
+        self._require_verifiable_snapshot(
+            record
+        )
+
+        target_state = self.target_status(
+            record.target_id
+        )
+
+        if target_state.status != "active":
+            raise BackupRestoreError(
+                f"Backup target {record.target_id} is offline."
+            )
+
+        target = self._target_for_record(
+            record
+        )
+
+        snapshot_root = (
+            target
+            / record.relative_path
+        )
+
         if record.manifest_sha256 is None:
-            raise BackupRestoreError("Backup snapshot has no recorded manifest hash.")
+            raise BackupRestoreError(
+                "Backup snapshot has no recorded manifest hash."
+            )
+
+        try:
+            with backup_target_lock(target):
+                valid = self._verify_light_path(
+                    target=target,
+                    snapshot_root=snapshot_root,
+                    expected_manifest_sha256=(
+                        record.manifest_sha256
+                    ),
+                    expected_snapshot_id=(
+                        record.snapshot_id
+                    ),
+                )
+
+        except OSError:
+            logger.warning(
+                "Backup Light verification aborted by environment",
+                extra={
+                    "event": (
+                        "backup."
+                        "verification_light_environment_error"
+                    ),
+                    "snapshot_id": str(
+                        record.snapshot_id
+                    ),
+                    "target_id": str(
+                        record.target_id
+                    ),
+                },
+            )
+            raise
+
+        if not valid:
+            refreshed = self.target_status(
+                record.target_id
+            )
+
+            if refreshed.status != "active":
+                raise BackupRestoreError(
+                    f"Backup target {record.target_id} "
+                    "became offline during verification."
+                )
+
+            self._record_verification_failure(
+                record,
+                mode="light",
+                detail=(
+                    "Light verification detected "
+                    "invalid backup content."
+                ),
+            )
+
+            raise BackupRestoreError(
+                "Backup Light verification failed."
+            )
+
+        verified = (
+            self._record_verification_success(
+                record,
+                mode="light",
+            )
+        )
+
+        logger.info(
+            "Backup Light verification completed",
+            extra={
+                "event": (
+                    "backup.verification_light_completed"
+                ),
+                "snapshot_id": str(
+                    record.snapshot_id
+                ),
+                "target_id": str(
+                    record.target_id
+                ),
+            },
+        )
+
+        return verified
+
+    def verify_deep(
+        self,
+        snapshot_id: uuid.UUID,
+    ) -> BackupSnapshotRecord:
+        """Hash every object and prove isolated restore capability."""
+        record = self.get_snapshot(
+            snapshot_id
+        )
+
+        self._require_verifiable_snapshot(
+            record
+        )
+
+        target_state = self.target_status(
+            record.target_id
+        )
+
+        if target_state.status != "active":
+            raise BackupRestoreError(
+                f"Backup target {record.target_id} is offline."
+            )
+
+        target = self._target_for_record(
+            record
+        )
+
+        snapshot_root = (
+            target
+            / record.relative_path
+        )
+
+        if record.manifest_sha256 is None:
+            raise BackupRestoreError(
+                "Backup snapshot has no recorded manifest hash."
+            )
+
+        try:
+            with backup_target_lock(target):
+                if not self._verify_path(
+                    target=target,
+                    snapshot_root=snapshot_root,
+                    expected_manifest_sha256=(
+                        record.manifest_sha256
+                    ),
+                    expected_snapshot_id=(
+                        record.snapshot_id
+                    ),
+                ):
+                    raise BackupRestoreError(
+                        "Backup Deep verification failed."
+                    )
+
+                self.paths.local_root.parent.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+                with tempfile.TemporaryDirectory(
+                    prefix=(
+                        "athena-backup-deep-verify-"
+                    ),
+                    dir=self.paths.local_root.parent,
+                ) as temporary_parent:
+                    destination = (
+                        Path(temporary_parent)
+                        / "restore-smoke"
+                    )
+
+                    restored = (
+                        self._restore_verified_path(
+                            target=target,
+                            snapshot_root=(
+                                snapshot_root
+                            ),
+                            destination_root=(
+                                destination
+                            ),
+                        )
+                    )
+
+                    if not (
+                        restored
+                        / "state"
+                        / "restore.complete"
+                    ).is_file():
+                        raise BackupRestoreError(
+                            "Deep verification restore smoke "
+                            "did not publish restore.complete."
+                        )
+
+                    if not (
+                        restored
+                        / "state"
+                        / "athena.db"
+                    ).is_file():
+                        raise BackupRestoreError(
+                            "Deep verification restore smoke "
+                            "did not publish athena.db."
+                        )
+
+        except OSError:
+            logger.warning(
+                "Backup Deep verification aborted by environment",
+                extra={
+                    "event": (
+                        "backup."
+                        "verification_deep_environment_error"
+                    ),
+                    "snapshot_id": str(
+                        record.snapshot_id
+                    ),
+                    "target_id": str(
+                        record.target_id
+                    ),
+                },
+            )
+            raise
+
+        except BackupRestoreError as exc:
+            refreshed = self.target_status(
+                record.target_id
+            )
+
+            if refreshed.status == "active":
+                self._record_verification_failure(
+                    record,
+                    mode="deep",
+                    detail=str(exc),
+                )
+
+            logger.warning(
+                "Backup Deep verification failed",
+                extra={
+                    "event": (
+                        "backup.verification_deep_failed"
+                    ),
+                    "snapshot_id": str(
+                        record.snapshot_id
+                    ),
+                    "target_id": str(
+                        record.target_id
+                    ),
+                    "error_type": (
+                        type(exc).__name__
+                    ),
+                },
+            )
+
+            raise
+
+        verified = (
+            self._record_verification_success(
+                record,
+                mode="deep",
+            )
+        )
+
+        logger.info(
+            "Backup Deep verification completed",
+            extra={
+                "event": (
+                    "backup.verification_deep_completed"
+                ),
+                "snapshot_id": str(
+                    record.snapshot_id
+                ),
+                "target_id": str(
+                    record.target_id
+                ),
+            },
+        )
+
+        return verified
+
+    def _require_verifiable_snapshot(
+        self,
+        record: BackupSnapshotRecord,
+    ) -> None:
+        row = self.database.connection.execute(
+            """
+            SELECT state, pruned_at_us
+            FROM backup_snapshots
+            WHERE snapshot_id = ?
+            """,
+            (
+                uuid_to_blob(
+                    record.snapshot_id
+                ),
+            ),
+        ).fetchone()
+
+        if row is None:
+            raise BackupRestoreError(
+                f"Backup snapshot "
+                f"{record.snapshot_id} not found."
+            )
+
+        if (
+            str(row["state"]) != "complete"
+            or row["pruned_at_us"] is not None
+        ):
+            raise BackupRestoreError(
+                "Backup snapshot is not an active "
+                "completed restore point."
+            )
+
+    def _record_verification_success(
+        self,
+        record: BackupSnapshotRecord,
+        *,
+        mode: str,
+    ) -> BackupSnapshotRecord:
+        if mode not in {
+            "light",
+            "deep",
+        }:
+            raise ValueError(
+                f"Unsupported verification mode: {mode!r}"
+            )
+
+        now_us = utc_now_us()
+
+        with self.database.write_transaction() as connection:
+            if mode == "light":
+                cursor = connection.execute(
+                    """
+                    UPDATE backup_snapshots
+                    SET verification_status = CASE
+                            WHEN verification_status = 'verified_deep'
+                                THEN 'verified_deep'
+                            ELSE 'verified_light'
+                        END,
+                        last_verified_at_us = ?,
+                        failure_detail = NULL
+                    WHERE snapshot_id = ?
+                      AND state = 'complete'
+                      AND pruned_at_us IS NULL
+                    """,
+                    (
+                        now_us,
+                        uuid_to_blob(
+                            record.snapshot_id
+                        ),
+                    ),
+                )
+            else:
+                cursor = connection.execute(
+                    """
+                    UPDATE backup_snapshots
+                    SET verification_status = 'verified_deep',
+                        last_verified_at_us = ?,
+                        failure_detail = NULL
+                    WHERE snapshot_id = ?
+                      AND state = 'complete'
+                      AND pruned_at_us IS NULL
+                    """,
+                    (
+                        now_us,
+                        uuid_to_blob(
+                            record.snapshot_id
+                        ),
+                    ),
+                )
+
+        if cursor.rowcount != 1:
+            raise BackupRestoreError(
+                "Backup verification result could "
+                "not be persisted safely."
+            )
+
+        return self.get_snapshot(
+            record.snapshot_id
+        )
+
+    def _record_verification_failure(
+        self,
+        record: BackupSnapshotRecord,
+        *,
+        mode: str,
+        detail: str,
+    ) -> None:
+        now_us = utc_now_us()
+
+        with self.database.write_transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE backup_snapshots
+                SET state = 'failed',
+                    verification_status = 'failed',
+                    last_verified_at_us = ?,
+                    failure_detail = ?
+                WHERE snapshot_id = ?
+                  AND state = 'complete'
+                  AND pruned_at_us IS NULL
+                """,
+                (
+                    now_us,
+                    (
+                        f"{mode} verification: "
+                        f"{detail}"
+                    )[:2000],
+                    uuid_to_blob(
+                        record.snapshot_id
+                    ),
+                ),
+            )
+
+        if cursor.rowcount != 1:
+            raise BackupRestoreError(
+                "Backup verification failure could "
+                "not be persisted safely."
+            )
+
+        logger.warning(
+            "Backup verification failure recorded",
+            extra={
+                "event": (
+                    "backup.verification_failed"
+                ),
+                "snapshot_id": str(
+                    record.snapshot_id
+                ),
+                "target_id": str(
+                    record.target_id
+                ),
+                "verification_mode": mode,
+            },
+        )
+
+    def verify(
+        self,
+        snapshot_id: uuid.UUID,
+    ) -> BackupSnapshotRecord:
+        record = self.get_snapshot(snapshot_id)
+        target = self._target_for_record(record)
+
+        with backup_target_lock(target):
+            return self._verify_record_locked(
+                record,
+                target,
+            )
+
+    def _verify_record_locked(
+        self,
+        record: BackupSnapshotRecord,
+        target: Path,
+    ) -> BackupSnapshotRecord:
+        if record.pruned_at_us is not None:
+            raise BackupRestoreError(
+                "Backup snapshot was pruned by retention."
+            )
+
+        if (
+            record.state != "complete"
+            or record.verification_status
+            not in {
+                "verified_light",
+                "verified_deep",
+            }
+        ):
+            raise BackupRestoreError(
+                "Backup snapshot is not a completed restore point."
+            )
+
+        target_record = self.get_target(
+            record.target_id
+        )
+        self._assert_target_available(
+            target_record,
+            target,
+        )
+
+        snapshot_root = (
+            target
+            / record.relative_path
+        )
+
+        if record.manifest_sha256 is None:
+            raise BackupRestoreError(
+                "Backup snapshot has no recorded manifest hash."
+            )
+
         if not self._verify_path(
             target=target,
             snapshot_root=snapshot_root,
-            expected_manifest_sha256=record.manifest_sha256,
+            expected_manifest_sha256=(
+                record.manifest_sha256
+            ),
             expected_snapshot_id=record.snapshot_id,
         ):
-            raise BackupRestoreError("Backup verification failed.")
-        return record
+            raise BackupRestoreError(
+                "Backup verification failed."
+            )
+
+        verified_at_us = utc_now_us()
+
+        with self.database.write_transaction() as connection:
+            connection.execute(
+                """
+                UPDATE backup_snapshots
+                SET last_verified_at_us = ?
+                WHERE snapshot_id = ?
+                  AND pruned_at_us IS NULL
+                """,
+                (
+                    verified_at_us,
+                    uuid_to_blob(
+                        record.snapshot_id
+                    ),
+                ),
+            )
+
+        return self.get_snapshot(
+            record.snapshot_id
+        )
 
     def restore_to(
         self,
@@ -450,14 +1134,24 @@ class BackupService:
         *,
         destination_root: Path,
     ) -> Path:
-        record = self.verify(snapshot_id)
+        record = self.get_snapshot(snapshot_id)
         target = self._target_for_record(record)
-        snapshot_root = target / record.relative_path
-        return self._restore_verified_path(
-            target=target,
-            snapshot_root=snapshot_root,
-            destination_root=destination_root,
-        )
+
+        with backup_target_lock(target):
+            verified = self._verify_record_locked(
+                record,
+                target,
+            )
+            snapshot_root = (
+                target
+                / verified.relative_path
+            )
+            return self._restore_verified_path(
+                target=target,
+                snapshot_root=snapshot_root,
+                destination_root=destination_root,
+            )
+
 
     def restore_path(
         self,
@@ -492,18 +1186,21 @@ class BackupService:
             raise BackupRestoreError("Backup completion marker is invalid.") from exc
         if len(expected_manifest_sha256) != 32:
             raise BackupRestoreError("Backup completion marker is not SHA-256.")
-        if not self._verify_path(
-            target=target,
-            snapshot_root=snapshot,
-            expected_manifest_sha256=expected_manifest_sha256,
-            expected_snapshot_id=snapshot_id,
-        ):
-            raise BackupRestoreError("Backup path verification failed.")
-        return self._restore_verified_path(
-            target=target,
-            snapshot_root=snapshot,
-            destination_root=destination_root,
-        )
+        with backup_target_lock(target):
+            if not self._verify_path(
+                target=target,
+                snapshot_root=snapshot,
+                expected_manifest_sha256=expected_manifest_sha256,
+                expected_snapshot_id=snapshot_id,
+            ):
+                raise BackupRestoreError(
+                    "Backup path verification failed."
+                )
+            return self._restore_verified_path(
+                target=target,
+                snapshot_root=snapshot,
+                destination_root=destination_root,
+            )
 
     def _restore_verified_path(
         self,
@@ -584,6 +1281,7 @@ class BackupService:
                 )
 
             restored = sqlite3.connect(restored_db, autocommit=True)
+            restored.row_factory = sqlite3.Row
             try:
                 restored.execute("PRAGMA foreign_keys = ON")
                 restored.execute("BEGIN IMMEDIATE")
@@ -591,7 +1289,15 @@ class BackupService:
                 restored.execute("UPDATE backup_targets SET status = 'offline'")
                 restored.execute("DELETE FROM backup_snapshot_pins")
                 restored.execute("COMMIT")
-                integrity = str(restored.execute("PRAGMA integrity_check").fetchone()[0])
+                initialize_schema(
+                    restored,
+                    created_at_us=utc_now_us(),
+                )
+                integrity = str(
+                    restored.execute(
+                        "PRAGMA integrity_check"
+                    ).fetchone()[0]
+                )
                 if integrity.lower() != "ok":
                     raise BackupRestoreError(
                         f"Restored database integrity_check failed: {integrity}"
@@ -643,58 +1349,1550 @@ class BackupService:
         ).fetchall()
         return tuple(_snapshot_from_row(row) for row in rows)
 
-    def _target_root(self, target_root: Path | None) -> Path:
-        raw = target_root if target_root is not None else self.paths.backup_root
-        if raw is None:
-            raise BackupRestoreError(
-                "No backup target configured; provide an explicit absolute target."
-            )
-        target = raw.expanduser()
-        if not target.is_absolute():
-            raise BackupRestoreError("Backup target must be an absolute path.")
-        target = target.resolve()
-        live = self.paths.local_root.resolve()
-        if target == live or live in target.parents or target in live.parents:
-            raise BackupRestoreError(
-                "Backup target must be physically/logically separate from live local_root."
-            )
-        archive = self.paths.archive_root
-        if archive is not None:
-            archive_resolved = archive.resolve()
-            if (
-                target == archive_resolved
-                or archive_resolved in target.parents
-                or target in archive_resolved.parents
-            ):
-                raise BackupRestoreError(
-                    "Backup target must not overlap the live Raw Archive root."
-                )
-        target.mkdir(parents=True, exist_ok=True)
-        return target
+    def register_target(
+        self,
+        target_root: Path,
+    ) -> BackupTargetRecord:
+        actor_id = self.chat.ensure_local_user()
+        target = self._normalize_target_path(
+            target_root
+        )
 
-    def _ensure_target(self, target: Path, *, actor_id: uuid.UUID) -> uuid.UUID:
-        row = self.database.connection.execute(
-            "SELECT target_id FROM backup_targets WHERE root_path = ?",
+        existing = self.database.connection.execute(
+            """
+            SELECT target_id
+            FROM backup_targets
+            WHERE root_path = ?
+            """,
             (str(target),),
         ).fetchone()
-        if row is not None:
-            return uuid_from_blob(bytes(row["target_id"]))
+
+        if (
+            existing is not None
+            and not target.is_dir()
+        ):
+            target_id = uuid_from_blob(
+                bytes(existing["target_id"])
+            )
+            self._set_target_status(
+                target_id,
+                "offline",
+            )
+            raise BackupRestoreError(
+                "Known backup target is offline; "
+                "refusing to recreate its root."
+            )
+
+        if not target.exists():
+            target.mkdir(
+                parents=True,
+                exist_ok=False,
+            )
+
+        if not target.is_dir():
+            raise BackupRestoreError(
+                "Backup target is not a directory."
+            )
+
+        with backup_target_lock(target):
+            return self._register_target_locked(
+                target=target,
+                actor_id=actor_id,
+            )
+
+    def _register_target_locked(
+        self,
+        *,
+        target: Path,
+        actor_id: uuid.UUID,
+    ) -> BackupTargetRecord:
+        descriptor_id = self._read_target_descriptor(
+            target
+        )
+
+        root_row = self.database.connection.execute(
+            """
+            SELECT target_id
+            FROM backup_targets
+            WHERE root_path = ?
+            """,
+            (str(target),),
+        ).fetchone()
+
+        root_record = (
+            self.get_target(
+                uuid_from_blob(
+                    bytes(
+                        root_row["target_id"]
+                    )
+                )
+            )
+            if root_row is not None
+            else None
+        )
+
+        if (
+            root_record is not None
+            and descriptor_id is not None
+            and descriptor_id
+            != root_record.target_id
+        ):
+            self._set_target_status(
+                root_record.target_id,
+                "offline",
+            )
+            raise BackupRestoreError(
+                "Backup target descriptor disagrees "
+                "with registered target identity."
+            )
+
+        if descriptor_id is not None:
+            descriptor_row = self.database.connection.execute(
+                """
+                SELECT target_id
+                FROM backup_targets
+                WHERE target_id = ?
+                """,
+                (
+                    uuid_to_blob(
+                        descriptor_id
+                    ),
+                ),
+            ).fetchone()
+
+            if descriptor_row is not None:
+                if (
+                    root_record is not None
+                    and root_record.target_id
+                    != descriptor_id
+                ):
+                    raise BackupRestoreError(
+                        "Backup target path is already "
+                        "owned by another target."
+                    )
+
+                with self.database.write_transaction() as connection:
+                    connection.execute(
+                        """
+                        UPDATE backup_targets
+                        SET root_path = ?,
+                            status = 'active',
+                            identity_initialized = 1
+                        WHERE target_id = ?
+                        """,
+                        (
+                            str(target),
+                            uuid_to_blob(
+                                descriptor_id
+                            ),
+                        ),
+                    )
+
+                return self.get_target(
+                    descriptor_id
+                )
+
+            if root_record is not None:
+                raise BackupRestoreError(
+                    "Backup target identity is inconsistent."
+                )
+
+            with self.database.write_transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO backup_targets (
+                        target_id,
+                        root_path,
+                        status,
+                        created_at_us,
+                        created_by_actor_id,
+                        identity_initialized,
+                        retention_daily,
+                        retention_weekly,
+                        retention_monthly,
+                        retention_yearly
+                    ) VALUES (
+                        ?, ?, 'active', ?, ?, 1,
+                        7, 4, 12, 5
+                    )
+                    """,
+                    (
+                        uuid_to_blob(
+                            descriptor_id
+                        ),
+                        str(target),
+                        utc_now_us(),
+                        uuid_to_blob(
+                            actor_id
+                        ),
+                    ),
+                )
+
+            return self.get_target(
+                descriptor_id
+            )
+
+        if root_record is not None:
+            self._assert_target_available(
+                root_record,
+                target,
+            )
+            return self.get_target(
+                root_record.target_id
+            )
+
+        non_control_entries = tuple(
+            item
+            for item in target.iterdir()
+            if item.name
+            != ".athena-backup.lock"
+        )
+
+        if non_control_entries:
+            raise BackupRestoreError(
+                "Refusing to adopt a non-empty backup "
+                "directory without an ATHENA target descriptor."
+            )
+
         target_id = new_uuid7()
+
         with self.database.write_transaction() as connection:
             connection.execute(
                 """
                 INSERT INTO backup_targets (
-                    target_id, root_path, status, created_at_us, created_by_actor_id
-                ) VALUES (?, ?, 'active', ?, ?)
+                    target_id,
+                    root_path,
+                    status,
+                    created_at_us,
+                    created_by_actor_id,
+                    identity_initialized,
+                    retention_daily,
+                    retention_weekly,
+                    retention_monthly,
+                    retention_yearly
+                ) VALUES (
+                    ?, ?, 'active', ?, ?, 0,
+                    7, 4, 12, 5
+                )
                 """,
                 (
-                    uuid_to_blob(target_id),
+                    uuid_to_blob(
+                        target_id
+                    ),
                     str(target),
                     utc_now_us(),
-                    uuid_to_blob(actor_id),
+                    uuid_to_blob(
+                        actor_id
+                    ),
                 ),
             )
-        return target_id
+
+        try:
+            self._write_target_descriptor(
+                target,
+                target_id,
+            )
+        except BaseException:
+            self._set_target_status(
+                target_id,
+                "offline",
+            )
+            raise
+
+        with self.database.write_transaction() as connection:
+            connection.execute(
+                """
+                UPDATE backup_targets
+                SET identity_initialized = 1
+                WHERE target_id = ?
+                """,
+                (
+                    uuid_to_blob(
+                        target_id
+                    ),
+                ),
+            )
+
+        return self.get_target(
+            target_id
+        )
+
+    def get_target(
+        self,
+        target_id: uuid.UUID,
+    ) -> BackupTargetRecord:
+        row = self.database.connection.execute(
+            """
+            SELECT
+                target.*,
+                (
+                    SELECT MAX(snapshot.completed_at_us)
+                    FROM backup_snapshots AS snapshot
+                    WHERE snapshot.target_id = target.target_id
+                      AND snapshot.state = 'complete'
+                      AND snapshot.verification_status IN (
+                          'verified_light',
+                          'verified_deep'
+                      )
+                      AND snapshot.pruned_at_us IS NULL
+                ) AS last_successful_backup_at_us,
+                (
+                    SELECT MAX(snapshot.last_verified_at_us)
+                    FROM backup_snapshots AS snapshot
+                    WHERE snapshot.target_id = target.target_id
+                ) AS last_verified_at_us
+            FROM backup_targets AS target
+            WHERE target.target_id = ?
+            """,
+            (
+                uuid_to_blob(
+                    target_id
+                ),
+            ),
+        ).fetchone()
+
+        if row is None:
+            raise BackupRestoreError(
+                f"Backup target {target_id} not found."
+            )
+
+        return _target_from_row(row)
+
+    def list_targets(
+        self,
+    ) -> tuple[BackupTargetRecord, ...]:
+        rows = self.database.connection.execute(
+            """
+            SELECT
+                target.*,
+                (
+                    SELECT MAX(snapshot.completed_at_us)
+                    FROM backup_snapshots AS snapshot
+                    WHERE snapshot.target_id = target.target_id
+                      AND snapshot.state = 'complete'
+                      AND snapshot.verification_status IN (
+                          'verified_light',
+                          'verified_deep'
+                      )
+                      AND snapshot.pruned_at_us IS NULL
+                ) AS last_successful_backup_at_us,
+                (
+                    SELECT MAX(snapshot.last_verified_at_us)
+                    FROM backup_snapshots AS snapshot
+                    WHERE snapshot.target_id = target.target_id
+                ) AS last_verified_at_us
+            FROM backup_targets AS target
+            ORDER BY target.created_at_us, target.target_id
+            """
+        ).fetchall()
+
+        return tuple(
+            _target_from_row(row)
+            for row in rows
+        )
+
+    def target_status(
+        self,
+        target_id: uuid.UUID,
+    ) -> BackupTargetRecord:
+        record = self.get_target(
+            target_id
+        )
+
+        if record.status == "retired":
+            return record
+
+        target = record.root_path
+
+        if not target.is_dir():
+            self._set_target_status(
+                target_id,
+                "offline",
+            )
+            return self.get_target(
+                target_id
+            )
+
+        with backup_target_lock(target):
+            self._assert_target_available(
+                record,
+                target,
+            )
+
+        return self.get_target(
+            target_id
+        )
+
+    def set_retention_policy(
+        self,
+        target_id: uuid.UUID,
+        *,
+        daily: int,
+        weekly: int,
+        monthly: int,
+        yearly: int,
+    ) -> BackupTargetRecord:
+        policy = BackupRetentionPolicy(
+            daily=daily,
+            weekly=weekly,
+            monthly=monthly,
+            yearly=yearly,
+        )
+        self.get_target(target_id)
+
+        with self.database.write_transaction() as connection:
+            connection.execute(
+                """
+                UPDATE backup_targets
+                SET retention_daily = ?,
+                    retention_weekly = ?,
+                    retention_monthly = ?,
+                    retention_yearly = ?
+                WHERE target_id = ?
+                """,
+                (
+                    policy.daily,
+                    policy.weekly,
+                    policy.monthly,
+                    policy.yearly,
+                    uuid_to_blob(
+                        target_id
+                    ),
+                ),
+            )
+
+        return self.get_target(
+            target_id
+        )
+
+    def plan_retention(
+        self,
+        target_id: uuid.UUID,
+    ) -> BackupRetentionPlan:
+        self.recover_incomplete()
+        record = self.get_target(
+            target_id
+        )
+        target = record.root_path
+
+        if not target.is_dir():
+            self._set_target_status(
+                target_id,
+                "offline",
+            )
+            raise BackupRestoreError(
+                "Backup target is offline."
+            )
+
+        with backup_target_lock(target):
+            self._assert_target_available(
+                record,
+                target,
+            )
+            self._recover_retention_locked(
+                target_id=target_id,
+                target=target,
+            )
+            return self._plan_retention_locked(
+                target_id=target_id,
+                target=target,
+            )
+
+    def apply_retention(
+        self,
+        target_id: uuid.UUID,
+    ) -> BackupRetentionResult:
+        self.recover_incomplete()
+        record = self.get_target(
+            target_id
+        )
+        target = record.root_path
+
+        if not target.is_dir():
+            self._set_target_status(
+                target_id,
+                "offline",
+            )
+            raise BackupRestoreError(
+                "Backup target is offline."
+            )
+
+        with backup_target_lock(target):
+            self._assert_target_available(
+                record,
+                target,
+            )
+            self._recover_retention_locked(
+                target_id=target_id,
+                target=target,
+            )
+
+            creating = self.database.connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM backup_snapshots
+                WHERE target_id = ?
+                  AND state = 'creating'
+                """,
+                (
+                    uuid_to_blob(
+                        target_id
+                    ),
+                ),
+            ).fetchone()
+
+            if (
+                creating is None
+                or int(creating[0]) != 0
+            ):
+                raise BackupRestoreError(
+                    "Retention is blocked while a backup "
+                    "snapshot is creating."
+                )
+
+            plan = self._plan_retention_locked(
+                target_id=target_id,
+                target=target,
+            )
+
+            pruned: list[uuid.UUID] = []
+
+            for snapshot_id in plan.prune_snapshot_ids:
+                self._prune_snapshot_locked(
+                    target_id=target_id,
+                    snapshot_id=snapshot_id,
+                    target=target,
+                )
+                pruned.append(
+                    snapshot_id
+                )
+
+            deleted_objects = 0
+
+            if pruned:
+                deleted_objects = (
+                    self._gc_backup_objects_locked(
+                        target=target
+                    )
+                )
+
+            return BackupRetentionResult(
+                plan=plan,
+                pruned_snapshot_ids=tuple(
+                    pruned
+                ),
+                deleted_object_count=(
+                    deleted_objects
+                ),
+            )
+
+    def recover_retention(
+        self,
+        target_id: uuid.UUID,
+    ) -> None:
+        record = self.get_target(
+            target_id
+        )
+        target = record.root_path
+
+        if not target.is_dir():
+            return
+
+        with backup_target_lock(target):
+            self._recover_retention_locked(
+                target_id=target_id,
+                target=target,
+            )
+
+    def _plan_retention_locked(
+        self,
+        *,
+        target_id: uuid.UUID,
+        target: Path,
+    ) -> BackupRetentionPlan:
+        target_record = self.get_target(
+            target_id
+        )
+
+        rows = self.database.connection.execute(
+            """
+            SELECT *
+            FROM backup_snapshots
+            WHERE target_id = ?
+              AND state = 'complete'
+              AND verification_status IN (
+                  'verified_light',
+                  'verified_deep'
+              )
+              AND pruned_at_us IS NULL
+            ORDER BY completed_at_us DESC, snapshot_id DESC
+            """,
+            (
+                uuid_to_blob(
+                    target_id
+                ),
+            ),
+        ).fetchall()
+
+        candidates: list[RetentionCandidate] = []
+
+        for row in rows:
+            snapshot = _snapshot_from_row(
+                row
+            )
+
+            if (
+                snapshot.completed_at_us is None
+                or snapshot.manifest_sha256 is None
+            ):
+                raise BackupRestoreError(
+                    "Completed backup metadata is incomplete."
+                )
+
+            snapshot_root = (
+                target
+                / snapshot.relative_path
+            )
+
+            if not self._verify_path(
+                target=target,
+                snapshot_root=snapshot_root,
+                expected_manifest_sha256=(
+                    snapshot.manifest_sha256
+                ),
+                expected_snapshot_id=(
+                    snapshot.snapshot_id
+                ),
+            ):
+                raise BackupRestoreError(
+                    "Retention refused because a recorded "
+                    "restore point failed verification."
+                )
+
+            candidates.append(
+                RetentionCandidate(
+                    snapshot_id=(
+                        snapshot.snapshot_id
+                    ),
+                    completed_at_us=(
+                        snapshot.completed_at_us
+                    ),
+                )
+            )
+
+        return calculate_retention_plan(
+            target_id=target_id,
+            snapshots=tuple(candidates),
+            policy=target_record.policy,
+        )
+
+    def _prune_snapshot_locked(
+        self,
+        *,
+        target_id: uuid.UUID,
+        snapshot_id: uuid.UUID,
+        target: Path,
+    ) -> None:
+        record = self.get_snapshot(
+            snapshot_id
+        )
+
+        if record.target_id != target_id:
+            raise BackupRestoreError(
+                "Retention snapshot belongs to another target."
+            )
+
+        if (
+            record.state != "complete"
+            or record.pruned_at_us is not None
+            or record.manifest_sha256 is None
+        ):
+            raise BackupRestoreError(
+                "Retention candidate is no longer prunable."
+            )
+
+        snapshot_root = (
+            target
+            / record.relative_path
+        )
+
+        if not self._verify_path(
+            target=target,
+            snapshot_root=snapshot_root,
+            expected_manifest_sha256=(
+                record.manifest_sha256
+            ),
+            expected_snapshot_id=(
+                snapshot_id
+            ),
+        ):
+            raise BackupRestoreError(
+                "Retention candidate failed final verification."
+            )
+
+        trash_root = (
+            target
+            / self.RETENTION_TRASH_NAME
+        )
+        trash_root.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        trash_path = (
+            trash_root
+            / str(snapshot_id)
+        )
+
+        if trash_path.exists():
+            raise BackupRestoreError(
+                "Retention trash already contains snapshot."
+            )
+
+        os.replace(
+            snapshot_root,
+            trash_path,
+        )
+
+        pruned_at_us = utc_now_us()
+
+        try:
+            with self.database.write_transaction() as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE backup_snapshots
+                    SET pruned_at_us = ?
+                    WHERE snapshot_id = ?
+                      AND target_id = ?
+                      AND state = 'complete'
+                      AND pruned_at_us IS NULL
+                    """,
+                    (
+                        pruned_at_us,
+                        uuid_to_blob(
+                            snapshot_id
+                        ),
+                        uuid_to_blob(
+                            target_id
+                        ),
+                    ),
+                )
+
+                if cursor.rowcount != 1:
+                    raise BackupRestoreError(
+                        "Retention database state changed "
+                        "during prune."
+                    )
+
+        except BaseException:
+            if (
+                trash_path.exists()
+                and not snapshot_root.exists()
+            ):
+                os.replace(
+                    trash_path,
+                    snapshot_root,
+                )
+            raise
+
+        shutil.rmtree(
+            trash_path
+        )
+
+    def _recover_retention_locked(
+        self,
+        *,
+        target_id: uuid.UUID,
+        target: Path,
+    ) -> None:
+        trash_root = (
+            target
+            / self.RETENTION_TRASH_NAME
+        )
+
+        if not trash_root.exists():
+            return
+
+        if (
+            trash_root.is_symlink()
+            or not trash_root.is_dir()
+        ):
+            raise BackupRestoreError(
+                "Backup retention trash is invalid."
+            )
+
+        for item in sorted(
+            trash_root.iterdir(),
+            key=lambda path: path.name,
+        ):
+            if item.is_symlink() or not item.is_dir():
+                raise BackupRestoreError(
+                    "Unexpected retention-trash entry."
+                )
+
+            try:
+                snapshot_id = uuid.UUID(
+                    item.name
+                )
+            except ValueError as exc:
+                raise BackupRestoreError(
+                    "Retention trash contains an "
+                    "invalid snapshot identifier."
+                ) from exc
+
+            row = self.database.connection.execute(
+                """
+                SELECT target_id, relative_path, pruned_at_us
+                FROM backup_snapshots
+                WHERE snapshot_id = ?
+                """,
+                (
+                    uuid_to_blob(
+                        snapshot_id
+                    ),
+                ),
+            ).fetchone()
+
+            if row is None:
+                raise BackupRestoreError(
+                    "Retention trash contains an "
+                    "unknown snapshot."
+                )
+
+            if uuid_from_blob(
+                bytes(row["target_id"])
+            ) != target_id:
+                raise BackupRestoreError(
+                    "Retention trash snapshot belongs "
+                    "to another target."
+                )
+
+            snapshot_root = (
+                target
+                / str(
+                    row["relative_path"]
+                )
+            )
+
+            if row["pruned_at_us"] is None:
+                if snapshot_root.exists():
+                    raise BackupRestoreError(
+                        "Retention recovery found both "
+                        "live and trashed snapshot copies."
+                    )
+
+                snapshot_root.parent.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+                os.replace(
+                    item,
+                    snapshot_root,
+                )
+                continue
+
+            if snapshot_root.exists():
+                raise BackupRestoreError(
+                    "A pruned snapshot unexpectedly "
+                    "exists outside retention trash."
+                )
+
+            shutil.rmtree(
+                item
+            )
+
+        try:
+            trash_root.rmdir()
+        except OSError:
+            pass
+
+    def _gc_backup_objects_locked(
+        self,
+        *,
+        target: Path,
+    ) -> int:
+        referenced = (
+            self._collect_physical_object_refs(
+                target=target
+            )
+        )
+
+        if not referenced:
+            return 0
+
+        objects_root = (
+            target
+            / "objects"
+            / "sha256"
+        )
+
+        if not objects_root.exists():
+            return 0
+
+        if (
+            objects_root.is_symlink()
+            or not objects_root.is_dir()
+        ):
+            raise BackupRestoreError(
+                "Backup object store is invalid."
+            )
+
+        deleted = 0
+
+        for path in sorted(
+            objects_root.rglob("*.blob"),
+            key=lambda item: item.as_posix(),
+        ):
+            if path.is_symlink() or not path.is_file():
+                raise BackupRestoreError(
+                    "Backup object store contains "
+                    "an unsafe object entry."
+                )
+
+            name = path.name
+
+            if (
+                len(name) != 69
+                or not name.endswith(".blob")
+            ):
+                continue
+
+            try:
+                digest = bytes.fromhex(
+                    name[:-5]
+                )
+            except ValueError:
+                continue
+
+            if len(digest) != 32:
+                continue
+
+            expected = (
+                target
+                / _object_relative_path(
+                    digest
+                )
+            )
+
+            if path.resolve() != expected.resolve():
+                continue
+
+            if digest in referenced:
+                continue
+
+            path.unlink()
+            deleted += 1
+
+        directories = sorted(
+            (
+                path
+                for path in objects_root.rglob("*")
+                if path.is_dir()
+            ),
+            key=lambda item: len(item.parts),
+            reverse=True,
+        )
+
+        for directory in directories:
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+
+        return deleted
+
+    def _collect_physical_object_refs(
+        self,
+        *,
+        target: Path,
+    ) -> set[bytes]:
+        snapshots_root = (
+            target
+            / "snapshots"
+        )
+
+        if not snapshots_root.exists():
+            return set()
+
+        if (
+            snapshots_root.is_symlink()
+            or not snapshots_root.is_dir()
+        ):
+            raise BackupRestoreError(
+                "Backup snapshots directory is invalid."
+            )
+
+        referenced: set[bytes] = set()
+        completed_count = 0
+
+        for snapshot_root in sorted(
+            snapshots_root.iterdir(),
+            key=lambda item: item.name,
+        ):
+            if (
+                snapshot_root.name.startswith(".")
+                or snapshot_root.is_symlink()
+                or not snapshot_root.is_dir()
+            ):
+                raise BackupRestoreError(
+                    "Incomplete or unexpected backup "
+                    "snapshot blocks object GC."
+                )
+
+            try:
+                snapshot_id = uuid.UUID(
+                    snapshot_root.name
+                )
+            except ValueError as exc:
+                raise BackupRestoreError(
+                    "Unexpected snapshot directory "
+                    "blocks object GC."
+                ) from exc
+
+            marker = (
+                snapshot_root
+                / "complete.marker"
+            )
+
+            if not marker.is_file():
+                raise BackupRestoreError(
+                    "Snapshot without completion marker "
+                    "blocks object GC."
+                )
+
+            try:
+                manifest_sha256 = bytes.fromhex(
+                    marker.read_text(
+                        encoding="ascii"
+                    ).strip()
+                )
+            except (
+                OSError,
+                ValueError,
+            ) as exc:
+                raise BackupRestoreError(
+                    "Invalid completion marker blocks "
+                    "object GC."
+                ) from exc
+
+            if len(manifest_sha256) != 32:
+                raise BackupRestoreError(
+                    "Invalid completion marker blocks "
+                    "object GC."
+                )
+
+            if not self._verify_path(
+                target=target,
+                snapshot_root=snapshot_root,
+                expected_manifest_sha256=(
+                    manifest_sha256
+                ),
+                expected_snapshot_id=(
+                    snapshot_id
+                ),
+            ):
+                raise BackupRestoreError(
+                    "Corrupt completed snapshot blocks "
+                    "object GC."
+                )
+
+            completed_count += 1
+            manifest = _read_manifest(
+                snapshot_root
+                / "manifest.json"
+            )
+            objects = manifest.get(
+                "objects"
+            )
+
+            if not isinstance(objects, list):
+                raise BackupRestoreError(
+                    "Invalid backup manifest blocks "
+                    "object GC."
+                )
+
+            for item in objects:
+                if not isinstance(item, dict):
+                    raise BackupRestoreError(
+                        "Invalid backup object metadata "
+                        "blocks object GC."
+                    )
+
+                try:
+                    digest = bytes.fromhex(
+                        _required_str(
+                            item,
+                            "sha256",
+                        )
+                    )
+                    relative = _safe_relative(
+                        _required_str(
+                            item,
+                            "object_path",
+                        )
+                    )
+                except (
+                    BackupRestoreError,
+                    ValueError,
+                ) as exc:
+                    raise BackupRestoreError(
+                        "Invalid backup object metadata "
+                        "blocks object GC."
+                    ) from exc
+
+                if (
+                    len(digest) != 32
+                    or relative
+                    != _object_relative_path(
+                        digest
+                    )
+                ):
+                    raise BackupRestoreError(
+                        "Non-canonical backup object "
+                        "metadata blocks object GC."
+                    )
+
+                referenced.add(
+                    digest
+                )
+
+        if completed_count == 0:
+            return set()
+
+        return referenced
+
+    def _resolve_target_for_create(
+        self,
+        *,
+        target_root: Path | None,
+        target_id: uuid.UUID | None,
+        actor_id: uuid.UUID,
+    ) -> tuple[Path, uuid.UUID]:
+        del actor_id
+
+        if (
+            target_root is not None
+            and target_id is not None
+        ):
+            raise BackupRestoreError(
+                "Specify either target_root or "
+                "target_id, not both."
+            )
+
+        if target_id is not None:
+            record = self.get_target(
+                target_id
+            )
+
+            if record.status == "retired":
+                raise BackupRestoreError(
+                    "Backup target is retired."
+                )
+
+            target = record.root_path
+
+            if not target.is_dir():
+                self._set_target_status(
+                    target_id,
+                    "offline",
+                )
+                raise BackupRestoreError(
+                    "Backup target is offline."
+                )
+
+            with backup_target_lock(target):
+                self._assert_target_available(
+                    record,
+                    target,
+                )
+
+            return (
+                target,
+                target_id,
+            )
+
+        raw = (
+            target_root
+            if target_root is not None
+            else self.paths.backup_root
+        )
+
+        if raw is None:
+            raise BackupRestoreError(
+                "No backup target configured; "
+                "provide an explicit target."
+            )
+
+        target = self._normalize_target_path(
+            raw
+        )
+
+        row = self.database.connection.execute(
+            """
+            SELECT target_id
+            FROM backup_targets
+            WHERE root_path = ?
+            """,
+            (str(target),),
+        ).fetchone()
+
+        if row is not None:
+            existing_id = uuid_from_blob(
+                bytes(row["target_id"])
+            )
+            record = self.get_target(
+                existing_id
+            )
+
+            if record.status == "retired":
+                raise BackupRestoreError(
+                    "Backup target is retired."
+                )
+
+            if not target.is_dir():
+                self._set_target_status(
+                    existing_id,
+                    "offline",
+                )
+                raise BackupRestoreError(
+                    "Known backup target is offline; "
+                    "refusing to recreate its root."
+                )
+
+            with backup_target_lock(target):
+                self._assert_target_available(
+                    record,
+                    target,
+                )
+
+            return (
+                target,
+                existing_id,
+            )
+
+        registered = self.register_target(
+            target
+        )
+
+        return (
+            registered.root_path,
+            registered.target_id,
+        )
+
+    def _assert_target_available(
+        self,
+        record: BackupTargetRecord,
+        target: Path,
+    ) -> None:
+        if not target.is_dir():
+            self._set_target_status(
+                record.target_id,
+                "offline",
+            )
+            raise BackupRestoreError(
+                "Backup target is offline."
+            )
+
+        descriptor_id = (
+            self._read_target_descriptor(
+                target
+            )
+        )
+
+        if descriptor_id is None:
+            if record.identity_initialized:
+                self._set_target_status(
+                    record.target_id,
+                    "offline",
+                )
+                raise BackupRestoreError(
+                    "Known backup target lost its "
+                    "identity descriptor."
+                )
+
+            complete_rows = (
+                self.database.connection.execute(
+                    """
+                    SELECT relative_path
+                    FROM backup_snapshots
+                    WHERE target_id = ?
+                      AND state = 'complete'
+                      AND pruned_at_us IS NULL
+                    ORDER BY created_at_us
+                    """,
+                    (
+                        uuid_to_blob(
+                            record.target_id
+                        ),
+                    ),
+                ).fetchall()
+            )
+
+            for row in complete_rows:
+                snapshot_root = (
+                    target
+                    / str(
+                        row["relative_path"]
+                    )
+                )
+
+                if not (
+                    snapshot_root.is_dir()
+                    and (
+                        snapshot_root
+                        / "complete.marker"
+                    ).is_file()
+                ):
+                    self._set_target_status(
+                        record.target_id,
+                        "offline",
+                    )
+                    raise BackupRestoreError(
+                        "Legacy backup target contents "
+                        "do not match registered history."
+                    )
+
+            self._write_target_descriptor(
+                target,
+                record.target_id,
+            )
+            descriptor_id = (
+                record.target_id
+            )
+
+        if descriptor_id != record.target_id:
+            self._set_target_status(
+                record.target_id,
+                "offline",
+            )
+            raise BackupRestoreError(
+                "Backup target identity mismatch."
+            )
+
+        with self.database.write_transaction() as connection:
+            connection.execute(
+                """
+                UPDATE backup_targets
+                SET status = 'active',
+                    identity_initialized = 1
+                WHERE target_id = ?
+                """,
+                (
+                    uuid_to_blob(
+                        record.target_id
+                    ),
+                ),
+            )
+
+    def _read_target_descriptor(
+        self,
+        target: Path,
+    ) -> uuid.UUID | None:
+        path = (
+            target
+            / self.TARGET_DESCRIPTOR_NAME
+        )
+
+        if not path.exists():
+            return None
+
+        if path.is_symlink() or not path.is_file():
+            raise BackupRestoreError(
+                "Backup target descriptor is unsafe."
+            )
+
+        try:
+            value = json.loads(
+                path.read_text(
+                    encoding="utf-8"
+                )
+            )
+        except (
+            OSError,
+            json.JSONDecodeError,
+        ) as exc:
+            raise BackupRestoreError(
+                "Backup target descriptor is invalid."
+            ) from exc
+
+        if (
+            not isinstance(value, dict)
+            or value.get("format_version")
+            != self.TARGET_FORMAT_VERSION
+        ):
+            raise BackupRestoreError(
+                "Backup target descriptor format "
+                "is unsupported."
+            )
+
+        raw_target_id = value.get(
+            "target_id"
+        )
+
+        if not isinstance(
+            raw_target_id,
+            str,
+        ):
+            raise BackupRestoreError(
+                "Backup target descriptor has no "
+                "valid target_id."
+            )
+
+        try:
+            return uuid.UUID(
+                raw_target_id
+            )
+        except ValueError as exc:
+            raise BackupRestoreError(
+                "Backup target descriptor target_id "
+                "is invalid."
+            ) from exc
+
+    def _write_target_descriptor(
+        self,
+        target: Path,
+        target_id: uuid.UUID,
+    ) -> None:
+        existing = self._read_target_descriptor(
+            target
+        )
+
+        if existing is not None:
+            if existing != target_id:
+                raise BackupRestoreError(
+                    "Refusing to overwrite a different "
+                    "backup target identity."
+                )
+            return
+
+        encoded = (
+            _canonical_json(
+                {
+                    "format_version": (
+                        self.TARGET_FORMAT_VERSION
+                    ),
+                    "target_id": str(
+                        target_id
+                    ),
+                }
+            )
+            + "\n"
+        ).encode("utf-8")
+
+        _write_fsynced(
+            target
+            / self.TARGET_DESCRIPTOR_NAME,
+            encoded,
+        )
+
+    def _set_target_status(
+        self,
+        target_id: uuid.UUID,
+        status: str,
+    ) -> None:
+        if status not in {
+            "active",
+            "offline",
+            "retired",
+        }:
+            raise ValueError(
+                "Invalid backup target status."
+            )
+
+        with self.database.write_transaction() as connection:
+            connection.execute(
+                """
+                UPDATE backup_targets
+                SET status = ?
+                WHERE target_id = ?
+                """,
+                (
+                    status,
+                    uuid_to_blob(
+                        target_id
+                    ),
+                ),
+            )
+
+    def _normalize_target_path(
+        self,
+        raw: Path,
+    ) -> Path:
+        target = raw.expanduser()
+
+        if not target.is_absolute():
+            raise BackupRestoreError(
+                "Backup target must be an absolute path."
+            )
+
+        if target.exists() and target.is_symlink():
+            raise BackupRestoreError(
+                "Backup target root must not be a symlink."
+            )
+
+        target = target.resolve()
+
+        live = self.paths.local_root.resolve()
+
+        if (
+            target == live
+            or live in target.parents
+            or target in live.parents
+        ):
+            raise BackupRestoreError(
+                "Backup target must be separate "
+                "from live local_root."
+            )
+
+        archive = self.paths.archive_root
+
+        if archive is not None:
+            archive_resolved = (
+                archive.resolve()
+            )
+
+            if (
+                target == archive_resolved
+                or archive_resolved
+                in target.parents
+                or target
+                in archive_resolved.parents
+            ):
+                raise BackupRestoreError(
+                    "Backup target must not overlap "
+                    "the live Raw Archive root."
+                )
+
+        return target
+
+    def _target_root(self, target_root: Path | None) -> Path:
+        raw = (
+            target_root
+            if target_root is not None
+            else self.paths.backup_root
+        )
+        if raw is None:
+            raise BackupRestoreError(
+                "No backup target configured; "
+                "provide an explicit target."
+            )
+        target = self._normalize_target_path(raw)
+        if not target.is_dir():
+            raise BackupRestoreError(
+                "Backup target is offline."
+            )
+        return target
+
+    def _ensure_target(
+        self,
+        target: Path,
+        *,
+        actor_id: uuid.UUID,
+    ) -> uuid.UUID:
+        del actor_id
+        return self.register_target(
+            target
+        ).target_id
+
 
     def _target_for_record(self, record: BackupSnapshotRecord) -> Path:
         row = self.database.connection.execute(
@@ -704,6 +2902,280 @@ class BackupService:
         if row is None:
             raise BackupRestoreError("Backup target metadata is missing.")
         return Path(str(row["root_path"]))
+
+    def _verify_light_path(
+        self,
+        *,
+        target: Path,
+        snapshot_root: Path,
+        expected_manifest_sha256: bytes,
+        expected_snapshot_id: uuid.UUID | None = None,
+    ) -> bool:
+        marker = (
+            snapshot_root
+            / "complete.marker"
+        )
+
+        if not marker.is_file():
+            return False
+
+        try:
+            marker_value = (
+                marker.read_text(
+                    encoding="ascii"
+                ).strip()
+            )
+        except OSError:
+            return False
+
+        if (
+            marker_value
+            != expected_manifest_sha256.hex()
+        ):
+            return False
+
+        manifest_path = (
+            snapshot_root
+            / "manifest.json"
+        )
+
+        database_path = (
+            snapshot_root
+            / "athena.db"
+        )
+
+        if (
+            not manifest_path.is_file()
+            or not database_path.is_file()
+        ):
+            return False
+
+        try:
+            manifest_bytes = (
+                manifest_path.read_bytes()
+            )
+        except OSError:
+            return False
+
+        if (
+            hashlib.sha256(
+                manifest_bytes
+            ).digest()
+            != expected_manifest_sha256
+        ):
+            return False
+
+        try:
+            manifest = _read_manifest(
+                manifest_path
+            )
+        except BackupRestoreError:
+            return False
+
+        if (
+            expected_snapshot_id is not None
+            and manifest.get(
+                "snapshot_id"
+            )
+            != str(
+                expected_snapshot_id
+            )
+        ):
+            return False
+
+        database = manifest.get(
+            "database"
+        )
+
+        if not isinstance(
+            database,
+            dict,
+        ):
+            return False
+
+        if (
+            database.get("path")
+            != "athena.db"
+        ):
+            return False
+
+        try:
+            expected_db_sha256 = (
+                bytes.fromhex(
+                    _required_str(
+                        database,
+                        "sha256",
+                    )
+                )
+            )
+        except (
+            BackupRestoreError,
+            ValueError,
+        ):
+            return False
+
+        db_sha256, _ = _hash_file(
+            database_path
+        )
+
+        if (
+            db_sha256
+            != expected_db_sha256
+        ):
+            return False
+
+        if not _manifest_matches_database(
+            manifest,
+            database_path,
+        ):
+            return False
+
+        objects = manifest.get(
+            "objects"
+        )
+
+        if not isinstance(
+            objects,
+            list,
+        ):
+            return False
+
+        for item in objects:
+            if not isinstance(
+                item,
+                dict,
+            ):
+                return False
+
+            try:
+                expected_sha256 = (
+                    bytes.fromhex(
+                        _required_str(
+                            item,
+                            "sha256",
+                        )
+                    )
+                )
+
+                expected_length = (
+                    _required_int(
+                        item,
+                        "byte_length",
+                    )
+                )
+
+                relative = (
+                    _safe_relative(
+                        _required_str(
+                            item,
+                            "object_path",
+                        )
+                    )
+                )
+
+            except (
+                BackupRestoreError,
+                ValueError,
+            ):
+                return False
+
+            if (
+                relative
+                != _object_relative_path(
+                    expected_sha256
+                )
+            ):
+                return False
+
+            try:
+                object_path = (
+                    _safe_existing_file(
+                        target,
+                        relative,
+                    )
+                )
+
+                actual_length = (
+                    object_path.stat().st_size
+                )
+
+            except (
+                BackupRestoreError,
+                OSError,
+            ):
+                return False
+
+            if (
+                actual_length
+                != expected_length
+            ):
+                return False
+
+        check = sqlite3.connect(
+            database_path
+        )
+
+        try:
+            check.execute(
+                "PRAGMA foreign_keys = ON"
+            )
+
+            quick = str(
+                check.execute(
+                    "PRAGMA quick_check"
+                ).fetchone()[0]
+            )
+
+            if quick.lower() != "ok":
+                return False
+
+            integrity = str(
+                check.execute(
+                    "PRAGMA integrity_check"
+                ).fetchone()[0]
+            )
+
+            if (
+                integrity.lower()
+                != "ok"
+            ):
+                return False
+
+            if check.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchall():
+                return False
+
+            snapshot_schema = int(
+                check.execute(
+                    "PRAGMA user_version"
+                ).fetchone()[0]
+            )
+
+            manifest_schema = (
+                manifest.get(
+                    "schema_version"
+                )
+            )
+
+            if (
+                isinstance(
+                    manifest_schema,
+                    bool,
+                )
+                or not isinstance(
+                    manifest_schema,
+                    int,
+                )
+                or snapshot_schema
+                != manifest_schema
+            ):
+                return False
+
+        finally:
+            check.close()
+
+        return True
 
     def _verify_path(
         self,
@@ -792,7 +3264,26 @@ class BackupService:
                 return False
             if check.execute("PRAGMA foreign_key_check").fetchall():
                 return False
-            if int(check.execute("PRAGMA user_version").fetchone()[0]) != SCHEMA_VERSION:
+            database_schema = int(
+                check.execute(
+                    "PRAGMA user_version"
+                ).fetchone()[0]
+            )
+            manifest_schema = manifest.get(
+                "schema_version"
+            )
+            if (
+                not isinstance(
+                    manifest_schema,
+                    int,
+                )
+                or isinstance(
+                    manifest_schema,
+                    bool,
+                )
+                or database_schema
+                != manifest_schema
+            ):
                 return False
         finally:
             check.close()
@@ -801,7 +3292,21 @@ class BackupService:
 
 
 def _manifest_matches_database(manifest: dict[str, Any], database_path: Path) -> bool:
-    if manifest.get("schema_version") != SCHEMA_VERSION:
+    manifest_schema_version = manifest.get(
+        "schema_version"
+    )
+    if (
+        not isinstance(
+            manifest_schema_version,
+            int,
+        )
+        or isinstance(
+            manifest_schema_version,
+            bool,
+        )
+        or manifest_schema_version < 1
+        or manifest_schema_version > SCHEMA_VERSION
+    ):
         return False
     snapshot_commit_seq = manifest.get("snapshot_commit_seq")
     if (
@@ -834,6 +3339,13 @@ def _manifest_matches_database(manifest: dict[str, Any], database_path: Path) ->
     check = sqlite3.connect(database_path)
     check.row_factory = sqlite3.Row
     try:
+        if int(
+            check.execute(
+                "PRAGMA user_version"
+            ).fetchone()[0]
+        ) != manifest_schema_version:
+            return False
+
         row = check.execute(
             "SELECT COALESCE(MAX(commit_seq), 0) AS commit_seq FROM commit_records"
         ).fetchone()
@@ -902,9 +3414,81 @@ def _snapshot_from_row(row: sqlite3.Row) -> BackupSnapshotRecord:
         object_count=int(row["object_count"]),
         created_at_us=int(row["created_at_us"]),
         completed_at_us=(
-            int(row["completed_at_us"]) if row["completed_at_us"] is not None else None
+            int(row["completed_at_us"])
+            if row["completed_at_us"] is not None
+            else None
+        ),
+        last_verified_at_us=(
+            int(row["last_verified_at_us"])
+            if row["last_verified_at_us"] is not None
+            else None
+        ),
+        pruned_at_us=(
+            int(row["pruned_at_us"])
+            if row["pruned_at_us"] is not None
+            else None
         ),
     )
+
+
+
+def _target_from_row(
+    row: sqlite3.Row,
+) -> BackupTargetRecord:
+    return BackupTargetRecord(
+        target_id=uuid_from_blob(
+            bytes(row["target_id"])
+        ),
+        root_path=Path(
+            str(row["root_path"])
+        ),
+        status=str(
+            row["status"]
+        ),
+        policy=BackupRetentionPolicy(
+            daily=int(
+                row["retention_daily"]
+            ),
+            weekly=int(
+                row["retention_weekly"]
+            ),
+            monthly=int(
+                row["retention_monthly"]
+            ),
+            yearly=int(
+                row["retention_yearly"]
+            ),
+        ),
+        identity_initialized=bool(
+            int(
+                row["identity_initialized"]
+            )
+        ),
+        created_at_us=int(
+            row["created_at_us"]
+        ),
+        last_successful_backup_at_us=(
+            int(
+                row[
+                    "last_successful_backup_at_us"
+                ]
+            )
+            if row[
+                "last_successful_backup_at_us"
+            ] is not None
+            else None
+        ),
+        last_verified_at_us=(
+            int(
+                row["last_verified_at_us"]
+            )
+            if row[
+                "last_verified_at_us"
+            ] is not None
+            else None
+        ),
+    )
+
 
 
 def _object_relative_path(digest: bytes) -> Path:
