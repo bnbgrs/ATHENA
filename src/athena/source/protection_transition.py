@@ -6,10 +6,12 @@ import sqlite3
 import uuid
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 
 from athena.chat.service import ChatService
 from athena.common.ids import new_uuid7, uuid_from_blob, uuid_to_blob
 from athena.common.time import utc_now_us
+from athena.lifecycle.runtime_lock import runtime_data_lock
 from athena.security.service import (
     ProtectedContentService,
     ProtectionScopeLockedError,
@@ -1219,22 +1221,25 @@ class SourceProtectionTransitionService:
         blob_store: BlobStore,
         protected_content: ProtectedContentService,
         chat: ChatService,
+        runtime_lock_root: Path | None = None,
     ) -> None:
         self.repository = repository
         self.sources = sources
         self.blob_store = blob_store
         self.protected_content = protected_content
         self.chat = chat
+        self.runtime_lock_root = runtime_lock_root
         self.protected_blobs = ProtectedBlobStore(
             blob_store=blob_store,
             protected_content=protected_content,
         )
 
     def start(self) -> None:
-        for transition in self.repository.list_recoverable(limit=1000):
-            if not self._recovery_storage_available(transition):
-                continue
-            self._finish_transition(transition)
+        with runtime_data_lock(self.runtime_lock_root):
+            for transition in self.repository.list_recoverable(limit=1000):
+                if not self._recovery_storage_available(transition):
+                    continue
+                self._finish_transition(transition)
 
     def stop(self) -> None:
         return
@@ -1244,40 +1249,41 @@ class SourceProtectionTransitionService:
         source_id: uuid.UUID,
         protection_scope_id: uuid.UUID,
     ) -> SourceCaptureResult:
-        protected_scope = self.repository.protected_scope(source_id)
-        if protected_scope is not None:
-            if protected_scope != protection_scope_id:
-                raise SourceProtectionUnsafeError(
-                    "Source is already protected by another ProtectionScope."
+        with runtime_data_lock(self.runtime_lock_root):
+            protected_scope = self.repository.protected_scope(source_id)
+            if protected_scope is not None:
+                if protected_scope != protection_scope_id:
+                    raise SourceProtectionUnsafeError(
+                        "Source is already protected by another ProtectionScope."
+                    )
+                source, blob = self.sources.get(source_id)
+                return SourceCaptureResult(
+                    source=source,
+                    blob=blob,
+                    reused_blob=False,
                 )
-            source, blob = self.sources.get(source_id)
-            return SourceCaptureResult(
-                source=source,
-                blob=blob,
-                reused_blob=False,
-            )
 
-        transition = self.repository.get_for_source(source_id)
-        if transition is None:
-            if not self.protected_content.is_unlocked(protection_scope_id):
-                raise ProtectionScopeLockedError("ProtectionScope is locked.")
-            source, blob = self.sources.get(source_id)
-            self._metadata_for_source(source, blob)
-            transition = self.repository.begin(
-                source_id=source_id,
-                protection_scope_id=protection_scope_id,
-            )
-        elif transition.protection_scope_id != protection_scope_id:
-            raise SourceProtectionUnsafeError(
-                "Source already has a protection transition for another scope."
-            )
+            transition = self.repository.get_for_source(source_id)
+            if transition is None:
+                if not self.protected_content.is_unlocked(protection_scope_id):
+                    raise ProtectionScopeLockedError("ProtectionScope is locked.")
+                source, blob = self.sources.get(source_id)
+                self._metadata_for_source(source, blob)
+                transition = self.repository.begin(
+                    source_id=source_id,
+                    protection_scope_id=protection_scope_id,
+                )
+            elif transition.protection_scope_id != protection_scope_id:
+                raise SourceProtectionUnsafeError(
+                    "Source already has a protection transition for another scope."
+                )
 
-        if transition.state is SourceProtectionTransitionState.PENDING:
-            if not self.protected_content.is_unlocked(protection_scope_id):
-                raise ProtectionScopeLockedError("ProtectionScope is locked.")
-            transition = self._prepare(transition)
+            if transition.state is SourceProtectionTransitionState.PENDING:
+                if not self.protected_content.is_unlocked(protection_scope_id):
+                    raise ProtectionScopeLockedError("ProtectionScope is locked.")
+                transition = self._prepare(transition)
 
-        return self._finish_transition(transition)
+            return self._finish_transition(transition)
 
     def _prepare(
         self,

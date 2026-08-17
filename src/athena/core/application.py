@@ -49,6 +49,9 @@ from athena.knowledge.source_hierarchical_repository import (
     SourceHierarchicalExtractionRepository,
 )
 from athena.knowledge.source_hierarchical_service import SourceHierarchicalExtractionService
+from athena.lifecycle.protected_purge import ProtectedScopePurgeService
+from athena.lifecycle.purge import LifecyclePurgeService
+from athena.lifecycle.service import LifecycleDeletionService
 from athena.memory.repository import PersonalMemoryRepository
 from athena.memory.service import PersonalMemoryService
 from athena.model.adapters.lm_studio import LMStudioProvider
@@ -171,6 +174,7 @@ class AthenaApplication:
         self.archive_replication = ArchiveReplicationService(
             repository=self.archive_replication_repository,
             blob_store=self.blob_store,
+            runtime_lock_root=self.paths.state_root,
         )
         self.archive_replication_worker = DurableArchiveReplicationWorker(
             jobs=self.jobs,
@@ -186,6 +190,7 @@ class AthenaApplication:
             blob_store=self.blob_store,
             protected_content=self.protected_content,
             chat=self.chat,
+            runtime_lock_root=self.paths.state_root,
         )
         self.source_representation_repository = SourceRepresentationRepository(self.database)
         self.source_anchor_repository = SourceAnchorRepository(self.database)
@@ -201,12 +206,35 @@ class AthenaApplication:
             chat=self.chat,
             protected_content=self.protected_content,
             protection_transitions=self.source_protection,
+            runtime_lock_root=self.paths.state_root,
         )
         self.backup = BackupService(
             database=self.database,
             blob_store=self.blob_store,
             paths=self.paths,
             chat=self.chat,
+        )
+        self.personal_memory.set_deletion_sync_callback(
+            self.backup.sync_all_deletion_ledgers
+        )
+        self.lifecycle_deletion = LifecycleDeletionService(
+            database=self.database,
+            chat=self.chat,
+            deletion_sync=self.backup.sync_all_deletion_ledgers,
+        )
+        self.lifecycle_purge = LifecyclePurgeService(
+            database=self.database,
+            blob_store=self.blob_store,
+            paths=self.paths,
+            chat=self.chat,
+        )
+        self.protected_scope_purge = ProtectedScopePurgeService(
+            database=self.database,
+            blob_store=self.blob_store,
+            paths=self.paths,
+            chat=self.chat,
+            protected_content=self.protected_content,
+            deletion_sync=self.backup.sync_all_deletion_ledgers,
         )
         self.backup_worker = DurableBackupWorker(
             jobs=self.jobs,
@@ -564,6 +592,7 @@ class AthenaApplication:
             self.services.start_all()
             self.news.start()
             recovered_backups = self.backup.recover_incomplete()
+            self.backup.sync_all_deletion_ledgers()
             if recovered_backups:
                 logger.warning(
                     "Recovered interrupted backup publication",

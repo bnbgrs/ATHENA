@@ -31,11 +31,21 @@ from athena.backup.target_lock import (
 from athena.chat.service import ChatService
 from athena.common.ids import new_uuid7, uuid_from_blob, uuid_to_blob
 from athena.common.time import utc_now_us
+from athena.lifecycle.deletion import (
+    DeletionLedgerRecord,
+    apply_deletion_records,
+    current_deletion_watermark,
+    read_deletion_records,
+)
 from athena.source.blob_store import BlobStore
 from athena.source.models import BlobStorageArea
 from athena.storage.database import SQLiteDatabase
 from athena.storage.paths import RuntimePaths
-from athena.storage.schema import SCHEMA_VERSION, initialize_schema
+from athena.storage.schema import (
+    DELETION_LEDGER_SCHEMA_VERSION,
+    SCHEMA_VERSION,
+    initialize_schema,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +69,7 @@ class BackupSnapshotRecord:
     completed_at_us: int | None
     last_verified_at_us: int | None
     pruned_at_us: int | None
+    deletion_ledger_watermark: int = 0
 
 
 class BackupService:
@@ -68,6 +79,11 @@ class BackupService:
     TARGET_FORMAT_VERSION = 1
     TARGET_DESCRIPTOR_NAME = ".athena-backup-target.json"
     RETENTION_TRASH_NAME = ".retention-trash"
+    DELETION_LEDGER_DIR = "deletion-ledger"
+    DELETION_LEDGER_RECORDS_DIR = "records"
+    DELETION_LEDGER_RECORD_FORMAT_VERSION = 1
+    DELETION_LEDGER_HEAD_NAME = "head.json"
+    DELETION_LEDGER_HEAD_FORMAT_VERSION = 1
 
     def __init__(
         self,
@@ -81,6 +97,1157 @@ class BackupService:
         self.blob_store = blob_store
         self.paths = paths
         self.chat = chat
+
+
+    def sync_deletion_ledger(
+        self,
+        target_id: uuid.UUID,
+    ) -> BackupTargetRecord:
+        """Bring one reachable backup target to the current deletion watermark."""
+        record = self.get_target(
+            target_id
+        )
+
+        if record.status == "retired":
+            return record
+
+        target = record.root_path
+
+        if not target.is_dir():
+            self._set_target_status(
+                target_id,
+                "offline",
+            )
+            return self.get_target(
+                target_id
+            )
+
+        with backup_target_lock(
+            target
+        ):
+            current = self.get_target(
+                target_id
+            )
+
+            self._assert_target_available(
+                current,
+                target,
+            )
+
+            self._sync_deletion_ledger_locked(
+                target_id=target_id,
+                target=target,
+            )
+
+        return self.get_target(
+            target_id
+        )
+
+    def sync_all_deletion_ledgers(
+        self,
+    ) -> tuple[
+        BackupTargetRecord,
+        ...,
+    ]:
+        """Best-effort fan-out; one unavailable target never blocks other targets."""
+        results: list[
+            BackupTargetRecord
+        ] = []
+
+        for target in self.list_targets():
+            if target.status == "retired":
+                results.append(
+                    target
+                )
+                continue
+
+            try:
+                results.append(
+                    self.sync_deletion_ledger(
+                        target.target_id
+                    )
+                )
+
+            except BackupTargetBusyError:
+                logger.info(
+                    "Deletion ledger target busy; propagation remains pending",
+                    extra={
+                        "event": "backup.deletion_sync_busy",
+                        "target_id": str(
+                            target.target_id
+                        ),
+                    },
+                )
+                results.append(
+                    self.get_target(
+                        target.target_id
+                    )
+                )
+
+            except (
+                BackupRestoreError,
+                OSError,
+            ) as exc:
+                self._set_target_status(
+                    target.target_id,
+                    "offline",
+                )
+
+                logger.warning(
+                    "Deletion ledger propagation failed for backup target",
+                    extra={
+                        "event": "backup.deletion_sync_failed",
+                        "target_id": str(
+                            target.target_id
+                        ),
+                        "error": (
+                            f"{type(exc).__name__}: {exc}"
+                        )[:1000],
+                    },
+                )
+
+                results.append(
+                    self.get_target(
+                        target.target_id
+                    )
+                )
+
+            except Exception:
+                # Deletion itself has already committed. A replication
+                # implementation fault must remain visible as pending,
+                # but must not make the user retry the semantic deletion.
+                logger.exception(
+                    "Unexpected deletion-ledger propagation failure",
+                    extra={
+                        "event": "backup.deletion_sync_unexpected",
+                        "target_id": str(
+                            target.target_id
+                        ),
+                    },
+                )
+
+                results.append(
+                    self.get_target(
+                        target.target_id
+                    )
+                )
+
+        return tuple(
+            results
+        )
+
+    def _sync_deletion_ledger_locked(
+        self,
+        *,
+        target_id: uuid.UUID,
+        target: Path,
+    ) -> int:
+        local = read_deletion_records(
+            self.database.connection
+        )
+
+        remote = (
+            self._read_target_deletion_records(
+                target
+            )
+        )
+
+        if len(remote) > len(local):
+            raise BackupRestoreError(
+                "Backup target deletion ledger is ahead "
+                "of the local durable ledger."
+            )
+
+        for index, remote_record in enumerate(
+            remote
+        ):
+            if remote_record != local[index]:
+                raise BackupRestoreError(
+                    "Backup target deletion ledger "
+                    "does not match the local ledger prefix."
+                )
+
+        for record in local[
+            len(remote):
+        ]:
+            self._write_target_deletion_record(
+                target,
+                record,
+            )
+
+        self._write_target_deletion_head(
+            target=target,
+            target_id=target_id,
+            records=local,
+        )
+
+        verified = (
+            self._read_target_deletion_records(
+                target
+            )
+        )
+
+        if verified != local:
+            raise BackupRestoreError(
+                "Backup target deletion ledger "
+                "failed post-write verification."
+            )
+
+        watermark = (
+            local[-1].ledger_seq
+            if local
+            else 0
+        )
+
+        with self.database.write_transaction() as connection:
+            connection.execute(
+                """
+                UPDATE backup_targets
+                SET deletion_ledger_watermark = ?
+                WHERE target_id = ?
+                """,
+                (
+                    watermark,
+                    uuid_to_blob(
+                        target_id
+                    ),
+                ),
+            )
+
+        return watermark
+
+    def _read_target_deletion_records(
+        self,
+        target: Path,
+    ) -> tuple[
+        DeletionLedgerRecord,
+        ...,
+    ]:
+        ledger_root = (
+            target
+            / self.DELETION_LEDGER_DIR
+        )
+
+        if not ledger_root.exists():
+            return ()
+
+        if (
+            ledger_root.is_symlink()
+            or not ledger_root.is_dir()
+        ):
+            raise BackupRestoreError(
+                "Backup target deletion-ledger root is unsafe."
+            )
+
+        allowed_names = {
+            self.DELETION_LEDGER_RECORDS_DIR,
+            self.DELETION_LEDGER_HEAD_NAME,
+        }
+
+        unexpected = tuple(
+            item
+            for item in ledger_root.iterdir()
+            if item.name not in allowed_names
+        )
+
+        if unexpected:
+            raise BackupRestoreError(
+                "Backup target deletion-ledger root "
+                "contains unexpected entries."
+            )
+
+        head_path = (
+            ledger_root
+            / self.DELETION_LEDGER_HEAD_NAME
+        )
+
+        if (
+            head_path.is_symlink()
+            or not head_path.is_file()
+        ):
+            raise BackupRestoreError(
+                "Existing backup deletion ledger "
+                "has no valid integrity head."
+            )
+
+        records_root = (
+            ledger_root
+            / self.DELETION_LEDGER_RECORDS_DIR
+        )
+
+        records: list[
+            DeletionLedgerRecord
+        ] = []
+
+        if records_root.exists():
+            if (
+                records_root.is_symlink()
+                or not records_root.is_dir()
+            ):
+                raise BackupRestoreError(
+                    "Backup target deletion records "
+                    "directory is unsafe."
+                )
+
+            for path in sorted(
+                records_root.iterdir(),
+                key=lambda item: item.name,
+            ):
+                if (
+                    path.is_symlink()
+                    or not path.is_file()
+                ):
+                    raise BackupRestoreError(
+                        "Backup deletion ledger contains "
+                        "a non-regular record."
+                    )
+
+                try:
+                    raw = path.read_bytes()
+                    payload = json.loads(
+                        raw.decode(
+                            "utf-8"
+                        )
+                    )
+                except (
+                    OSError,
+                    UnicodeDecodeError,
+                    json.JSONDecodeError,
+                ) as exc:
+                    raise BackupRestoreError(
+                        "Backup deletion-ledger record "
+                        "cannot be decoded."
+                    ) from exc
+
+                if not isinstance(
+                    payload,
+                    dict,
+                ):
+                    raise BackupRestoreError(
+                        "Backup deletion-ledger record "
+                        "must be a JSON object."
+                    )
+
+                canonical = (
+                    _canonical_json(
+                        payload
+                    ).encode(
+                        "utf-8"
+                    )
+                )
+
+                if canonical != raw:
+                    raise BackupRestoreError(
+                        "Backup deletion-ledger record "
+                        "is not canonical."
+                    )
+
+                record = (
+                    self._deletion_record_from_payload(
+                        payload
+                    )
+                )
+
+                expected_name = (
+                    self._deletion_record_name(
+                        record
+                    )
+                )
+
+                if path.name != expected_name:
+                    raise BackupRestoreError(
+                        "Backup deletion-ledger filename "
+                        "does not match its full record identity."
+                    )
+
+                records.append(
+                    record
+                )
+
+        for index, record in enumerate(
+            records,
+            start=1,
+        ):
+            if record.ledger_seq != index:
+                raise BackupRestoreError(
+                    "Backup deletion ledger is not "
+                    "a contiguous sequence from 1."
+                )
+
+        result = tuple(
+            records
+        )
+
+        self._validate_target_deletion_head(
+            target=target,
+            records=result,
+        )
+
+        return result
+
+
+    @classmethod
+    def _deletion_records_digest(
+        cls,
+        records: tuple[
+            DeletionLedgerRecord,
+            ...,
+        ],
+    ) -> str:
+        hasher = hashlib.sha256()
+
+        for record in records:
+            encoded = _canonical_json(
+                cls._deletion_record_payload(
+                    record
+                )
+            ).encode(
+                "utf-8"
+            )
+
+            hasher.update(
+                len(encoded).to_bytes(
+                    8,
+                    byteorder="big",
+                    signed=False,
+                )
+            )
+
+            hasher.update(
+                encoded
+            )
+
+        return hasher.hexdigest()
+
+    @classmethod
+    def _deletion_head_payload(
+        cls,
+        *,
+        target_id: uuid.UUID,
+        records: tuple[
+            DeletionLedgerRecord,
+            ...,
+        ],
+    ) -> dict[
+        str,
+        object,
+    ]:
+        watermark = (
+            records[-1].ledger_seq
+            if records
+            else 0
+        )
+
+        return {
+            "format_version": (
+                cls.DELETION_LEDGER_HEAD_FORMAT_VERSION
+            ),
+            "record_count": len(
+                records
+            ),
+            "records_sha256": (
+                cls._deletion_records_digest(
+                    records
+                )
+            ),
+            "target_id": str(
+                target_id
+            ),
+            "watermark": watermark,
+        }
+
+    def _write_target_deletion_head(
+        self,
+        *,
+        target: Path,
+        target_id: uuid.UUID,
+        records: tuple[
+            DeletionLedgerRecord,
+            ...,
+        ],
+    ) -> None:
+        descriptor_id = (
+            self._read_target_descriptor(
+                target
+            )
+        )
+
+        if descriptor_id != target_id:
+            raise BackupRestoreError(
+                "Cannot publish deletion-ledger head: "
+                "backup target identity mismatch."
+            )
+
+        ledger_root = (
+            target
+            / self.DELETION_LEDGER_DIR
+        )
+
+        ledger_root.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        if (
+            ledger_root.is_symlink()
+            or not ledger_root.is_dir()
+        ):
+            raise BackupRestoreError(
+                "Backup deletion-ledger root is unsafe."
+            )
+
+        payload = (
+            self._deletion_head_payload(
+                target_id=target_id,
+                records=records,
+            )
+        )
+
+        encoded = _canonical_json(
+            payload
+        ).encode(
+            "utf-8"
+        )
+
+        destination = (
+            ledger_root
+            / self.DELETION_LEDGER_HEAD_NAME
+        )
+
+        temporary = (
+            destination.with_name(
+                f".{destination.name}."
+                f"{new_uuid7()}.partial"
+            )
+        )
+
+        try:
+            with temporary.open(
+                "xb"
+            ) as handle:
+                handle.write(
+                    encoded
+                )
+                handle.flush()
+                os.fsync(
+                    handle.fileno()
+                )
+
+            os.replace(
+                temporary,
+                destination,
+            )
+
+        finally:
+            temporary.unlink(
+                missing_ok=True
+            )
+
+        if (
+            destination.is_symlink()
+            or not destination.is_file()
+            or destination.read_bytes()
+            != encoded
+        ):
+            raise BackupRestoreError(
+                "Deletion-ledger integrity head failed "
+                "post-publication verification."
+            )
+
+    def _validate_target_deletion_head(
+        self,
+        *,
+        target: Path,
+        records: tuple[
+            DeletionLedgerRecord,
+            ...,
+        ],
+    ) -> None:
+        ledger_root = (
+            target
+            / self.DELETION_LEDGER_DIR
+        )
+
+        head_path = (
+            ledger_root
+            / self.DELETION_LEDGER_HEAD_NAME
+        )
+
+        try:
+            raw = head_path.read_bytes()
+            payload = json.loads(
+                raw.decode(
+                    "utf-8"
+                )
+            )
+        except (
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ) as exc:
+            raise BackupRestoreError(
+                "Backup deletion-ledger integrity head "
+                "cannot be decoded."
+            ) from exc
+
+        if not isinstance(
+            payload,
+            dict,
+        ):
+            raise BackupRestoreError(
+                "Backup deletion-ledger integrity head "
+                "must be a JSON object."
+            )
+
+        canonical = _canonical_json(
+            payload
+        ).encode(
+            "utf-8"
+        )
+
+        if canonical != raw:
+            raise BackupRestoreError(
+                "Backup deletion-ledger integrity head "
+                "is not canonical."
+            )
+
+        required_keys = {
+            "format_version",
+            "record_count",
+            "records_sha256",
+            "target_id",
+            "watermark",
+        }
+
+        if set(
+            payload
+        ) != required_keys:
+            raise BackupRestoreError(
+                "Backup deletion-ledger integrity head "
+                "contains unexpected fields."
+            )
+
+        format_version = payload[
+            "format_version"
+        ]
+
+        record_count = payload[
+            "record_count"
+        ]
+
+        watermark = payload[
+            "watermark"
+        ]
+
+        digest = payload[
+            "records_sha256"
+        ]
+
+        if (
+            not isinstance(
+                format_version,
+                int,
+            )
+            or isinstance(
+                format_version,
+                bool,
+            )
+            or format_version
+            != self.DELETION_LEDGER_HEAD_FORMAT_VERSION
+        ):
+            raise BackupRestoreError(
+                "Backup deletion-ledger integrity head "
+                "format is unsupported."
+            )
+
+        if (
+            not isinstance(
+                record_count,
+                int,
+            )
+            or isinstance(
+                record_count,
+                bool,
+            )
+            or record_count < 0
+        ):
+            raise BackupRestoreError(
+                "Backup deletion-ledger head "
+                "record_count is invalid."
+            )
+
+        if (
+            not isinstance(
+                watermark,
+                int,
+            )
+            or isinstance(
+                watermark,
+                bool,
+            )
+            or watermark < 0
+        ):
+            raise BackupRestoreError(
+                "Backup deletion-ledger head "
+                "watermark is invalid."
+            )
+
+        if (
+            not isinstance(
+                digest,
+                str,
+            )
+            or len(digest) != 64
+        ):
+            raise BackupRestoreError(
+                "Backup deletion-ledger head "
+                "digest is invalid."
+            )
+
+        try:
+            bytes.fromhex(
+                digest
+            )
+        except ValueError as exc:
+            raise BackupRestoreError(
+                "Backup deletion-ledger head "
+                "digest is not hexadecimal."
+            ) from exc
+
+        try:
+            head_target_id = uuid.UUID(
+                str(
+                    payload[
+                        "target_id"
+                    ]
+                )
+            )
+        except (
+            ValueError,
+            AttributeError,
+        ) as exc:
+            raise BackupRestoreError(
+                "Backup deletion-ledger head "
+                "target ID is invalid."
+            ) from exc
+
+        descriptor_id = (
+            self._read_target_descriptor(
+                target
+            )
+        )
+
+        if descriptor_id is None:
+            raise BackupRestoreError(
+                "Backup deletion-ledger exists on a "
+                "target without an identity descriptor."
+            )
+
+        if head_target_id != descriptor_id:
+            raise BackupRestoreError(
+                "Backup deletion-ledger head belongs "
+                "to a different backup target."
+            )
+
+        expected = (
+            self._deletion_head_payload(
+                target_id=descriptor_id,
+                records=records,
+            )
+        )
+
+        if payload != expected:
+            raise BackupRestoreError(
+                "Backup deletion ledger does not match "
+                "its integrity head."
+            )
+
+    def _write_target_deletion_record(
+        self,
+        target: Path,
+        record: DeletionLedgerRecord,
+    ) -> None:
+        records_root = (
+            target
+            / self.DELETION_LEDGER_DIR
+            / self.DELETION_LEDGER_RECORDS_DIR
+        )
+
+        records_root.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        if (
+            records_root.is_symlink()
+            or not records_root.is_dir()
+        ):
+            raise BackupRestoreError(
+                "Backup deletion records directory is unsafe."
+            )
+
+        payload = (
+            self._deletion_record_payload(
+                record
+            )
+        )
+
+        encoded = (
+            _canonical_json(
+                payload
+            ).encode(
+                "utf-8"
+            )
+        )
+
+        destination = (
+            records_root
+            / self._deletion_record_name(
+                record
+            )
+        )
+
+        if destination.exists():
+            if (
+                destination.is_symlink()
+                or not destination.is_file()
+            ):
+                raise BackupRestoreError(
+                    "Existing deletion-ledger record is unsafe."
+                )
+
+            if destination.read_bytes() != encoded:
+                raise BackupRestoreError(
+                    "Existing deletion-ledger record "
+                    "disagrees with the durable ledger."
+                )
+
+            return
+
+        temporary = (
+            destination.with_name(
+                f".{destination.name}."
+                f"{new_uuid7()}.partial"
+            )
+        )
+
+        try:
+            with temporary.open(
+                "xb"
+            ) as handle:
+                handle.write(
+                    encoded
+                )
+                handle.flush()
+                os.fsync(
+                    handle.fileno()
+                )
+
+            os.replace(
+                temporary,
+                destination,
+            )
+
+        finally:
+            temporary.unlink(
+                missing_ok=True
+            )
+
+        if destination.read_bytes() != encoded:
+            raise BackupRestoreError(
+                "Deletion-ledger record failed "
+                "post-publication verification."
+            )
+
+    @classmethod
+    @classmethod
+    def _deletion_record_name(
+        cls,
+        record: DeletionLedgerRecord,
+    ) -> str:
+        """Return immutable identity bound to every canonical record field."""
+        canonical_payload = _canonical_json(
+            cls._deletion_record_payload(
+                record
+            )
+        ).encode(
+            "utf-8"
+        )
+
+        payload_sha256 = hashlib.sha256(
+            canonical_payload
+        ).hexdigest()
+
+        return (
+            f"{record.ledger_seq:020d}-"
+            f"{record.deletion_id}-"
+            f"{payload_sha256}.json"
+        )
+
+    @classmethod
+    def _deletion_record_payload(
+        cls,
+        record: DeletionLedgerRecord,
+    ) -> dict[
+        str,
+        object,
+    ]:
+        return {
+            "deleted_at_us": (
+                record.deleted_at_us
+            ),
+            "deleted_by_actor_id": str(
+                record.deleted_by_actor_id
+            ),
+            "deletion_commit_seq": (
+                record.deletion_commit_seq
+            ),
+            "deletion_id": str(
+                record.deletion_id
+            ),
+            "entity_id": str(
+                record.entity_id
+            ),
+            "entity_type": (
+                record.entity_type
+            ),
+            "format_version": (
+                cls.DELETION_LEDGER_RECORD_FORMAT_VERSION
+            ),
+            "ledger_seq": (
+                record.ledger_seq
+            ),
+        }
+
+    @classmethod
+    def _deletion_record_from_payload(
+        cls,
+        payload: dict[
+            str,
+            object,
+        ],
+    ) -> DeletionLedgerRecord:
+        required_keys = {
+            "deleted_at_us",
+            "deleted_by_actor_id",
+            "deletion_commit_seq",
+            "deletion_id",
+            "entity_id",
+            "entity_type",
+            "format_version",
+            "ledger_seq",
+        }
+
+        if set(
+            payload
+        ) != required_keys:
+            raise BackupRestoreError(
+                "Backup deletion-ledger record "
+                "contains unexpected fields."
+            )
+
+        format_version = payload[
+            "format_version"
+        ]
+
+        if (
+            not isinstance(
+                format_version,
+                int,
+            )
+            or isinstance(
+                format_version,
+                bool,
+            )
+            or format_version
+            != cls.DELETION_LEDGER_RECORD_FORMAT_VERSION
+        ):
+            raise BackupRestoreError(
+                "Backup deletion-ledger record "
+                "format version is unsupported."
+            )
+
+        def integer(
+            key: str,
+            *,
+            minimum: int,
+        ) -> int:
+            value = payload[
+                key
+            ]
+
+            if (
+                not isinstance(
+                    value,
+                    int,
+                )
+                or isinstance(
+                    value,
+                    bool,
+                )
+                or value < minimum
+            ):
+                raise BackupRestoreError(
+                    f"Backup deletion-ledger field "
+                    f"{key!r} is invalid."
+                )
+
+            return value
+
+        entity_type = payload[
+            "entity_type"
+        ]
+
+        if (
+            not isinstance(
+                entity_type,
+                str,
+            )
+            or not entity_type.strip()
+        ):
+            raise BackupRestoreError(
+                "Backup deletion-ledger entity_type is invalid."
+            )
+
+        try:
+            return DeletionLedgerRecord(
+                ledger_seq=integer(
+                    "ledger_seq",
+                    minimum=1,
+                ),
+                deletion_id=uuid.UUID(
+                    str(
+                        payload[
+                            "deletion_id"
+                        ]
+                    )
+                ),
+                entity_id=uuid.UUID(
+                    str(
+                        payload[
+                            "entity_id"
+                        ]
+                    )
+                ),
+                entity_type=entity_type,
+                deleted_at_us=integer(
+                    "deleted_at_us",
+                    minimum=0,
+                ),
+                deletion_commit_seq=integer(
+                    "deletion_commit_seq",
+                    minimum=1,
+                ),
+                deleted_by_actor_id=uuid.UUID(
+                    str(
+                        payload[
+                            "deleted_by_actor_id"
+                        ]
+                    )
+                ),
+            )
+
+        except (
+            ValueError,
+            AttributeError,
+        ) as exc:
+            raise BackupRestoreError(
+                "Backup deletion-ledger UUID is invalid."
+            ) from exc
+
+    @staticmethod
+    def _merge_restore_deletion_records(
+        *groups: tuple[
+            DeletionLedgerRecord,
+            ...,
+        ],
+    ) -> tuple[
+        DeletionLedgerRecord,
+        ...,
+    ]:
+        by_sequence: dict[
+            int,
+            DeletionLedgerRecord,
+        ] = {}
+
+        by_entity: dict[
+            uuid.UUID,
+            DeletionLedgerRecord,
+        ] = {}
+
+        by_deletion: dict[
+            uuid.UUID,
+            DeletionLedgerRecord,
+        ] = {}
+
+        for group in groups:
+            for record in group:
+                existing_sequence = (
+                    by_sequence.get(
+                        record.ledger_seq
+                    )
+                )
+
+                if (
+                    existing_sequence is not None
+                    and existing_sequence != record
+                ):
+                    raise BackupRestoreError(
+                        "Conflicting deletion ledger sequence "
+                        "between restore sources."
+                    )
+
+                existing_entity = (
+                    by_entity.get(
+                        record.entity_id
+                    )
+                )
+
+                if (
+                    existing_entity is not None
+                    and existing_entity != record
+                ):
+                    raise BackupRestoreError(
+                        "Conflicting deletion ledger entity "
+                        "between restore sources."
+                    )
+
+                existing_deletion = (
+                    by_deletion.get(
+                        record.deletion_id
+                    )
+                )
+
+                if (
+                    existing_deletion is not None
+                    and existing_deletion != record
+                ):
+                    raise BackupRestoreError(
+                        "Conflicting deletion ID "
+                        "between restore sources."
+                    )
+
+                by_sequence[
+                    record.ledger_seq
+                ] = record
+
+                by_entity[
+                    record.entity_id
+                ] = record
+
+                by_deletion[
+                    record.deletion_id
+                ] = record
+
+        return tuple(
+            by_sequence[
+                sequence
+            ]
+            for sequence in sorted(
+                by_sequence
+            )
+        )
+
 
     def create_snapshot(
         self,
@@ -97,6 +1264,10 @@ class BackupService:
         )
 
         with backup_target_lock(target):
+            self._sync_deletion_ledger_locked(
+                target_id=resolved_target_id,
+                target=target,
+            )
             self._recover_retention_locked(
                 target_id=resolved_target_id,
                 target=target,
@@ -165,13 +1336,31 @@ class BackupService:
                     "SELECT COALESCE(MAX(commit_seq), 0) FROM commit_records"
                 ).fetchone()
                 snapshot_commit_seq = int(row[0]) if row is not None else 0
+                deletion_ledger_watermark = (
+                    current_deletion_watermark(
+                        snap
+                    )
+                )
                 blobs = tuple(
                     snap.execute(
                         """
-                        SELECT blob_id, byte_length, storage_area, storage_locator,
-                               integrity_sha256, encryption_state
-                        FROM blob_records
-                        ORDER BY integrity_sha256, blob_id
+                        SELECT
+                            b.blob_id,
+                            b.byte_length,
+                            b.storage_area,
+                            b.storage_locator,
+                            b.integrity_sha256,
+                            b.encryption_state
+                        FROM blob_records AS b
+                        WHERE EXISTS (
+                            SELECT 1
+                            FROM sources AS source
+                            JOIN entity_registry AS source_entity
+                              ON source_entity.entity_id = source.source_id
+                            WHERE source.blob_id = b.blob_id
+                              AND source_entity.lifecycle_state != 'deleted'
+                        )
+                        ORDER BY b.integrity_sha256, b.blob_id
                         """
                     ).fetchall()
                 )
@@ -195,12 +1384,15 @@ class BackupService:
                 connection.execute(
                     """
                     UPDATE backup_snapshots
-                    SET snapshot_commit_seq = ?, schema_version = ?
+                    SET snapshot_commit_seq = ?,
+                        schema_version = ?,
+                        deletion_ledger_watermark = ?
                     WHERE snapshot_id = ?
                     """,
                     (
                         snapshot_commit_seq,
                         schema_version,
+                        deletion_ledger_watermark,
                         uuid_to_blob(snapshot_id),
                     ),
                 )
@@ -240,6 +1432,9 @@ class BackupService:
                 "snapshot_id": str(snapshot_id),
                 "snapshot_commit_seq": snapshot_commit_seq,
                 "schema_version": schema_version,
+                "deletion_ledger_watermark": (
+                    deletion_ledger_watermark
+                ),
                 "database": {
                     "path": "athena.db",
                     "sha256": db_sha256.hex(),
@@ -311,6 +1506,22 @@ class BackupService:
                 connection.execute(
                     "DELETE FROM backup_snapshot_pins WHERE snapshot_id = ?",
                     (uuid_to_blob(snapshot_id),),
+                )
+                connection.execute(
+                    """
+                    UPDATE backup_targets
+                    SET deletion_ledger_watermark = MAX(
+                        deletion_ledger_watermark,
+                        ?
+                    )
+                    WHERE target_id = ?
+                    """,
+                    (
+                        deletion_ledger_watermark,
+                        uuid_to_blob(
+                            target_id
+                        ),
+                    ),
                 )
             return self.get_snapshot(snapshot_id)
         except BaseException as exc:
@@ -430,6 +1641,7 @@ class BackupService:
         db_sha256: bytes | None = None
         snapshot_commit_seq: int | None = None
         schema_version: int | None = None
+        deletion_ledger_watermark: int | None = None
         objects: list[Any] | None = None
 
         if marker.is_file():
@@ -491,6 +1703,15 @@ class BackupService:
                         manifest,
                         "schema_version",
                     )
+                    deletion_ledger_watermark = (
+                        _required_int(
+                            manifest,
+                            "deletion_ledger_watermark",
+                        )
+                        if schema_version
+                        >= DELETION_LEDGER_SCHEMA_VERSION
+                        else 0
+                    )
                 except (
                     BackupRestoreError,
                     ValueError,
@@ -503,6 +1724,7 @@ class BackupService:
             and db_sha256 is not None
             and snapshot_commit_seq is not None
             and schema_version is not None
+            and deletion_ledger_watermark is not None
             and objects is not None
         ):
             completed_at_us = utc_now_us()
@@ -515,6 +1737,7 @@ class BackupService:
                         verification_status = 'verified_light',
                         snapshot_commit_seq = ?,
                         schema_version = ?,
+                        deletion_ledger_watermark = ?,
                         db_sha256 = ?,
                         manifest_sha256 = ?,
                         object_count = ?,
@@ -527,6 +1750,7 @@ class BackupService:
                     (
                         snapshot_commit_seq,
                         schema_version,
+                        deletion_ledger_watermark,
                         db_sha256,
                         manifest_sha256,
                         len(objects),
@@ -545,6 +1769,24 @@ class BackupService:
                         (
                             uuid_to_blob(
                                 snapshot_id
+                            ),
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE backup_targets
+                        SET deletion_ledger_watermark = MAX(
+                            deletion_ledger_watermark,
+                            ?
+                        )
+                        WHERE target_id = ?
+                        """,
+                        (
+                            deletion_ledger_watermark,
+                            bytes(
+                                row[
+                                    "target_id"
+                                ]
                             ),
                         ),
                     )
@@ -786,6 +2028,13 @@ class BackupService:
                             snapshot_root=(
                                 snapshot_root
                             ),
+                            deletion_records=(
+                                self._read_target_deletion_records(
+                                    target
+                                )
+                            ),
+                            deletion_ledger_source="target_sidecar",
+                            deletion_currentness_guaranteed=False,
                             destination_root=(
                                 destination
                             ),
@@ -1137,19 +2386,46 @@ class BackupService:
         record = self.get_snapshot(snapshot_id)
         target = self._target_for_record(record)
 
+        live_deletions = read_deletion_records(
+            self.database.connection
+        )
+
         with backup_target_lock(target):
+            self._sync_deletion_ledger_locked(
+                target_id=record.target_id,
+                target=target,
+            )
+
+            target_deletions = (
+                self._read_target_deletion_records(
+                    target
+                )
+            )
+
+            available_deletions = (
+                self._merge_restore_deletion_records(
+                    live_deletions,
+                    target_deletions,
+                )
+            )
+
             verified = self._verify_record_locked(
                 record,
                 target,
             )
+
             snapshot_root = (
                 target
                 / verified.relative_path
             )
+
             return self._restore_verified_path(
                 target=target,
                 snapshot_root=snapshot_root,
                 destination_root=destination_root,
+                deletion_records=available_deletions,
+                deletion_ledger_source="live_and_target",
+                deletion_currentness_guaranteed=True,
             )
 
 
@@ -1196,10 +2472,31 @@ class BackupService:
                 raise BackupRestoreError(
                     "Backup path verification failed."
                 )
+
+            ledger_root = (
+                target
+                / self.DELETION_LEDGER_DIR
+            )
+
+            target_deletions = (
+                self._read_target_deletion_records(
+                    target
+                )
+            )
+
+            source = (
+                "target_sidecar"
+                if ledger_root.exists()
+                else "snapshot_only"
+            )
+
             return self._restore_verified_path(
                 target=target,
                 snapshot_root=snapshot,
                 destination_root=destination_root,
+                deletion_records=target_deletions,
+                deletion_ledger_source=source,
+                deletion_currentness_guaranteed=False,
             )
 
     def _restore_verified_path(
@@ -1208,6 +2505,12 @@ class BackupService:
         target: Path,
         snapshot_root: Path,
         destination_root: Path,
+        deletion_records: tuple[
+            DeletionLedgerRecord,
+            ...,
+        ],
+        deletion_ledger_source: str,
+        deletion_currentness_guaranteed: bool,
     ) -> Path:
         requested_destination = destination_root.expanduser()
         if not requested_destination.is_absolute():
@@ -1243,6 +2546,34 @@ class BackupService:
 
         try:
             manifest = _read_manifest(snapshot_root / "manifest.json")
+
+            raw_snapshot_deletion_watermark = (
+                manifest.get(
+                    "deletion_ledger_watermark",
+                    0,
+                )
+            )
+
+            if (
+                not isinstance(
+                    raw_snapshot_deletion_watermark,
+                    int,
+                )
+                or isinstance(
+                    raw_snapshot_deletion_watermark,
+                    bool,
+                )
+                or raw_snapshot_deletion_watermark < 0
+            ):
+                raise BackupRestoreError(
+                    "Backup manifest deletion-ledger "
+                    "watermark is invalid."
+                )
+
+            snapshot_deletion_watermark = (
+                raw_snapshot_deletion_watermark
+            )
+
             state_root = staging / "state"
             spool_root = state_root / "spool"
             state_root.mkdir(parents=True, exist_ok=True)
@@ -1293,6 +2624,18 @@ class BackupService:
                     restored,
                     created_at_us=utc_now_us(),
                 )
+                apply_deletion_records(
+                    restored,
+                    deletion_records,
+                )
+                self._remove_restored_deleted_source_payloads(restored=restored, spool_root=spool_root)
+
+                restored_deletion_watermark = (
+                    current_deletion_watermark(
+                        restored
+                    )
+                )
+
                 integrity = str(
                     restored.execute(
                         "PRAGMA integrity_check"
@@ -1315,7 +2658,55 @@ class BackupService:
                     restored.execute("ROLLBACK")
                 restored.close()
 
+            deletion_status = {
+                "available_watermark": (
+                    restored_deletion_watermark
+                ),
+                "currentness_guaranteed": (
+                    deletion_currentness_guaranteed
+                ),
+                "format_version": 1,
+                "snapshot_watermark": (
+                    snapshot_deletion_watermark
+                ),
+                "source": (
+                    deletion_ledger_source
+                ),
+            }
+
+            _write_fsynced(
+                state_root
+                / "restore.deletion-ledger.json",
+                _canonical_json(
+                    deletion_status
+                ).encode(
+                    "utf-8"
+                ),
+            )
+
+            if not deletion_currentness_guaranteed:
+                logger.warning(
+                    "Restore deletion-ledger completeness "
+                    "cannot be independently proven without "
+                    "the original live runtime metadata",
+                    extra={
+                        "event": (
+                            "backup.restore_deletion_ledger_warning"
+                        ),
+                        "deletion_ledger_source": (
+                            deletion_ledger_source
+                        ),
+                        "available_watermark": (
+                            restored_deletion_watermark
+                        ),
+                        "snapshot_watermark": (
+                            snapshot_deletion_watermark
+                        ),
+                    },
+                )
+
             (staging / "derived").mkdir(parents=True, exist_ok=True)
+
             _write_fsynced(
                 state_root / "restore.complete",
                 b"ATHENA_RESTORE_COMPLETE_V1\n",
@@ -1326,6 +2717,129 @@ class BackupService:
             shutil.rmtree(staging, ignore_errors=True)
             raise
 
+
+    @staticmethod
+    def _remove_restored_deleted_source_payloads(
+        *,
+        restored: sqlite3.Connection,
+        spool_root: Path,
+    ) -> None:
+        """Prevent logical deletion replay from reactivating Raw Source bytes."""
+
+        restored.execute(
+            """
+            UPDATE sources
+            SET original_name = NULL,
+                original_modified_at_us = NULL,
+                source_uri = NULL
+            WHERE source_id IN (
+                SELECT entity_id
+                FROM entity_registry
+                WHERE entity_type = 'source'
+                  AND lifecycle_state = 'deleted'
+            )
+            """
+        )
+
+        rows = restored.execute(
+            """
+            SELECT
+                b.storage_locator,
+                b.integrity_sha256,
+                b.byte_length
+            FROM blob_records AS b
+            WHERE EXISTS (
+                SELECT 1
+                FROM sources AS deleted_source
+                JOIN entity_registry AS deleted_entity
+                  ON deleted_entity.entity_id = deleted_source.source_id
+                WHERE deleted_source.blob_id = b.blob_id
+                  AND deleted_entity.lifecycle_state = 'deleted'
+            )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM sources AS live_source
+                JOIN entity_registry AS live_entity
+                  ON live_entity.entity_id = live_source.source_id
+                WHERE live_source.blob_id = b.blob_id
+                  AND live_entity.lifecycle_state != 'deleted'
+            )
+            ORDER BY b.blob_id
+            """
+        ).fetchall()
+
+        for row in rows:
+            relative = _safe_relative(
+                str(
+                    row[
+                        "storage_locator"
+                    ]
+                )
+            )
+
+            path = (
+                spool_root
+                / relative
+            )
+
+            if path.is_symlink():
+                raise BackupRestoreError(
+                    "Restored deleted Source blob "
+                    "resolved to a symbolic link."
+                )
+
+            if not path.exists():
+                continue
+
+            if not path.is_file():
+                raise BackupRestoreError(
+                    "Restored deleted Source blob "
+                    "is not a regular file."
+                )
+
+            digest, length = (
+                _hash_file(
+                    path
+                )
+            )
+
+            if (
+                digest
+                != bytes(
+                    row[
+                        "integrity_sha256"
+                    ]
+                )
+                or length
+                != int(
+                    row[
+                        "byte_length"
+                    ]
+                )
+            ):
+                raise BackupRestoreError(
+                    "Restored deleted Source blob "
+                    "failed integrity verification "
+                    "before purge."
+                )
+
+            try:
+                path.unlink()
+
+            except OSError as exc:
+                raise BackupRestoreError(
+                    "Restored deleted Source blob "
+                    "could not be removed before activation."
+                ) from exc
+
+            if (
+                path.exists()
+                or path.is_symlink()
+            ):
+                raise BackupRestoreError(
+                    "Restored deleted Source blob "
+                    "still exists after purge."
+                )
 
     def get_snapshot(self, snapshot_id: uuid.UUID) -> BackupSnapshotRecord:
         row = self.database.connection.execute(
@@ -1395,10 +2909,14 @@ class BackupService:
             )
 
         with backup_target_lock(target):
-            return self._register_target_locked(
+            registered = self._register_target_locked(
                 target=target,
                 actor_id=actor_id,
             )
+
+        return self.sync_deletion_ledger(
+            registered.target_id
+        )
 
     def _register_target_locked(
         self,
@@ -1640,7 +3158,18 @@ class BackupService:
                     SELECT MAX(snapshot.last_verified_at_us)
                     FROM backup_snapshots AS snapshot
                     WHERE snapshot.target_id = target.target_id
-                ) AS last_verified_at_us
+                ) AS last_verified_at_us,
+                CASE
+                    WHEN target.deletion_ledger_watermark < (
+                        SELECT COALESCE(
+                            MAX(ledger_seq),
+                            0
+                        )
+                        FROM deletion_ledger
+                    )
+                    THEN 1
+                    ELSE 0
+                END AS deletion_sync_pending
             FROM backup_targets AS target
             WHERE target.target_id = ?
             """,
@@ -1680,7 +3209,18 @@ class BackupService:
                     SELECT MAX(snapshot.last_verified_at_us)
                     FROM backup_snapshots AS snapshot
                     WHERE snapshot.target_id = target.target_id
-                ) AS last_verified_at_us
+                ) AS last_verified_at_us,
+                CASE
+                    WHEN target.deletion_ledger_watermark < (
+                        SELECT COALESCE(
+                            MAX(ledger_seq),
+                            0
+                        )
+                        FROM deletion_ledger
+                    )
+                    THEN 1
+                    ELSE 0
+                END AS deletion_sync_pending
             FROM backup_targets AS target
             ORDER BY target.created_at_us, target.target_id
             """
@@ -1717,6 +3257,10 @@ class BackupService:
             self._assert_target_available(
                 record,
                 target,
+            )
+            self._sync_deletion_ledger_locked(
+                target_id=target_id,
+                target=target,
             )
 
         return self.get_target(
@@ -3315,6 +4859,34 @@ def _manifest_matches_database(manifest: dict[str, Any], database_path: Path) ->
         or snapshot_commit_seq < 0
     ):
         return False
+
+    deletion_ledger_watermark: int | None = None
+
+    if (
+        manifest_schema_version
+        >= DELETION_LEDGER_SCHEMA_VERSION
+    ):
+        raw_watermark = manifest.get(
+            "deletion_ledger_watermark"
+        )
+
+        if (
+            not isinstance(
+                raw_watermark,
+                int,
+            )
+            or isinstance(
+                raw_watermark,
+                bool,
+            )
+            or raw_watermark < 0
+        ):
+            return False
+
+        deletion_ledger_watermark = (
+            raw_watermark
+        )
+
     objects = manifest.get("objects")
     if not isinstance(objects, list):
         return False
@@ -3353,10 +4925,22 @@ def _manifest_matches_database(manifest: dict[str, Any], database_path: Path) ->
             return False
         rows = check.execute(
             """
-            SELECT blob_id, integrity_sha256, byte_length, storage_locator,
-                   encryption_state
-            FROM blob_records
-            ORDER BY blob_id
+            SELECT
+                b.blob_id,
+                b.integrity_sha256,
+                b.byte_length,
+                b.storage_locator,
+                b.encryption_state
+            FROM blob_records AS b
+            WHERE EXISTS (
+                SELECT 1
+                FROM sources AS source
+                JOIN entity_registry AS source_entity
+                  ON source_entity.entity_id = source.source_id
+                WHERE source.blob_id = b.blob_id
+                  AND source_entity.lifecycle_state != 'deleted'
+            )
+            ORDER BY b.blob_id
             """
         ).fetchall()
         actual = sorted(
@@ -3369,7 +4953,37 @@ def _manifest_matches_database(manifest: dict[str, Any], database_path: Path) ->
             )
             for row in rows
         )
-        return actual == expected
+
+        if actual != expected:
+            return False
+
+        if (
+            manifest_schema_version
+            >= DELETION_LEDGER_SCHEMA_VERSION
+        ):
+            row = check.execute(
+                """
+                SELECT COALESCE(
+                    MAX(ledger_seq),
+                    0
+                )
+                FROM deletion_ledger
+                """
+            ).fetchone()
+
+            actual_watermark = (
+                int(row[0])
+                if row is not None
+                else 0
+            )
+
+            if (
+                actual_watermark
+                != deletion_ledger_watermark
+            ):
+                return False
+
+        return True
     finally:
         check.close()
 
@@ -3427,6 +5041,11 @@ def _snapshot_from_row(row: sqlite3.Row) -> BackupSnapshotRecord:
             int(row["pruned_at_us"])
             if row["pruned_at_us"] is not None
             else None
+        ),
+        deletion_ledger_watermark=int(
+            row[
+                "deletion_ledger_watermark"
+            ]
         ),
     )
 
@@ -3486,6 +5105,18 @@ def _target_from_row(
                 "last_verified_at_us"
             ] is not None
             else None
+        ),
+        deletion_ledger_watermark=int(
+            row[
+                "deletion_ledger_watermark"
+            ]
+        ),
+        deletion_sync_pending=bool(
+            int(
+                row[
+                    "deletion_sync_pending"
+                ]
+            )
         ),
     )
 

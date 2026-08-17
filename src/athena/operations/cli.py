@@ -109,6 +109,57 @@ def add_operational_parsers(commands: Any) -> None:
     resource_mode = resource_commands.add_parser("mode", help="Set resource scheduling mode.")
     resource_mode.add_argument("mode", choices=tuple(item.value for item in ResourceMode))
 
+    delete = commands.add_parser(
+        "delete",
+        help="Preview and execute explicit lifecycle deletion.",
+    )
+    delete_commands = delete.add_subparsers(
+        dest="delete_command",
+        required=True,
+    )
+    delete_preview = delete_commands.add_parser(
+        "preview",
+        help="Show payload-free deletion dependencies.",
+    )
+    delete_preview.add_argument(
+        "entity_id",
+        type=uuid.UUID,
+    )
+    delete_apply = delete_commands.add_parser(
+        "apply",
+        help="Apply a reviewed deletion preview.",
+    )
+    delete_apply.add_argument(
+        "entity_id",
+        type=uuid.UUID,
+    )
+    delete_apply.add_argument(
+        "--preview-digest",
+        required=True,
+    )
+
+    protected_scope_preview = delete_commands.add_parser(
+        "protected-scope-preview",
+        help="Preview destructive ProtectionScope crypto-erasure.",
+    )
+    protected_scope_preview.add_argument(
+        "protection_scope_id",
+        type=uuid.UUID,
+    )
+
+    protected_scope_apply = delete_commands.add_parser(
+        "protected-scope-apply",
+        help="Apply reviewed ProtectionScope crypto-erasure.",
+    )
+    protected_scope_apply.add_argument(
+        "protection_scope_id",
+        type=uuid.UUID,
+    )
+    protected_scope_apply.add_argument(
+        "--preview-digest",
+        required=True,
+    )
+
     backup = commands.add_parser("backup", help="Verified backup and isolated restore.")
     backup_commands = backup.add_subparsers(dest="backup_command", required=True)
     backup_create = backup_commands.add_parser(
@@ -165,6 +216,15 @@ def add_operational_parsers(commands: Any) -> None:
         help="Refresh one backup target status.",
     )
     backup_target_status.add_argument("target_id", type=uuid.UUID)
+
+    backup_target_sync = backup_target_commands.add_parser(
+        "sync",
+        help="Synchronize pending deletion-ledger records.",
+    )
+    backup_target_sync.add_argument(
+        "target_id",
+        type=uuid.UUID,
+    )
     backup_target_policy = backup_target_commands.add_parser(
         "policy",
         help="Set one target retention policy.",
@@ -203,6 +263,8 @@ def run_operational_command(app: AthenaApplication, args: argparse.Namespace) ->
             return _run_external(app, args)
         if args.command == "resource":
             return _run_resource(app, args)
+        if args.command == "delete":
+            return _run_delete(app, args)
         if args.command == "backup":
             return _run_backup(app, args)
     except (ValueError, RuntimeError, OSError) as exc:
@@ -375,6 +437,148 @@ def _run_resource(app: AthenaApplication, args: argparse.Namespace) -> int:
     )
 
 
+def _run_delete(
+    app: AthenaApplication,
+    args: argparse.Namespace,
+) -> int:
+    if args.delete_command == "preview":
+        preview = app.lifecycle_deletion.preview(
+            args.entity_id
+        )
+
+        print(
+            f"Entity: {preview.entity_id}"
+        )
+        print(
+            f"Type: {preview.entity_type}"
+        )
+        print(
+            f"Lifecycle: {preview.lifecycle_state}"
+        )
+        print(
+            f"Preview digest: {preview.preview_digest}"
+        )
+        print(
+            "Dependencies: "
+            f"{len(preview.dependencies)}"
+        )
+
+        for dependency in preview.dependencies:
+            dependent_id = (
+                str(
+                    dependency.dependent_entity_id
+                )
+                if dependency.dependent_entity_id
+                is not None
+                else "<none>"
+            )
+
+            dependent_type = (
+                dependency.dependent_entity_type
+                or "<none>"
+            )
+
+            print(
+                "  "
+                f"{dependency.relation} "
+                f"count={dependency.count} "
+                f"entity={dependent_id} "
+                f"type={dependent_type}"
+            )
+
+        return 0
+
+    if args.delete_command == "apply":
+        result = app.lifecycle_deletion.delete(
+            args.entity_id,
+            preview_digest=args.preview_digest,
+        )
+
+        print(
+            f"Deleted entity: {result.entity_id}"
+        )
+        print(
+            f"Type: {result.entity_type}"
+        )
+        print(
+            f"Commit: {result.commit_id}"
+        )
+        print(
+            "Logical entities deleted: "
+            f"{len(result.deleted_entity_ids)}"
+        )
+
+        return 0
+
+    if args.delete_command == "protected-scope-preview":
+        protected_preview = app.protected_scope_purge.preview(
+            args.protection_scope_id
+        )
+        print(
+            f"Protection scope: {protected_preview.protection_scope_id}"
+        )
+        print(
+            f"Lifecycle: {protected_preview.lifecycle_state}"
+        )
+        print(
+            f"Sources: {protected_preview.source_count}"
+        )
+        print(
+            "Protected payloads: "
+            f"{protected_preview.protected_payload_count}"
+        )
+        print(
+            "Protected blobs: "
+            f"{protected_preview.protected_blob_count}"
+        )
+        print(
+            f"Scope keys: {protected_preview.scope_key_count}"
+        )
+        print(
+            f"Preview digest: {protected_preview.preview_digest}"
+        )
+        return 0
+
+    if args.delete_command == "protected-scope-apply":
+        protected_result = app.protected_scope_purge.delete(
+            args.protection_scope_id,
+            preview_digest=args.preview_digest,
+        )
+        print(
+            "Protection scope deleted: "
+            f"{protected_result.protection_scope_id}"
+        )
+        print(
+            "Deleted Sources: "
+            f"{len(protected_result.deleted_source_ids)}"
+        )
+        print(
+            "Destroyed Scope Keys: "
+            f"{protected_result.destroyed_scope_key_count}"
+        )
+        print(
+            "Removed Protected Payloads: "
+            f"{protected_result.removed_payload_count}"
+        )
+        print(
+            "Removed Blob Envelopes: "
+            f"{protected_result.removed_blob_envelope_count}"
+        )
+        print(
+            "Deleted ciphertext replicas: "
+            f"{protected_result.deleted_replica_count}"
+        )
+        print(
+            f"Commit: {protected_result.commit_id}"
+        )
+        return 0
+
+    raise OperationalCommandError(
+        "Unsupported delete command: "
+        f"{args.delete_command!r}"
+    )
+
+
 def _run_backup(app: AthenaApplication, args: argparse.Namespace) -> int:
     if args.backup_command == "create":
         snapshot = app.backup.create_snapshot(
@@ -444,6 +648,14 @@ def _run_backup_target(
     if args.backup_target_command == "status":
         _print_backup_target(
             app.backup.target_status(
+                args.target_id
+            )
+        )
+        return 0
+
+    if args.backup_target_command == "sync":
+        _print_backup_target(
+            app.backup.sync_deletion_ledger(
                 args.target_id
             )
         )
@@ -521,6 +733,14 @@ def _print_backup_target(target: Any) -> None:
     print(
         "Last verification us: "
         f"{target.last_verified_at_us}"
+    )
+    print(
+        "Deletion ledger watermark: "
+        f"{target.deletion_ledger_watermark}"
+    )
+    print(
+        "Deletion sync pending: "
+        f"{'yes' if target.deletion_sync_pending else 'no'}"
     )
 
 

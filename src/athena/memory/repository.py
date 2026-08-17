@@ -9,6 +9,10 @@ import uuid
 
 from athena.common.ids import new_uuid7, uuid_from_blob, uuid_to_blob
 from athena.common.time import utc_now_us
+from athena.lifecycle.deletion import (
+    PERSONAL_MEMORY_ENTITY_TYPE,
+    record_deletion,
+)
 from athena.memory.models import (
     MemoryKind,
     MemoryLearningMode,
@@ -420,6 +424,17 @@ class PersonalMemoryRepository:
                 revision_id=None,
                 change_type=lifecycle_state,
             )
+
+            if lifecycle_state == "deleted":
+                record_deletion(
+                    connection,
+                    entity_id=memory_id,
+                    entity_type=PERSONAL_MEMORY_ENTITY_TYPE,
+                    deleted_at_us=created_at_us,
+                    deletion_commit_seq=commit_seq,
+                    deleted_by_actor_id=actor_id,
+                )
+
         return commit_id
 
     def reset_all(
@@ -468,6 +483,14 @@ class PersonalMemoryRepository:
                     memory_id=memory_id,
                     revision_id=None,
                     change_type="reset",
+                )
+                record_deletion(
+                    connection,
+                    entity_id=memory_id,
+                    entity_type=PERSONAL_MEMORY_ENTITY_TYPE,
+                    deleted_at_us=created_at_us,
+                    deletion_commit_seq=commit_seq,
+                    deleted_by_actor_id=actor_id,
                 )
 
         return PersonalMemoryResetResult(

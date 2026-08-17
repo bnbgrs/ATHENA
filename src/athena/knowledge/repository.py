@@ -307,6 +307,7 @@ class KnowledgeRepository:
             JOIN knowledge_unit_revisions AS kr
               ON kr.revision_id = r.revision_id
             WHERE k.knowledge_id = ?
+              AND e.lifecycle_state != 'deleted'
             """,
             (uuid_to_blob(knowledge_id),),
         ).fetchone()
@@ -346,6 +347,7 @@ class KnowledgeRepository:
               ON r.revision_id = h.current_revision_id
             JOIN knowledge_unit_revisions AS kr
               ON kr.revision_id = r.revision_id
+            WHERE e.lifecycle_state != 'deleted'
             ORDER BY r.created_at_us DESC, e.entity_id DESC
             LIMIT ?
             """,
@@ -379,9 +381,12 @@ class KnowledgeRepository:
             FROM revisions AS r
             JOIN knowledge_units AS k
               ON k.knowledge_id = r.entity_id
+            JOIN entity_registry AS e
+              ON e.entity_id = k.knowledge_id
             JOIN knowledge_unit_revisions AS kr
               ON kr.revision_id = r.revision_id
             WHERE r.entity_id = ?
+              AND e.lifecycle_state != 'deleted'
             ORDER BY r.revision_no ASC
             """,
             (uuid_to_blob(knowledge_id),),
@@ -487,7 +492,10 @@ class KnowledgeRepository:
             FROM knowledge_units AS k
             JOIN entity_heads AS h
               ON h.entity_id = k.knowledge_id
+            JOIN entity_registry AS e
+              ON e.entity_id = k.knowledge_id
             WHERE k.knowledge_id = ?
+              AND e.lifecycle_state != 'deleted'
             """,
             (uuid_to_blob(knowledge_id),),
         ).fetchone()

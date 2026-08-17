@@ -329,6 +329,214 @@ class BlobStore:
 
         return True
 
+    def verified_replica_paths(
+        self,
+        *,
+        storage_locator: str,
+        expected_sha256: bytes,
+        expected_length: int,
+    ) -> tuple[Path, ...]:
+        """Return every verified Raw Archive replica of one content object."""
+
+        relative = Path(
+            storage_locator
+        )
+
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+        ):
+            raise BlobStoreError(
+                "Stored blob locator is not a safe relative path."
+            )
+
+        roots: list[
+            Path
+        ] = [
+            self.paths.spool_root,
+        ]
+
+        archive_root = (
+            self.paths.archive_root
+        )
+
+        if archive_root is not None:
+            if (
+                archive_root.is_symlink()
+                or not archive_root.is_dir()
+            ):
+                raise ArchiveStorageUnavailableError(
+                    "Configured Archive Root is unavailable; "
+                    "physical deletion cannot prove that all "
+                    "Raw Archive replicas are gone."
+                )
+
+            roots.append(
+                archive_root
+            )
+
+        verified: list[
+            Path
+        ] = []
+
+        seen: set[
+            Path
+        ] = set()
+
+        for root in roots:
+            if (
+                root.is_symlink()
+                or not root.is_dir()
+            ):
+                raise BlobStoreError(
+                    "Blob storage root is unavailable "
+                    "or is a symbolic link."
+                )
+
+            resolved_root = (
+                root.resolve()
+            )
+
+            candidate = (
+                root
+                / relative
+            )
+
+            if candidate.is_symlink():
+                raise BlobStoreError(
+                    "Refusing to inspect a symbolic-link "
+                    "Raw Archive blob."
+                )
+
+            resolved_candidate = (
+                candidate.resolve(
+                    strict=False
+                )
+            )
+
+            if (
+                resolved_candidate
+                != resolved_root
+                and resolved_root
+                not in resolved_candidate.parents
+            ):
+                raise BlobStoreError(
+                    "Raw Archive blob resolves outside "
+                    "its configured storage root."
+                )
+
+            if (
+                resolved_candidate
+                in seen
+            ):
+                continue
+
+            seen.add(
+                resolved_candidate
+            )
+
+            if not candidate.exists():
+                continue
+
+            if not candidate.is_file():
+                raise BlobStoreError(
+                    "Raw Archive blob path is not "
+                    "a regular file."
+                )
+
+            digest, length = (
+                _hash_file(
+                    candidate
+                )
+            )
+
+            if (
+                digest
+                != expected_sha256
+                or length
+                != expected_length
+            ):
+                raise BlobIntegrityError(
+                    "Raw Archive replica failed "
+                    "integrity verification before purge."
+                )
+
+            verified.append(
+                candidate
+            )
+
+        return tuple(
+            verified
+        )
+
+    def purge_verified_replicas(
+        self,
+        *,
+        storage_locator: str,
+        expected_sha256: bytes,
+        expected_length: int,
+    ) -> tuple[Path, ...]:
+        """Delete all verified spool/archive replicas of one Raw Archive blob."""
+
+        paths = (
+            self.verified_replica_paths(
+                storage_locator=storage_locator,
+                expected_sha256=expected_sha256,
+                expected_length=expected_length,
+            )
+        )
+
+        deleted: list[
+            Path
+        ] = []
+
+        for path in paths:
+            # Re-verify immediately before unlink. The shared
+            # runtime mutation lock prevents ATHENA writers,
+            # while this catches out-of-band filesystem changes.
+            digest, length = (
+                _hash_file(
+                    path
+                )
+            )
+
+            if (
+                digest
+                != expected_sha256
+                or length
+                != expected_length
+            ):
+                raise BlobIntegrityError(
+                    "Raw Archive replica changed "
+                    "between purge verification and unlink."
+                )
+
+            try:
+                path.unlink()
+
+            except OSError as exc:
+                raise BlobStoreError(
+                    "Verified Raw Archive replica "
+                    "could not be removed."
+                ) from exc
+
+            if (
+                path.exists()
+                or path.is_symlink()
+            ):
+                raise BlobStoreError(
+                    "Raw Archive replica still exists "
+                    "after physical deletion."
+                )
+
+            deleted.append(
+                path
+            )
+
+        return tuple(
+            deleted
+        )
+
     def _commit_staged_blob(
         self,
         staging_path: Path,

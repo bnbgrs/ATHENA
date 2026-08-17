@@ -51,7 +51,8 @@ PROTECTED_CONTENT_SCHEMA_VERSION = 32
 PROTECTED_SOURCE_BLOB_SCHEMA_VERSION = 33
 SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION = 34
 BACKUP_RETENTION_SCHEMA_VERSION = 35
-SCHEMA_VERSION = BACKUP_RETENTION_SCHEMA_VERSION
+DELETION_LEDGER_SCHEMA_VERSION = 36
+SCHEMA_VERSION = DELETION_LEDGER_SCHEMA_VERSION
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
@@ -98,6 +99,7 @@ PROTECTED_SOURCE_BLOB_MIGRATION_ID = (
 )
 SOURCE_PROTECTION_TRANSITION_MIGRATION_ID = "0034_source_protection_transition"
 BACKUP_RETENTION_MIGRATION_ID = "0035_backup_targets_retention"
+DELETION_LEDGER_MIGRATION_ID = "0036_deletion_ledger"
 
 
 class DatabaseCompatibilityError(RuntimeError):
@@ -197,6 +199,7 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         PROTECTED_CONTENT_SCHEMA_VERSION,
         PROTECTED_SOURCE_BLOB_SCHEMA_VERSION,
         SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
+        BACKUP_RETENTION_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -404,8 +407,16 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         _migrate_schema_v34_to_v35(connection)
         existing_user_version = BACKUP_RETENTION_SCHEMA_VERSION
 
+    if (
+        existing_user_version
+        == BACKUP_RETENTION_SCHEMA_VERSION
+    ):
+        _verify_schema_v35(connection)
+        _migrate_schema_v35_to_v36(connection)
+        existing_user_version = DELETION_LEDGER_SCHEMA_VERSION
+
     _configure_connection(connection)
-    _verify_schema_v35(connection)
+    _verify_schema_v36(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -3670,13 +3681,330 @@ def _migrate_schema_v34_to_v35(
         raise
 
 
+
+def _migrate_schema_v35_to_v36(
+    connection: sqlite3.Connection,
+) -> None:
+    """Add the durable payload-free deletion ledger and backup watermarks."""
+    if connection.in_transaction:
+        raise RuntimeError(
+            "Deletion ledger migration requires no active transaction."
+        )
+
+    _verify_schema_v35(
+        connection
+    )
+
+    tables = set(
+        _user_tables(
+            connection
+        )
+    )
+
+    ledger_columns = (
+        {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(deletion_ledger)"
+            )
+        }
+        if "deletion_ledger" in tables
+        else set()
+    )
+
+    required_ledger_columns = {
+        "ledger_seq",
+        "deletion_id",
+        "entity_id",
+        "entity_type",
+        "deleted_at_us",
+        "deletion_commit_seq",
+        "deleted_by_actor_id",
+    }
+
+    if (
+        ledger_columns
+        and not required_ledger_columns.issubset(
+            ledger_columns
+        )
+    ):
+        raise DatabaseCompatibilityError(
+            "Deletion ledger migration is partially present."
+        )
+
+    target_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(backup_targets)"
+        )
+    }
+
+    snapshot_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(backup_snapshots)"
+        )
+    }
+
+    try:
+        connection.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+        if "deletion_ledger" not in tables:
+            connection.execute(
+                """
+                CREATE TABLE deletion_ledger (
+                    ledger_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    deletion_id BLOB(16) NOT NULL UNIQUE
+                        CHECK(length(deletion_id) = 16),
+                    entity_id BLOB(16) NOT NULL
+                        CHECK(length(entity_id) = 16),
+                    entity_type TEXT NOT NULL
+                        CHECK(length(entity_type) > 0),
+                    deleted_at_us INTEGER NOT NULL
+                        CHECK(deleted_at_us >= 0),
+                    deletion_commit_seq INTEGER NOT NULL
+                        CHECK(deletion_commit_seq > 0),
+                    deleted_by_actor_id BLOB(16) NOT NULL
+                        CHECK(length(deleted_by_actor_id) = 16)
+                )
+                """
+            )
+
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS
+                uq_deletion_ledger_entity
+            ON deletion_ledger(entity_id)
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+                idx_deletion_ledger_deleted_at
+            ON deletion_ledger(
+                deleted_at_us,
+                ledger_seq
+            )
+            """
+        )
+
+        if (
+            "deletion_ledger_watermark"
+            not in target_columns
+        ):
+            connection.execute(
+                """
+                ALTER TABLE backup_targets
+                ADD COLUMN deletion_ledger_watermark
+                    INTEGER NOT NULL DEFAULT 0
+                    CHECK(deletion_ledger_watermark >= 0)
+                """
+            )
+
+        if (
+            "deletion_ledger_watermark"
+            not in snapshot_columns
+        ):
+            connection.execute(
+                """
+                ALTER TABLE backup_snapshots
+                ADD COLUMN deletion_ledger_watermark
+                    INTEGER NOT NULL DEFAULT 0
+                    CHECK(deletion_ledger_watermark >= 0)
+                """
+            )
+
+        connection.execute(
+            """
+            UPDATE schema_metadata
+            SET schema_version = ?,
+                last_migration_id = ?,
+                minimum_reader_version = ?
+            WHERE singleton_id = 1
+            """,
+            (
+                DELETION_LEDGER_SCHEMA_VERSION,
+                DELETION_LEDGER_MIGRATION_ID,
+                DELETION_LEDGER_SCHEMA_VERSION,
+            ),
+        )
+
+        connection.execute(
+            f"PRAGMA user_version = "
+            f"{DELETION_LEDGER_SCHEMA_VERSION}"
+        )
+
+        connection.execute(
+            "COMMIT"
+        )
+
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def _verify_schema_v36(
+    connection: sqlite3.Connection,
+) -> None:
+    _verify_schema_v35(
+        connection,
+        schema_version=DELETION_LEDGER_SCHEMA_VERSION,
+        migration_id=DELETION_LEDGER_MIGRATION_ID,
+    )
+
+    if (
+        "deletion_ledger"
+        not in _user_tables(
+            connection
+        )
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA deletion ledger table is missing."
+        )
+
+    columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(deletion_ledger)"
+        )
+    }
+
+    required = {
+        "ledger_seq",
+        "deletion_id",
+        "entity_id",
+        "entity_type",
+        "deleted_at_us",
+        "deletion_commit_seq",
+        "deleted_by_actor_id",
+    }
+
+    if not required.issubset(
+        columns
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA deletion ledger schema is incomplete."
+        )
+
+    target_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(backup_targets)"
+        )
+    }
+
+    snapshot_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(backup_snapshots)"
+        )
+    }
+
+    if (
+        "deletion_ledger_watermark"
+        not in target_columns
+        or "deletion_ledger_watermark"
+        not in snapshot_columns
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA backup deletion-ledger "
+            "watermark schema is incomplete."
+        )
+
+    indexes = {
+        str(row[0])
+        for row in connection.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'index'
+              AND name IN (
+                  'uq_deletion_ledger_entity',
+                  'idx_deletion_ledger_deleted_at'
+              )
+            """
+        )
+    }
+
+    if indexes != {
+        "uq_deletion_ledger_entity",
+        "idx_deletion_ledger_deleted_at",
+    }:
+        raise DatabaseCompatibilityError(
+            "ATHENA deletion ledger indexes are incomplete."
+        )
+
+    invalid_ledger = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM deletion_ledger
+        WHERE ledger_seq <= 0
+           OR length(deletion_id) != 16
+           OR length(entity_id) != 16
+           OR length(entity_type) = 0
+           OR deleted_at_us < 0
+           OR deletion_commit_seq <= 0
+           OR length(deleted_by_actor_id) != 16
+        """
+    ).fetchone()
+
+    if (
+        invalid_ledger is None
+        or int(
+            invalid_ledger[0]
+        ) != 0
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA deletion ledger contains invalid records."
+        )
+
+    invalid_targets = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM backup_targets
+        WHERE deletion_ledger_watermark < 0
+        """
+    ).fetchone()
+
+    invalid_snapshots = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM backup_snapshots
+        WHERE deletion_ledger_watermark < 0
+        """
+    ).fetchone()
+
+    if (
+        invalid_targets is None
+        or invalid_snapshots is None
+        or int(invalid_targets[0]) != 0
+        or int(invalid_snapshots[0]) != 0
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA deletion ledger watermark is invalid."
+        )
+
+    if connection.execute(
+        "PRAGMA foreign_key_check"
+    ).fetchall():
+        raise DatabaseCompatibilityError(
+            "ATHENA foreign-key verification failed."
+        )
+
+
 def _verify_schema_v35(
     connection: sqlite3.Connection,
+    *,
+    schema_version: int = BACKUP_RETENTION_SCHEMA_VERSION,
+    migration_id: str = BACKUP_RETENTION_MIGRATION_ID,
 ) -> None:
     _verify_schema_v34(
         connection,
-        schema_version=BACKUP_RETENTION_SCHEMA_VERSION,
-        migration_id=BACKUP_RETENTION_MIGRATION_ID,
+        schema_version=schema_version,
+        migration_id=migration_id,
     )
 
     target_columns = {
@@ -3997,10 +4325,62 @@ def _verify_schema_v34(
         """
         SELECT COUNT(*)
         FROM blob_records AS b
+        JOIN entity_registry AS be
+          ON be.entity_id = b.blob_id
         LEFT JOIN protected_blob_envelopes AS e
           ON e.blob_id = b.blob_id
+        LEFT JOIN protection_scopes AS scope
+          ON scope.protection_scope_id =
+             be.protection_scope_id
         WHERE b.encryption_state = 'protected_v1'
           AND e.blob_id IS NULL
+          AND NOT (
+              be.entity_type = 'blob_record'
+              AND be.lifecycle_state = 'deleted'
+              AND be.protection_scope_id IS NOT NULL
+              AND scope.lifecycle_state = 'pending_delete'
+              AND scope.current_scope_key_id IS NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM protection_scope_keys AS key
+                  WHERE key.protection_scope_id =
+                        be.protection_scope_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM protected_payloads AS payload
+                  WHERE payload.protection_scope_id =
+                        be.protection_scope_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM protected_blob_envelopes AS envelope
+                  WHERE envelope.protection_scope_id =
+                        be.protection_scope_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM protected_sources AS protected_source
+                  WHERE protected_source.protection_scope_id =
+                        be.protection_scope_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM source_protection_transitions AS transition
+                  WHERE transition.protection_scope_id =
+                        be.protection_scope_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM sources AS source
+                  JOIN entity_registry AS source_entity
+                    ON source_entity.entity_id =
+                       source.source_id
+                  WHERE source.blob_id = b.blob_id
+                    AND source_entity.lifecycle_state
+                        != 'deleted'
+              )
+          )
         """
     ).fetchone()
     if missing_envelope is None or int(missing_envelope[0]) != 0:

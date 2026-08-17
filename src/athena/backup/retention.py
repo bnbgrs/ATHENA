@@ -38,6 +38,8 @@ class BackupTargetRecord:
     created_at_us: int
     last_successful_backup_at_us: int | None
     last_verified_at_us: int | None
+    deletion_ledger_watermark: int = 0
+    deletion_sync_pending: bool = False
 
 
 @dataclass(frozen=True, slots=True)

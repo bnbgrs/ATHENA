@@ -284,6 +284,7 @@ class ChatRepository:
             FROM chats AS c
             LEFT JOIN chat_messages AS m
               ON m.chat_id = c.chat_id
+            WHERE c.lifecycle_state != 'deleted'
             GROUP BY
                 c.chat_id,
                 c.started_at_us,
@@ -317,6 +318,7 @@ class ChatRepository:
             SELECT chat_id, started_at_us, ended_at_us, archive_mode, lifecycle_state
             FROM chats
             WHERE chat_id = ?
+              AND lifecycle_state != 'deleted'
             """,
             (uuid_to_blob(chat_id),),
         ).fetchone()
@@ -393,10 +395,13 @@ class ChatRepository:
     @staticmethod
     def _require_standard_chat(connection: sqlite3.Connection, chat_id: uuid.UUID) -> None:
         row = connection.execute(
-            "SELECT archive_mode FROM chats WHERE chat_id = ?",
+            "SELECT archive_mode, lifecycle_state "
+            "FROM chats WHERE chat_id = ?",
             (uuid_to_blob(chat_id),),
         ).fetchone()
         if row is None:
+            raise ChatNotFoundError(str(chat_id))
+        if str(row["lifecycle_state"]) == "deleted":
             raise ChatNotFoundError(str(chat_id))
         if str(row["archive_mode"]) != "standard":
             raise UnsupportedArchiveModeError(

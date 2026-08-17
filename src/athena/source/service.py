@@ -6,6 +6,7 @@ import uuid
 from pathlib import Path
 
 from athena.chat.service import ChatService
+from athena.lifecycle.runtime_lock import runtime_data_lock
 from athena.security.service import (
     ProtectedContentIntegrityError,
     ProtectedContentService,
@@ -33,39 +34,42 @@ class SourceCaptureService:
         chat: ChatService,
         protected_content: ProtectedContentService,
         protection_transitions: SourceProtectionTransitionService | None = None,
+        runtime_lock_root: Path | None = None,
     ) -> None:
         self.repository = repository
         self.blob_store = blob_store
         self.chat = chat
         self.protected_content = protected_content
         self.protection_transitions = protection_transitions
+        self.runtime_lock_root = runtime_lock_root
         self.protected_blobs = ProtectedBlobStore(
             blob_store=blob_store,
             protected_content=protected_content,
         )
 
     def capture_file(self, path: Path) -> SourceCaptureResult:
-        source_path = path.expanduser()
-        prepared_blob = self.blob_store.capture_file(source_path)
-        source_path = source_path.resolve()
-        existing_blob = self.repository.find_blob_by_integrity(
-            integrity_sha256=prepared_blob.integrity_sha256,
-            byte_length=prepared_blob.byte_length,
-        )
-        if existing_blob is not None:
-            self.blob_store.verify_blob(
-                storage_area=existing_blob.storage_area,
-                storage_locator=existing_blob.storage_locator,
-                expected_sha256=existing_blob.integrity_sha256,
-                expected_length=existing_blob.byte_length,
+        with runtime_data_lock(self.runtime_lock_root):
+            source_path = path.expanduser()
+            prepared_blob = self.blob_store.capture_file(source_path)
+            source_path = source_path.resolve()
+            existing_blob = self.repository.find_blob_by_integrity(
+                integrity_sha256=prepared_blob.integrity_sha256,
+                byte_length=prepared_blob.byte_length,
             )
-        actor_id = self.chat.ensure_local_user()
-        return self.repository.capture_file(
-            actor_id=actor_id,
-            original_name=source_path.name,
-            source_uri=source_path.as_uri(),
-            prepared_blob=prepared_blob,
-        )
+            if existing_blob is not None:
+                self.blob_store.verify_blob(
+                    storage_area=existing_blob.storage_area,
+                    storage_locator=existing_blob.storage_locator,
+                    expected_sha256=existing_blob.integrity_sha256,
+                    expected_length=existing_blob.byte_length,
+                )
+            actor_id = self.chat.ensure_local_user()
+            return self.repository.capture_file(
+                actor_id=actor_id,
+                original_name=source_path.name,
+                source_uri=source_path.as_uri(),
+                prepared_blob=prepared_blob,
+            )
 
     def capture_protected_file(
         self,
@@ -73,21 +77,22 @@ class SourceCaptureService:
         *,
         protection_scope_id: uuid.UUID,
     ) -> SourceCaptureResult:
-        prepared = self.protected_blobs.capture_file(
-            path,
-            protection_scope_id=protection_scope_id,
-            source_type=SourceType.FILE,
-        )
-        metadata_record = self.protected_content.store_payload(
-            protection_scope_id,
-            prepared.metadata.to_payload(),
-        )
-        actor_id = self.chat.ensure_local_user()
-        return self.repository.capture_protected_file(
-            actor_id=actor_id,
-            prepared=prepared,
-            protected_metadata_payload_id=metadata_record.protected_payload_id,
-        )
+        with runtime_data_lock(self.runtime_lock_root):
+            prepared = self.protected_blobs.capture_file(
+                path,
+                protection_scope_id=protection_scope_id,
+                source_type=SourceType.FILE,
+            )
+            metadata_record = self.protected_content.store_payload(
+                protection_scope_id,
+                prepared.metadata.to_payload(),
+            )
+            actor_id = self.chat.ensure_local_user()
+            return self.repository.capture_protected_file(
+                actor_id=actor_id,
+                prepared=prepared,
+                protected_metadata_payload_id=metadata_record.protected_payload_id,
+            )
 
     def protect_existing_source(
         self,
@@ -111,31 +116,32 @@ class SourceCaptureService:
         original_name: str | None = None,
     ) -> SourceCaptureResult:
         """Capture already-fetched external bytes as immutable web_snapshot Source."""
-        normalized_uri = source_uri.strip()
-        if not normalized_uri:
-            raise ValueError("External Source URI must not be empty.")
-        source_path = path.expanduser()
-        prepared_blob = self.blob_store.capture_file(source_path)
-        source_path = source_path.resolve()
-        existing_blob = self.repository.find_blob_by_integrity(
-            integrity_sha256=prepared_blob.integrity_sha256,
-            byte_length=prepared_blob.byte_length,
-        )
-        if existing_blob is not None:
-            self.blob_store.verify_blob(
-                storage_area=existing_blob.storage_area,
-                storage_locator=existing_blob.storage_locator,
-                expected_sha256=existing_blob.integrity_sha256,
-                expected_length=existing_blob.byte_length,
+        with runtime_data_lock(self.runtime_lock_root):
+            normalized_uri = source_uri.strip()
+            if not normalized_uri:
+                raise ValueError("External Source URI must not be empty.")
+            source_path = path.expanduser()
+            prepared_blob = self.blob_store.capture_file(source_path)
+            source_path = source_path.resolve()
+            existing_blob = self.repository.find_blob_by_integrity(
+                integrity_sha256=prepared_blob.integrity_sha256,
+                byte_length=prepared_blob.byte_length,
             )
-        actor_id = self.chat.ensure_local_user()
-        return self.repository.capture_file(
-            actor_id=actor_id,
-            original_name=original_name or source_path.name,
-            source_uri=normalized_uri,
-            prepared_blob=prepared_blob,
-            source_type=SourceType.WEB_SNAPSHOT,
-        )
+            if existing_blob is not None:
+                self.blob_store.verify_blob(
+                    storage_area=existing_blob.storage_area,
+                    storage_locator=existing_blob.storage_locator,
+                    expected_sha256=existing_blob.integrity_sha256,
+                    expected_length=existing_blob.byte_length,
+                )
+            actor_id = self.chat.ensure_local_user()
+            return self.repository.capture_file(
+                actor_id=actor_id,
+                original_name=original_name or source_path.name,
+                source_uri=normalized_uri,
+                prepared_blob=prepared_blob,
+                source_type=SourceType.WEB_SNAPSHOT,
+            )
 
     def get(self, source_id: uuid.UUID) -> tuple[SourceRecord, BlobRecord]:
         return self.repository.get(source_id)

@@ -23,8 +23,8 @@ from athena.config.settings import AthenaSettings
 from athena.core.application import AthenaApplication
 from athena.storage.database import SQLiteDatabase
 from athena.storage.schema import (
-    BACKUP_RETENTION_MIGRATION_ID,
-    BACKUP_RETENTION_SCHEMA_VERSION,
+    DELETION_LEDGER_MIGRATION_ID,
+    SCHEMA_VERSION,
     SOURCE_PROTECTION_TRANSITION_MIGRATION_ID,
     SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
 )
@@ -136,7 +136,7 @@ def test_v34_to_v35_adds_backup_retention_schema(
             upgraded.connection.execute(
                 "PRAGMA user_version"
             ).fetchone()[0]
-            == BACKUP_RETENTION_SCHEMA_VERSION
+            == SCHEMA_VERSION
         )
 
         metadata = (
@@ -153,13 +153,13 @@ def test_v34_to_v35_adds_backup_retention_schema(
 
         assert metadata is not None
         assert int(metadata[0]) == (
-            BACKUP_RETENTION_SCHEMA_VERSION
+            SCHEMA_VERSION
         )
         assert str(metadata[1]) == (
-            BACKUP_RETENTION_MIGRATION_ID
+            DELETION_LEDGER_MIGRATION_ID
         )
         assert int(metadata[2]) == (
-            BACKUP_RETENTION_SCHEMA_VERSION
+            SCHEMA_VERSION
         )
 
         target_columns = {

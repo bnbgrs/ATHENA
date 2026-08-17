@@ -3679,7 +3679,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"ATHENA source error: {exc}", file=sys.stderr)
                 return 2
 
-        if args.command in {"research", "external", "resource", "backup"}:
+        if args.command in {"research", "external", "resource", "backup", "delete"}:
             try:
                 return run_operational_command(app, args)
             except OperationalCommandError as exc:

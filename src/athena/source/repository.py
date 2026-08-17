@@ -626,6 +626,9 @@ class SourceRepository:
             b.created_at_us AS blob_created_at_us,
             b.verified_at_us
         FROM sources AS s
+        JOIN entity_registry AS source_entity
+          ON source_entity.entity_id = s.source_id
+         AND source_entity.lifecycle_state != 'deleted'
         JOIN blob_records AS b ON b.blob_id = s.blob_id
         LEFT JOIN protected_sources AS ps ON ps.source_id = s.source_id
         """

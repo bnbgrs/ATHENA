@@ -6,9 +6,11 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 
 from athena.common.ids import uuid_from_blob, uuid_to_blob
 from athena.common.time import utc_now_us
+from athena.lifecycle.runtime_lock import runtime_data_lock
 from athena.source.blob_store import (
     ArchiveStorageUnavailableError,
     BlobStore,
@@ -559,9 +561,11 @@ class ArchiveReplicationService:
         *,
         repository: ArchiveReplicationRepository,
         blob_store: BlobStore,
+        runtime_lock_root: Path | None = None,
     ) -> None:
         self.repository = repository
         self.blob_store = blob_store
+        self.runtime_lock_root = runtime_lock_root
 
     def status(
         self,
@@ -573,108 +577,109 @@ class ArchiveReplicationService:
         *,
         limit: int = 100,
     ) -> ArchiveSyncResult:
-        if not 1 <= limit <= 1000:
-            raise ValueError(
-                "Archive sync limit must be between 1 and 1000."
+        with runtime_data_lock(self.runtime_lock_root):
+            if not 1 <= limit <= 1000:
+                raise ValueError(
+                    "Archive sync limit must be between 1 and 1000."
+                )
+
+            archive_root = (
+                self.blob_store.paths.archive_root
             )
 
-        archive_root = (
-            self.blob_store.paths.archive_root
-        )
+            if archive_root is None:
+                return ArchiveSyncResult(
+                    attempted=0,
+                    verified=0,
+                    failed=0,
+                    cleaned_spool_replicas=0,
+                    cleanup_failures=0,
+                    blocked_reason="archive_root_unconfigured",
+                    status=self.repository.status(),
+                )
 
-        if archive_root is None:
-            return ArchiveSyncResult(
-                attempted=0,
-                verified=0,
-                failed=0,
-                cleaned_spool_replicas=0,
-                cleanup_failures=0,
-                blocked_reason="archive_root_unconfigured",
-                status=self.repository.status(),
+            if not archive_root.is_dir():
+                return ArchiveSyncResult(
+                    attempted=0,
+                    verified=0,
+                    failed=0,
+                    cleaned_spool_replicas=0,
+                    cleanup_failures=0,
+                    blocked_reason="archive_root_unavailable",
+                    status=self.repository.status(),
+                )
+
+            cleaned, cleanup_failures = (
+                self.cleanup_verified_spool_duplicates(
+                    limit=limit
+                )
             )
 
-        if not archive_root.is_dir():
-            return ArchiveSyncResult(
-                attempted=0,
-                verified=0,
-                failed=0,
-                cleaned_spool_replicas=0,
-                cleanup_failures=0,
-                blocked_reason="archive_root_unavailable",
-                status=self.repository.status(),
-            )
+            attempted = 0
+            verified = 0
+            failed = 0
+            blocked_reason: str | None = None
 
-        cleaned, cleanup_failures = (
-            self.cleanup_verified_spool_duplicates(
+            for record in self.repository.list_pending(
                 limit=limit
-            )
-        )
+            ):
+                attempted += 1
 
-        attempted = 0
-        verified = 0
-        failed = 0
-        blocked_reason: str | None = None
-
-        for record in self.repository.list_pending(
-            limit=limit
-        ):
-            attempted += 1
-
-            record = self.repository.mark_attempt(
-                record.outbox_seq
-            )
-
-            try:
-                self.blob_store.replicate_spool_blob_to_archive(
-                    storage_locator=record.blob.storage_locator,
-                    expected_sha256=record.blob.integrity_sha256,
-                    expected_length=record.blob.byte_length,
+                record = self.repository.mark_attempt(
+                    record.outbox_seq
                 )
-            except ArchiveStorageUnavailableError as exc:
-                self.repository.record_failure(
-                    record.outbox_seq,
-                    error_code=type(exc).__name__,
-                    error_detail=str(exc),
-                )
-                failed += 1
-                blocked_reason = "archive_root_unavailable"
-                break
-            except BlobStoreError as exc:
-                self.repository.record_failure(
-                    record.outbox_seq,
-                    error_code=type(exc).__name__,
-                    error_detail=str(exc),
-                )
-                failed += 1
-                continue
 
-            confirmed = self.repository.confirm_verified(
-                record.outbox_seq
-            )
-
-            verified += 1
-
-            try:
-                was_cleaned = (
-                    self._cleanup_verified_spool_replica_if_unpinned(
-                        confirmed
+                try:
+                    self.blob_store.replicate_spool_blob_to_archive(
+                        storage_locator=record.blob.storage_locator,
+                        expected_sha256=record.blob.integrity_sha256,
+                        expected_length=record.blob.byte_length,
                     )
-                )
-            except BlobStoreError:
-                cleanup_failures += 1
-            else:
-                if was_cleaned:
-                    cleaned += 1
+                except ArchiveStorageUnavailableError as exc:
+                    self.repository.record_failure(
+                        record.outbox_seq,
+                        error_code=type(exc).__name__,
+                        error_detail=str(exc),
+                    )
+                    failed += 1
+                    blocked_reason = "archive_root_unavailable"
+                    break
+                except BlobStoreError as exc:
+                    self.repository.record_failure(
+                        record.outbox_seq,
+                        error_code=type(exc).__name__,
+                        error_detail=str(exc),
+                    )
+                    failed += 1
+                    continue
 
-        return ArchiveSyncResult(
-            attempted=attempted,
-            verified=verified,
-            failed=failed,
-            cleaned_spool_replicas=cleaned,
-            cleanup_failures=cleanup_failures,
-            blocked_reason=blocked_reason,
-            status=self.repository.status(),
-        )
+                confirmed = self.repository.confirm_verified(
+                    record.outbox_seq
+                )
+
+                verified += 1
+
+                try:
+                    was_cleaned = (
+                        self._cleanup_verified_spool_replica_if_unpinned(
+                            confirmed
+                        )
+                    )
+                except BlobStoreError:
+                    cleanup_failures += 1
+                else:
+                    if was_cleaned:
+                        cleaned += 1
+
+            return ArchiveSyncResult(
+                attempted=attempted,
+                verified=verified,
+                failed=failed,
+                cleaned_spool_replicas=cleaned,
+                cleanup_failures=cleanup_failures,
+                blocked_reason=blocked_reason,
+                status=self.repository.status(),
+            )
 
     def _cleanup_verified_spool_replica_if_unpinned(
         self,
@@ -723,22 +728,23 @@ class ArchiveReplicationService:
         limit: int = 500,
     ) -> tuple[int, int]:
         """Reconcile crashes after DB confirmation but before spool deletion."""
-        cleaned = 0
-        failures = 0
+        with runtime_data_lock(self.runtime_lock_root):
+            cleaned = 0
+            failures = 0
 
-        for record in self.repository.list_verified(
-            limit=limit
-        ):
-            try:
-                was_cleaned = (
-                    self._cleanup_verified_spool_replica_if_unpinned(
-                        record
+            for record in self.repository.list_verified(
+                limit=limit
+            ):
+                try:
+                    was_cleaned = (
+                        self._cleanup_verified_spool_replica_if_unpinned(
+                            record
+                        )
                     )
-                )
-            except BlobStoreError:
-                failures += 1
-            else:
-                if was_cleaned:
-                    cleaned += 1
+                except BlobStoreError:
+                    failures += 1
+                else:
+                    if was_cleaned:
+                        cleaned += 1
 
-        return cleaned, failures
+            return cleaned, failures

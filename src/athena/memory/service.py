@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from athena.chat.models import ChatMessage
@@ -40,6 +41,20 @@ class PersonalMemoryService:
     def __init__(self, repository: PersonalMemoryRepository, chat: ChatService) -> None:
         self.repository = repository
         self.chat = chat
+        self._deletion_sync_callback: Callable[[], object] | None = None
+
+    def set_deletion_sync_callback(
+        self,
+        callback: Callable[[], object] | None,
+    ) -> None:
+        """Configure best-effort post-commit deletion propagation."""
+        self._deletion_sync_callback = callback
+
+    def _sync_deletion_targets(self) -> None:
+        callback = self._deletion_sync_callback
+
+        if callback is not None:
+            callback()
 
     def remember(
         self,
@@ -179,18 +194,22 @@ class PersonalMemoryService:
         )
 
     def delete(self, memory_id: uuid.UUID) -> uuid.UUID | None:
-        return self.repository.set_lifecycle_state(
+        commit_id = self.repository.set_lifecycle_state(
             actor_id=self.chat.ensure_local_user(),
             memory_id=memory_id,
             lifecycle_state="deleted",
             reason="explicit user Personal Memory delete",
         )
+        self._sync_deletion_targets()
+        return commit_id
 
     def reset(self) -> PersonalMemoryResetResult:
-        return self.repository.reset_all(
+        result = self.repository.reset_all(
             actor_id=self.chat.ensure_local_user(),
             reason="explicit user Personal Memory bulk reset",
         )
+        self._sync_deletion_targets()
+        return result
 
     def load(self, memory_id: uuid.UUID) -> PersonalMemorySnapshot:
         return self.repository.load_current(memory_id)

@@ -3,8 +3,8 @@ import sqlite3
 from athena.common.ids import new_uuid7, uuid_to_blob
 from athena.storage.database import SQLiteDatabase
 from athena.storage.schema import (
-    BACKUP_RETENTION_MIGRATION_ID,
     CONSOLIDATED_OPERATIONS_SCHEMA_VERSION,
+    DELETION_LEDGER_MIGRATION_ID,
     DURABLE_JOBS_SCHEMA_VERSION,
     EXHAUSTIVE_RESEARCH_SCHEMA_VERSION,
     EXTRACTION_SNAPSHOT_SCHEMA_VERSION,
@@ -114,6 +114,7 @@ EXPECTED_SEMANTIC_TABLES = {
     "backup_targets",
     "backup_snapshots",
     "backup_snapshot_pins",
+    "deletion_ledger",
     "news_schema_metadata",
     "news_categories",
     "news_profiles",
@@ -140,6 +141,41 @@ def _table_names(connection: sqlite3.Connection) -> set[str]:
     return {str(row[0]) for row in rows}
 
 
+def _strip_v36_deletion_ledger_for_legacy_fixture(
+    connection: sqlite3.Connection,
+) -> None:
+    """Remove v36-only additions before declaring an older schema boundary."""
+    tables = _table_names(
+        connection
+    )
+
+    if "deletion_ledger" in tables:
+        connection.execute(
+            "DROP TABLE deletion_ledger"
+        )
+
+    for table in (
+        "backup_targets",
+        "backup_snapshots",
+    ):
+        columns = {
+            str(row[1])
+            for row in connection.execute(
+                f"PRAGMA table_info({table})"
+            )
+        }
+
+        if (
+            "deletion_ledger_watermark"
+            in columns
+        ):
+            connection.execute(
+                f"ALTER TABLE {table} "
+                "DROP COLUMN deletion_ledger_watermark"
+            )
+
+
+
 def test_fresh_database_contains_semantic_schema(tmp_path) -> None:
     database = SQLiteDatabase(tmp_path / "athena.db")
     database.start()
@@ -154,7 +190,7 @@ def test_fresh_database_contains_semantic_schema(tmp_path) -> None:
     ).fetchone()
     assert tuple(metadata) == (
         SCHEMA_VERSION,
-        BACKUP_RETENTION_MIGRATION_ID,
+        DELETION_LEDGER_MIGRATION_ID,
         SCHEMA_VERSION,
     )
 
@@ -167,6 +203,10 @@ def test_v1_database_is_upgraded_without_losing_existing_actor(tmp_path) -> None
 
     legacy = sqlite3.connect(path, autocommit=True)
     legacy.row_factory = sqlite3.Row
+
+    _strip_v36_deletion_ledger_for_legacy_fixture(
+        legacy
+    )
     legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
     legacy.execute("PRAGMA application_id = 1096042574")
     _create_schema_v1(legacy, created_at_us=1)
@@ -202,6 +242,10 @@ def test_v2_database_is_upgraded_additively_to_latest_schema(tmp_path) -> None:
 
     legacy = sqlite3.connect(path, autocommit=True)
     legacy.row_factory = sqlite3.Row
+
+    _strip_v36_deletion_ledger_for_legacy_fixture(
+        legacy
+    )
     legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
     legacy.execute("PRAGMA application_id = 1096042574")
     _create_schema_v1(legacy, created_at_us=1)
@@ -224,6 +268,10 @@ def test_v3_database_is_upgraded_additively_to_model_run_schema(tmp_path) -> Non
 
     legacy = sqlite3.connect(path, autocommit=True)
     legacy.row_factory = sqlite3.Row
+
+    _strip_v36_deletion_ledger_for_legacy_fixture(
+        legacy
+    )
     legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
     legacy.execute("PRAGMA application_id = 1096042574")
     _create_schema_v1(legacy, created_at_us=1)
@@ -272,6 +320,10 @@ def test_v4_database_is_upgraded_additively_to_review_queue(tmp_path) -> None:
     path = tmp_path / "athena.db"
     legacy = sqlite3.connect(path, autocommit=True)
     legacy.row_factory = sqlite3.Row
+
+    _strip_v36_deletion_ledger_for_legacy_fixture(
+        legacy
+    )
     legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
     legacy.execute("PRAGMA application_id = 1096042574")
     _create_schema_v1(legacy, created_at_us=1)
@@ -295,6 +347,10 @@ def test_v5_database_is_upgraded_additively_to_persistent_merge_reviews(tmp_path
     path = tmp_path / "athena.db"
     legacy = sqlite3.connect(path, autocommit=True)
     legacy.row_factory = sqlite3.Row
+
+    _strip_v36_deletion_ledger_for_legacy_fixture(
+        legacy
+    )
     legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
     legacy.execute("PRAGMA application_id = 1096042574")
     _create_schema_v1(legacy, created_at_us=1)
@@ -323,6 +379,10 @@ def test_v6_database_is_upgraded_to_multi_target_merge_reviews(tmp_path) -> None
     path = tmp_path / "athena.db"
     legacy = sqlite3.connect(path, autocommit=True)
     legacy.row_factory = sqlite3.Row
+
+    _strip_v36_deletion_ledger_for_legacy_fixture(
+        legacy
+    )
     legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
     legacy.execute("PRAGMA application_id = 1096042574")
     _create_schema_v1(legacy, created_at_us=1)
@@ -371,6 +431,10 @@ def test_v7_database_is_upgraded_to_frozen_extraction_snapshots(tmp_path) -> Non
     path = tmp_path / "athena.db"
     legacy = sqlite3.connect(path, autocommit=True)
     legacy.row_factory = sqlite3.Row
+
+    _strip_v36_deletion_ledger_for_legacy_fixture(
+        legacy
+    )
     legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
     legacy.execute("PRAGMA application_id = 1096042574")
     _create_schema_v1(legacy, created_at_us=1)
@@ -406,6 +470,10 @@ def test_v8_database_is_upgraded_additively_to_local_fts_search(tmp_path) -> Non
     path = tmp_path / "athena.db"
     legacy = sqlite3.connect(path, autocommit=True)
     legacy.row_factory = sqlite3.Row
+
+    _strip_v36_deletion_ledger_for_legacy_fixture(
+        legacy
+    )
     legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
     legacy.execute("PRAGMA application_id = 1096042574")
     _create_schema_v1(legacy, created_at_us=1)
@@ -444,6 +512,10 @@ def test_v9_database_is_upgraded_additively_to_local_embeddings(tmp_path) -> Non
     path = tmp_path / "athena.db"
     legacy = sqlite3.connect(path, autocommit=True)
     legacy.row_factory = sqlite3.Row
+
+    _strip_v36_deletion_ledger_for_legacy_fixture(
+        legacy
+    )
     legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
     legacy.execute("PRAGMA application_id = 1096042574")
     _create_schema_v1(legacy, created_at_us=1)
@@ -481,6 +553,10 @@ def test_v10_database_is_upgraded_additively_to_source_capture(tmp_path) -> None
     path = tmp_path / "athena.db"
     legacy = sqlite3.connect(path, autocommit=True)
     legacy.row_factory = sqlite3.Row
+
+    _strip_v36_deletion_ledger_for_legacy_fixture(
+        legacy
+    )
     legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
     legacy.execute("PRAGMA application_id = 1096042574")
     _create_schema_v1(legacy, created_at_us=1)
@@ -521,6 +597,10 @@ def test_v11_database_is_upgraded_additively_to_source_representations(tmp_path)
     path = tmp_path / "athena.db"
     legacy = sqlite3.connect(path, autocommit=True)
     legacy.row_factory = sqlite3.Row
+
+    _strip_v36_deletion_ledger_for_legacy_fixture(
+        legacy
+    )
     legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
     legacy.execute("PRAGMA application_id = 1096042574")
     _create_schema_v1(legacy, created_at_us=1)
@@ -564,6 +644,10 @@ def test_v12_database_is_upgraded_additively_to_chunking_profiles(tmp_path) -> N
     path = tmp_path / "athena.db"
     legacy = sqlite3.connect(path, autocommit=True)
     legacy.row_factory = sqlite3.Row
+
+    _strip_v36_deletion_ledger_for_legacy_fixture(
+        legacy
+    )
     legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
     legacy.execute("PRAGMA application_id = 1096042574")
     _create_schema_v1(legacy, created_at_us=1)
@@ -610,6 +694,10 @@ def test_v13_database_is_upgraded_additively_to_source_anchors(tmp_path) -> None
     path = tmp_path / "athena.db"
     legacy = sqlite3.connect(path, autocommit=True)
     legacy.row_factory = sqlite3.Row
+
+    _strip_v36_deletion_ledger_for_legacy_fixture(
+        legacy
+    )
     legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
     legacy.execute("PRAGMA application_id = 1096042574")
     _create_schema_v1(legacy, created_at_us=1)
@@ -655,6 +743,10 @@ def test_v14_database_is_upgraded_additively_to_durable_jobs(tmp_path) -> None:
     path = tmp_path / "athena.db"
     legacy = sqlite3.connect(path, autocommit=True)
     legacy.row_factory = sqlite3.Row
+
+    _strip_v36_deletion_ledger_for_legacy_fixture(
+        legacy
+    )
     legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
     legacy.execute("PRAGMA application_id = 1096042574")
     _create_schema_v1(legacy, created_at_us=1)
@@ -687,7 +779,7 @@ def test_v14_database_is_upgraded_additively_to_durable_jobs(tmp_path) -> None:
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == BACKUP_RETENTION_MIGRATION_ID
+    assert metadata["last_migration_id"] == DELETION_LEDGER_MIGRATION_ID
     database.stop()
 
 
@@ -710,6 +802,10 @@ def test_v15_database_is_upgraded_additively_to_pdf_page_map(tmp_path) -> None:
     path = tmp_path / "athena.db"
     legacy = sqlite3.connect(path, autocommit=True)
     legacy.row_factory = sqlite3.Row
+
+    _strip_v36_deletion_ledger_for_legacy_fixture(
+        legacy
+    )
     legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
     legacy.execute("PRAGMA application_id = 1096042574")
     _create_schema_v1(legacy, created_at_us=1)
@@ -758,6 +854,10 @@ def test_v16_database_is_upgraded_additively_to_document_structure(tmp_path) -> 
     path = tmp_path / "athena.db"
     legacy = sqlite3.connect(path, autocommit=True)
     legacy.row_factory = sqlite3.Row
+
+    _strip_v36_deletion_ledger_for_legacy_fixture(
+        legacy
+    )
     legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
     legacy.execute("PRAGMA application_id = 1096042574")
     _create_schema_v1(legacy, created_at_us=1)
@@ -811,6 +911,10 @@ def test_v17_database_is_upgraded_additively_to_hierarchical_source_analysis(tmp
     path = tmp_path / "athena.db"
     legacy = sqlite3.connect(path, autocommit=True)
     legacy.row_factory = sqlite3.Row
+
+    _strip_v36_deletion_ledger_for_legacy_fixture(
+        legacy
+    )
     legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
     legacy.execute("PRAGMA application_id = 1096042574")
     _create_schema_v1(legacy, created_at_us=1)
@@ -852,7 +956,7 @@ def test_v17_database_is_upgraded_additively_to_hierarchical_source_analysis(tmp
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == BACKUP_RETENTION_MIGRATION_ID
+    assert metadata["last_migration_id"] == DELETION_LEDGER_MIGRATION_ID
     database.stop()
 
 
@@ -878,6 +982,10 @@ def test_v18_database_is_upgraded_additively_to_source_knowledge_promotion(tmp_p
     path = tmp_path / "athena.db"
     legacy = sqlite3.connect(path, autocommit=True)
     legacy.row_factory = sqlite3.Row
+
+    _strip_v36_deletion_ledger_for_legacy_fixture(
+        legacy
+    )
     legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
     legacy.execute("PRAGMA application_id = 1096042574")
     _create_schema_v1(legacy, created_at_us=1)
@@ -911,7 +1019,7 @@ def test_v18_database_is_upgraded_additively_to_source_knowledge_promotion(tmp_p
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == BACKUP_RETENTION_MIGRATION_ID
+    assert metadata["last_migration_id"] == DELETION_LEDGER_MIGRATION_ID
     database.stop()
 
 
@@ -938,6 +1046,10 @@ def test_v19_database_is_upgraded_additively_to_hierarchical_source_extraction(t
     path = tmp_path / "athena.db"
     legacy = sqlite3.connect(path, autocommit=True)
     legacy.row_factory = sqlite3.Row
+
+    _strip_v36_deletion_ledger_for_legacy_fixture(
+        legacy
+    )
     legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
     legacy.execute("PRAGMA application_id = 1096042574")
     _create_schema_v1(legacy, created_at_us=1)
@@ -977,7 +1089,7 @@ def test_v19_database_is_upgraded_additively_to_hierarchical_source_extraction(t
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == BACKUP_RETENTION_MIGRATION_ID
+    assert metadata["last_migration_id"] == DELETION_LEDGER_MIGRATION_ID
     database.stop()
 
 
@@ -1005,6 +1117,10 @@ def test_v20_database_is_upgraded_additively_to_personal_memory(tmp_path) -> Non
     path = tmp_path / "athena.db"
     legacy = sqlite3.connect(path, autocommit=True)
     legacy.row_factory = sqlite3.Row
+
+    _strip_v36_deletion_ledger_for_legacy_fixture(
+        legacy
+    )
     legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
     legacy.execute("PRAGMA application_id = 1096042574")
     _create_schema_v1(legacy, created_at_us=1)
@@ -1046,7 +1162,7 @@ def test_v20_database_is_upgraded_additively_to_personal_memory(tmp_path) -> Non
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == BACKUP_RETENTION_MIGRATION_ID
+    assert metadata["last_migration_id"] == DELETION_LEDGER_MIGRATION_ID
     database.stop()
 
 
@@ -1075,6 +1191,10 @@ def test_v21_database_is_upgraded_additively_to_exhaustive_research(tmp_path) ->
     path = tmp_path / "athena.db"
     legacy = sqlite3.connect(path, autocommit=True)
     legacy.row_factory = sqlite3.Row
+
+    _strip_v36_deletion_ledger_for_legacy_fixture(
+        legacy
+    )
     legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
     legacy.execute("PRAGMA application_id = 1096042574")
     _create_schema_v1(legacy, created_at_us=1)
@@ -1124,7 +1244,7 @@ def test_v21_database_is_upgraded_additively_to_exhaustive_research(tmp_path) ->
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == BACKUP_RETENTION_MIGRATION_ID
+    assert metadata["last_migration_id"] == DELETION_LEDGER_MIGRATION_ID
     database.stop()
 
 
@@ -1156,6 +1276,10 @@ def test_v22_database_is_upgraded_additively_to_research_orchestration(
     path = tmp_path / "athena.db"
     legacy = sqlite3.connect(path, autocommit=True)
     legacy.row_factory = sqlite3.Row
+
+    _strip_v36_deletion_ledger_for_legacy_fixture(
+        legacy
+    )
     legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
     legacy.execute("PRAGMA application_id = 1096042574")
     _create_schema_v1(legacy, created_at_us=1)
@@ -1218,7 +1342,7 @@ def test_v22_database_is_upgraded_additively_to_research_orchestration(
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == BACKUP_RETENTION_MIGRATION_ID
+    assert metadata["last_migration_id"] == DELETION_LEDGER_MIGRATION_ID
     database.stop()
 
 
@@ -1249,6 +1373,10 @@ def test_v23_database_is_upgraded_additively_to_research_synthesis(tmp_path) -> 
     path = tmp_path / "athena.db"
     legacy = sqlite3.connect(path, autocommit=True)
     legacy.row_factory = sqlite3.Row
+
+    _strip_v36_deletion_ledger_for_legacy_fixture(
+        legacy
+    )
     legacy.execute("PRAGMA auto_vacuum = INCREMENTAL")
     legacy.execute("PRAGMA application_id = 1096042574")
     _create_schema_v1(legacy, created_at_us=1)
@@ -1303,7 +1431,7 @@ def test_v23_database_is_upgraded_additively_to_research_synthesis(tmp_path) -> 
         "FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == BACKUP_RETENTION_MIGRATION_ID
+    assert metadata["last_migration_id"] == DELETION_LEDGER_MIGRATION_ID
     assert metadata["minimum_reader_version"] == SCHEMA_VERSION
     assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     database.stop()
@@ -1368,6 +1496,10 @@ def test_v28_database_is_upgraded_additively_to_precise_research_provenance(
         autocommit=True,
     )
     legacy.row_factory = sqlite3.Row
+
+    _strip_v36_deletion_ledger_for_legacy_fixture(
+        legacy
+    )
 
     # This test creates the latest database first and then
     # reconstructs an older schema boundary. Remove every
@@ -1540,7 +1672,7 @@ def test_v28_database_is_upgraded_additively_to_precise_research_provenance(
 
     assert tuple(metadata) == (
         SCHEMA_VERSION,
-        BACKUP_RETENTION_MIGRATION_ID,
+        DELETION_LEDGER_MIGRATION_ID,
         SCHEMA_VERSION,
     )
 
@@ -1579,6 +1711,10 @@ def test_v29_database_is_upgraded_additively_to_news_event_eligibility(
         autocommit=True,
     )
     legacy.row_factory = sqlite3.Row
+
+    _strip_v36_deletion_ledger_for_legacy_fixture(
+        legacy
+    )
 
     # This test creates the latest database first and then
     # reconstructs an older schema boundary. Remove every
@@ -1721,7 +1857,7 @@ def test_v29_database_is_upgraded_additively_to_news_event_eligibility(
 
     assert tuple(metadata) == (
         SCHEMA_VERSION,
-        BACKUP_RETENTION_MIGRATION_ID,
+        DELETION_LEDGER_MIGRATION_ID,
         SCHEMA_VERSION,
     )
 
