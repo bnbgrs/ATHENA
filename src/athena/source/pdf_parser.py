@@ -469,7 +469,14 @@ class _WindowsMemoryJob:
         try:
             from ctypes import wintypes
 
-            kernel32 = ctypes.WinDLL(
+            # These ctypes symbols exist only on Windows. Resolve them
+            # dynamically so Linux/macOS type checking remains valid while
+            # preserving the native Windows Job Object implementation.
+            win_dll = vars(ctypes)["WinDLL"]
+            win_error = vars(ctypes)["WinError"]
+            get_last_error = vars(ctypes)["get_last_error"]
+
+            kernel32 = win_dll(
                 "kernel32",
                 use_last_error=True,
             )
@@ -643,8 +650,8 @@ class _WindowsMemoryJob:
             )
 
             if not job:
-                raise ctypes.WinError(
-                    ctypes.get_last_error()
+                raise win_error(
+                    get_last_error()
                 )
 
             process_handle = None
@@ -678,8 +685,8 @@ class _WindowsMemoryJob:
                         ),
                     )
                 ):
-                    raise ctypes.WinError(
-                        ctypes.get_last_error()
+                    raise win_error(
+                        get_last_error()
                     )
 
                 process_handle = (
@@ -694,8 +701,8 @@ class _WindowsMemoryJob:
                 )
 
                 if not process_handle:
-                    raise ctypes.WinError(
-                        ctypes.get_last_error()
+                    raise win_error(
+                        get_last_error()
                     )
 
                 if not (
@@ -705,8 +712,8 @@ class _WindowsMemoryJob:
                         process_handle,
                     )
                 ):
-                    raise ctypes.WinError(
-                        ctypes.get_last_error()
+                    raise win_error(
+                        get_last_error()
                     )
 
             except OSError:
@@ -742,7 +749,9 @@ class _WindowsMemoryJob:
 
         from ctypes import wintypes
 
-        kernel32 = ctypes.WinDLL(
+        win_dll = vars(ctypes)["WinDLL"]
+
+        kernel32 = win_dll(
             "kernel32",
             use_last_error=True,
         )

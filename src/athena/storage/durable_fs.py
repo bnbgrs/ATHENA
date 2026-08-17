@@ -285,6 +285,11 @@ def _windows_replace_write_through(
     import ctypes
     from ctypes import wintypes
 
+    # These ctypes symbols exist only on Windows. Resolve them dynamically so
+    # non-Windows type checking does not require Windows-only ctypes stubs.
+    win_dll = vars(ctypes)["WinDLL"]
+    get_last_error = vars(ctypes)["get_last_error"]
+
     # MOVEFILE_REPLACE_EXISTING cannot replace an existing directory.
     # ATHENA directory publications already require an absent destination.
     source_is_directory = source.is_dir()
@@ -294,7 +299,7 @@ def _windows_replace_write_through(
             f"Durable directory destination already exists: {destination}"
         )
 
-    kernel32 = ctypes.WinDLL(
+    kernel32 = win_dll(
         "kernel32",
         use_last_error=True,
     )
@@ -321,7 +326,7 @@ def _windows_replace_write_through(
     if succeeded:
         return
 
-    error = ctypes.get_last_error()
+    error = get_last_error()
 
     raise OSError(
         error,
