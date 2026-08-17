@@ -22,6 +22,7 @@ from athena.security.models import (
     KeySlotType,
     KeyStatus,
     PasswordKeySlotRecord,
+    ProtectedBlobEnvelopeRecord,
     ProtectedPayloadRecord,
     ProtectionScopeKeyRecord,
     ProtectionScopeLifecycle,
@@ -734,6 +735,114 @@ class ProtectedContentService:
                 dek
             )
 
+    def wrap_blob_dek(
+        self,
+        protection_scope_id: uuid.UUID,
+        *,
+        blob_id: uuid.UUID,
+        dek: bytes,
+        nonce_prefix: bytes,
+        chunk_size: int,
+        format_version: int,
+    ) -> ProtectedBlobEnvelopeRecord:
+        if len(dek) != KEY_BYTES:
+            raise ValueError(
+                "Protected Blob DEKs must contain exactly 32 bytes."
+            )
+        if len(nonce_prefix) != 8:
+            raise ValueError(
+                "Protected Blob nonce prefixes must contain exactly 8 bytes."
+            )
+        if chunk_size < 1:
+            raise ValueError(
+                "Protected Blob chunk size must be positive."
+            )
+        if format_version != 1:
+            raise ValueError(
+                "Unsupported Protected Blob format version."
+            )
+
+        unlocked = self._require_unlocked(
+            protection_scope_id
+        )
+        current_key = self.repository.get_current_scope_key(
+            protection_scope_id
+        )
+        if (
+            current_key.scope_key_id != unlocked.scope_key_id
+            or current_key.status is not KeyStatus.ACTIVE
+        ):
+            raise ProtectionScopeLockedError(
+                "ProtectionScope key changed; unlock the scope again."
+            )
+
+        wrapped = self.crypto.encrypt(
+            bytes(unlocked.key),
+            dek,
+            aad=_blob_dek_aad(
+                blob_id=blob_id,
+                protection_scope_id=protection_scope_id,
+                scope_key_id=unlocked.scope_key_id,
+                nonce_prefix=nonce_prefix,
+                chunk_size=chunk_size,
+                format_version=format_version,
+            ),
+        )
+        return ProtectedBlobEnvelopeRecord(
+            blob_id=blob_id,
+            protection_scope_id=protection_scope_id,
+            scope_key_id=unlocked.scope_key_id,
+            wrapped_dek=wrapped.ciphertext,
+            dek_wrap_nonce=wrapped.nonce,
+            nonce_prefix=nonce_prefix,
+            chunk_size=chunk_size,
+            cipher_suite=AES_256_GCM,
+            format_version=format_version,
+        )
+
+    def unwrap_blob_dek(
+        self,
+        envelope: ProtectedBlobEnvelopeRecord,
+    ) -> bytearray:
+        if (
+            envelope.cipher_suite != AES_256_GCM
+            or envelope.format_version != 1
+            or len(envelope.nonce_prefix) != 8
+            or envelope.chunk_size < 1
+        ):
+            raise ProtectedContentIntegrityError(
+                "Protected Blob envelope metadata is invalid."
+            )
+
+        unlocked = self._require_unlocked(
+            envelope.protection_scope_id,
+            expected_scope_key_id=envelope.scope_key_id,
+        )
+        try:
+            raw = self.crypto.decrypt(
+                bytes(unlocked.key),
+                nonce=envelope.dek_wrap_nonce,
+                ciphertext=envelope.wrapped_dek,
+                aad=_blob_dek_aad(
+                    blob_id=envelope.blob_id,
+                    protection_scope_id=envelope.protection_scope_id,
+                    scope_key_id=envelope.scope_key_id,
+                    nonce_prefix=envelope.nonce_prefix,
+                    chunk_size=envelope.chunk_size,
+                    format_version=envelope.format_version,
+                ),
+            )
+        except CryptoAuthenticationError as exc:
+            raise ProtectedContentIntegrityError(
+                "Protected Blob DEK authentication failed."
+            ) from exc
+
+        if len(raw) != KEY_BYTES:
+            raise ProtectedContentIntegrityError(
+                "Protected Blob DEK has an invalid length."
+            )
+        return bytearray(raw)
+
     def _unwrap_root_key(
         self,
         password: bytes,
@@ -1013,6 +1122,29 @@ def _payload_aad(
         },
     )
 
+
+def _blob_dek_aad(
+    *,
+    blob_id: uuid.UUID,
+    protection_scope_id: uuid.UUID,
+    scope_key_id: uuid.UUID,
+    nonce_prefix: bytes,
+    chunk_size: int,
+    format_version: int,
+) -> bytes:
+    return json.dumps(
+        {
+            "blob_id": str(blob_id),
+            "chunk_size": chunk_size,
+            "domain": "athena.protected_blob.dek",
+            "format_version": format_version,
+            "nonce_prefix": nonce_prefix.hex(),
+            "protection_scope_id": str(protection_scope_id),
+            "scope_key_id": str(scope_key_id),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
 
 def _wipe(
     buffer: bytearray,

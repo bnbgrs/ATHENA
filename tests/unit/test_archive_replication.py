@@ -13,8 +13,8 @@ from athena.storage.database import SQLiteDatabase
 from athena.storage.schema import (
     NEWS_EVENT_ELIGIBILITY_MIGRATION_ID,
     NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION,
-    PROTECTED_CONTENT_MIGRATION_ID,
-    PROTECTED_CONTENT_SCHEMA_VERSION,
+    SOURCE_PROTECTION_TRANSITION_MIGRATION_ID,
+    SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
 )
 
 
@@ -677,6 +677,17 @@ def test_v30_to_v31_migration_creates_replication_schema(
 
     # Reconstruct a pre-v32 boundary: remove every additive
     # Protected-Content object before downgrading metadata.
+    legacy.execute("DROP TRIGGER trg_source_protection_transition_block_blob_reuse")
+    legacy.execute("DROP TRIGGER trg_source_protection_transition_block_source_update")
+    legacy.execute("DROP TRIGGER trg_source_protection_transition_block_source_delete")
+    legacy.execute("DROP TRIGGER trg_source_protection_transition_block_representation")
+    legacy.execute("DROP TRIGGER trg_source_protection_transition_block_old_blob_update")
+    legacy.execute("DROP TRIGGER trg_source_protection_transition_block_old_blob_delete")
+    legacy.execute("DROP TABLE source_protection_transitions")
+    legacy.execute(
+        "DROP TABLE protected_sources"
+    )
+
     legacy.execute(
         "DROP TABLE "
         "protected_blob_envelopes"
@@ -741,7 +752,7 @@ def test_v30_to_v31_migration_creates_replication_schema(
             connection.execute(
                 "PRAGMA user_version"
             ).fetchone()[0]
-            == PROTECTED_CONTENT_SCHEMA_VERSION
+            == SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION
         )
 
         tables = {
@@ -786,9 +797,9 @@ def test_v30_to_v31_migration_creates_replication_schema(
         assert metadata is not None
 
         assert tuple(metadata) == (
-            PROTECTED_CONTENT_SCHEMA_VERSION,
-            PROTECTED_CONTENT_MIGRATION_ID,
-            PROTECTED_CONTENT_SCHEMA_VERSION,
+            SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
+            SOURCE_PROTECTION_TRANSITION_MIGRATION_ID,
+            SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
         )
 
         assert connection.execute(
@@ -839,6 +850,17 @@ def test_v30_migration_backfills_existing_spool_blob(
 
     # Reconstruct a pre-v32 boundary: remove every additive
     # Protected-Content object before downgrading metadata.
+    legacy.execute("DROP TRIGGER trg_source_protection_transition_block_blob_reuse")
+    legacy.execute("DROP TRIGGER trg_source_protection_transition_block_source_update")
+    legacy.execute("DROP TRIGGER trg_source_protection_transition_block_source_delete")
+    legacy.execute("DROP TRIGGER trg_source_protection_transition_block_representation")
+    legacy.execute("DROP TRIGGER trg_source_protection_transition_block_old_blob_update")
+    legacy.execute("DROP TRIGGER trg_source_protection_transition_block_old_blob_delete")
+    legacy.execute("DROP TABLE source_protection_transitions")
+    legacy.execute(
+        "DROP TABLE protected_sources"
+    )
+
     legacy.execute(
         "DROP TABLE "
         "protected_blob_envelopes"

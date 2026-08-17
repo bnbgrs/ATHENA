@@ -7,6 +7,7 @@ import uuid
 
 from athena.common.ids import new_uuid7, uuid_from_blob, uuid_to_blob
 from athena.common.time import utc_now_us
+from athena.security.models import ProtectedBlobEnvelopeRecord
 from athena.source.blob_store import PreparedBlob
 from athena.source.models import (
     BlobRecord,
@@ -15,6 +16,10 @@ from athena.source.models import (
     SourceLifecycleState,
     SourceRecord,
     SourceType,
+)
+from athena.source.protected_blob import (
+    PROTECTED_BLOB_ENCRYPTION_STATE,
+    PreparedProtectedBlob,
 )
 from athena.storage.database import SQLiteDatabase
 
@@ -25,6 +30,14 @@ class SourceNotFoundError(LookupError):
 
 class SourceActorError(LookupError):
     """Raised when the capture actor does not exist or is inactive."""
+
+
+class ProtectedSourceInvariantError(RuntimeError):
+    """Raised when Protected Source persistence is internally inconsistent."""
+
+
+class SourceProtectionTransitionPendingError(RuntimeError):
+    """Raised while an existing Source has an active protection transition."""
 
 
 class SourceRepository:
@@ -114,13 +127,10 @@ class SourceRepository:
                         now_us,
                     ),
                 )
-                connection.execute(
-                    """
-                    INSERT INTO commit_changes (
-                        commit_seq, entity_id, revision_id, change_type
-                    ) VALUES (?, ?, NULL, 'create')
-                    """,
-                    (commit_seq, uuid_to_blob(blob_id)),
+                self._insert_commit_change(
+                    connection,
+                    commit_seq=commit_seq,
+                    entity_id=blob_id,
                 )
 
             self._insert_entity(
@@ -170,13 +180,10 @@ class SourceRepository:
                     uuid_to_blob(source_provenance_id),
                 ),
             )
-            connection.execute(
-                """
-                INSERT INTO commit_changes (
-                    commit_seq, entity_id, revision_id, change_type
-                ) VALUES (?, ?, NULL, 'create')
-                """,
-                (commit_seq, uuid_to_blob(source_id)),
+            self._insert_commit_change(
+                connection,
+                commit_seq=commit_seq,
+                entity_id=source_id,
             )
 
         source = SourceRecord(
@@ -204,7 +211,233 @@ class SourceRepository:
             created_at_us=now_us,
             verified_at_us=now_us,
         )
-        return SourceCaptureResult(source=source, blob=blob, reused_blob=reused_blob)
+        return SourceCaptureResult(
+            source=source,
+            blob=blob,
+            reused_blob=reused_blob,
+        )
+
+    def capture_protected_file(
+        self,
+        *,
+        actor_id: uuid.UUID,
+        prepared: PreparedProtectedBlob,
+        protected_metadata_payload_id: uuid.UUID,
+    ) -> SourceCaptureResult:
+        now_us = utc_now_us()
+        source_id = new_uuid7()
+        source_provenance_id = new_uuid7()
+        blob_provenance_id = new_uuid7()
+        commit_id = new_uuid7()
+        scope_id = prepared.envelope.protection_scope_id
+        blob_id = prepared.blob_id
+
+        if (
+            prepared.envelope.blob_id != blob_id
+            or prepared.prepared_blob.media_type != "application/octet-stream"
+        ):
+            raise ProtectedSourceInvariantError(
+                "Protected Blob preparation is inconsistent."
+            )
+
+        with self.database.write_transaction() as connection:
+            self._require_active_actor(connection, actor_id)
+            self._require_active_scope(connection, scope_id)
+            self._require_metadata_payload(
+                connection,
+                protected_metadata_payload_id,
+                scope_id,
+            )
+            commit_seq = self._insert_commit(
+                connection,
+                commit_id=commit_id,
+                actor_id=actor_id,
+                operation_type="source.capture.protected_file",
+                committed_at_us=now_us,
+            )
+
+            self._insert_entity(
+                connection,
+                entity_id=blob_id,
+                entity_type="blob_record",
+                actor_id=actor_id,
+                created_at_us=now_us,
+                commit_seq=commit_seq,
+                protection_scope_id=scope_id,
+            )
+            self._insert_provenance(
+                connection,
+                provenance_id=blob_provenance_id,
+                entity_id=blob_id,
+                operation="blob.capture.protected",
+                actor_id=actor_id,
+                created_at_us=now_us,
+                protection_scope_id=scope_id,
+            )
+            blob = prepared.prepared_blob
+            connection.execute(
+                """
+                INSERT INTO blob_records (
+                    blob_id,
+                    byte_length,
+                    media_type,
+                    storage_area,
+                    storage_locator,
+                    integrity_sha256,
+                    encryption_state,
+                    created_at_us,
+                    verified_at_us
+                ) VALUES (
+                    ?, ?, 'application/octet-stream',
+                    ?, ?, ?, 'protected_v1', ?, ?
+                )
+                """,
+                (
+                    uuid_to_blob(blob_id),
+                    blob.byte_length,
+                    blob.storage_area.value,
+                    blob.storage_locator,
+                    blob.integrity_sha256,
+                    now_us,
+                    now_us,
+                ),
+            )
+            envelope = prepared.envelope
+            connection.execute(
+                """
+                INSERT INTO protected_blob_envelopes (
+                    blob_id,
+                    protection_scope_id,
+                    scope_key_id,
+                    wrapped_dek,
+                    dek_wrap_nonce,
+                    nonce_prefix,
+                    chunk_size,
+                    cipher_suite,
+                    format_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    uuid_to_blob(envelope.blob_id),
+                    uuid_to_blob(envelope.protection_scope_id),
+                    uuid_to_blob(envelope.scope_key_id),
+                    envelope.wrapped_dek,
+                    envelope.dek_wrap_nonce,
+                    envelope.nonce_prefix,
+                    envelope.chunk_size,
+                    envelope.cipher_suite,
+                    envelope.format_version,
+                ),
+            )
+            self._insert_commit_change(
+                connection,
+                commit_seq=commit_seq,
+                entity_id=blob_id,
+            )
+
+            self._insert_entity(
+                connection,
+                entity_id=source_id,
+                entity_type="source",
+                actor_id=actor_id,
+                created_at_us=now_us,
+                commit_seq=commit_seq,
+                protection_scope_id=scope_id,
+            )
+            self._insert_provenance(
+                connection,
+                provenance_id=source_provenance_id,
+                entity_id=source_id,
+                operation="source.capture.protected_file",
+                actor_id=actor_id,
+                created_at_us=now_us,
+                protection_scope_id=scope_id,
+            )
+            connection.execute(
+                """
+                INSERT INTO sources (
+                    source_id,
+                    source_type,
+                    created_at_us,
+                    acquired_at_us,
+                    original_name,
+                    original_modified_at_us,
+                    mime_type,
+                    blob_id,
+                    content_sha256,
+                    source_uri,
+                    lifecycle_state,
+                    provenance_id
+                ) VALUES (
+                    ?, ?, ?, ?,
+                    NULL, NULL, 'application/octet-stream',
+                    ?, ?, NULL, 'captured', ?
+                )
+                """,
+                (
+                    uuid_to_blob(source_id),
+                    prepared.metadata.source_type.value,
+                    now_us,
+                    now_us,
+                    uuid_to_blob(blob_id),
+                    blob.integrity_sha256,
+                    uuid_to_blob(source_provenance_id),
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO protected_sources (
+                    source_id,
+                    protection_scope_id,
+                    protected_metadata_payload_id,
+                    created_at_us
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    uuid_to_blob(source_id),
+                    uuid_to_blob(scope_id),
+                    uuid_to_blob(protected_metadata_payload_id),
+                    now_us,
+                ),
+            )
+            self._insert_commit_change(
+                connection,
+                commit_seq=commit_seq,
+                entity_id=source_id,
+            )
+
+        source = SourceRecord(
+            source_id=source_id,
+            source_type=prepared.metadata.source_type,
+            created_at_us=now_us,
+            acquired_at_us=now_us,
+            original_name=None,
+            original_modified_at_us=None,
+            mime_type="application/octet-stream",
+            blob_id=blob_id,
+            content_sha256=prepared.prepared_blob.integrity_sha256,
+            source_uri=None,
+            lifecycle_state=SourceLifecycleState.CAPTURED,
+            provenance_id=source_provenance_id,
+            protection_scope_id=scope_id,
+            protected_metadata_payload_id=protected_metadata_payload_id,
+        )
+        blob_record = BlobRecord(
+            blob_id=blob_id,
+            byte_length=prepared.prepared_blob.byte_length,
+            media_type="application/octet-stream",
+            storage_area=prepared.prepared_blob.storage_area,
+            storage_locator=prepared.prepared_blob.storage_locator,
+            integrity_sha256=prepared.prepared_blob.integrity_sha256,
+            encryption_state=PROTECTED_BLOB_ENCRYPTION_STATE,
+            created_at_us=now_us,
+            verified_at_us=now_us,
+        )
+        return SourceCaptureResult(
+            source=source,
+            blob=blob_record,
+            reused_blob=False,
+        )
 
     def find_blob_by_integrity(
         self,
@@ -218,74 +451,130 @@ class SourceRepository:
             byte_length=byte_length,
         )
 
-    def get(self, source_id: uuid.UUID) -> tuple[SourceRecord, BlobRecord]:
+    def is_protection_transitioning(
+        self,
+        source_id: uuid.UUID,
+    ) -> bool:
         row = self.database.connection.execute(
             """
-            SELECT
-                s.source_id,
-                s.source_type,
-                s.created_at_us AS source_created_at_us,
-                s.acquired_at_us,
-                s.original_name,
-                s.original_modified_at_us,
-                s.mime_type,
-                s.blob_id,
-                s.content_sha256,
-                s.source_uri,
-                s.lifecycle_state,
-                s.provenance_id,
-                b.byte_length,
-                b.media_type AS blob_media_type,
-                b.storage_area,
-                b.storage_locator,
-                b.integrity_sha256,
-                b.encryption_state,
-                b.created_at_us AS blob_created_at_us,
-                b.verified_at_us
-            FROM sources AS s
-            JOIN blob_records AS b ON b.blob_id = s.blob_id
-            WHERE s.source_id = ?
+            SELECT 1
+            FROM source_protection_transitions
+            WHERE source_id = ?
             """,
+            (uuid_to_blob(source_id),),
+        ).fetchone()
+        return row is not None
+
+    def get(
+        self,
+        source_id: uuid.UUID,
+        *,
+        allow_protection_transition: bool = False,
+    ) -> tuple[SourceRecord, BlobRecord]:
+        if (
+            not allow_protection_transition
+            and self.is_protection_transitioning(source_id)
+        ):
+            raise SourceProtectionTransitionPendingError(
+                "Source protection transition is active."
+            )
+        row = self.database.connection.execute(
+            self._source_query() + """\nWHERE s.source_id = ?\n""",
             (uuid_to_blob(source_id),),
         ).fetchone()
         if row is None:
             raise SourceNotFoundError(str(source_id))
         return self._source_from_row(row), self._blob_from_row(row)
 
-    def list(self, *, limit: int = 50) -> tuple[tuple[SourceRecord, BlobRecord], ...]:
+    def list(
+        self,
+        *,
+        limit: int = 50,
+    ) -> tuple[tuple[SourceRecord, BlobRecord], ...]:
         if limit < 1 or limit > 500:
             raise ValueError("Source list limit must be between 1 and 500.")
         rows = self.database.connection.execute(
-            """
-            SELECT
-                s.source_id,
-                s.source_type,
-                s.created_at_us AS source_created_at_us,
-                s.acquired_at_us,
-                s.original_name,
-                s.original_modified_at_us,
-                s.mime_type,
-                s.blob_id,
-                s.content_sha256,
-                s.source_uri,
-                s.lifecycle_state,
-                s.provenance_id,
-                b.byte_length,
-                b.media_type AS blob_media_type,
-                b.storage_area,
-                b.storage_locator,
-                b.integrity_sha256,
-                b.encryption_state,
-                b.created_at_us AS blob_created_at_us,
-                b.verified_at_us
-            FROM sources AS s
-            JOIN blob_records AS b ON b.blob_id = s.blob_id
+            self._source_query()
+            + """
             ORDER BY s.acquired_at_us DESC, s.source_id DESC
             LIMIT ?
             """,
             (limit,),
         ).fetchall()
-        return tuple((self._source_from_row(row), self._blob_from_row(row)) for row in rows)
+        return tuple(
+            (self._source_from_row(row), self._blob_from_row(row))
+            for row in rows
+        )
+
+    def get_protected_blob_envelope(
+        self,
+        blob_id: uuid.UUID,
+    ) -> ProtectedBlobEnvelopeRecord:
+        row = self.database.connection.execute(
+            """
+            SELECT
+                blob_id,
+                protection_scope_id,
+                scope_key_id,
+                wrapped_dek,
+                dek_wrap_nonce,
+                nonce_prefix,
+                chunk_size,
+                cipher_suite,
+                format_version
+            FROM protected_blob_envelopes
+            WHERE blob_id = ?
+            """,
+            (uuid_to_blob(blob_id),),
+        ).fetchone()
+        if row is None:
+            raise ProtectedSourceInvariantError(
+                "Protected Blob envelope is missing."
+            )
+        return ProtectedBlobEnvelopeRecord(
+            blob_id=uuid_from_blob(bytes(row["blob_id"])),
+            protection_scope_id=uuid_from_blob(
+                bytes(row["protection_scope_id"])
+            ),
+            scope_key_id=uuid_from_blob(bytes(row["scope_key_id"])),
+            wrapped_dek=bytes(row["wrapped_dek"]),
+            dek_wrap_nonce=bytes(row["dek_wrap_nonce"]),
+            nonce_prefix=bytes(row["nonce_prefix"]),
+            chunk_size=int(row["chunk_size"]),
+            cipher_suite=str(row["cipher_suite"]),
+            format_version=int(row["format_version"]),
+        )
+
+    @staticmethod
+    def _source_query() -> str:
+        return """
+        SELECT
+            s.source_id,
+            s.source_type,
+            s.created_at_us AS source_created_at_us,
+            s.acquired_at_us,
+            s.original_name,
+            s.original_modified_at_us,
+            s.mime_type,
+            s.blob_id,
+            s.content_sha256,
+            s.source_uri,
+            s.lifecycle_state,
+            s.provenance_id,
+            ps.protection_scope_id,
+            ps.protected_metadata_payload_id,
+            b.byte_length,
+            b.media_type AS blob_media_type,
+            b.storage_area,
+            b.storage_locator,
+            b.integrity_sha256,
+            b.encryption_state,
+            b.created_at_us AS blob_created_at_us,
+            b.verified_at_us
+        FROM sources AS s
+        JOIN blob_records AS b ON b.blob_id = s.blob_id
+        LEFT JOIN protected_sources AS ps ON ps.source_id = s.source_id
+        """
 
     @staticmethod
     def _find_blob_by_integrity(
@@ -319,25 +608,49 @@ class SourceRepository:
 
     @staticmethod
     def _source_from_row(row: sqlite3.Row) -> SourceRecord:
+        scope_raw = row["protection_scope_id"]
+        metadata_raw = row["protected_metadata_payload_id"]
+        if (scope_raw is None) != (metadata_raw is None):
+            raise ProtectedSourceInvariantError(
+                "Protected Source membership is incomplete."
+            )
         return SourceRecord(
             source_id=uuid_from_blob(bytes(row["source_id"])),
             source_type=SourceType(str(row["source_type"])),
             created_at_us=int(row["source_created_at_us"]),
             acquired_at_us=int(row["acquired_at_us"]),
             original_name=(
-                str(row["original_name"]) if row["original_name"] is not None else None
+                str(row["original_name"])
+                if row["original_name"] is not None
+                else None
             ),
             original_modified_at_us=(
                 int(row["original_modified_at_us"])
                 if row["original_modified_at_us"] is not None
                 else None
             ),
-            mime_type=str(row["mime_type"]) if row["mime_type"] is not None else None,
+            mime_type=(
+                str(row["mime_type"])
+                if row["mime_type"] is not None
+                else None
+            ),
             blob_id=uuid_from_blob(bytes(row["blob_id"])),
             content_sha256=bytes(row["content_sha256"]),
-            source_uri=str(row["source_uri"]) if row["source_uri"] is not None else None,
+            source_uri=(
+                str(row["source_uri"])
+                if row["source_uri"] is not None
+                else None
+            ),
             lifecycle_state=SourceLifecycleState(str(row["lifecycle_state"])),
             provenance_id=uuid_from_blob(bytes(row["provenance_id"])),
+            protection_scope_id=(
+                None if scope_raw is None else uuid_from_blob(bytes(scope_raw))
+            ),
+            protected_metadata_payload_id=(
+                None
+                if metadata_raw is None
+                else uuid_from_blob(bytes(metadata_raw))
+            ),
         )
 
     @staticmethod
@@ -359,13 +672,57 @@ class SourceRepository:
         )
 
     @staticmethod
-    def _require_active_actor(connection: sqlite3.Connection, actor_id: uuid.UUID) -> None:
+    def _require_active_actor(
+        connection: sqlite3.Connection,
+        actor_id: uuid.UUID,
+    ) -> None:
         row = connection.execute(
             "SELECT active FROM actors WHERE actor_id = ?",
             (uuid_to_blob(actor_id),),
         ).fetchone()
         if row is None or int(row["active"]) != 1:
             raise SourceActorError(str(actor_id))
+
+    @staticmethod
+    def _require_active_scope(
+        connection: sqlite3.Connection,
+        protection_scope_id: uuid.UUID,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT lifecycle_state
+            FROM protection_scopes
+            WHERE protection_scope_id = ?
+            """,
+            (uuid_to_blob(protection_scope_id),),
+        ).fetchone()
+        if row is None or str(row["lifecycle_state"]) != "active":
+            raise ProtectedSourceInvariantError(
+                "Protected Source requires an active ProtectionScope."
+            )
+
+    @staticmethod
+    def _require_metadata_payload(
+        connection: sqlite3.Connection,
+        protected_payload_id: uuid.UUID,
+        protection_scope_id: uuid.UUID,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT protection_scope_id
+            FROM protected_payloads
+            WHERE protected_payload_id = ?
+            """,
+            (uuid_to_blob(protected_payload_id),),
+        ).fetchone()
+        if (
+            row is None
+            or bytes(row["protection_scope_id"])
+            != uuid_to_blob(protection_scope_id)
+        ):
+            raise ProtectedSourceInvariantError(
+                "Protected Source metadata payload does not belong to its scope."
+            )
 
     @staticmethod
     def _insert_commit(
@@ -402,9 +759,15 @@ class SourceRepository:
         actor_id: uuid.UUID,
         created_at_us: int,
         commit_seq: int,
+        protection_scope_id: uuid.UUID | None = None,
     ) -> None:
         entity_blob = uuid_to_blob(entity_id)
         actor_blob = uuid_to_blob(actor_id)
+        scope_blob = (
+            None
+            if protection_scope_id is None
+            else uuid_to_blob(protection_scope_id)
+        )
         connection.execute(
             """
             INSERT INTO entity_registry (
@@ -416,9 +779,9 @@ class SourceRepository:
                 lifecycle_state,
                 protection_scope_id,
                 schema_version
-            ) VALUES (?, ?, 'raw_archive', ?, ?, 'active', NULL, 1)
+            ) VALUES (?, ?, 'raw_archive', ?, ?, 'active', ?, 1)
             """,
-            (entity_blob, entity_type, created_at_us, actor_blob),
+            (entity_blob, entity_type, created_at_us, actor_blob, scope_blob),
         )
         connection.execute(
             """
@@ -430,9 +793,9 @@ class SourceRepository:
                 protection_scope_id,
                 changed_by_actor_id,
                 reason
-            ) VALUES (?, ?, NULL, 'active', NULL, ?, NULL)
+            ) VALUES (?, ?, NULL, 'active', ?, ?, NULL)
             """,
-            (entity_blob, commit_seq, actor_blob),
+            (entity_blob, commit_seq, scope_blob, actor_blob),
         )
 
     @staticmethod
@@ -444,7 +807,13 @@ class SourceRepository:
         operation: str,
         actor_id: uuid.UUID,
         created_at_us: int,
+        protection_scope_id: uuid.UUID | None = None,
     ) -> None:
+        scope_blob = (
+            None
+            if protection_scope_id is None
+            else uuid_to_blob(protection_scope_id)
+        )
         connection.execute(
             """
             INSERT INTO provenance_records (
@@ -458,7 +827,7 @@ class SourceRepository:
                 processing_run_id,
                 reason,
                 protection_scope_id
-            ) VALUES (?, ?, NULL, ?, ?, ?, NULL, NULL, NULL, NULL)
+            ) VALUES (?, ?, NULL, ?, ?, ?, NULL, NULL, NULL, ?)
             """,
             (
                 uuid_to_blob(provenance_id),
@@ -466,5 +835,22 @@ class SourceRepository:
                 operation,
                 uuid_to_blob(actor_id),
                 created_at_us,
+                scope_blob,
             ),
+        )
+
+    @staticmethod
+    def _insert_commit_change(
+        connection: sqlite3.Connection,
+        *,
+        commit_seq: int,
+        entity_id: uuid.UUID,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO commit_changes (
+                commit_seq, entity_id, revision_id, change_type
+            ) VALUES (?, ?, NULL, 'create')
+            """,
+            (commit_seq, uuid_to_blob(entity_id)),
         )

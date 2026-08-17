@@ -108,6 +108,8 @@ class SourceRecord:
     source_uri: str | None
     lifecycle_state: SourceLifecycleState
     provenance_id: uuid.UUID
+    protection_scope_id: uuid.UUID | None = None
+    protected_metadata_payload_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)

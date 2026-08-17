@@ -207,6 +207,19 @@ class ProtectedPayloadRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class ProtectedBlobEnvelopeRecord:
+    blob_id: uuid.UUID
+    protection_scope_id: uuid.UUID
+    scope_key_id: uuid.UUID
+    wrapped_dek: bytes
+    dek_wrap_nonce: bytes
+    nonce_prefix: bytes
+    chunk_size: int
+    cipher_suite: str
+    format_version: int
+
+
+@dataclass(frozen=True, slots=True)
 class SecurityContext:
     """Runtime-only authorization view. It is never persisted."""
 

@@ -103,6 +103,10 @@ from athena.source.html_representation_service import SourceHtmlRepresentationSe
 from athena.source.html_representation_store import HtmlNativeTextRepresentationStore
 from athena.source.pdf_representation_service import SourcePdfRepresentationService
 from athena.source.pdf_representation_store import PdfNativeTextRepresentationStore
+from athena.source.protection_transition import (
+    SourceProtectionTransitionRepository,
+    SourceProtectionTransitionService,
+)
 from athena.source.repository import SourceRepository
 from athena.source.representation_repository import SourceRepresentationRepository
 from athena.source.representation_service import SourceTextRepresentationService
@@ -168,6 +172,16 @@ class AthenaApplication:
             replication=self.archive_replication,
         )
         self.source_repository = SourceRepository(self.database)
+        self.source_protection_repository = (
+            SourceProtectionTransitionRepository(self.database)
+        )
+        self.source_protection = SourceProtectionTransitionService(
+            repository=self.source_protection_repository,
+            sources=self.source_repository,
+            blob_store=self.blob_store,
+            protected_content=self.protected_content,
+            chat=self.chat,
+        )
         self.source_representation_repository = SourceRepresentationRepository(self.database)
         self.source_anchor_repository = SourceAnchorRepository(self.database)
         self.chunking_profiles = ChunkingProfileRepository(self.database)
@@ -180,6 +194,8 @@ class AthenaApplication:
             repository=self.source_repository,
             blob_store=self.blob_store,
             chat=self.chat,
+            protected_content=self.protected_content,
+            protection_transitions=self.source_protection,
         )
         self.backup = BackupService(
             database=self.database,
@@ -505,6 +521,7 @@ class AthenaApplication:
             RuntimeLayoutService(self.paths),
             self.database,
             self.protected_content,
+            self.source_protection,
         )
         self.services = ServiceManager(bootstrap_services + services)
 

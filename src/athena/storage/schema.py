@@ -48,7 +48,9 @@ PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION = 29
 NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION = 30
 ARCHIVE_REPLICATION_SCHEMA_VERSION = 31
 PROTECTED_CONTENT_SCHEMA_VERSION = 32
-SCHEMA_VERSION = PROTECTED_CONTENT_SCHEMA_VERSION
+PROTECTED_SOURCE_BLOB_SCHEMA_VERSION = 33
+SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION = 34
+SCHEMA_VERSION = SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
@@ -90,6 +92,10 @@ ARCHIVE_REPLICATION_MIGRATION_ID = (
 PROTECTED_CONTENT_MIGRATION_ID = (
     "0032_protected_content_foundation"
 )
+PROTECTED_SOURCE_BLOB_MIGRATION_ID = (
+    "0033_protected_source_blob_storage"
+)
+SOURCE_PROTECTION_TRANSITION_MIGRATION_ID = "0034_source_protection_transition"
 
 
 class DatabaseCompatibilityError(RuntimeError):
@@ -186,6 +192,8 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION,
         NEWS_EVENT_ELIGIBILITY_SCHEMA_VERSION,
         ARCHIVE_REPLICATION_SCHEMA_VERSION,
+        PROTECTED_CONTENT_SCHEMA_VERSION,
+        PROTECTED_SOURCE_BLOB_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -365,8 +373,28 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
             PROTECTED_CONTENT_SCHEMA_VERSION
         )
 
+    if (
+        existing_user_version
+        == PROTECTED_CONTENT_SCHEMA_VERSION
+    ):
+        _verify_schema_v32(connection)
+        _migrate_schema_v32_to_v33(connection)
+        existing_user_version = (
+            PROTECTED_SOURCE_BLOB_SCHEMA_VERSION
+        )
+
+    if (
+        existing_user_version
+        == PROTECTED_SOURCE_BLOB_SCHEMA_VERSION
+    ):
+        _verify_schema_v33(connection)
+        _migrate_schema_v33_to_v34(connection)
+        existing_user_version = (
+            SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION
+        )
+
     _configure_connection(connection)
-    _verify_schema_v32(connection)
+    _verify_schema_v34(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -3080,6 +3108,870 @@ def _migrate_schema_v31_to_v32(
         connection.rollback()
         raise
 
+
+def _migrate_schema_v32_to_v33(
+    connection: sqlite3.Connection,
+) -> None:
+    """Enable encrypted BlobRecords and Protected Source membership."""
+    if connection.in_transaction:
+        raise RuntimeError(
+            "Protected Source/Blob migration requires no active transaction."
+        )
+
+    _verify_schema_v32(connection)
+
+    previous_foreign_keys = int(
+        connection.execute("PRAGMA foreign_keys").fetchone()[0]
+    )
+    previous_legacy_alter = int(
+        connection.execute("PRAGMA legacy_alter_table").fetchone()[0]
+    )
+    connection.execute("PRAGMA foreign_keys = OFF")
+    connection.execute("PRAGMA legacy_alter_table = ON")
+
+    try:
+        connection.executescript(
+            f"""
+            BEGIN IMMEDIATE;
+
+            DROP TRIGGER
+                trg_blob_records_archive_replication_outbox;
+
+            ALTER TABLE blob_records
+                RENAME TO blob_records_v32;
+
+            CREATE TABLE blob_records (
+                blob_id BLOB(16) PRIMARY KEY
+                    CHECK(length(blob_id) = 16),
+                byte_length INTEGER NOT NULL
+                    CHECK(byte_length >= 0),
+                media_type TEXT NULL,
+                storage_area TEXT NOT NULL
+                    CHECK(storage_area IN ('archive', 'spool')),
+                storage_locator TEXT NOT NULL
+                    CHECK(length(storage_locator) > 0),
+                integrity_sha256 BLOB(32) NOT NULL
+                    CHECK(length(integrity_sha256) = 32),
+                encryption_state TEXT NOT NULL
+                    CHECK(encryption_state IN ('none', 'protected_v1')),
+                created_at_us INTEGER NOT NULL,
+                verified_at_us INTEGER NOT NULL,
+                UNIQUE(integrity_sha256, byte_length, encryption_state),
+                UNIQUE(storage_area, storage_locator),
+                FOREIGN KEY(blob_id)
+                    REFERENCES entity_registry(entity_id)
+            ) WITHOUT ROWID;
+
+            INSERT INTO blob_records (
+                blob_id,
+                byte_length,
+                media_type,
+                storage_area,
+                storage_locator,
+                integrity_sha256,
+                encryption_state,
+                created_at_us,
+                verified_at_us
+            )
+            SELECT
+                blob_id,
+                byte_length,
+                media_type,
+                storage_area,
+                storage_locator,
+                integrity_sha256,
+                encryption_state,
+                created_at_us,
+                verified_at_us
+            FROM blob_records_v32;
+
+            DROP TABLE blob_records_v32;
+
+            CREATE TRIGGER
+                trg_blob_records_archive_replication_outbox
+            AFTER INSERT ON blob_records
+            WHEN NEW.storage_area = 'spool'
+            BEGIN
+                INSERT OR IGNORE INTO archive_replication_outbox (
+                    blob_id,
+                    target_role,
+                    state,
+                    attempt_count,
+                    created_at_us,
+                    last_attempt_at_us,
+                    last_error_code,
+                    last_error_detail,
+                    verified_at_us
+                ) VALUES (
+                    NEW.blob_id,
+                    'archive_root',
+                    'pending',
+                    0,
+                    NEW.created_at_us,
+                    NULL,
+                    NULL,
+                    NULL,
+                    NULL
+                );
+            END;
+
+            CREATE TABLE protected_sources (
+                source_id BLOB(16) PRIMARY KEY
+                    CHECK(length(source_id) = 16),
+                protection_scope_id BLOB(16) NOT NULL
+                    CHECK(length(protection_scope_id) = 16),
+                protected_metadata_payload_id BLOB(16) NOT NULL UNIQUE
+                    CHECK(length(protected_metadata_payload_id) = 16),
+                created_at_us INTEGER NOT NULL,
+                FOREIGN KEY(source_id)
+                    REFERENCES sources(source_id),
+                FOREIGN KEY(protection_scope_id)
+                    REFERENCES protection_scopes(protection_scope_id),
+                FOREIGN KEY(protected_metadata_payload_id)
+                    REFERENCES protected_payloads(protected_payload_id)
+            ) WITHOUT ROWID;
+
+            CREATE INDEX idx_protected_sources_scope
+            ON protected_sources(
+                protection_scope_id,
+                created_at_us,
+                source_id
+            );
+
+            UPDATE schema_metadata
+            SET schema_version = {
+                    PROTECTED_SOURCE_BLOB_SCHEMA_VERSION
+                },
+                last_migration_id = '{
+                    PROTECTED_SOURCE_BLOB_MIGRATION_ID
+                }',
+                minimum_reader_version = {
+                    PROTECTED_SOURCE_BLOB_SCHEMA_VERSION
+                }
+            WHERE singleton_id = 1;
+
+            PRAGMA user_version = {
+                PROTECTED_SOURCE_BLOB_SCHEMA_VERSION
+            };
+
+            COMMIT;
+            """
+        )
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.execute(
+            "PRAGMA legacy_alter_table = " + str(previous_legacy_alter)
+        )
+        connection.execute(
+            "PRAGMA foreign_keys = " + str(previous_foreign_keys)
+        )
+
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise DatabaseCompatibilityError(
+            "Protected Source/Blob migration produced invalid foreign keys."
+        )
+
+def _migrate_schema_v33_to_v34(
+    connection: sqlite3.Connection,
+) -> None:
+    """Add restart-safe copy-on-write protection transitions for existing Sources."""
+    if connection.in_transaction:
+        raise RuntimeError(
+            "Source protection transition migration requires no active transaction."
+        )
+
+    _verify_schema_v33(connection)
+
+    try:
+        connection.executescript(
+            f"""
+            BEGIN IMMEDIATE;
+
+            CREATE TABLE source_protection_transitions (
+                transition_id BLOB(16) PRIMARY KEY
+                    CHECK(length(transition_id) = 16),
+                source_id BLOB(16) NOT NULL UNIQUE
+                    CHECK(length(source_id) = 16),
+                protection_scope_id BLOB(16) NOT NULL
+                    CHECK(length(protection_scope_id) = 16),
+                old_blob_id BLOB(16) NOT NULL UNIQUE
+                    CHECK(length(old_blob_id) = 16),
+                target_blob_id BLOB(16) NULL UNIQUE
+                    CHECK(
+                        target_blob_id IS NULL
+                        OR length(target_blob_id) = 16
+                    ),
+                protected_metadata_payload_id BLOB(16) NULL UNIQUE
+                    CHECK(
+                        protected_metadata_payload_id IS NULL
+                        OR length(protected_metadata_payload_id) = 16
+                    ),
+                state TEXT NOT NULL
+                    CHECK(state IN ('pending', 'prepared', 'sanitized')),
+                created_at_us INTEGER NOT NULL,
+                updated_at_us INTEGER NOT NULL
+                    CHECK(updated_at_us >= created_at_us),
+                FOREIGN KEY(source_id)
+                    REFERENCES sources(source_id),
+                FOREIGN KEY(protection_scope_id)
+                    REFERENCES protection_scopes(protection_scope_id),
+                FOREIGN KEY(old_blob_id)
+                    REFERENCES blob_records(blob_id),
+                FOREIGN KEY(target_blob_id)
+                    REFERENCES blob_records(blob_id),
+                FOREIGN KEY(protected_metadata_payload_id)
+                    REFERENCES protected_payloads(protected_payload_id),
+                CHECK(
+                    (
+                        state = 'pending'
+                        AND target_blob_id IS NULL
+                        AND protected_metadata_payload_id IS NULL
+                    )
+                    OR
+                    (
+                        state IN ('prepared', 'sanitized')
+                        AND target_blob_id IS NOT NULL
+                        AND protected_metadata_payload_id IS NOT NULL
+                    )
+                )
+            ) WITHOUT ROWID;
+
+            CREATE INDEX idx_source_protection_transitions_state
+            ON source_protection_transitions(
+                state,
+                updated_at_us,
+                transition_id
+            );
+
+            CREATE TRIGGER
+                trg_source_protection_transition_block_blob_reuse
+            BEFORE INSERT ON sources
+            WHEN EXISTS (
+                SELECT 1
+                FROM source_protection_transitions AS t
+                WHERE t.old_blob_id = NEW.blob_id
+            )
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'source protection transition active: blob reuse blocked'
+                );
+            END;
+
+            CREATE TRIGGER
+                trg_source_protection_transition_block_source_update
+            BEFORE UPDATE ON sources
+            WHEN EXISTS (
+                SELECT 1
+                FROM source_protection_transitions AS t
+                WHERE t.source_id = OLD.source_id
+                  AND NOT (
+                      t.state = 'prepared'
+                      AND t.target_blob_id IS NOT NULL
+                      AND NEW.blob_id = t.target_blob_id
+                      AND NEW.original_name IS NULL
+                      AND NEW.original_modified_at_us IS NULL
+                      AND NEW.mime_type = 'application/octet-stream'
+                      AND NEW.source_uri IS NULL
+                      AND NEW.content_sha256 = (
+                          SELECT b.integrity_sha256
+                          FROM blob_records AS b
+                          WHERE b.blob_id = t.target_blob_id
+                      )
+                      AND NEW.source_type = OLD.source_type
+                      AND NEW.created_at_us = OLD.created_at_us
+                      AND NEW.acquired_at_us = OLD.acquired_at_us
+                      AND NEW.lifecycle_state = OLD.lifecycle_state
+                      AND NEW.provenance_id = OLD.provenance_id
+                  )
+            )
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'source protection transition active: source update blocked'
+                );
+            END;
+
+            CREATE TRIGGER
+                trg_source_protection_transition_block_source_delete
+            BEFORE DELETE ON sources
+            WHEN EXISTS (
+                SELECT 1
+                FROM source_protection_transitions AS t
+                WHERE t.source_id = OLD.source_id
+            )
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'source protection transition active: source delete blocked'
+                );
+            END;
+
+            CREATE TRIGGER
+                trg_source_protection_transition_block_representation
+            BEFORE INSERT ON source_representations
+            WHEN EXISTS (
+                SELECT 1
+                FROM source_protection_transitions AS t
+                WHERE t.source_id = NEW.source_id
+                   OR t.old_blob_id = NEW.blob_id
+            )
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'source protection transition active: representation blocked'
+                );
+            END;
+
+            CREATE TRIGGER
+                trg_source_protection_transition_block_old_blob_update
+            BEFORE UPDATE ON blob_records
+            WHEN EXISTS (
+                SELECT 1
+                FROM source_protection_transitions AS t
+                WHERE t.old_blob_id = OLD.blob_id
+            )
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'source protection transition active: old blob update blocked'
+                );
+            END;
+
+            CREATE TRIGGER
+                trg_source_protection_transition_block_old_blob_delete
+            BEFORE DELETE ON blob_records
+            WHEN EXISTS (
+                SELECT 1
+                FROM source_protection_transitions AS t
+                WHERE t.old_blob_id = OLD.blob_id
+            )
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'source protection transition active: old blob delete blocked'
+                );
+            END;
+
+            UPDATE schema_metadata
+            SET schema_version = {
+                    SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION
+                },
+                last_migration_id = '{
+                    SOURCE_PROTECTION_TRANSITION_MIGRATION_ID
+                }',
+                minimum_reader_version = {
+                    SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION
+                }
+            WHERE singleton_id = 1;
+
+            PRAGMA user_version = {
+                SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION
+            };
+
+            COMMIT;
+            """
+        )
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def _verify_schema_v34(
+    connection: sqlite3.Connection,
+) -> None:
+    application_id = int(
+        connection.execute("PRAGMA application_id").fetchone()[0]
+    )
+    user_version = int(
+        connection.execute("PRAGMA user_version").fetchone()[0]
+    )
+    if (
+        application_id != ATHENA_APPLICATION_ID
+        or user_version != SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA Source protection transition schema version verification failed."
+        )
+
+    metadata = connection.execute(
+        "SELECT schema_version, "
+        "storage_layout_version, "
+        "blob_format_version, "
+        "last_migration_id, "
+        "minimum_reader_version "
+        "FROM schema_metadata "
+        "WHERE singleton_id = 1"
+    ).fetchone()
+    expected = (
+        SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
+        STORAGE_LAYOUT_VERSION,
+        BLOB_FORMAT_VERSION,
+        SOURCE_PROTECTION_TRANSITION_MIGRATION_ID,
+        SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
+    )
+    if metadata is None or tuple(metadata) != expected:
+        raise DatabaseCompatibilityError(
+            "ATHENA Source protection transition schema_metadata verification failed."
+        )
+
+    _verify_schema_v31_compatible(connection)
+
+    required_tables = {
+        "key_slots",
+        "protection_scopes",
+        "protection_scope_keys",
+        "protected_payloads",
+        "protected_blob_envelopes",
+        "protected_sources",
+        "source_protection_transitions",
+    }
+    missing = required_tables.difference(_user_tables(connection))
+    if missing:
+        raise DatabaseCompatibilityError(
+            "ATHENA Source protection transition schema is incomplete: "
+            + ", ".join(sorted(missing))
+            + "."
+        )
+
+    required_columns = {
+        "key_slots": {
+            "key_slot_id",
+            "slot_type",
+            "kdf_algorithm",
+            "kdf_parameters_json",
+            "salt",
+            "wrap_algorithm",
+            "wrap_nonce",
+            "wrapped_root_key",
+            "created_at_us",
+            "retired_at_us",
+            "status",
+        },
+        "protection_scopes": {
+            "protection_scope_id",
+            "lifecycle_state",
+            "created_at_us",
+            "current_scope_key_id",
+            "neutral_label",
+        },
+        "protection_scope_keys": {
+            "scope_key_id",
+            "protection_scope_id",
+            "key_version",
+            "wrap_algorithm",
+            "wrap_nonce",
+            "wrapped_scope_key",
+            "created_at_us",
+            "retired_at_us",
+            "status",
+        },
+        "protected_payloads": {
+            "protected_payload_id",
+            "protection_scope_id",
+            "scope_key_id",
+            "cipher_suite",
+            "ciphertext",
+            "nonce",
+            "wrapped_dek",
+            "dek_wrap_nonce",
+            "aad_version",
+            "ciphertext_hash",
+            "created_at_us",
+        },
+        "protected_blob_envelopes": {
+            "blob_id",
+            "protection_scope_id",
+            "scope_key_id",
+            "wrapped_dek",
+            "dek_wrap_nonce",
+            "nonce_prefix",
+            "chunk_size",
+            "cipher_suite",
+            "format_version",
+        },
+        "protected_sources": {
+            "source_id",
+            "protection_scope_id",
+            "protected_metadata_payload_id",
+            "created_at_us",
+        },
+        "source_protection_transitions": {
+            "transition_id",
+            "source_id",
+            "protection_scope_id",
+            "old_blob_id",
+            "target_blob_id",
+            "protected_metadata_payload_id",
+            "state",
+            "created_at_us",
+            "updated_at_us",
+        },
+    }
+    for table_name, columns in required_columns.items():
+        actual = {
+            str(row[1])
+            for row in connection.execute(
+                f"PRAGMA table_info({table_name})"
+            )
+        }
+        if not columns.issubset(actual):
+            raise DatabaseCompatibilityError(
+                f"ATHENA table {table_name!r} is incomplete."
+            )
+
+    scope_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(protection_scopes)"
+        )
+    }
+    if {"locked", "unlocked", "is_unlocked"} & scope_columns:
+        raise DatabaseCompatibilityError(
+            "ProtectionScope lock state must never be persisted."
+        )
+
+    password_index = connection.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'index'
+          AND name = 'uq_key_slots_active_password'
+        """
+    ).fetchone()
+    if password_index is None:
+        raise DatabaseCompatibilityError(
+            "ATHENA active-password-slot uniqueness index is missing."
+        )
+
+    blob_sql_row = connection.execute(
+        """
+        SELECT sql
+        FROM sqlite_master
+        WHERE type = 'table'
+          AND name = 'blob_records'
+        """
+    ).fetchone()
+    if blob_sql_row is None or "protected_v1" not in str(blob_sql_row[0]):
+        raise DatabaseCompatibilityError(
+            "ATHENA BlobRecord schema does not allow Protected Blobs."
+        )
+
+    missing_envelope = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM blob_records AS b
+        LEFT JOIN protected_blob_envelopes AS e
+          ON e.blob_id = b.blob_id
+        WHERE b.encryption_state = 'protected_v1'
+          AND e.blob_id IS NULL
+        """
+    ).fetchone()
+    if missing_envelope is None or int(missing_envelope[0]) != 0:
+        raise DatabaseCompatibilityError(
+            "A Protected Blob is missing its encrypted envelope."
+        )
+
+    invalid_source = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM protected_sources AS ps
+        JOIN sources AS s ON s.source_id = ps.source_id
+        JOIN blob_records AS b ON b.blob_id = s.blob_id
+        JOIN protected_blob_envelopes AS e ON e.blob_id = b.blob_id
+        JOIN protected_payloads AS p
+          ON p.protected_payload_id = ps.protected_metadata_payload_id
+        JOIN entity_registry AS se ON se.entity_id = s.source_id
+        JOIN entity_registry AS be ON be.entity_id = b.blob_id
+        WHERE
+            s.original_name IS NOT NULL
+            OR s.original_modified_at_us IS NOT NULL
+            OR s.source_uri IS NOT NULL
+            OR s.mime_type != 'application/octet-stream'
+            OR b.media_type != 'application/octet-stream'
+            OR b.encryption_state != 'protected_v1'
+            OR e.protection_scope_id != ps.protection_scope_id
+            OR p.protection_scope_id != ps.protection_scope_id
+            OR se.protection_scope_id != ps.protection_scope_id
+            OR be.protection_scope_id != ps.protection_scope_id
+        """
+    ).fetchone()
+    if invalid_source is None or int(invalid_source[0]) != 0:
+        raise DatabaseCompatibilityError(
+            "Protected Source public metadata or scope linkage is inconsistent."
+        )
+
+    invalid_transition = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM source_protection_transitions AS t
+        JOIN sources AS s ON s.source_id = t.source_id
+        JOIN blob_records AS old_b ON old_b.blob_id = t.old_blob_id
+        JOIN protection_scopes AS scope
+          ON scope.protection_scope_id = t.protection_scope_id
+        LEFT JOIN protected_sources AS ps ON ps.source_id = t.source_id
+        LEFT JOIN blob_records AS target_b ON target_b.blob_id = t.target_blob_id
+        LEFT JOIN protected_blob_envelopes AS e
+          ON e.blob_id = t.target_blob_id
+        LEFT JOIN protected_payloads AS p
+          ON p.protected_payload_id = t.protected_metadata_payload_id
+        WHERE
+            ps.source_id IS NOT NULL
+            OR old_b.encryption_state != 'none'
+            OR scope.lifecycle_state != 'active'
+            OR (
+                t.state IN ('pending', 'prepared')
+                AND (
+                    s.blob_id != t.old_blob_id
+                    OR s.original_name IS NULL
+                    OR s.source_uri IS NULL
+                    OR (
+                        SELECT COUNT(*)
+                        FROM sources AS refs
+                        WHERE refs.blob_id = t.old_blob_id
+                    ) != 1
+                )
+            )
+            OR (
+                t.state = 'sanitized'
+                AND (
+                    target_b.blob_id IS NULL
+                    OR s.blob_id != t.target_blob_id
+                    OR s.original_name IS NOT NULL
+                    OR s.original_modified_at_us IS NOT NULL
+                    OR s.source_uri IS NOT NULL
+                    OR s.mime_type != 'application/octet-stream'
+                    OR s.content_sha256 != target_b.integrity_sha256
+                    OR (
+                        SELECT COUNT(*)
+                        FROM sources AS refs
+                        WHERE refs.blob_id = t.old_blob_id
+                    ) != 0
+                )
+            )
+            OR (
+                t.state IN ('prepared', 'sanitized')
+                AND (
+                    target_b.blob_id IS NULL
+                    OR target_b.encryption_state != 'protected_v1'
+                    OR e.blob_id IS NULL
+                    OR e.protection_scope_id != t.protection_scope_id
+                    OR p.protected_payload_id IS NULL
+                    OR p.protection_scope_id != t.protection_scope_id
+                )
+            )
+            OR (
+                SELECT COUNT(*)
+                FROM source_representations AS r
+                WHERE r.source_id = t.source_id
+                   OR r.blob_id = t.old_blob_id
+            ) != 0
+        """
+    ).fetchone()
+    if invalid_transition is None or int(invalid_transition[0]) != 0:
+        raise DatabaseCompatibilityError(
+            "A Source protection transition violates its durable safety invariants."
+        )
+
+    expected_triggers = {
+        "trg_source_protection_transition_block_blob_reuse",
+        "trg_source_protection_transition_block_source_update",
+        "trg_source_protection_transition_block_source_delete",
+        "trg_source_protection_transition_block_representation",
+        "trg_source_protection_transition_block_old_blob_update",
+        "trg_source_protection_transition_block_old_blob_delete",
+    }
+    actual_triggers = {
+        str(row[0])
+        for row in connection.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'trigger'
+              AND name LIKE 'trg_source_protection_transition_%'
+            """
+        )
+    }
+    if actual_triggers != expected_triggers:
+        raise DatabaseCompatibilityError(
+            "ATHENA Source protection transition guards are incomplete."
+        )
+
+    invalid_active_scope = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM protection_scopes AS s
+        LEFT JOIN protection_scope_keys AS k
+          ON k.scope_key_id = s.current_scope_key_id
+         AND k.protection_scope_id = s.protection_scope_id
+        WHERE s.lifecycle_state = 'active'
+          AND (
+              s.current_scope_key_id IS NULL
+              OR k.scope_key_id IS NULL
+          )
+        """
+    ).fetchone()
+    if invalid_active_scope is None or int(invalid_active_scope[0]) != 0:
+        raise DatabaseCompatibilityError(
+            "An active ProtectionScope has no valid current Scope Key."
+        )
+
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise DatabaseCompatibilityError(
+            "ATHENA foreign-key verification failed."
+        )
+
+def _verify_schema_v33(
+    connection: sqlite3.Connection,
+) -> None:
+    application_id = int(
+        connection.execute("PRAGMA application_id").fetchone()[0]
+    )
+    user_version = int(
+        connection.execute("PRAGMA user_version").fetchone()[0]
+    )
+    if (
+        application_id != ATHENA_APPLICATION_ID
+        or user_version != PROTECTED_SOURCE_BLOB_SCHEMA_VERSION
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA Protected Source/Blob schema version verification failed."
+        )
+
+    metadata = connection.execute(
+        "SELECT schema_version, "
+        "storage_layout_version, "
+        "blob_format_version, "
+        "last_migration_id, "
+        "minimum_reader_version "
+        "FROM schema_metadata "
+        "WHERE singleton_id = 1"
+    ).fetchone()
+    expected = (
+        PROTECTED_SOURCE_BLOB_SCHEMA_VERSION,
+        STORAGE_LAYOUT_VERSION,
+        BLOB_FORMAT_VERSION,
+        PROTECTED_SOURCE_BLOB_MIGRATION_ID,
+        PROTECTED_SOURCE_BLOB_SCHEMA_VERSION,
+    )
+    if metadata is None or tuple(metadata) != expected:
+        raise DatabaseCompatibilityError(
+            "ATHENA Protected Source/Blob schema metadata verification failed."
+        )
+
+    _verify_schema_v31_compatible(connection)
+    required_tables = {
+        "key_slots",
+        "protection_scopes",
+        "protection_scope_keys",
+        "protected_payloads",
+        "protected_blob_envelopes",
+        "protected_sources",
+    }
+    missing = required_tables.difference(_user_tables(connection))
+    if missing:
+        raise DatabaseCompatibilityError(
+            "ATHENA Protected Source/Blob schema is incomplete: "
+            + ", ".join(sorted(missing))
+            + "."
+        )
+
+    protected_source_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(protected_sources)")
+    }
+    if not {
+        "source_id",
+        "protection_scope_id",
+        "protected_metadata_payload_id",
+        "created_at_us",
+    }.issubset(protected_source_columns):
+        raise DatabaseCompatibilityError(
+            "ATHENA protected_sources schema is incomplete."
+        )
+
+    blob_sql_row = connection.execute(
+        """
+        SELECT sql
+        FROM sqlite_master
+        WHERE type = 'table'
+          AND name = 'blob_records'
+        """
+    ).fetchone()
+    if blob_sql_row is None or "protected_v1" not in str(blob_sql_row[0]):
+        raise DatabaseCompatibilityError(
+            "ATHENA BlobRecord schema does not allow Protected Blobs."
+        )
+
+    missing_envelope = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM blob_records AS b
+        LEFT JOIN protected_blob_envelopes AS e
+          ON e.blob_id = b.blob_id
+        WHERE b.encryption_state = 'protected_v1'
+          AND e.blob_id IS NULL
+        """
+    ).fetchone()
+    if missing_envelope is None or int(missing_envelope[0]) != 0:
+        raise DatabaseCompatibilityError(
+            "A Protected Blob is missing its encrypted envelope."
+        )
+
+    invalid_source = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM protected_sources AS ps
+        JOIN sources AS s ON s.source_id = ps.source_id
+        JOIN blob_records AS b ON b.blob_id = s.blob_id
+        JOIN protected_blob_envelopes AS e ON e.blob_id = b.blob_id
+        JOIN protected_payloads AS p
+          ON p.protected_payload_id = ps.protected_metadata_payload_id
+        JOIN entity_registry AS se ON se.entity_id = s.source_id
+        JOIN entity_registry AS be ON be.entity_id = b.blob_id
+        WHERE
+            s.original_name IS NOT NULL
+            OR s.original_modified_at_us IS NOT NULL
+            OR s.source_uri IS NOT NULL
+            OR s.mime_type != 'application/octet-stream'
+            OR b.media_type != 'application/octet-stream'
+            OR b.encryption_state != 'protected_v1'
+            OR e.protection_scope_id != ps.protection_scope_id
+            OR p.protection_scope_id != ps.protection_scope_id
+            OR se.protection_scope_id != ps.protection_scope_id
+            OR be.protection_scope_id != ps.protection_scope_id
+        """
+    ).fetchone()
+    if invalid_source is None or int(invalid_source[0]) != 0:
+        raise DatabaseCompatibilityError(
+            "Protected Source public metadata or scope linkage is inconsistent."
+        )
+
+    invalid_active_scope = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM protection_scopes AS s
+        LEFT JOIN protection_scope_keys AS k
+          ON k.scope_key_id = s.current_scope_key_id
+         AND k.protection_scope_id = s.protection_scope_id
+        WHERE s.lifecycle_state = 'active'
+          AND (
+              s.current_scope_key_id IS NULL
+              OR k.scope_key_id IS NULL
+          )
+        """
+    ).fetchone()
+    if invalid_active_scope is None or int(invalid_active_scope[0]) != 0:
+        raise DatabaseCompatibilityError(
+            "An active ProtectionScope has no valid current Scope Key."
+        )
+
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise DatabaseCompatibilityError(
+            "ATHENA foreign-key verification failed."
+        )
 
 def _verify_schema_v32(
     connection: sqlite3.Connection,

@@ -118,11 +118,29 @@ class CryptoProvider:
         *,
         aad: bytes,
     ) -> AeadEnvelope:
+        return self.encrypt_with_nonce(
+            key,
+            plaintext,
+            nonce=self.random_nonce(),
+            aad=aad,
+        )
+
+    def encrypt_with_nonce(
+        self,
+        key: bytes,
+        plaintext: bytes,
+        *,
+        nonce: bytes,
+        aad: bytes,
+    ) -> AeadEnvelope:
         self._require_aes256_key(
             key
         )
 
-        nonce = self.random_nonce()
+        if len(nonce) != NONCE_BYTES:
+            raise ValueError(
+                "AES-256-GCM nonces must contain exactly 12 bytes."
+            )
 
         ciphertext = AESGCM(
             key

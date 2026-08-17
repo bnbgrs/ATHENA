@@ -129,6 +129,29 @@ class BlobStore:
             source_modified_at_us=modified_at_us,
         )
 
+    def detect_media_type(
+        self,
+        path: Path,
+    ) -> str | None:
+        return _detect_media_type(path)
+
+    def commit_encrypted_staging(
+        self,
+        staging_path: Path,
+        *,
+        integrity_sha256: bytes,
+        byte_length: int,
+    ) -> tuple[BlobStorageArea, str]:
+        if not staging_path.is_file():
+            raise BlobStoreError(
+                "Protected Blob ciphertext staging file is missing."
+            )
+        return self._commit_staged_blob(
+            staging_path,
+            integrity_sha256=integrity_sha256,
+            byte_length=byte_length,
+        )
+
     def resolve_blob_path(self, *, storage_area: BlobStorageArea, storage_locator: str) -> Path:
         relative = Path(storage_locator)
         if relative.is_absolute() or ".." in relative.parts:

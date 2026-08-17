@@ -1268,6 +1268,17 @@ def test_v29_migration_backfills_legacy_event_assessment_without_model(
         # before declaring the database to be v29.
         # Reconstruct a pre-v32 boundary: remove every additive
         # Protected-Content object before downgrading metadata.
+        legacy.execute("DROP TRIGGER trg_source_protection_transition_block_blob_reuse")
+        legacy.execute("DROP TRIGGER trg_source_protection_transition_block_source_update")
+        legacy.execute("DROP TRIGGER trg_source_protection_transition_block_source_delete")
+        legacy.execute("DROP TRIGGER trg_source_protection_transition_block_representation")
+        legacy.execute("DROP TRIGGER trg_source_protection_transition_block_old_blob_update")
+        legacy.execute("DROP TRIGGER trg_source_protection_transition_block_old_blob_delete")
+        legacy.execute("DROP TABLE source_protection_transitions")
+        legacy.execute(
+            "DROP TABLE protected_sources"
+        )
+
         legacy.execute(
             "DROP TABLE "
             "protected_blob_envelopes"

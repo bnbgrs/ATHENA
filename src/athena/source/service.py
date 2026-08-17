@@ -6,9 +6,20 @@ import uuid
 from pathlib import Path
 
 from athena.chat.service import ChatService
+from athena.security.service import (
+    ProtectedContentIntegrityError,
+    ProtectedContentService,
+    ProtectionScopeLockedError,
+)
 from athena.source.blob_store import BlobStore
 from athena.source.models import BlobRecord, SourceCaptureResult, SourceRecord, SourceType
-from athena.source.repository import SourceRepository
+from athena.source.protected_blob import ProtectedBlobStore, ProtectedSourceMetadata
+from athena.source.protection_transition import SourceProtectionTransitionService
+from athena.source.repository import ProtectedSourceInvariantError, SourceRepository
+
+
+class ProtectedSourcePersistentPathUnavailableError(RuntimeError):
+    """Protected plaintext never has a persistent filesystem path."""
 
 
 class SourceCaptureService:
@@ -20,10 +31,18 @@ class SourceCaptureService:
         repository: SourceRepository,
         blob_store: BlobStore,
         chat: ChatService,
+        protected_content: ProtectedContentService,
+        protection_transitions: SourceProtectionTransitionService | None = None,
     ) -> None:
         self.repository = repository
         self.blob_store = blob_store
         self.chat = chat
+        self.protected_content = protected_content
+        self.protection_transitions = protection_transitions
+        self.protected_blobs = ProtectedBlobStore(
+            blob_store=blob_store,
+            protected_content=protected_content,
+        )
 
     def capture_file(self, path: Path) -> SourceCaptureResult:
         source_path = path.expanduser()
@@ -48,6 +67,41 @@ class SourceCaptureService:
             prepared_blob=prepared_blob,
         )
 
+    def capture_protected_file(
+        self,
+        path: Path,
+        *,
+        protection_scope_id: uuid.UUID,
+    ) -> SourceCaptureResult:
+        prepared = self.protected_blobs.capture_file(
+            path,
+            protection_scope_id=protection_scope_id,
+            source_type=SourceType.FILE,
+        )
+        metadata_record = self.protected_content.store_payload(
+            protection_scope_id,
+            prepared.metadata.to_payload(),
+        )
+        actor_id = self.chat.ensure_local_user()
+        return self.repository.capture_protected_file(
+            actor_id=actor_id,
+            prepared=prepared,
+            protected_metadata_payload_id=metadata_record.protected_payload_id,
+        )
+
+    def protect_existing_source(
+        self,
+        source_id: uuid.UUID,
+        protection_scope_id: uuid.UUID,
+    ) -> SourceCaptureResult:
+        if self.protection_transitions is None:
+            raise RuntimeError(
+                "Source protection transitions are not configured."
+            )
+        return self.protection_transitions.protect_existing_source(
+            source_id,
+            protection_scope_id,
+        )
 
     def capture_external_snapshot(
         self,
@@ -86,11 +140,61 @@ class SourceCaptureService:
     def get(self, source_id: uuid.UUID) -> tuple[SourceRecord, BlobRecord]:
         return self.repository.get(source_id)
 
-    def list(self, *, limit: int = 50) -> tuple[tuple[SourceRecord, BlobRecord], ...]:
+    def list(
+        self,
+        *,
+        limit: int = 50,
+    ) -> tuple[tuple[SourceRecord, BlobRecord], ...]:
         return self.repository.list(limit=limit)
 
+    def load_protected_metadata(
+        self,
+        source_id: uuid.UUID,
+    ) -> ProtectedSourceMetadata:
+        source, _blob = self.repository.get(source_id)
+        scope_id = source.protection_scope_id
+        payload_id = source.protected_metadata_payload_id
+        if scope_id is None or payload_id is None:
+            raise ProtectedSourceInvariantError("Source is not protected.")
+        payload = self.protected_content.load_payload(payload_id)
+        metadata = ProtectedSourceMetadata.from_payload(payload)
+        if metadata.source_type is not source.source_type:
+            raise ProtectedContentIntegrityError(
+                "Protected Source type metadata disagrees with its public row."
+            )
+        return metadata
+
+    def read_protected_bytes(self, source_id: uuid.UUID) -> bytes:
+        source, blob = self.repository.get(source_id)
+        scope_id = source.protection_scope_id
+        if scope_id is None:
+            raise ProtectedSourceInvariantError("Source is not protected.")
+        if source.content_sha256 != blob.integrity_sha256:
+            raise ProtectedContentIntegrityError(
+                "Protected Source ciphertext hash disagrees with its BlobRecord."
+            )
+        metadata = self.load_protected_metadata(source_id)
+        envelope = self.repository.get_protected_blob_envelope(blob.blob_id)
+        if envelope.protection_scope_id != scope_id:
+            raise ProtectedContentIntegrityError(
+                "Protected Source and Blob envelope belong to different scopes."
+            )
+        plaintext = self.protected_blobs.read_bytes(blob, envelope)
+        if len(plaintext) != metadata.plaintext_byte_length:
+            raise ProtectedContentIntegrityError(
+                "Protected Source plaintext length does not match authenticated metadata."
+            )
+        return plaintext
+
     def verify(self, source_id: uuid.UUID) -> Path:
-        _source, blob = self.repository.get(source_id)
+        source, blob = self.repository.get(source_id)
+        if source.protection_scope_id is not None:
+            if not self.protected_content.is_unlocked(source.protection_scope_id):
+                raise ProtectionScopeLockedError("ProtectionScope is locked.")
+            raise ProtectedSourcePersistentPathUnavailableError(
+                "Protected Source plaintext has no persistent path; "
+                "use read_protected_bytes()."
+            )
         return self.blob_store.verify_blob(
             storage_area=blob.storage_area,
             storage_locator=blob.storage_locator,

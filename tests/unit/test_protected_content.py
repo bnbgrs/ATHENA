@@ -18,9 +18,9 @@ from athena.storage.database import SQLiteDatabase
 from athena.storage.schema import (
     ARCHIVE_REPLICATION_MIGRATION_ID,
     ARCHIVE_REPLICATION_SCHEMA_VERSION,
-    PROTECTED_CONTENT_MIGRATION_ID,
-    PROTECTED_CONTENT_SCHEMA_VERSION,
     SCHEMA_VERSION,
+    SOURCE_PROTECTION_TRANSITION_MIGRATION_ID,
+    SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
 )
 
 _TEST_KDF = Argon2idParameters(
@@ -88,7 +88,7 @@ def test_fresh_schema_has_v32_security_tables_without_persistent_unlock_state(
             connection.execute(
                 "PRAGMA user_version"
             ).fetchone()[0]
-            == PROTECTED_CONTENT_SCHEMA_VERSION
+            == SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION
             == SCHEMA_VERSION
         )
 
@@ -158,9 +158,9 @@ def test_fresh_schema_has_v32_security_tables_without_persistent_unlock_state(
         assert tuple(
             metadata
         ) == (
-            PROTECTED_CONTENT_SCHEMA_VERSION,
-            PROTECTED_CONTENT_MIGRATION_ID,
-            PROTECTED_CONTENT_SCHEMA_VERSION,
+            SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
+            SOURCE_PROTECTION_TRANSITION_MIGRATION_ID,
+            SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
         )
 
         assert connection.execute(
@@ -714,6 +714,20 @@ def test_v31_database_is_upgraded_additively_to_protected_content_v32(
 
     # Reconstruct exact v31 by removing
     # only the additive v32 security objects.
+    legacy.execute("DROP TRIGGER trg_source_protection_transition_block_blob_reuse")
+    legacy.execute("DROP TRIGGER trg_source_protection_transition_block_source_update")
+    legacy.execute("DROP TRIGGER trg_source_protection_transition_block_source_delete")
+    legacy.execute("DROP TRIGGER trg_source_protection_transition_block_representation")
+    legacy.execute("DROP TRIGGER trg_source_protection_transition_block_old_blob_update")
+    legacy.execute("DROP TRIGGER trg_source_protection_transition_block_old_blob_delete")
+    legacy.execute("DROP TABLE source_protection_transitions")
+    legacy.execute(
+        """
+        DROP TABLE
+        protected_sources
+        """
+    )
+
     legacy.execute(
         """
         DROP TABLE
@@ -786,7 +800,7 @@ def test_v31_database_is_upgraded_additively_to_protected_content_v32(
             connection.execute(
                 "PRAGMA user_version"
             ).fetchone()[0]
-            == PROTECTED_CONTENT_SCHEMA_VERSION
+            == SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION
         )
 
         tables = {
@@ -823,9 +837,9 @@ def test_v31_database_is_upgraded_additively_to_protected_content_v32(
         assert tuple(
             metadata
         ) == (
-            PROTECTED_CONTENT_SCHEMA_VERSION,
-            PROTECTED_CONTENT_MIGRATION_ID,
-            PROTECTED_CONTENT_SCHEMA_VERSION,
+            SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
+            SOURCE_PROTECTION_TRANSITION_MIGRATION_ID,
+            SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
         )
 
         assert connection.execute(
