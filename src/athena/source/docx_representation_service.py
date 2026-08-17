@@ -23,7 +23,10 @@ from athena.source.models import (
     TextRepresentationResult,
 )
 from athena.source.repository import SourceRepository
-from athena.source.representation_repository import SourceRepresentationRepository
+from athena.source.representation_repository import (
+    CanonicalWriteFence,
+    SourceRepresentationRepository,
+)
 
 _DOCX_SUFFIXES = {".docx"}
 _DOCX_MIME_TYPES = {
@@ -93,7 +96,12 @@ class SourceDocxRepresentationService:
             return True
         return suffix in _DOCX_SUFFIXES and source.mime_type in _CONTAINER_MIME_TYPES
 
-    def build(self, source_id: uuid.UUID) -> DocxRepresentationBuildResult:
+    def build(
+        self,
+        source_id: uuid.UUID,
+        *,
+        write_fence: CanonicalWriteFence | None = None,
+    ) -> DocxRepresentationBuildResult:
         source, source_blob = self.sources.get(source_id)
         _require_supported_docx_source(source)
         actor_id = self.chat.ensure_local_user()
@@ -174,6 +182,7 @@ class SourceDocxRepresentationService:
                 representation_type=SourceRepresentationType.NORMALIZED_TEXT,
                 operation="source.representation.docx_text.create",
                 structure_map=structure_map,
+                write_fence=write_fence,
             )
             structures = self.verify_structure_map(result.representation.representation_id)
             return DocxRepresentationBuildResult(

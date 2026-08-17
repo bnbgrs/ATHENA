@@ -24,7 +24,10 @@ from athena.source.pdf_representation_store import (
     UnsupportedPdfSourceError,
 )
 from athena.source.repository import SourceRepository
-from athena.source.representation_repository import SourceRepresentationRepository
+from athena.source.representation_repository import (
+    CanonicalWriteFence,
+    SourceRepresentationRepository,
+)
 
 _PDF_SUFFIXES = {".pdf"}
 _PDF_MIME_TYPES = {"application/pdf"}
@@ -90,7 +93,12 @@ class SourcePdfRepresentationService:
             return True
         return source.mime_type in {None, "application/octet-stream"} and suffix in _PDF_SUFFIXES
 
-    def build(self, source_id: uuid.UUID) -> PdfRepresentationBuildResult:
+    def build(
+        self,
+        source_id: uuid.UUID,
+        *,
+        write_fence: CanonicalWriteFence | None = None,
+    ) -> PdfRepresentationBuildResult:
         source, source_blob = self.sources.get(source_id)
         _require_supported_pdf_source(source)
         actor_id = self.chat.ensure_local_user()
@@ -168,6 +176,7 @@ class SourcePdfRepresentationService:
                 representation_type=SourceRepresentationType.EXTRACTED_TEXT,
                 operation="source.representation.pdf_text.create",
                 page_map=page_map,
+                write_fence=write_fence,
             )
             pages = self.verify_page_map(result.representation.representation_id)
             return PdfRepresentationBuildResult(

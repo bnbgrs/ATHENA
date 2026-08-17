@@ -25,7 +25,10 @@ from athena.source.models import (
     TextRepresentationResult,
 )
 from athena.source.repository import SourceRepository
-from athena.source.representation_repository import SourceRepresentationRepository
+from athena.source.representation_repository import (
+    CanonicalWriteFence,
+    SourceRepresentationRepository,
+)
 
 _HTML_SUFFIXES = {".html", ".htm", ".xhtml"}
 _HTML_MIME_TYPES = {"text/html", "application/xhtml+xml"}
@@ -107,7 +110,12 @@ class SourceHtmlRepresentationService:
             return True
         return suffix in _HTML_SUFFIXES and source.mime_type in _TEXTISH_MIME_TYPES
 
-    def build(self, source_id: uuid.UUID) -> HtmlRepresentationBuildResult:
+    def build(
+        self,
+        source_id: uuid.UUID,
+        *,
+        write_fence: CanonicalWriteFence | None = None,
+    ) -> HtmlRepresentationBuildResult:
         source, source_blob = self.sources.get(source_id)
         _require_supported_html_source(source)
         primary_article = (
@@ -207,6 +215,7 @@ class SourceHtmlRepresentationService:
                 representation_type=SourceRepresentationType.NORMALIZED_TEXT,
                 operation="source.representation.html_text.create",
                 structure_map=structure_map,
+                write_fence=write_fence,
             )
             structures = self.verify_structure_map(result.representation.representation_id)
             return HtmlRepresentationBuildResult(

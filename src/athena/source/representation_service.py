@@ -18,7 +18,10 @@ from athena.source.models import (
     TextRepresentationResult,
 )
 from athena.source.repository import SourceRepository
-from athena.source.representation_repository import SourceRepresentationRepository
+from athena.source.representation_repository import (
+    CanonicalWriteFence,
+    SourceRepresentationRepository,
+)
 from athena.source.representation_store import (
     PreparedTextRepresentation,
     TextRepresentationStore,
@@ -87,7 +90,12 @@ class SourceTextRepresentationService:
             return False
         return True
 
-    def build(self, source_id: uuid.UUID) -> TextRepresentationBuildResult:
+    def build(
+        self,
+        source_id: uuid.UUID,
+        *,
+        write_fence: CanonicalWriteFence | None = None,
+    ) -> TextRepresentationBuildResult:
         source, source_blob = self.sources.get(source_id)
         _require_supported_text_source(source)
         actor_id = self.chat.ensure_local_user()
@@ -153,6 +161,7 @@ class SourceTextRepresentationService:
                 parser_id=_PARSER_ID,
                 parser_version=_PARSER_VERSION,
                 options=_TEXT_OPTIONS,
+                write_fence=write_fence,
             )
             return TextRepresentationBuildResult(
                 result=result,

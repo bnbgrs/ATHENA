@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from collections.abc import Callable
 
 from athena.common.ids import new_uuid7, uuid_from_blob, uuid_to_blob
 from athena.common.time import utc_now_us
@@ -21,6 +22,8 @@ from athena.source.models import (
 )
 from athena.source.representation_store import StoredRepresentationBlob
 from athena.storage.database import SQLiteDatabase
+
+CanonicalWriteFence = Callable[[sqlite3.Connection], None]
 
 
 class SourceRepresentationNotFoundError(LookupError):
@@ -65,6 +68,7 @@ class SourceRepresentationRepository:
             ],
             ...,
         ] = (),
+        write_fence: CanonicalWriteFence | None = None,
     ) -> TextRepresentationResult:
         if (stored_blob is None) == (existing_blob is None):
             raise ValueError("Exactly one of stored_blob or existing_blob is required.")
@@ -82,6 +86,9 @@ class SourceRepresentationRepository:
         )
 
         with self.database.write_transaction() as connection:
+            if write_fence is not None:
+                write_fence(connection)
+
             self._require_active_actor(connection, actor_id)
             source_blob_id = self._require_source(connection, source_id)
             self._require_running_run(connection, processing_run_id)
@@ -372,6 +379,9 @@ class SourceRepresentationRepository:
                 """,
                 (commit_seq, uuid_to_blob(source_id)),
             )
+            if write_fence is not None:
+                write_fence(connection)
+
             updated_run = connection.execute(
                 """
                 UPDATE processing_runs
@@ -382,6 +392,12 @@ class SourceRepresentationRepository:
             )
             if updated_run.rowcount != 1:
                 raise ValueError("ProcessingRun stopped being writable during representation commit.")
+
+            # Last possible fence before leaving the canonical transaction.
+            # A competing worker cannot acquire a replacement lease while
+            # this BEGIN IMMEDIATE transaction remains active.
+            if write_fence is not None:
+                write_fence(connection)
 
         representation = SourceRepresentationRecord(
             representation_id=representation_id,

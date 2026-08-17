@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 from athena.common.ids import new_uuid7, uuid_from_blob, uuid_to_blob
 from athena.common.time import utc_now_us
@@ -16,6 +16,8 @@ from athena.jobs.models import (
     WaitingReason,
 )
 from athena.storage.database import SQLiteDatabase
+
+CanonicalJobWriteFence = Callable[[sqlite3.Connection], None]
 
 
 class JobNotFoundError(LookupError):
@@ -424,6 +426,35 @@ class JobRepository:
                 ),
             )
         return self.get(job_id)
+
+    def require_live_write_fence(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        job_id: uuid.UUID,
+        lease_token: bytes,
+        now_us: int | None = None,
+    ) -> None:
+        """Fence one canonical write inside its active transaction."""
+        if not connection.in_transaction:
+            raise RuntimeError(
+                "Canonical job write fence requires an active transaction."
+            )
+
+        now = utc_now_us() if now_us is None else now_us
+        row = self._require_live_lease(
+            connection,
+            job_id,
+            lease_token,
+            now,
+        )
+        state = JobState(str(row["state"]))
+
+        if state is not JobState.RUNNING:
+            raise JobLeaseError(
+                f"Job {job_id} cannot publish canonical state "
+                f"in state {state.value!r}."
+            )
 
     def add_checkpoint(
         self,

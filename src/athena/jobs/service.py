@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import secrets
+import sqlite3
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from athena.chat.service import ChatService
@@ -119,6 +120,23 @@ class DurableJobService:
             extend_by_us=extend_seconds * 1_000_000,
             now_us=now_us,
         )
+
+    def canonical_write_fence(
+        self,
+        job_id: uuid.UUID,
+        *,
+        lease_token: bytes,
+    ) -> Callable[[sqlite3.Connection], None]:
+        """Return a lease fence for one canonical write transaction."""
+
+        def fence(connection: sqlite3.Connection) -> None:
+            self.repository.require_live_write_fence(
+                connection,
+                job_id=job_id,
+                lease_token=lease_token,
+            )
+
+        return fence
 
     def checkpoint(
         self,

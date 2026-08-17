@@ -308,17 +308,34 @@ class DurableSourceProcessingWorker:
         )
         reused_representation = representation is not None
         if representation is None:
+            write_fence = self.jobs.canonical_write_fence(
+                job_id,
+                lease_token=lease_token,
+            )
+
             if is_pdf:
-                built_pdf = self.source_pdf.build(cursor.source_id)
+                built_pdf = self.source_pdf.build(
+                    cursor.source_id,
+                    write_fence=write_fence,
+                )
                 representation = built_pdf.result.representation
             elif is_docx:
-                built_docx = self.source_docx.build(cursor.source_id)
+                built_docx = self.source_docx.build(
+                    cursor.source_id,
+                    write_fence=write_fence,
+                )
                 representation = built_docx.result.representation
             elif is_html:
-                built_html = self.source_html.build(cursor.source_id)
+                built_html = self.source_html.build(
+                    cursor.source_id,
+                    write_fence=write_fence,
+                )
                 representation = built_html.result.representation
             else:
-                built_text = self.source_text.build(cursor.source_id)
+                built_text = self.source_text.build(
+                    cursor.source_id,
+                    write_fence=write_fence,
+                )
                 representation = built_text.result.representation
         self.source_text.verify(representation.representation_id)
         if is_pdf:
