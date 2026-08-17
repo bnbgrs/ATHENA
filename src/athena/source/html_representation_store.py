@@ -424,90 +424,69 @@ class HtmlNativeTextRepresentationStore:
         *,
         primary_article: bool = False,
     ) -> PreparedHtmlTextRepresentation:
-        staging_dir = self.paths.spool_root / "representations" / "staging"
-        staging_dir.mkdir(parents=True, exist_ok=True)
-        staging_path = staging_dir / f"html-text-{secrets.token_hex(16)}.partial"
+        staging_dir = (
+            self.paths.spool_root
+            / "representations"
+            / "staging"
+        )
+        staging_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        staging_path = (
+            staging_dir
+            / f"html-text-{secrets.token_hex(16)}.partial"
+        )
 
         try:
-            raw = _read_html_bytes(source_path)
-            decoded, encoding = _decode_html(raw)
-            parser = _TreeBuilder()
-            try:
-                parser.feed(decoded)
-                parser.close()
-            except (RecursionError, ValueError) as exc:
-                raise HtmlRepresentationError("Cannot parse HTML source safely.") from exc
-            _assign_dom_paths(parser.root)
-
-            builder = _TextAndStructureBuilder()
-            title = _document_title(parser.root)
-            emitted = False
-            if title is not None:
-                title_node, title_text = title
-                title_index = builder.begin(
-                    SourceRepresentationStructureType.HEADING,
-                    path=title_node.path,
-                    parent_index=None,
-                    metadata={
-                        "heading_level": 1,
-                        "html_tag": "title",
-                        "document_title": True,
-                        "source_encoding": encoding,
-                    },
-                )
-                builder.append(title_text)
-                builder.end(title_index)
-                emitted = True
-
-            body = _first_element(
-                parser.root,
-                "body",
+            raw = _read_html_bytes(
+                source_path
             )
 
-            if primary_article:
-                flow_root = (
-                    _select_primary_article_flow_root(
-                        parser.root
-                    )
+            text, structures = (
+                _extract_html_text_and_structures(
+                    raw,
+                    primary_article=(
+                        primary_article
+                    ),
                 )
-                _prune_article_boilerplate(
-                    flow_root
-                )
-            else:
-                flow_root = (
-                    body
-                    if body is not None
-                    else parser.root
-                )
-            if emitted and _has_readable_flow(flow_root):
-                builder.append(_BLOCK_SEPARATOR)
-            _render_flow_container(
-                flow_root,
-                builder=builder,
-                parent_index=None,
-                separator=_BLOCK_SEPARATOR,
             )
-            text, structures = builder.finish()
-            if not text.strip():
-                raise HtmlTextUnavailableError("HTML contains no usable cleaned readable text.")
-            if not structures:
-                raise HtmlTextUnavailableError("HTML contains no retained readable structure.")
 
-            encoded = text.encode("utf-8")
-            with staging_path.open("xb") as target:
-                target.write(encoded)
+            encoded = text.encode(
+                "utf-8"
+            )
+
+            with staging_path.open(
+                "xb"
+            ) as target:
+                target.write(
+                    encoded
+                )
                 target.flush()
-                os.fsync(target.fileno())
+                os.fsync(
+                    target.fileno()
+                )
 
             return PreparedHtmlTextRepresentation(
                 staging_path=staging_path,
-                byte_length=len(encoded),
-                content_sha256=hashlib.sha256(encoded).digest(),
+                byte_length=len(
+                    encoded
+                ),
+                content_sha256=(
+                    hashlib.sha256(
+                        encoded
+                    ).digest()
+                ),
                 structures=structures,
             )
+
         except Exception:
-            staging_path.unlink(missing_ok=True)
+            staging_path.unlink(
+                missing_ok=True
+            )
             raise
+
 
     def discard(self, prepared: PreparedHtmlTextRepresentation) -> None:
         prepared.staging_path.unlink(missing_ok=True)
@@ -521,20 +500,202 @@ class HtmlNativeTextRepresentationStore:
         return self._text_store.commit(base)
 
 
-def _read_html_bytes(path: Path) -> bytes:
+def extract_html_text_bytes(
+    payload: bytes,
+    *,
+    primary_article: bool = False,
+) -> str:
+    """Extract cleaned HTML text directly from plaintext bytes in memory."""
+
+    text, _structures = (
+        _extract_html_text_and_structures(
+            payload,
+            primary_article=primary_article,
+        )
+    )
+
+    return text
+
+
+def _extract_html_text_and_structures(
+    payload: bytes,
+    *,
+    primary_article: bool,
+) -> tuple[
+    str,
+    tuple[HtmlStructureSpan, ...],
+]:
+    _validate_html_payload(
+        payload
+    )
+
+    decoded, encoding = _decode_html(
+        payload
+    )
+
+    parser = _TreeBuilder()
+
+    try:
+        parser.feed(
+            decoded
+        )
+        parser.close()
+
+    except (
+        RecursionError,
+        ValueError,
+    ) as exc:
+        raise HtmlRepresentationError(
+            "Cannot parse HTML source safely."
+        ) from exc
+
+    _assign_dom_paths(
+        parser.root
+    )
+
+    builder = (
+        _TextAndStructureBuilder()
+    )
+
+    title = _document_title(
+        parser.root
+    )
+
+    emitted = False
+
+    if title is not None:
+        title_node, title_text = title
+
+        title_index = builder.begin(
+            SourceRepresentationStructureType.HEADING,
+            path=title_node.path,
+            parent_index=None,
+            metadata={
+                "heading_level": 1,
+                "html_tag": "title",
+                "document_title": True,
+                "source_encoding": encoding,
+            },
+        )
+
+        builder.append(
+            title_text
+        )
+        builder.end(
+            title_index
+        )
+
+        emitted = True
+
+    body = _first_element(
+        parser.root,
+        "body",
+    )
+
+    if primary_article:
+        flow_root = (
+            _select_primary_article_flow_root(
+                parser.root
+            )
+        )
+
+        _prune_article_boilerplate(
+            flow_root
+        )
+
+    else:
+        flow_root = (
+            body
+            if body is not None
+            else parser.root
+        )
+
+    if (
+        emitted
+        and _has_readable_flow(
+            flow_root
+        )
+    ):
+        builder.append(
+            _BLOCK_SEPARATOR
+        )
+
+    _render_flow_container(
+        flow_root,
+        builder=builder,
+        parent_index=None,
+        separator=_BLOCK_SEPARATOR,
+    )
+
+    text, structures = (
+        builder.finish()
+    )
+
+    if not text.strip():
+        raise HtmlTextUnavailableError(
+            "HTML contains no usable "
+            "cleaned readable text."
+        )
+
+    if not structures:
+        raise HtmlTextUnavailableError(
+            "HTML contains no retained "
+            "readable structure."
+        )
+
+    return (
+        text,
+        structures,
+    )
+
+
+def _validate_html_payload(
+    payload: bytes,
+) -> None:
+    if len(payload) > _MAX_HTML_BYTES:
+        raise HtmlRepresentationError(
+            "HTML source exceeds the "
+            "native parser safety limit."
+        )
+
+    if b"\x00" in payload:
+        raise HtmlRepresentationError(
+            "HTML source contains NUL bytes "
+            "and is not accepted as text HTML."
+        )
+
+
+def _read_html_bytes(
+    path: Path,
+) -> bytes:
     try:
         size = path.stat().st_size
+
     except OSError as exc:
-        raise HtmlRepresentationError("Cannot stat HTML source blob.") from exc
+        raise HtmlRepresentationError(
+            "Cannot stat HTML source blob."
+        ) from exc
+
     if size > _MAX_HTML_BYTES:
-        raise HtmlRepresentationError("HTML source exceeds the native parser safety limit.")
+        raise HtmlRepresentationError(
+            "HTML source exceeds the "
+            "native parser safety limit."
+        )
+
     try:
         payload = path.read_bytes()
+
     except OSError as exc:
-        raise HtmlRepresentationError("Cannot read HTML source blob.") from exc
-    if b"\x00" in payload:
-        raise HtmlRepresentationError("HTML source contains NUL bytes and is not accepted as text HTML.")
+        raise HtmlRepresentationError(
+            "Cannot read HTML source blob."
+        ) from exc
+
+    _validate_html_payload(
+        payload
+    )
+
     return payload
+
 
 
 def _decode_html(payload: bytes) -> tuple[str, str]:

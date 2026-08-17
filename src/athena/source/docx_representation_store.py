@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import re
@@ -149,45 +150,73 @@ class DocxNativeTextRepresentationStore:
         self.paths = paths
         self._text_store = TextRepresentationStore(paths)
 
-    def extract(self, source_path: Path) -> PreparedDocxTextRepresentation:
-        staging_dir = self.paths.spool_root / "representations" / "staging"
-        staging_dir.mkdir(parents=True, exist_ok=True)
-        staging_path = staging_dir / f"docx-text-{secrets.token_hex(16)}.partial"
+    def extract(
+        self,
+        source_path: Path,
+    ) -> PreparedDocxTextRepresentation:
+        staging_dir = (
+            self.paths.spool_root
+            / "representations"
+            / "staging"
+        )
+        staging_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        staging_path = (
+            staging_dir
+            / f"docx-text-{secrets.token_hex(16)}.partial"
+        )
 
         try:
-            document_root, styles = _read_docx_parts(source_path)
-            body = document_root.find(f"{_W}body")
-            if body is None:
-                raise DocxRepresentationError("DOCX word/document.xml has no body element.")
-
-            builder = _TextAndStructureBuilder()
-            _render_block_container(
-                body,
-                builder=builder,
-                path="/body",
-                parent_index=None,
-                separator=_BLOCK_SEPARATOR,
-                styles=styles,
+            document_root, styles = (
+                _read_docx_parts(
+                    source_path
+                )
             )
-            text, structures = builder.finish()
-            if not text.strip():
-                raise DocxTextUnavailableError("DOCX contains no usable native document text.")
 
-            encoded = text.encode("utf-8")
-            with staging_path.open("xb") as target:
-                target.write(encoded)
+            text, structures = (
+                _render_docx_text(
+                    document_root,
+                    styles,
+                )
+            )
+
+            encoded = text.encode(
+                "utf-8"
+            )
+
+            with staging_path.open(
+                "xb"
+            ) as target:
+                target.write(
+                    encoded
+                )
                 target.flush()
-                os.fsync(target.fileno())
+                os.fsync(
+                    target.fileno()
+                )
 
             return PreparedDocxTextRepresentation(
                 staging_path=staging_path,
-                byte_length=len(encoded),
-                content_sha256=hashlib.sha256(encoded).digest(),
+                byte_length=len(
+                    encoded
+                ),
+                content_sha256=(
+                    hashlib.sha256(
+                        encoded
+                    ).digest()
+                ),
                 structures=structures,
             )
+
         except Exception:
-            staging_path.unlink(missing_ok=True)
+            staging_path.unlink(
+                missing_ok=True
+            )
             raise
+
 
     def discard(self, prepared: PreparedDocxTextRepresentation) -> None:
         prepared.staging_path.unlink(missing_ok=True)
@@ -203,32 +232,192 @@ class DocxNativeTextRepresentationStore:
 
 def _read_docx_parts(
     source_path: Path,
-) -> tuple[ET.Element, dict[str, tuple[str | None, int | None]]]:
+) -> tuple[
+    ET.Element,
+    dict[str, tuple[str | None, int | None]],
+]:
     try:
-        with zipfile.ZipFile(source_path, "r") as archive:
-            names = set(archive.namelist())
-            if _CONTENT_TYPES_XML not in names or _DOCUMENT_XML not in names:
-                raise UnsupportedDocxSourceError(
-                    "DOCX package is missing required OOXML document parts."
-                )
-            _require_safe_member(archive, _DOCUMENT_XML, _MAX_DOCUMENT_XML_BYTES)
-            document_bytes = archive.read(_DOCUMENT_XML)
-            styles: dict[str, tuple[str | None, int | None]] = {}
-            if _STYLES_XML in names:
-                _require_safe_member(archive, _STYLES_XML, _MAX_STYLES_XML_BYTES)
-                styles = _parse_styles(archive.read(_STYLES_XML))
+        with zipfile.ZipFile(
+            source_path,
+            "r",
+        ) as archive:
+            return _read_docx_parts_from_archive(
+                archive
+            )
+
     except zipfile.BadZipFile as exc:
-        raise DocxRepresentationError("Cannot parse DOCX ZIP container.") from exc
-    except (OSError, KeyError) as exc:
-        raise DocxRepresentationError("Cannot read DOCX package parts.") from exc
+        raise DocxRepresentationError(
+            "Cannot parse DOCX ZIP container."
+        ) from exc
+
+    except (
+        OSError,
+        KeyError,
+    ) as exc:
+        raise DocxRepresentationError(
+            "Cannot read DOCX package parts."
+        ) from exc
+
+
+
+def extract_docx_text_bytes(
+    payload: bytes,
+) -> str:
+    """Extract DOCX text directly from plaintext bytes in memory."""
 
     try:
-        root = ET.fromstring(document_bytes)
+        with zipfile.ZipFile(
+            io.BytesIO(
+                payload
+            ),
+            "r",
+        ) as archive:
+            document_root, styles = (
+                _read_docx_parts_from_archive(
+                    archive
+                )
+            )
+
+    except zipfile.BadZipFile as exc:
+        raise DocxRepresentationError(
+            "Cannot parse DOCX ZIP container."
+        ) from exc
+
+    except (
+        OSError,
+        KeyError,
+    ) as exc:
+        raise DocxRepresentationError(
+            "Cannot read DOCX package parts."
+        ) from exc
+
+    text, _structures = (
+        _render_docx_text(
+            document_root,
+            styles,
+        )
+    )
+
+    return text
+
+
+def _read_docx_parts_from_archive(
+    archive: zipfile.ZipFile,
+) -> tuple[
+    ET.Element,
+    dict[str, tuple[str | None, int | None]],
+]:
+    names = set(
+        archive.namelist()
+    )
+
+    if (
+        _CONTENT_TYPES_XML not in names
+        or _DOCUMENT_XML not in names
+    ):
+        raise UnsupportedDocxSourceError(
+            "DOCX package is missing required "
+            "OOXML document parts."
+        )
+
+    _require_safe_member(
+        archive,
+        _DOCUMENT_XML,
+        _MAX_DOCUMENT_XML_BYTES,
+    )
+
+    document_bytes = archive.read(
+        _DOCUMENT_XML
+    )
+
+    styles: dict[
+        str,
+        tuple[str | None, int | None],
+    ] = {}
+
+    if _STYLES_XML in names:
+        _require_safe_member(
+            archive,
+            _STYLES_XML,
+            _MAX_STYLES_XML_BYTES,
+        )
+
+        styles = _parse_styles(
+            archive.read(
+                _STYLES_XML
+            )
+        )
+
+    try:
+        root = ET.fromstring(
+            document_bytes
+        )
+
     except ET.ParseError as exc:
-        raise DocxRepresentationError("DOCX word/document.xml is malformed XML.") from exc
+        raise DocxRepresentationError(
+            "DOCX word/document.xml "
+            "is malformed XML."
+        ) from exc
+
     if root.tag != f"{_W}document":
-        raise UnsupportedDocxSourceError("DOCX main part is not a WordprocessingML document.")
-    return root, styles
+        raise UnsupportedDocxSourceError(
+            "DOCX main part is not a "
+            "WordprocessingML document."
+        )
+
+    return (
+        root,
+        styles,
+    )
+
+
+def _render_docx_text(
+    document_root: ET.Element,
+    styles: dict[
+        str,
+        tuple[str | None, int | None],
+    ],
+) -> tuple[
+    str,
+    tuple[DocxStructureSpan, ...],
+]:
+    body = document_root.find(
+        f"{_W}body"
+    )
+
+    if body is None:
+        raise DocxRepresentationError(
+            "DOCX word/document.xml "
+            "has no body element."
+        )
+
+    builder = (
+        _TextAndStructureBuilder()
+    )
+
+    _render_block_container(
+        body,
+        builder=builder,
+        path="/body",
+        parent_index=None,
+        separator=_BLOCK_SEPARATOR,
+        styles=styles,
+    )
+
+    text, structures = (
+        builder.finish()
+    )
+
+    if not text.strip():
+        raise DocxTextUnavailableError(
+            "DOCX contains no usable "
+            "native document text."
+        )
+
+    return (
+        text,
+        structures,
+    )
 
 
 def _require_safe_member(archive: zipfile.ZipFile, name: str, maximum_size: int) -> None:

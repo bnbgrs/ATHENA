@@ -506,6 +506,60 @@ class SourceRepository:
             for row in rows
         )
 
+    def list_protected_in_scopes(
+        self,
+        protection_scope_ids: frozenset[uuid.UUID],
+        *,
+        limit: int = 5001,
+    ) -> tuple[tuple[SourceRecord, BlobRecord], ...]:
+        """List Protected Sources belonging to the requested neutral scopes."""
+
+        if not protection_scope_ids:
+            return ()
+
+        if not 1 <= limit <= 10001:
+            raise ValueError(
+                "Protected Source list limit must be between 1 and 10001."
+            )
+
+        ordered_scopes = tuple(
+            sorted(
+                protection_scope_ids,
+                key=lambda item: item.hex,
+            )
+        )
+
+        placeholders = ", ".join(
+            "?"
+            for _scope_id in ordered_scopes
+        )
+
+        parameters: tuple[object, ...] = (
+            *(
+                uuid_to_blob(scope_id)
+                for scope_id in ordered_scopes
+            ),
+            limit,
+        )
+
+        rows = self.database.connection.execute(
+            self._source_query()
+            + f"""
+            WHERE ps.protection_scope_id IN ({placeholders})
+            ORDER BY s.acquired_at_us DESC, s.source_id DESC
+            LIMIT ?
+            """,
+            parameters,
+        ).fetchall()
+
+        return tuple(
+            (
+                self._source_from_row(row),
+                self._blob_from_row(row),
+            )
+            for row in rows
+        )
+
     def get_protected_blob_envelope(
         self,
         blob_id: uuid.UUID,

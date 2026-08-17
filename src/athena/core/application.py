@@ -78,6 +78,10 @@ from athena.retrieval.prior_research import (
     PriorResearchContextBuilderService,
     PriorResearchSearchService,
 )
+from athena.retrieval.protected_source import (
+    ProtectedRuntimeSourceContextBuilderService,
+    ProtectedRuntimeSourceSearchService,
+)
 from athena.retrieval.ranking import RetrievalRankingService
 from athena.retrieval.search import LocalSearchService
 from athena.retrieval.semantic import LocalSemanticSearchService
@@ -333,6 +337,16 @@ class AthenaApplication:
         )
         self.source_context_builder = SourceContextBuilderService(
             self.source_anchors
+        )
+        self.protected_source_search = ProtectedRuntimeSourceSearchService(
+            protected_content=self.protected_content,
+            sources=self.sources,
+            repository=self.source_repository,
+        )
+        self.protected_source_context_builder = (
+            ProtectedRuntimeSourceContextBuilderService(
+                self.protected_source_search
+            )
         )
         self.source_grounded_chat = SourceGroundedChatService(
             chat_generation=self.chat_generation,

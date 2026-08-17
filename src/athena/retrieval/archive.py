@@ -272,7 +272,8 @@ class ArchiveSearchService:
                 s.lifecycle_state AS source_state,
                 sr.retention_state,
                 se.lifecycle_state AS source_entity_state,
-                re.lifecycle_state AS representation_entity_state
+                re.lifecycle_state AS representation_entity_state,
+                ps.protection_scope_id AS protection_scope_id
             FROM source_representations AS sr
             JOIN sources AS s
               ON s.source_id = sr.source_id
@@ -280,6 +281,8 @@ class ArchiveSearchService:
               ON se.entity_id = s.source_id
             JOIN entity_registry AS re
               ON re.entity_id = sr.representation_id
+            LEFT JOIN protected_sources AS ps
+              ON ps.source_id = s.source_id
             WHERE sr.representation_id = ?
               AND sr.source_id = ?
             """,
@@ -289,6 +292,8 @@ class ArchiveSearchService:
             raise ArchiveSearchError(
                 "Derived SourceChunk references missing authoritative Source metadata."
             )
+        if row["protection_scope_id"] is not None:
+            return None
         if str(row["source_entity_state"]) != "active":
             return None
         if str(row["representation_entity_state"]) != "active":
