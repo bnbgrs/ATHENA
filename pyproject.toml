@@ -24,6 +24,7 @@ dev = [
 
 [project.scripts]
 athena = "athena.__main__:main"
+athena-recover = "athena.recovery_cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

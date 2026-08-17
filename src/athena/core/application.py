@@ -122,9 +122,30 @@ from athena.source.representation_store import TextRepresentationStore
 from athena.source.service import SourceCaptureService
 from athena.storage.database import SQLiteDatabase
 from athena.storage.paths import RuntimePaths
+from athena.storage.recovery import (
+    DatabaseRecoveryRequiredError,
+    inspect_database_read_only,
+)
 from athena.storage.runtime import RuntimeLayoutService
 
 logger = logging.getLogger(__name__)
+
+
+def _database_recovery_error(
+    error: BaseException,
+) -> DatabaseRecoveryRequiredError | None:
+    """Find a fail-closed DB recovery signal through wrapped failures."""
+    current: BaseException | None = error
+    seen: set[int] = set()
+
+    while current is not None and id(current) not in seen:
+        if isinstance(current, DatabaseRecoveryRequiredError):
+            return current
+
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+
+    return None
 
 
 class ApplicationState(str, Enum):
@@ -132,6 +153,7 @@ class ApplicationState(str, Enum):
 
     STOPPED = "stopped"
     STARTING = "starting"
+    RECOVERY_REQUIRED = "recovery_required"
     RUNNING = "running"
     STOPPING = "stopping"
     FAILED = "failed"
@@ -589,6 +611,9 @@ class AthenaApplication:
         logger.info("ATHENA Core starting", extra={"event": "core.starting"})
 
         try:
+            # Canonical integrity is established before RuntimeLayoutService
+            # can perform even temporary filesystem write probes.
+            inspect_database_read_only(self.paths.database_path)
             self.services.start_all()
             self.news.start()
             recovered_backups = self.backup.recover_incomplete()
@@ -611,12 +636,25 @@ class AthenaApplication:
                     },
                 )
         except Exception as exc:
-            self.state = ApplicationState.FAILED
-            self.health.mark_failed(str(exc))
-            logger.exception(
-                "ATHENA Core startup failed",
-                extra={"event": "core.start_failed"},
-            )
+            recovery_error = _database_recovery_error(exc)
+
+            if recovery_error is not None:
+                self.state = ApplicationState.RECOVERY_REQUIRED
+                self.health.mark_recovery_required(
+                    str(recovery_error)
+                )
+                logger.exception(
+                    "ATHENA Core startup requires recovery",
+                    extra={"event": "core.recovery_required"},
+                )
+            else:
+                self.state = ApplicationState.FAILED
+                self.health.mark_failed(str(exc))
+                logger.exception(
+                    "ATHENA Core startup failed",
+                    extra={"event": "core.start_failed"},
+                )
+
             raise
 
         self.state = ApplicationState.RUNNING
@@ -629,6 +667,7 @@ class AthenaApplication:
             return
         if self.state not in {
             ApplicationState.RUNNING,
+            ApplicationState.RECOVERY_REQUIRED,
             ApplicationState.FAILED,
         }:
             raise RuntimeError(

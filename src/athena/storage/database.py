@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from athena.common.time import utc_now_us
+from athena.storage.recovery import inspect_database_read_only
 from athena.storage.schema import initialize_schema
 
 
@@ -38,6 +39,8 @@ class SQLiteDatabase:
     def start(self) -> None:
         if self._connection is not None:
             return
+
+        inspect_database_read_only(self.path)
 
         connection = sqlite3.connect(
             self.path,

@@ -9,6 +9,7 @@ from enum import Enum
 class HealthStatus(str, Enum):
     STOPPED = "stopped"
     STARTING = "starting"
+    RECOVERY_REQUIRED = "recovery_required"
     OK = "ok"
     STOPPING = "stopping"
     FAILED = "failed"
@@ -32,6 +33,9 @@ class HealthService:
 
     def mark_ok(self) -> None:
         self._set(HealthStatus.OK)
+
+    def mark_recovery_required(self, detail: str) -> None:
+        self._set(HealthStatus.RECOVERY_REQUIRED, detail)
 
     def mark_stopping(self) -> None:
         self._set(HealthStatus.STOPPING)

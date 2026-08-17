@@ -8,8 +8,14 @@ from pathlib import Path
 import pytest
 
 import athena.backup.service as backup_module
+from athena.common.time import utc_now_us
 from athena.config.settings import AthenaSettings
 from athena.core.application import AthenaApplication
+from athena.jobs.models import JobState
+from athena.jobs.recovery import (
+    CANCELLED_AFTER_RESTORE,
+    RECOVERY_REQUIRED_AFTER_RESTORE,
+)
 
 
 def test_backup_is_verified_and_restores_snapshot_without_later_changes(
@@ -69,6 +75,225 @@ def test_backup_is_verified_and_restores_snapshot_without_later_changes(
         assert restored_db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     finally:
         restored_db.close()
+
+    app.stop()
+
+
+def test_restore_fences_inflight_jobs_and_preserves_confirmed_checkpoint(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "job-recovery-runtime"
+    backup_root = tmp_path / "job-recovery-backup"
+    restored_root = tmp_path / "job-recovery-restored"
+
+    app = AthenaApplication(
+        settings=AthenaSettings(local_root=runtime)
+    )
+    app.start()
+
+    running = app.jobs.create(
+        job_type="source.process"
+    )
+    cancelling = app.jobs.create(
+        job_type="integrity.sweep"
+    )
+    queued = app.jobs.create(
+        job_type="search.rebuild"
+    )
+
+    base = utc_now_us()
+
+    running_lease = app.jobs.acquire(
+        running.job_id,
+        worker_id="pre-restore-running-worker",
+        lease_seconds=3600,
+        now_us=base,
+    )
+    assert running_lease.lease_token is not None
+
+    checkpoint = app.jobs.checkpoint(
+        running.job_id,
+        lease_token=running_lease.lease_token,
+        current_stage="representation",
+        progress_state={"completed_units": 3},
+        last_confirmed_input={"source_id": "source-before-restore"},
+        last_confirmed_output={"representation_id": "confirmed-output"},
+        resume_metadata={"next_unit": 4},
+        now_us=base + 1,
+    )
+
+    cancelling_lease = app.jobs.acquire(
+        cancelling.job_id,
+        worker_id="pre-restore-cancelling-worker",
+        lease_seconds=3600,
+        now_us=base,
+    )
+    assert cancelling_lease.lease_token is not None
+
+    cancel_requested = app.jobs.request_cancel(
+        cancelling.job_id
+    )
+    assert cancel_requested.state is JobState.CANCEL_REQUESTED
+
+    snapshot = app.backup.create_snapshot(
+        target_root=backup_root
+    )
+
+    app.backup.restore_to(
+        snapshot.snapshot_id,
+        destination_root=restored_root,
+    )
+
+    restored_db = sqlite3.connect(
+        restored_root / "state" / "athena.db"
+    )
+    restored_db.row_factory = sqlite3.Row
+
+    try:
+        running_row = restored_db.execute(
+            """
+            SELECT
+                state,
+                blocked_reason,
+                current_stage,
+                last_checkpoint_id,
+                retry_count,
+                worker_id,
+                lease_token,
+                lease_acquired_at_us,
+                lease_expires_at_us,
+                heartbeat_at_us,
+                fencing_sequence
+            FROM jobs
+            WHERE job_id = ?
+            """,
+            (running.job_id.bytes,),
+        ).fetchone()
+
+        assert running_row is not None
+        assert running_row["state"] == JobState.PAUSED.value
+        assert (
+            running_row["blocked_reason"]
+            == RECOVERY_REQUIRED_AFTER_RESTORE
+        )
+        assert running_row["current_stage"] == "representation"
+        assert (
+            bytes(running_row["last_checkpoint_id"])
+            == checkpoint.checkpoint_id.bytes
+        )
+        assert int(running_row["retry_count"]) == 0
+        assert running_row["worker_id"] is None
+        assert running_row["lease_token"] is None
+        assert running_row["lease_acquired_at_us"] is None
+        assert running_row["lease_expires_at_us"] is None
+        assert running_row["heartbeat_at_us"] is None
+        assert (
+            int(running_row["fencing_sequence"])
+            == running_lease.fencing_sequence
+        )
+
+        checkpoint_row = restored_db.execute(
+            """
+            SELECT
+                current_stage,
+                last_checkpoint_id
+            FROM jobs
+            WHERE job_id = ?
+            """,
+            (running.job_id.bytes,),
+        ).fetchone()
+
+        assert checkpoint_row is not None
+        assert checkpoint_row["current_stage"] == "representation"
+        assert (
+            bytes(checkpoint_row["last_checkpoint_id"])
+            == checkpoint.checkpoint_id.bytes
+        )
+
+        cancelling_row = restored_db.execute(
+            """
+            SELECT
+                state,
+                blocked_reason,
+                worker_id,
+                lease_token,
+                lease_acquired_at_us,
+                lease_expires_at_us,
+                heartbeat_at_us,
+                fencing_sequence
+            FROM jobs
+            WHERE job_id = ?
+            """,
+            (cancelling.job_id.bytes,),
+        ).fetchone()
+
+        assert cancelling_row is not None
+        assert cancelling_row["state"] == JobState.CANCELLED.value
+        assert (
+            cancelling_row["blocked_reason"]
+            == CANCELLED_AFTER_RESTORE
+        )
+        assert cancelling_row["worker_id"] is None
+        assert cancelling_row["lease_token"] is None
+        assert cancelling_row["lease_acquired_at_us"] is None
+        assert cancelling_row["lease_expires_at_us"] is None
+        assert cancelling_row["heartbeat_at_us"] is None
+        assert (
+            int(cancelling_row["fencing_sequence"])
+            == cancelling_lease.fencing_sequence
+        )
+
+        queued_row = restored_db.execute(
+            """
+            SELECT
+                state,
+                blocked_reason,
+                worker_id,
+                lease_token,
+                fencing_sequence
+            FROM jobs
+            WHERE job_id = ?
+            """,
+            (queued.job_id.bytes,),
+        ).fetchone()
+
+        assert queued_row is not None
+        assert queued_row["state"] == JobState.QUEUED.value
+        assert queued_row["blocked_reason"] is None
+        assert queued_row["worker_id"] is None
+        assert queued_row["lease_token"] is None
+        assert int(queued_row["fencing_sequence"]) == 0
+
+        assert (
+            restored_db.execute(
+                "PRAGMA integrity_check"
+            ).fetchone()[0]
+            == "ok"
+        )
+        assert (
+            restored_db.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchall()
+            == []
+        )
+
+    finally:
+        restored_db.close()
+
+    # Reconciliation belongs only to the isolated restore target. The live
+    # source runtime must not be rewritten as a side effect of restore.
+    assert (
+        app.jobs.get(running.job_id).state
+        is JobState.RUNNING
+    )
+    assert (
+        app.jobs.get(cancelling.job_id).state
+        is JobState.CANCEL_REQUESTED
+    )
+    assert (
+        app.jobs.get(queued.job_id).state
+        is JobState.QUEUED
+    )
 
     app.stop()
 

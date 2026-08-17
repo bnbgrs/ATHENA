@@ -31,6 +31,7 @@ from athena.backup.target_lock import (
 from athena.chat.service import ChatService
 from athena.common.ids import new_uuid7, uuid_from_blob, uuid_to_blob
 from athena.common.time import utc_now_us
+from athena.jobs.recovery import reconcile_jobs_after_restore
 from athena.lifecycle.deletion import (
     DeletionLedgerRecord,
     apply_deletion_records,
@@ -2429,6 +2430,28 @@ class BackupService:
             )
 
 
+    @classmethod
+    def restore_path_without_live_runtime(
+        cls,
+        snapshot_root: Path,
+        *,
+        destination_root: Path,
+        paths: RuntimePaths,
+    ) -> Path:
+        """Restore a completed backup without opening the configured live database.
+
+        The short-lived instance deliberately receives only RuntimePaths. It never
+        escapes this method and may execute only restore_path(), whose verified
+        restore pipeline does not require the live database, BlobStore, ChatService,
+        model provider, security unlock state, or optional runtime services.
+        """
+        restore_only = cls.__new__(cls)
+        restore_only.paths = paths
+        return restore_only.restore_path(
+            snapshot_root,
+            destination_root=destination_root,
+        )
+
     def restore_path(
         self,
         snapshot_root: Path,
@@ -2628,7 +2651,29 @@ class BackupService:
                     restored,
                     deletion_records,
                 )
-                self._remove_restored_deleted_source_payloads(restored=restored, spool_root=spool_root)
+                self._remove_restored_deleted_source_payloads(
+                    restored=restored,
+                    spool_root=spool_root,
+                )
+
+                job_recovery = reconcile_jobs_after_restore(
+                    restored,
+                    now_us=utc_now_us(),
+                )
+
+                if job_recovery.total:
+                    logger.warning(
+                        "Reconciled in-flight durable jobs in restored runtime",
+                        extra={
+                            "event": "backup.restore_jobs_reconciled",
+                            "paused_running_jobs": (
+                                job_recovery.paused_running
+                            ),
+                            "cancelled_requested_jobs": (
+                                job_recovery.cancelled_requested
+                            ),
+                        },
+                    )
 
                 restored_deletion_watermark = (
                     current_deletion_watermark(

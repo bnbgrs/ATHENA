@@ -3511,6 +3511,17 @@ def _run_model_command(app: AthenaApplication, args: argparse.Namespace) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
+    if (
+        args.command == "backup"
+        and args.backup_command == "restore-path"
+    ):
+        from athena.recovery_cli import run_restore_path
+
+        return run_restore_path(
+            args.snapshot_root,
+            destination_root=args.destination_root,
+        )
+
     try:
         app = AthenaApplication()
     except ConfigurationError as exc:
