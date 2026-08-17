@@ -1404,3 +1404,97 @@ def test_protected_web_snapshot_runtime_uses_primary_article_mode(
             "ascii"
         ),
     )
+
+def test_protected_pdf_input_limit_precedes_plaintext_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import athena.retrieval.protected_source as protected_source_module
+    from athena.retrieval.protected_source import (
+        ProtectedRuntimeSearchError,
+    )
+    from athena.source.pdf_parser import (
+        PdfParserPolicy,
+    )
+
+    password = (
+        b"protected-pdf-limit-password"
+    )
+
+    pdf_path = (
+        tmp_path
+        / "protected-limit.pdf"
+    )
+
+    pdf_path.write_bytes(
+        _runtime_native_text_pdf(
+            (
+                "Protected PDF size-limit evidence",
+            )
+        )
+    )
+
+    app = _app(
+        tmp_path
+    )
+
+    try:
+        _initialize(
+            app,
+            password,
+        )
+
+        scope_id = _scope(
+            app,
+            password,
+            label="protected-pdf-limit",
+        )
+
+        captured = (
+            app.sources.capture_protected_file(
+                pdf_path,
+                protection_scope_id=scope_id,
+            )
+        )
+
+        monkeypatch.setattr(
+            protected_source_module,
+            "DEFAULT_PDF_PARSER_POLICY",
+            PdfParserPolicy(
+                max_input_bytes=1
+            ),
+        )
+
+        read_called = False
+
+        def forbidden_plaintext_read(
+            source_id: uuid.UUID,
+        ) -> bytes:
+            nonlocal read_called
+
+            read_called = True
+
+            raise AssertionError(
+                "Protected plaintext was read "
+                "before the PDF size limit."
+            )
+
+        monkeypatch.setattr(
+            app.sources,
+            "read_protected_bytes",
+            forbidden_plaintext_read,
+        )
+
+        with pytest.raises(
+            ProtectedRuntimeSearchError,
+            match="input byte limit",
+        ):
+            app.protected_source_search.load_document(
+                captured.source.source_id,
+                expected_scope_id=scope_id,
+            )
+
+        assert not read_called
+
+    finally:
+        app.stop()

@@ -31,6 +31,7 @@ from athena.source.html_representation_store import (
 )
 from athena.source.models import SourceLifecycleState, SourceType
 from athena.source.pdf_representation_store import (
+    DEFAULT_PDF_PARSER_POLICY,
     PdfRepresentationError,
     extract_pdf_text_bytes,
 )
@@ -392,6 +393,18 @@ class ProtectedRuntimeSourceSearchService:
         metadata = self.sources.load_protected_metadata(
             source_id
         )
+
+        if (
+            _is_pdf_metadata(
+                metadata
+            )
+            and metadata.plaintext_byte_length
+            > DEFAULT_PDF_PARSER_POLICY.max_input_bytes
+        ):
+            raise ProtectedRuntimeSearchError(
+                "Protected PDF exceeds the "
+                "runtime parser input byte limit."
+            )
 
         plaintext = self.sources.read_protected_bytes(
             source_id
@@ -1065,6 +1078,28 @@ def _runtime_chunks(
     )
 
 
+def _is_pdf_metadata(
+    metadata: ProtectedSourceMetadata,
+) -> bool:
+    suffix = Path(
+        metadata.original_name
+    ).suffix.casefold()
+
+    generic_mime = (
+        metadata.mime_type
+        in _GENERIC_MIME_TYPES
+    )
+
+    return (
+        metadata.mime_type
+        in _PDF_MIME_TYPES
+        or (
+            generic_mime
+            and suffix in _PDF_SUFFIXES
+        )
+    )
+
+
 def _extract_runtime_text(
     payload: bytes,
     metadata: ProtectedSourceMetadata,
@@ -1078,13 +1113,8 @@ def _extract_runtime_text(
         in _GENERIC_MIME_TYPES
     )
 
-    is_pdf = (
-        metadata.mime_type
-        in _PDF_MIME_TYPES
-        or (
-            generic_mime
-            and suffix in _PDF_SUFFIXES
-        )
+    is_pdf = _is_pdf_metadata(
+        metadata
     )
 
     if is_pdf:

@@ -5,9 +5,8 @@ from __future__ import annotations
 import hashlib
 import uuid
 from dataclasses import dataclass
+from importlib.metadata import version
 from pathlib import Path
-
-import pypdf
 
 from athena.chat.service import ChatService
 from athena.model.provenance import ModelRunRepository, ProcessingRun
@@ -31,12 +30,13 @@ from athena.source.representation_repository import (
 
 _PDF_SUFFIXES = {".pdf"}
 _PDF_MIME_TYPES = {"application/pdf"}
+_PYPDF_VERSION = version("pypdf")
 _PARSER_ID = "athena.native_pdf"
-_PARSER_VERSION = f"1+pypdf-{pypdf.__version__}"
+_PARSER_VERSION = f"1+pypdf-{_PYPDF_VERSION}"
 _PIPELINE_VERSION = "native-pdf-text-v1"
 _PDF_OPTIONS: dict[str, object] = {
     "engine": "pypdf",
-    "engine_version": pypdf.__version__,
+    "engine_version": _PYPDF_VERSION,
     "line_endings": "lf",
     "page_order": "document",
     "page_separator": "\n\n",
