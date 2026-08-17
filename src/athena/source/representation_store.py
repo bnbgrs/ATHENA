@@ -12,6 +12,7 @@ from typing import BinaryIO, Protocol
 
 from athena.source.blob_store import BlobIntegrityError, BlobStoreError
 from athena.source.models import BlobStorageArea
+from athena.storage.durable_fs import durable_mkdir, durable_replace
 from athena.storage.paths import RuntimePaths
 
 _COPY_BUFFER_SIZE = 1024 * 1024
@@ -168,7 +169,11 @@ class TextRepresentationStore:
         expected_length: int,
     ) -> None:
         final_path = root / Path(locator)
-        final_path.parent.mkdir(parents=True, exist_ok=True)
+        durable_mkdir(
+            final_path.parent,
+            parents=True,
+            exist_ok=True,
+        )
         if final_path.exists():
             digest, length = _hash_file(final_path)
             if digest != expected_sha256 or length != expected_length:
@@ -194,7 +199,10 @@ class TextRepresentationStore:
                 raise BlobIntegrityError(
                     f"Representation changed before finalization: {str(temp_path)!r}."
                 )
-            os.replace(temp_path, final_path)
+            durable_replace(
+                temp_path,
+                final_path,
+            )
         finally:
             temp_path.unlink(missing_ok=True)
 

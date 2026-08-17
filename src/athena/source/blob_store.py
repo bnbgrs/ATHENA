@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from athena.source.models import BlobStorageArea
+from athena.storage.durable_fs import durable_mkdir, durable_replace
 from athena.storage.paths import RuntimePaths
 
 _COPY_BUFFER_SIZE = 1024 * 1024
@@ -586,7 +587,8 @@ class BlobStore:
             / Path(locator)
         )
 
-        final_path.parent.mkdir(
+        durable_mkdir(
+            final_path.parent,
             parents=True,
             exist_ok=True,
         )
@@ -652,7 +654,7 @@ class BlobStore:
                     f"{str(temp_path)!r}."
                 )
 
-            os.replace(
+            durable_replace(
                 temp_path,
                 final_path,
             )

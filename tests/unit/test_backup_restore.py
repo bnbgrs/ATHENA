@@ -478,3 +478,73 @@ def test_recover_incomplete_finalizes_valid_published_marker_and_releases_pins(
     ).fetchone()
     assert pins is not None and int(pins[0]) == 0
     app.stop()
+
+
+
+def test_restore_post_rename_durability_failure_removes_published_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = AthenaApplication(
+        settings=AthenaSettings(
+            local_root=tmp_path / "post-rename-runtime"
+        )
+    )
+    app.start()
+
+    try:
+        source_path = tmp_path / "post-rename-source.txt"
+        source_path.write_text(
+            "post-rename durability failure evidence",
+            encoding="utf-8",
+        )
+        app.sources.capture_file(source_path)
+
+        snapshot = app.backup.create_snapshot(
+            target_root=tmp_path / "post-rename-backup"
+        )
+
+        destination = tmp_path / "post-rename-restored"
+
+        real_durable_replace = backup_module.durable_replace
+
+        def fail_after_restore_publication(
+            source: Path,
+            target: Path,
+        ) -> None:
+            real_durable_replace(
+                source,
+                target,
+            )
+
+            if (
+                source.name.endswith(".restore-partial")
+                and target == destination
+            ):
+                raise OSError(
+                    "synthetic post-rename durability failure"
+                )
+
+        monkeypatch.setattr(
+            backup_module,
+            "durable_replace",
+            fail_after_restore_publication,
+        )
+
+        with pytest.raises(
+            OSError,
+            match="synthetic post-rename durability failure",
+        ):
+            app.backup.restore_to(
+                snapshot.snapshot_id,
+                destination_root=destination,
+            )
+
+        assert not destination.exists()
+        assert not tuple(
+            destination.parent.glob(
+                f".{destination.name}.*.restore-partial"
+            )
+        )
+    finally:
+        app.stop()

@@ -41,6 +41,11 @@ from athena.lifecycle.deletion import (
 from athena.source.blob_store import BlobStore
 from athena.source.models import BlobStorageArea
 from athena.storage.database import SQLiteDatabase
+from athena.storage.durable_fs import (
+    durable_mkdir,
+    durable_replace,
+    fsync_directory,
+)
 from athena.storage.paths import RuntimePaths
 from athena.storage.schema import (
     DELETION_LEDGER_SCHEMA_VERSION,
@@ -584,7 +589,8 @@ class BackupService:
             / self.DELETION_LEDGER_DIR
         )
 
-        ledger_root.mkdir(
+        durable_mkdir(
+            ledger_root,
             parents=True,
             exist_ok=True,
         )
@@ -634,7 +640,7 @@ class BackupService:
                     handle.fileno()
                 )
 
-            os.replace(
+            durable_replace(
                 temporary,
                 destination,
             )
@@ -874,7 +880,8 @@ class BackupService:
             / self.DELETION_LEDGER_RECORDS_DIR
         )
 
-        records_root.mkdir(
+        durable_mkdir(
+            records_root,
             parents=True,
             exist_ok=True,
         )
@@ -944,7 +951,7 @@ class BackupService:
                     handle.fileno()
                 )
 
-            os.replace(
+            durable_replace(
                 temporary,
                 destination,
             )
@@ -1289,7 +1296,15 @@ class BackupService:
         relative_path = f"snapshots/{snapshot_id}"
         snapshot_root = target / relative_path
         staging_root = target / "snapshots" / f".{snapshot_id}.partial"
-        staging_root.mkdir(parents=True, exist_ok=False)
+        durable_mkdir(
+            staging_root.parent,
+            parents=True,
+            exist_ok=True,
+        )
+        staging_root.mkdir(
+            parents=False,
+            exist_ok=False,
+        )
         snapshot_db = staging_root / "athena.db"
 
         with self.database.write_transaction() as connection:
@@ -1458,7 +1473,7 @@ class BackupService:
                 )
             if snapshot_root.exists():
                 raise BackupRestoreError("Backup snapshot destination already exists.")
-            os.replace(staging_root, snapshot_root)
+            durable_replace(staging_root, snapshot_root)
             if not self._verify_payload_path(
                 target=target,
                 snapshot_root=snapshot_root,
@@ -2559,13 +2574,18 @@ class BackupService:
             )
         if not destination.name:
             raise BackupRestoreError("Restore destination must have a final directory name.")
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        durable_mkdir(
+            destination.parent,
+            parents=True,
+            exist_ok=True,
+        )
         staging = destination.with_name(
             f".{destination.name}.{new_uuid7()}.restore-partial"
         )
         if staging.exists():
             raise BackupRestoreError("Restore staging destination already exists.")
         staging.mkdir(parents=False, exist_ok=False)
+        publication_identity: tuple[int, int] | None = None
 
         try:
             manifest = _read_manifest(snapshot_root / "manifest.json")
@@ -2599,8 +2619,16 @@ class BackupService:
 
             state_root = staging / "state"
             spool_root = state_root / "spool"
-            state_root.mkdir(parents=True, exist_ok=True)
-            spool_root.mkdir(parents=True, exist_ok=True)
+            durable_mkdir(
+                state_root,
+                parents=True,
+                exist_ok=True,
+            )
+            durable_mkdir(
+                spool_root,
+                parents=True,
+                exist_ok=True,
+            )
             restored_db = state_root / "athena.db"
             shutil.copy2(snapshot_root / "athena.db", restored_db)
             database_meta = manifest.get("database")
@@ -2750,16 +2778,70 @@ class BackupService:
                     },
                 )
 
-            (staging / "derived").mkdir(parents=True, exist_ok=True)
+            durable_mkdir(
+                staging / "derived",
+                parents=True,
+                exist_ok=True,
+            )
 
             _write_fsynced(
                 state_root / "restore.complete",
                 b"ATHENA_RESTORE_COMPLETE_V1\n",
             )
-            os.replace(staging, destination)
+
+            # state/ and derived/ are directory entries owned by the staging
+            # directory. Persist them before publishing the staging directory
+            # itself.
+            fsync_directory(staging)
+
+            staging_stat = staging.stat()
+            publication_identity = (
+                staging_stat.st_dev,
+                staging_stat.st_ino,
+            )
+
+            durable_replace(
+                staging,
+                destination,
+            )
             return destination
+
         except BaseException:
-            shutil.rmtree(staging, ignore_errors=True)
+            shutil.rmtree(
+                staging,
+                ignore_errors=True,
+            )
+
+            # durable_replace may have completed the atomic rename and then
+            # failed while making that rename durable. The destination was
+            # required to be absent at entry. Remove it only if its filesystem
+            # identity proves that it is the exact staging directory created
+            # by this restore.
+            if (
+                publication_identity is not None
+                and destination.exists()
+                and destination.is_dir()
+            ):
+                try:
+                    destination_stat = destination.stat()
+                except OSError:
+                    destination_stat = None
+
+                if (
+                    destination_stat is not None
+                    and (
+                        destination_stat.st_dev,
+                        destination_stat.st_ino,
+                    )
+                    == publication_identity
+                ):
+                    shutil.rmtree(
+                        destination
+                    )
+                    fsync_directory(
+                        destination.parent
+                    )
+
             raise
 
 
@@ -2943,7 +3025,8 @@ class BackupService:
             )
 
         if not target.exists():
-            target.mkdir(
+            durable_mkdir(
+                target,
                 parents=True,
                 exist_ok=False,
             )
@@ -3623,7 +3706,8 @@ class BackupService:
             target
             / self.RETENTION_TRASH_NAME
         )
-        trash_root.mkdir(
+        durable_mkdir(
+            trash_root,
             parents=True,
             exist_ok=True,
         )
@@ -3637,7 +3721,7 @@ class BackupService:
                 "Retention trash already contains snapshot."
             )
 
-        os.replace(
+        durable_replace(
             snapshot_root,
             trash_path,
         )
@@ -3677,7 +3761,7 @@ class BackupService:
                 trash_path.exists()
                 and not snapshot_root.exists()
             ):
-                os.replace(
+                durable_replace(
                     trash_path,
                     snapshot_root,
                 )
@@ -3769,11 +3853,12 @@ class BackupService:
                         "live and trashed snapshot copies."
                     )
 
-                snapshot_root.parent.mkdir(
+                durable_mkdir(
+                    snapshot_root.parent,
                     parents=True,
                     exist_ok=True,
                 )
-                os.replace(
+                durable_replace(
                     item,
                     snapshot_root,
                 )
@@ -5200,7 +5285,11 @@ def _copy_verified(
         if digest != expected_sha256 or length != expected_length:
             raise BackupRestoreError(f"Existing backup object is corrupt: {destination}.")
         return
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    durable_mkdir(
+        destination.parent,
+        parents=True,
+        exist_ok=True,
+    )
     temporary = destination.with_name(f".{destination.name}.{new_uuid7()}.partial")
     try:
         with source.open("rb") as src, temporary.open("xb") as dst:
@@ -5214,7 +5303,7 @@ def _copy_verified(
         digest, length = _hash_file(temporary)
         if digest != expected_sha256 or length != expected_length:
             raise BackupRestoreError(f"Copied backup object failed hash verification: {source}.")
-        os.replace(temporary, destination)
+        durable_replace(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -5229,10 +5318,34 @@ def _fsync_existing(path: Path) -> None:
 
 
 def _write_fsynced(path: Path, data: bytes) -> None:
-    with path.open("xb") as handle:
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
+    """Write and durably publish one new backup metadata file."""
+
+    if path.exists() or path.is_symlink():
+        raise FileExistsError(
+            f"Durable backup metadata destination already exists: {path}."
+        )
+
+    temporary = path.with_name(
+        f".{path.name}.{new_uuid7()}.partial"
+    )
+
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        # Publish only after the bytes themselves are stable. This also makes
+        # the new directory entry durable rather than relying on file fsync
+        # alone.
+        durable_replace(
+            temporary,
+            path,
+        )
+    finally:
+        temporary.unlink(
+            missing_ok=True
+        )
 
 
 def _canonical_json(value: Any) -> str:
