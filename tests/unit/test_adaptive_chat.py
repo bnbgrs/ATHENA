@@ -397,6 +397,115 @@ def test_archive_probe_runs_after_canonical_miss() -> None:
     assert len(archive.calls) == 1
 
 
+def test_natural_local_data_question_routes_to_archive_without_noise_inflation() -> None:
+    planned, local, archive = planner(
+        knowledge_texts=(
+            "ATHENA ist ein lokales Wissenssystem.",
+        ),
+        archive_texts=(
+            "Der Ladezustand des Projekts "
+            "ATHENA-LIVE-F8164C762FE3 betr\u00e4gt 83 Prozent. "
+            "Die technische Leiterin ist Mira-F8164C762FE3.",
+        ),
+    )
+
+    result = planned.plan(
+        "Was ist laut meinen vorhandenen lokalen Daten "
+        "der Ladezustand des Projekts ATHENA-LIVE-F8164C762FE3, "
+        "und wer ist die technische Leiterin?"
+    )
+
+    assert (
+        result.probe_query
+        == "ladezustand athena live f8164c762fe3 technische leiterin"
+    )
+    assert result.mode is AdaptiveRetrievalMode.SOURCES
+    assert (
+        result.reason
+        is AdaptivePlanReason.ARCHIVE_LEXICAL_HIT
+    )
+    assert result.canonical_probe_hit is False
+    assert result.archive_probe_hit is True
+
+    # A weak higher-priority ATHENA-only canonical hit must not shadow
+    # the strongly matching Source.
+    assert len(local.calls) == 2
+    assert len(archive.calls) == 1
+
+
+def test_vague_local_data_language_does_not_select_arbitrary_domain() -> None:
+    planned, local, archive = planner(
+        knowledge_texts=(
+            "Unrelated canonical information.",
+        ),
+        archive_texts=(
+            "Unrelated archived information.",
+        ),
+    )
+
+    result = planned.plan(
+        "Was ist laut meinen vorhandenen lokalen Daten?"
+    )
+
+    assert result.mode is AdaptiveRetrievalMode.DIRECT
+    assert (
+        result.reason
+        is AdaptivePlanReason.NO_INFORMATIVE_QUERY_TERMS
+    )
+    assert result.probe_query is None
+    assert local.calls == []
+    assert archive.calls == []
+
+
+def test_distinctive_identifier_can_support_strong_partial_long_probe() -> None:
+    planned, local, archive = planner(
+        knowledge_texts=(
+            "ATHENA ist ein lokales Wissenssystem.",
+        ),
+        archive_texts=(
+            "ATHENA-LIVE-F8164C762FE3 "
+            "Ladezustand technische Leiterin",
+        ),
+    )
+
+    result = planned.plan(
+        "Pr\u00fcfe Historie Risiken Abh\u00e4ngigkeiten "
+        "Ladezustand ATHENA-LIVE-F8164C762FE3 "
+        "technische Leiterin."
+    )
+
+    assert result.mode is AdaptiveRetrievalMode.SOURCES
+    assert result.canonical_probe_hit is False
+    assert result.archive_probe_hit is True
+    assert len(local.calls) == 2
+    assert len(archive.calls) == 1
+
+
+def test_identifier_alone_cannot_rescue_unrelated_long_probe() -> None:
+    planned, local, archive = planner(
+        archive_texts=(
+            "Interne Referenz F8164C762FE3.",
+        ),
+    )
+
+    result = planned.plan(
+        "Vergleiche Architektur Sicherheit Performance Skalierung "
+        "Wartbarkeit Kosten Betrieb Dokumentation Governance "
+        "Datenschutz Netzwerk Speicher Datenbank "
+        "ATHENA-LIVE-F8164C762FE3."
+    )
+
+    assert result.mode is AdaptiveRetrievalMode.DIRECT
+    assert (
+        result.reason
+        is AdaptivePlanReason.NO_LOCAL_LEXICAL_HIT
+    )
+    assert result.probe_query is not None
+    assert "f8164c762fe3" in result.probe_query
+    assert len(local.calls) == 2
+    assert len(archive.calls) == 1
+
+
 def test_creative_task_does_not_force_direct_but_weak_hit_is_rejected() -> None:
     planned, local, archive = planner(
         knowledge_texts=(

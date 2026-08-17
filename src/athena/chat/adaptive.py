@@ -419,6 +419,47 @@ _PROBE_STOPWORDS = frozenset(
     }
 )
 
+# Generic routing/storage language carries little entity-level retrieval
+# information. Keep it out of cross-domain probes so natural-language
+# phrasing cannot inflate the relevance threshold artificially.
+_PROBE_META_STOPWORDS = frozenset(
+    {
+        "according",
+        "available",
+        "data",
+        "daten",
+        "existing",
+        "gespeichert",
+        "local",
+        "locally",
+        "lokal",
+        "laut",
+        "stored",
+        "vorhanden",
+    }
+)
+
+# Narrow morphology handling for words that are already classified as
+# probe noise. This intentionally is not a general-purpose stemmer:
+# semantic query terms remain exact.
+_PROBE_STOPWORD_INFLECTION_SUFFIXES = (
+    "ern",
+    "em",
+    "en",
+    "er",
+    "es",
+    "e",
+    "s",
+)
+
+_MAX_PROBE_TERMS = 12
+_MAX_RESERVED_DISTINCTIVE_PROBE_TERMS = 4
+
+# A matched opaque identifier may compensate for at most two otherwise
+# unmatched terms in a long natural-language probe. It can never make a
+# candidate relevant by itself.
+_DISTINCTIVE_PROBE_MATCH_BONUS = 2
+
 
 class AdaptiveRetrievalPlanner:
     """Choose the smallest mature local retrieval domain required for one turn."""
@@ -1247,6 +1288,42 @@ def _normalize_for_matching(value: str) -> str:
     )
 
 
+def _is_probe_stopword(
+    token: str,
+) -> bool:
+    if (
+        token in _PROBE_STOPWORDS
+        or token in _PROBE_META_STOPWORDS
+    ):
+        return True
+
+    for suffix in _PROBE_STOPWORD_INFLECTION_SUFFIXES:
+        if len(token) <= len(suffix) + 2:
+            continue
+
+        stem = token[: -len(suffix)]
+
+        if (
+            stem in _PROBE_STOPWORDS
+            or stem in _PROBE_META_STOPWORDS
+        ):
+            return True
+
+    return False
+
+
+def _is_distinctive_probe_term(
+    term: str,
+) -> bool:
+    if len(term) < 5:
+        return False
+
+    return (
+        any(character.isalpha() for character in term)
+        and any(character.isdigit() for character in term)
+    )
+
+
 def _probe_terms(
     value: str,
 ) -> tuple[str, ...]:
@@ -1261,11 +1338,11 @@ def _probe_terms(
         flags=re.UNICODE,
     )
 
-    selected: list[str] = []
+    candidates: list[str] = []
     seen: set[str] = set()
 
     for token in tokens:
-        if token in _PROBE_STOPWORDS:
+        if _is_probe_stopword(token):
             continue
 
         if len(token) < 2:
@@ -1275,12 +1352,40 @@ def _probe_terms(
             continue
 
         seen.add(token)
-        selected.append(token)
+        candidates.append(token)
 
-        if len(selected) >= 12:
+    if len(candidates) <= _MAX_PROBE_TERMS:
+        return tuple(candidates)
+
+    # Preserve a bounded number of opaque identifiers even when they occur
+    # late in a verbose user query. Without this reservation, the old
+    # first-N policy could discard the strongest local entity key.
+    reserved_indices: list[int] = []
+
+    for index, term in enumerate(candidates):
+        if not _is_distinctive_probe_term(term):
+            continue
+
+        reserved_indices.append(index)
+
+        if (
+            len(reserved_indices)
+            >= _MAX_RESERVED_DISTINCTIVE_PROBE_TERMS
+        ):
             break
 
-    return tuple(selected)
+    selected_indices = set(reserved_indices)
+
+    for index in range(len(candidates)):
+        if len(selected_indices) >= _MAX_PROBE_TERMS:
+            break
+
+        selected_indices.add(index)
+
+    return tuple(
+        candidates[index]
+        for index in sorted(selected_indices)
+    )
 
 
 def _build_probe_query(
@@ -1333,14 +1438,47 @@ def _supports_probe_terms(
         text,
     )
 
-    matched = sum(
-        1
+    matched_terms = tuple(
+        term
         for term in probe_terms
         if term in candidate
     )
+
+    matched = len(matched_terms)
 
     required = required_term_matches(
         len(probe_terms)
     )
 
-    return matched >= required
+    if matched >= required:
+        return True
+
+    # Short probes remain fully conservative. Their existing exact/near-exact
+    # semantics must not be weakened by identifier heuristics.
+    if len(probe_terms) <= 3:
+        return False
+
+    distinctive_matches = sum(
+        1
+        for term in matched_terms
+        if _is_distinctive_probe_term(term)
+    )
+
+    non_distinctive_matches = (
+        matched - distinctive_matches
+    )
+
+    # One opaque identifier alone must never turn an otherwise unrelated
+    # candidate into a routing hit.
+    if (
+        distinctive_matches < 1
+        or non_distinctive_matches < 2
+    ):
+        return False
+
+    credited_matches = (
+        matched
+        + _DISTINCTIVE_PROBE_MATCH_BONUS
+    )
+
+    return credited_matches >= required

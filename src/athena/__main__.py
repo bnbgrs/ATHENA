@@ -1485,6 +1485,14 @@ def _run_chat_command(app: AthenaApplication, args: argparse.Namespace) -> int:
                     on_delta=lambda chunk: print(chunk, end="", flush=True),
                 )
                 result = adaptive_result.generation
+
+                # Preserve the concrete delegated result for the common
+                # diagnostics below. Adaptive routing must expose the same
+                # retrieval/context observability as selecting that hardened
+                # chat path explicitly.
+                memory_result = adaptive_result.memory_result
+                source_result = adaptive_result.source_result
+                unified_result = adaptive_result.unified_result
             elif args.memory and args.sources:
                 unified_allow_model_prior = True
                 if args.memory_allow_model_prior is not None:
