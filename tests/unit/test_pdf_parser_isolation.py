@@ -495,4 +495,3 @@ def test_default_pdf_timeout_leaves_scheduler_lease_headroom() -> None:
         DEFAULT_PDF_PARSER_POLICY.timeout_seconds
         <= SchedulerPolicy().lease_seconds - 30
     )
-
