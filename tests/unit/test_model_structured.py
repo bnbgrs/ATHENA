@@ -10,6 +10,7 @@ from athena.model.adapters.lm_studio import (
     ProviderContextLimitError,
     ProviderOutputLimitError,
     ProviderProtocolError,
+    ProviderRefusalError,
 )
 from athena.model.domain import ModelChatMessage
 
@@ -170,3 +171,33 @@ def test_lm_studio_structured_generation_honors_max_output_tokens() -> None:
     request = mocked.call_args.args[0]
     payload = json.loads(request.data.decode("utf-8"))
     assert payload["max_tokens"] == 900
+
+
+def test_lm_studio_classifies_explicit_structured_refusal() -> None:
+    response = FakeResponse(
+        {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "refusal": "I cannot comply with that request.",
+                    },
+                }
+            ]
+        }
+    )
+    provider = LMStudioProvider("http://127.0.0.1:1234")
+
+    with patch("athena.model.adapters.lm_studio.urlopen", return_value=response):
+        with pytest.raises(
+            ProviderRefusalError,
+            match="refused by the model",
+        ):
+            provider.generate_structured(
+                model_id="example/model",
+                messages=(ModelChatMessage(role="user", content="Extract."),),
+                schema_id="example_schema_v1",
+                json_schema={"type": "object"},
+            )

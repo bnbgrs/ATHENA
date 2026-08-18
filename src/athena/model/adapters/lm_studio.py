@@ -33,6 +33,10 @@ class ProviderOutputLimitError(ModelProviderError):
     """Raised when structured generation exhausts its output-token budget."""
 
 
+class ProviderRefusalError(ModelProviderError):
+    """Raised when the selected model explicitly refuses a generation request."""
+
+
 @dataclass(frozen=True, slots=True)
 class LMStudioProvider:
     """LM Studio adapter.
@@ -281,6 +285,19 @@ class LMStudioProvider:
             raise ProviderProtocolError(
                 "LM Studio structured choice is missing a message object."
             )
+
+        refusal = message.get("refusal")
+        if refusal is not None:
+            if not isinstance(refusal, str):
+                raise ProviderProtocolError(
+                    "LM Studio structured response has an invalid refusal field."
+                )
+            normalized_refusal = refusal.strip()
+            if normalized_refusal:
+                raise ProviderRefusalError(
+                    "LM Studio structured generation was refused by the model: "
+                    f"{normalized_refusal[:500]}"
+                )
 
         # LM Studio can expose reasoning separately from message.content.
         # Structured ATHENA calls pin reasoning off, so any non-empty reasoning
