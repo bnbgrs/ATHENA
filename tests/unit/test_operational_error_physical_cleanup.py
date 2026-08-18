@@ -11,8 +11,6 @@ from athena.storage.database import SQLiteDatabase
 from athena.storage.schema import (
     DELETION_LEDGER_MIGRATION_ID,
     DELETION_LEDGER_SCHEMA_VERSION,
-    OPERATIONAL_ERROR_PHYSICAL_CLEANUP_MIGRATION_ID,
-    OPERATIONAL_ERROR_PHYSICAL_CLEANUP_SCHEMA_VERSION,
     OPERATIONAL_ERROR_SANITIZATION_MIGRATION_ID,
     OPERATIONAL_ERROR_SANITIZATION_SCHEMA_VERSION,
     DatabaseCompatibilityError,
@@ -77,6 +75,19 @@ def _set_version(
     )
 
     try:
+        if (
+            version
+            < schema_module.PROTECTED_SOURCE_SEMANTIC_SCHEMA_VERSION
+        ):
+            connection.execute(
+                "DROP TABLE IF EXISTS "
+                "source_protection_representation_blobs"
+            )
+            connection.execute(
+                "DROP TABLE IF EXISTS "
+                "source_protected_semantic_payloads"
+            )
+
         connection.execute(
             """
             UPDATE schema_metadata
@@ -370,15 +381,12 @@ def test_physical_cleanup_migration_removes_deleted_canary(
         path
     )
 
-    assert (
-        version
-        == OPERATIONAL_ERROR_PHYSICAL_CLEANUP_SCHEMA_VERSION
-    )
+    assert version == schema_module.SCHEMA_VERSION
 
     assert metadata == (
-        OPERATIONAL_ERROR_PHYSICAL_CLEANUP_SCHEMA_VERSION,
-        OPERATIONAL_ERROR_PHYSICAL_CLEANUP_MIGRATION_ID,
-        OPERATIONAL_ERROR_PHYSICAL_CLEANUP_SCHEMA_VERSION,
+        schema_module.SCHEMA_VERSION,
+        schema_module.PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
+        schema_module.SCHEMA_VERSION,
     )
 
     assert _raw_canary_count(
@@ -386,13 +394,87 @@ def test_physical_cleanup_migration_removes_deleted_canary(
         canary,
     ) == 0
 
-    assert _schema_objects(
+    objects_after = _schema_objects(
         path
-    ) == objects_before
+    )
 
-    assert _table_counts(
+    v39_object_names = {
+        "source_protected_semantic_payloads",
+        "source_protection_representation_blobs",
+        "idx_source_protected_semantic_scope",
+        "idx_source_protected_semantic_entity",
+        "idx_source_protection_representation_state",
+        "idx_source_protection_representation_old_blob",
+    }
+
+    preserved_objects_after = tuple(
+        row
+        for row in objects_after
+        if str(row[1]) not in v39_object_names
+    )
+
+    assert preserved_objects_after == objects_before
+
+    added_objects = {
+        (
+            str(row[0]),
+            str(row[1]),
+        )
+        for row in objects_after
+        if str(row[1]) in v39_object_names
+    }
+
+    assert added_objects == {
+        (
+            "table",
+            "source_protected_semantic_payloads",
+        ),
+        (
+            "table",
+            "source_protection_representation_blobs",
+        ),
+        (
+            "index",
+            "idx_source_protected_semantic_scope",
+        ),
+        (
+            "index",
+            "idx_source_protected_semantic_entity",
+        ),
+        (
+            "index",
+            "idx_source_protection_representation_state",
+        ),
+        (
+            "index",
+            "idx_source_protection_representation_old_blob",
+        ),
+    }
+
+    counts_after = _table_counts(
         path
-    ) == counts_before
+    )
+
+    v39_tables = {
+        "source_protected_semantic_payloads",
+        "source_protection_representation_blobs",
+    }
+
+    preserved_counts_after = {
+        table: count
+        for table, count in counts_after.items()
+        if table not in v39_tables
+    }
+
+    assert preserved_counts_after == counts_before
+
+    assert {
+        table: counts_after[table]
+        for table in v39_tables
+    } == {
+        "source_protected_semantic_payloads": 0,
+        "source_protection_representation_blobs": 0,
+    }
 
     _assert_integrity(
         path
@@ -502,15 +584,12 @@ def test_v38_second_start_does_not_repeat_cleanup(
         path
     )
 
-    assert (
-        version
-        == OPERATIONAL_ERROR_PHYSICAL_CLEANUP_SCHEMA_VERSION
-    )
+    assert version == schema_module.SCHEMA_VERSION
 
     assert metadata == (
-        OPERATIONAL_ERROR_PHYSICAL_CLEANUP_SCHEMA_VERSION,
-        OPERATIONAL_ERROR_PHYSICAL_CLEANUP_MIGRATION_ID,
-        OPERATIONAL_ERROR_PHYSICAL_CLEANUP_SCHEMA_VERSION,
+        schema_module.SCHEMA_VERSION,
+        schema_module.PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
+        schema_module.SCHEMA_VERSION,
     )
 
 
