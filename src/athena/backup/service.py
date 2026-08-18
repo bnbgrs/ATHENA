@@ -38,6 +38,7 @@ from athena.lifecycle.deletion import (
     current_deletion_watermark,
     read_deletion_records,
 )
+from athena.lifecycle.runtime_lock import runtime_data_lock
 from athena.source.blob_store import BlobStore
 from athena.source.models import BlobStorageArea
 from athena.storage.database import SQLiteDatabase
@@ -98,11 +99,13 @@ class BackupService:
         blob_store: BlobStore,
         paths: RuntimePaths,
         chat: ChatService,
+        runtime_lock_root: Path | None = None,
     ) -> None:
         self.database = database
         self.blob_store = blob_store
         self.paths = paths
         self.chat = chat
+        self.runtime_lock_root = runtime_lock_root
 
 
     def sync_deletion_ledger(
@@ -206,9 +209,7 @@ class BackupService:
                         "target_id": str(
                             target.target_id
                         ),
-                        "error": (
-                            f"{type(exc).__name__}: {exc}"
-                        )[:1000],
+                        "error": type(exc).__name__,
                     },
                 )
 
@@ -968,7 +969,6 @@ class BackupService:
             )
 
     @classmethod
-    @classmethod
     def _deletion_record_name(
         cls,
         record: DeletionLedgerRecord,
@@ -1271,19 +1271,22 @@ class BackupService:
             actor_id=actor_id,
         )
 
-        with backup_target_lock(target):
-            self._sync_deletion_ledger_locked(
-                target_id=resolved_target_id,
-                target=target,
-            )
-            self._recover_retention_locked(
-                target_id=resolved_target_id,
-                target=target,
-            )
-            return self._create_snapshot_locked(
-                target=target,
-                target_id=resolved_target_id,
-            )
+        with runtime_data_lock(
+            self.runtime_lock_root
+        ):
+            with backup_target_lock(target):
+                self._sync_deletion_ledger_locked(
+                    target_id=resolved_target_id,
+                    target=target,
+                )
+                self._recover_retention_locked(
+                    target_id=resolved_target_id,
+                    target=target,
+                )
+                return self._create_snapshot_locked(
+                    target=target,
+                    target_id=resolved_target_id,
+                )
 
     def _create_snapshot_locked(
         self,
@@ -1561,7 +1564,7 @@ class BackupService:
                         WHERE snapshot_id = ?
                         """,
                         (
-                            f"{type(exc).__name__}: {exc}"[:2000],
+                            type(exc).__name__,
                             uuid_to_blob(snapshot_id),
                         ),
                     )
@@ -1841,7 +1844,7 @@ class BackupService:
                 SET state = 'failed',
                     verification_status = 'failed',
                     failure_detail =
-                        'startup recovery: incomplete or invalid backup'
+                        'BackupStartupRecoveryError'
                 WHERE snapshot_id = ?
                   AND state = 'creating'
                 """,
@@ -1936,10 +1939,7 @@ class BackupService:
             self._record_verification_failure(
                 record,
                 mode="light",
-                detail=(
-                    "Light verification detected "
-                    "invalid backup content."
-                ),
+                detail="BackupLightVerificationError",
             )
 
             raise BackupRestoreError(
@@ -2104,7 +2104,7 @@ class BackupService:
                 self._record_verification_failure(
                     record,
                     mode="deep",
-                    detail=str(exc),
+                    detail=type(exc).__name__,
                 )
 
             logger.warning(

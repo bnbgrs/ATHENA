@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 import sqlite3
 
 from athena.news.schema import (
@@ -52,7 +54,10 @@ PROTECTED_SOURCE_BLOB_SCHEMA_VERSION = 33
 SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION = 34
 BACKUP_RETENTION_SCHEMA_VERSION = 35
 DELETION_LEDGER_SCHEMA_VERSION = 36
-SCHEMA_VERSION = DELETION_LEDGER_SCHEMA_VERSION
+OPERATIONAL_ERROR_SANITIZATION_SCHEMA_VERSION = 37
+OPERATIONAL_ERROR_PHYSICAL_CLEANUP_SCHEMA_VERSION = 38
+PROTECTED_SOURCE_SEMANTIC_SCHEMA_VERSION = 39
+SCHEMA_VERSION = PROTECTED_SOURCE_SEMANTIC_SCHEMA_VERSION
 STORAGE_LAYOUT_VERSION = 1
 BLOB_FORMAT_VERSION = 1
 KNOWLEDGE_CORE_MIGRATION_ID = "0002_knowledge_core"
@@ -100,6 +105,14 @@ PROTECTED_SOURCE_BLOB_MIGRATION_ID = (
 SOURCE_PROTECTION_TRANSITION_MIGRATION_ID = "0034_source_protection_transition"
 BACKUP_RETENTION_MIGRATION_ID = "0035_backup_targets_retention"
 DELETION_LEDGER_MIGRATION_ID = "0036_deletion_ledger"
+OPERATIONAL_ERROR_SANITIZATION_MIGRATION_ID = (
+    "0037_operational_error_sanitization"
+)
+OPERATIONAL_ERROR_PHYSICAL_CLEANUP_MIGRATION_ID = (
+    "0038_operational_error_physical_cleanup"
+)
+PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID = "0039_protected_source_semantic_foundation"
+
 
 
 class DatabaseCompatibilityError(RuntimeError):
@@ -200,6 +213,9 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         PROTECTED_SOURCE_BLOB_SCHEMA_VERSION,
         SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
         BACKUP_RETENTION_SCHEMA_VERSION,
+        DELETION_LEDGER_SCHEMA_VERSION,
+        OPERATIONAL_ERROR_SANITIZATION_SCHEMA_VERSION,
+        OPERATIONAL_ERROR_PHYSICAL_CLEANUP_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -415,8 +431,38 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         _migrate_schema_v35_to_v36(connection)
         existing_user_version = DELETION_LEDGER_SCHEMA_VERSION
 
+    if (
+        existing_user_version
+        == DELETION_LEDGER_SCHEMA_VERSION
+    ):
+        _verify_schema_v36(connection)
+        _migrate_schema_v36_to_v37(connection)
+        existing_user_version = (
+            OPERATIONAL_ERROR_SANITIZATION_SCHEMA_VERSION
+        )
+
+    if (
+        existing_user_version
+        == OPERATIONAL_ERROR_SANITIZATION_SCHEMA_VERSION
+    ):
+        _verify_schema_v37(connection)
+        _migrate_schema_v37_to_v38(connection)
+        existing_user_version = (
+            OPERATIONAL_ERROR_PHYSICAL_CLEANUP_SCHEMA_VERSION
+        )
+
+    if (
+        existing_user_version
+        == OPERATIONAL_ERROR_PHYSICAL_CLEANUP_SCHEMA_VERSION
+    ):
+        _verify_schema_v38(connection)
+        _migrate_schema_v38_to_v39(connection)
+        existing_user_version = (
+            PROTECTED_SOURCE_SEMANTIC_SCHEMA_VERSION
+        )
+
     _configure_connection(connection)
-    _verify_schema_v36(connection)
+    _verify_schema_v39(connection)
 
 
 def _create_schema_v1(connection: sqlite3.Connection, *, created_at_us: int) -> None:
@@ -3846,13 +3892,1060 @@ def _migrate_schema_v35_to_v36(
         raise
 
 
+_PERSISTED_ERROR_CODE_RE = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_.-]{0,127}"
+    r"(?::[A-Za-z_][A-Za-z0-9_.-]{0,127})*\Z",
+    re.ASCII,
+)
+
+_PERSISTED_ERROR_SCALAR_FIELDS = (
+    ("processing_runs", "error_detail"),
+    ("archive_replication_outbox", "last_error_detail"),
+    ("backup_snapshots", "failure_detail"),
+    ("news_discoveries", "failure_reason"),
+    ("news_source_run_failures", "detail"),
+    ("news_source_states", "last_error"),
+    ("jobs", "blocked_reason"),
+)
+
+
+def _sanitize_persisted_error_value(
+    value: str,
+) -> str | None:
+    normalized = value.strip()
+
+    if not normalized:
+        return None
+
+    if _PERSISTED_ERROR_CODE_RE.fullmatch(normalized) is not None:
+        return normalized
+
+    prefix, separator, _suffix = normalized.partition(":")
+
+    if separator:
+        normalized_prefix = prefix.strip()
+
+        if (
+            _PERSISTED_ERROR_CODE_RE.fullmatch(
+                normalized_prefix
+            )
+            is not None
+        ):
+            return normalized_prefix
+
+    return "OperationalError"
+
+_PERSISTED_ERROR_CHECKPOINT_JOB_TYPES = frozenset(
+    {
+        "research.exhaustive",
+        "source.analyze",
+        "source.extract",
+    }
+)
+
+
+def _sanitize_checkpoint_error_payload(
+    *,
+    job_type: str,
+    value: object,
+) -> tuple[object, bool]:
+    """Sanitize only historically known operational checkpoint fields."""
+    if (
+        job_type
+        not in _PERSISTED_ERROR_CHECKPOINT_JOB_TYPES
+        or not isinstance(value, dict)
+    ):
+        return value, False
+
+    sanitized = dict(value)
+
+    if job_type == "source.extract":
+        raw_error = value.get("error")
+
+        if not isinstance(raw_error, str):
+            return value, False
+
+        replacement = _sanitize_persisted_error_value(
+            raw_error
+        )
+
+        if replacement == raw_error:
+            return value, False
+
+        sanitized["error"] = replacement
+
+        return sanitized, True
+
+    raw_reason = value.get("reason")
+    raw_detail = value.get("detail")
+
+    if (
+        not isinstance(raw_reason, str)
+        or not isinstance(raw_detail, str)
+    ):
+        return value, False
+
+    replacement = _sanitize_persisted_error_value(
+        raw_detail
+    )
+
+    if replacement == raw_detail:
+        return value, False
+
+    sanitized["detail"] = replacement
+
+    return sanitized, True
+
+
+def _canonical_migration_json(
+    value: object,
+) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _migrate_schema_v36_to_v37(
+    connection: sqlite3.Connection,
+) -> None:
+    """Remove historical free-text operational errors without changing identity."""
+    if connection.in_transaction:
+        raise RuntimeError(
+            "Operational-error sanitization migration "
+            "requires no active transaction."
+        )
+
+    _verify_schema_v36(
+        connection
+    )
+
+    try:
+        connection.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+        for table, column in (
+            _PERSISTED_ERROR_SCALAR_FIELDS
+        ):
+            rows = connection.execute(
+                f"""
+                SELECT DISTINCT "{column}"
+                FROM "{table}"
+                WHERE "{column}" IS NOT NULL
+                """
+            ).fetchall()
+
+            for row in rows:
+                original = str(
+                    row[0]
+                )
+
+                sanitized_error = (
+                    _sanitize_persisted_error_value(
+                        original
+                    )
+                )
+
+                if sanitized_error == original:
+                    continue
+
+                connection.execute(
+                    f"""
+                    UPDATE "{table}"
+                    SET "{column}" = ?
+                    WHERE "{column}" = ?
+                    """,
+                    (
+                        sanitized_error,
+                        original,
+                    ),
+                )
+
+        checkpoint_rows = connection.execute(
+            """
+            SELECT
+                c.checkpoint_id,
+                j.job_type,
+                c.last_confirmed_output_json
+            FROM checkpoints AS c
+            JOIN jobs AS j
+              ON j.job_id = c.job_id
+            WHERE c.last_confirmed_output_json IS NOT NULL
+            """
+        ).fetchall()
+
+        for row in checkpoint_rows:
+            job_type = str(
+                row[1]
+            )
+
+            raw = str(
+                row[2]
+            )
+
+            try:
+                payload = json.loads(
+                    raw
+                )
+            except json.JSONDecodeError as exc:
+                raise DatabaseCompatibilityError(
+                    "Historical checkpoint output "
+                    "contains invalid JSON."
+                ) from exc
+
+            sanitized_payload, changed = (
+                _sanitize_checkpoint_error_payload(
+                    job_type=job_type,
+                    value=payload,
+                )
+            )
+
+            if not changed:
+                continue
+
+            connection.execute(
+                """
+                UPDATE checkpoints
+                SET last_confirmed_output_json = ?
+                WHERE checkpoint_id = ?
+                """,
+                (
+                    _canonical_migration_json(
+                        sanitized_payload
+                    ),
+                    row[0],
+                ),
+            )
+
+        connection.execute(
+            """
+            UPDATE schema_metadata
+            SET schema_version = ?,
+                last_migration_id = ?,
+                minimum_reader_version = ?
+            WHERE singleton_id = 1
+            """,
+            (
+                OPERATIONAL_ERROR_SANITIZATION_SCHEMA_VERSION,
+                OPERATIONAL_ERROR_SANITIZATION_MIGRATION_ID,
+                OPERATIONAL_ERROR_SANITIZATION_SCHEMA_VERSION,
+            ),
+        )
+
+        connection.execute(
+            f"PRAGMA user_version = "
+            f"{OPERATIONAL_ERROR_SANITIZATION_SCHEMA_VERSION}"
+        )
+
+        connection.execute(
+            "COMMIT"
+        )
+
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def _checkpoint_wal_truncate_for_physical_cleanup(
+    connection: sqlite3.Connection,
+) -> None:
+    try:
+        row = connection.execute(
+            "PRAGMA wal_checkpoint(TRUNCATE)"
+        ).fetchone()
+
+    except sqlite3.OperationalError as exc:
+        raise DatabaseCompatibilityError(
+            "SQLite WAL physical-cleanup checkpoint "
+            "could not run."
+        ) from exc
+
+    if (
+        row is None
+        or len(row) < 1
+        or int(row[0]) != 0
+    ):
+        raise DatabaseCompatibilityError(
+            "SQLite WAL physical-cleanup checkpoint is busy."
+        )
+
+
+def _physical_cleanup_operational_error_remnants(
+    connection: sqlite3.Connection,
+) -> None:
+    """Remove unreachable historical error bytes from SQLite storage."""
+    if connection.in_transaction:
+        raise RuntimeError(
+            "Operational-error physical cleanup "
+            "requires no active transaction."
+        )
+
+    # Do not switch a freshly created database into WAL here.
+    # A manual checkpoint immediately after that transition can be
+    # blocked by statements from the same startup connection.
+    journal_row = connection.execute(
+        "PRAGMA journal_mode"
+    ).fetchone()
+
+    if journal_row is None:
+        raise DatabaseCompatibilityError(
+            "SQLite journal mode could not be determined."
+        )
+
+    journal_mode = str(
+        journal_row[0]
+    ).lower()
+
+    # Existing ATHENA databases are WAL. A database being created by
+    # this same initialize_schema() call is still in SQLite's default
+    # DELETE mode until normal connection configuration runs below.
+    if journal_mode not in {
+        "wal",
+        "delete",
+    }:
+        raise DatabaseCompatibilityError(
+            "ATHENA physical cleanup encountered "
+            f"unsupported SQLite journal mode {journal_mode!r}."
+        )
+
+    connection.execute(
+        "PRAGMA busy_timeout = 5000"
+    )
+
+    connection.execute(
+        "PRAGMA secure_delete = ON"
+    )
+
+    secure_delete_row = connection.execute(
+        "PRAGMA secure_delete"
+    ).fetchone()
+
+    if (
+        secure_delete_row is None
+        or int(secure_delete_row[0]) != 1
+    ):
+        raise DatabaseCompatibilityError(
+            "SQLite secure_delete could not be enabled."
+        )
+
+    # Existing ATHENA databases may still contain historical frames
+    # in their WAL. Fresh databases are still in DELETE mode and have
+    # no WAL to checkpoint.
+    if journal_mode == "wal":
+        _checkpoint_wal_truncate_for_physical_cleanup(
+            connection
+        )
+
+    # VACUUM must run outside a transaction. With secure_delete
+    # enabled it rebuilds the main database using only reachable
+    # logical content.
+    connection.execute(
+        "VACUUM"
+    )
+
+    # VACUUM in WAL mode may itself create WAL frames. Truncate them
+    # before declaring the physical cleanup complete.
+    if journal_mode == "wal":
+        _checkpoint_wal_truncate_for_physical_cleanup(
+            connection
+        )
+
+    quick_check = tuple(
+        str(row[0])
+        for row in connection.execute(
+            "PRAGMA quick_check"
+        )
+    )
+
+    if quick_check != ("ok",):
+        raise DatabaseCompatibilityError(
+            "ATHENA physical-cleanup integrity verification failed."
+        )
+
+    if connection.execute(
+        "PRAGMA foreign_key_check"
+    ).fetchall():
+        raise DatabaseCompatibilityError(
+            "ATHENA physical-cleanup foreign-key verification failed."
+        )
+
+
+def _migrate_schema_v37_to_v38(
+    connection: sqlite3.Connection,
+) -> None:
+    """Physically purge unreachable historical operational-error bytes."""
+    if connection.in_transaction:
+        raise RuntimeError(
+            "Operational-error physical-cleanup migration "
+            "requires no active transaction."
+        )
+
+    _verify_schema_v37(
+        connection
+    )
+
+    # Crucially, perform the physical work before advancing durable
+    # schema metadata. A crash or failure before the final transaction
+    # leaves the database at v37 so startup retries the cleanup.
+    _physical_cleanup_operational_error_remnants(
+        connection
+    )
+
+    try:
+        connection.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+        connection.execute(
+            """
+            UPDATE schema_metadata
+            SET schema_version = ?,
+                last_migration_id = ?,
+                minimum_reader_version = ?
+            WHERE singleton_id = 1
+            """,
+            (
+                OPERATIONAL_ERROR_PHYSICAL_CLEANUP_SCHEMA_VERSION,
+                OPERATIONAL_ERROR_PHYSICAL_CLEANUP_MIGRATION_ID,
+                OPERATIONAL_ERROR_PHYSICAL_CLEANUP_SCHEMA_VERSION,
+            ),
+        )
+
+        connection.execute(
+            f"PRAGMA user_version = "
+            f"{OPERATIONAL_ERROR_PHYSICAL_CLEANUP_SCHEMA_VERSION}"
+        )
+
+        connection.execute(
+            "COMMIT"
+        )
+
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def _migrate_schema_v38_to_v39(
+    connection: sqlite3.Connection,
+) -> None:
+    """Add Protected Source semantic and representation transition state."""
+    if connection.in_transaction:
+        raise RuntimeError(
+            "Protected Source semantic migration "
+            "requires no active transaction."
+        )
+
+    _verify_schema_v38(
+        connection
+    )
+
+    try:
+        connection.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE
+            source_protected_semantic_payloads (
+                source_id BLOB(16) NOT NULL
+                    CHECK(length(source_id) = 16),
+
+                semantic_kind TEXT NOT NULL
+                    CHECK(length(trim(semantic_kind)) > 0),
+
+                entity_id BLOB(16) NOT NULL
+                    CHECK(length(entity_id) = 16),
+
+                protection_scope_id BLOB(16) NOT NULL
+                    CHECK(length(protection_scope_id) = 16),
+
+                protected_payload_id BLOB(16) NOT NULL UNIQUE
+                    CHECK(length(protected_payload_id) = 16),
+
+                payload_version INTEGER NOT NULL
+                    CHECK(payload_version >= 1),
+
+                created_at_us INTEGER NOT NULL
+                    CHECK(created_at_us >= 0),
+
+                PRIMARY KEY(
+                    source_id,
+                    semantic_kind,
+                    entity_id
+                ),
+
+                FOREIGN KEY(source_id)
+                    REFERENCES sources(source_id),
+
+                FOREIGN KEY(protection_scope_id)
+                    REFERENCES protection_scopes(
+                        protection_scope_id
+                    ),
+
+                FOREIGN KEY(protected_payload_id)
+                    REFERENCES protected_payloads(
+                        protected_payload_id
+                    )
+            ) WITHOUT ROWID
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE INDEX
+            idx_source_protected_semantic_scope
+            ON source_protected_semantic_payloads(
+                protection_scope_id,
+                source_id,
+                semantic_kind,
+                entity_id
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE INDEX
+            idx_source_protected_semantic_entity
+            ON source_protected_semantic_payloads(
+                semantic_kind,
+                entity_id,
+                source_id
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE
+            source_protection_representation_blobs (
+                transition_id BLOB(16) NOT NULL
+                    CHECK(length(transition_id) = 16),
+
+                representation_id BLOB(16) NOT NULL
+                    CHECK(length(representation_id) = 16),
+
+                old_blob_id BLOB(16) NOT NULL
+                    CHECK(length(old_blob_id) = 16),
+
+                target_blob_id BLOB(16) NULL
+                    CHECK(
+                        target_blob_id IS NULL
+                        OR length(target_blob_id) = 16
+                    ),
+
+                state TEXT NOT NULL
+                    CHECK(
+                        state IN (
+                            'pending',
+                            'prepared',
+                            'swapped'
+                        )
+                    ),
+
+                created_at_us INTEGER NOT NULL
+                    CHECK(created_at_us >= 0),
+
+                updated_at_us INTEGER NOT NULL
+                    CHECK(updated_at_us >= created_at_us),
+
+                PRIMARY KEY(
+                    transition_id,
+                    representation_id
+                ),
+
+                FOREIGN KEY(transition_id)
+                    REFERENCES source_protection_transitions(
+                        transition_id
+                    ),
+
+                FOREIGN KEY(representation_id)
+                    REFERENCES source_representations(
+                        representation_id
+                    ),
+
+                FOREIGN KEY(old_blob_id)
+                    REFERENCES blob_records(blob_id),
+
+                FOREIGN KEY(target_blob_id)
+                    REFERENCES blob_records(blob_id),
+
+                CHECK(
+                    (
+                        state = 'pending'
+                        AND target_blob_id IS NULL
+                    )
+                    OR
+                    (
+                        state IN (
+                            'prepared',
+                            'swapped'
+                        )
+                        AND target_blob_id IS NOT NULL
+                    )
+                )
+            ) WITHOUT ROWID
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE INDEX
+            idx_source_protection_representation_state
+            ON source_protection_representation_blobs(
+                transition_id,
+                state,
+                representation_id
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE INDEX
+            idx_source_protection_representation_old_blob
+            ON source_protection_representation_blobs(
+                old_blob_id,
+                transition_id,
+                representation_id
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            UPDATE schema_metadata
+            SET schema_version = ?,
+                last_migration_id = ?,
+                minimum_reader_version = ?
+            WHERE singleton_id = 1
+            """,
+            (
+                PROTECTED_SOURCE_SEMANTIC_SCHEMA_VERSION,
+                PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
+                PROTECTED_SOURCE_SEMANTIC_SCHEMA_VERSION,
+            ),
+        )
+
+        connection.execute(
+            f"PRAGMA user_version = "
+            f"{PROTECTED_SOURCE_SEMANTIC_SCHEMA_VERSION}"
+        )
+
+        connection.execute(
+            "COMMIT"
+        )
+
+    except BaseException:
+        connection.rollback()
+        raise
+
+def _verify_schema_v37(
+    connection: sqlite3.Connection,
+    *,
+    schema_version: int = (
+        OPERATIONAL_ERROR_SANITIZATION_SCHEMA_VERSION
+    ),
+    migration_id: str = (
+        OPERATIONAL_ERROR_SANITIZATION_MIGRATION_ID
+    ),
+) -> None:
+    _verify_schema_v36(
+        connection,
+        schema_version=schema_version,
+        migration_id=migration_id,
+    )
+
+    for table, column in (
+        _PERSISTED_ERROR_SCALAR_FIELDS
+    ):
+        rows = connection.execute(
+            f"""
+            SELECT "{column}"
+            FROM "{table}"
+            WHERE "{column}" IS NOT NULL
+            """
+        ).fetchall()
+
+        for row in rows:
+            value = str(
+                row[0]
+            )
+
+            if (
+                _sanitize_persisted_error_value(
+                    value
+                )
+                != value
+            ):
+                raise DatabaseCompatibilityError(
+                    "ATHENA contains unsanitized "
+                    "operational error persistence."
+                )
+
+    checkpoint_rows = connection.execute(
+        """
+        SELECT
+            j.job_type,
+            c.last_confirmed_output_json
+        FROM checkpoints AS c
+        JOIN jobs AS j
+          ON j.job_id = c.job_id
+        WHERE c.last_confirmed_output_json IS NOT NULL
+        """
+    ).fetchall()
+
+    for row in checkpoint_rows:
+        job_type = str(
+            row[0]
+        )
+
+        try:
+            payload = json.loads(
+                str(
+                    row[1]
+                )
+            )
+        except json.JSONDecodeError as exc:
+            raise DatabaseCompatibilityError(
+                "ATHENA checkpoint output is invalid JSON."
+            ) from exc
+
+        _sanitized, changed = (
+            _sanitize_checkpoint_error_payload(
+                job_type=job_type,
+                value=payload,
+            )
+        )
+
+        if changed:
+            raise DatabaseCompatibilityError(
+                "ATHENA contains unsanitized "
+                "checkpoint error persistence."
+            )
+
+    if connection.execute(
+        "PRAGMA foreign_key_check"
+    ).fetchall():
+        raise DatabaseCompatibilityError(
+            "ATHENA foreign-key verification failed."
+        )
+
+
+def _verify_schema_v39(
+    connection: sqlite3.Connection,
+) -> None:
+    _verify_schema_v38(
+        connection,
+        schema_version=(
+            PROTECTED_SOURCE_SEMANTIC_SCHEMA_VERSION
+        ),
+        migration_id=(
+            PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID
+        ),
+    )
+
+    required_tables = {
+        "source_protected_semantic_payloads",
+        "source_protection_representation_blobs",
+    }
+
+    tables = set(
+        _user_tables(
+            connection
+        )
+    )
+
+    if not required_tables.issubset(
+        tables
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA Protected Source semantic "
+            "schema is incomplete."
+        )
+
+    semantic_columns = {
+        str(row[1])
+        for row
+        in connection.execute(
+            """
+            PRAGMA table_info(
+                source_protected_semantic_payloads
+            )
+            """
+        )
+    }
+
+    expected_semantic_columns = {
+        "source_id",
+        "semantic_kind",
+        "entity_id",
+        "protection_scope_id",
+        "protected_payload_id",
+        "payload_version",
+        "created_at_us",
+    }
+
+    if not expected_semantic_columns.issubset(
+        semantic_columns
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA Protected Source semantic "
+            "payload columns are incomplete."
+        )
+
+    transition_columns = {
+        str(row[1])
+        for row
+        in connection.execute(
+            """
+            PRAGMA table_info(
+                source_protection_representation_blobs
+            )
+            """
+        )
+    }
+
+    expected_transition_columns = {
+        "transition_id",
+        "representation_id",
+        "old_blob_id",
+        "target_blob_id",
+        "state",
+        "created_at_us",
+        "updated_at_us",
+    }
+
+    if not expected_transition_columns.issubset(
+        transition_columns
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA Protected Source representation "
+            "transition columns are incomplete."
+        )
+
+    indexes = {
+        str(row[0])
+        for row
+        in connection.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'index'
+              AND name IN (
+                  'idx_source_protected_semantic_scope',
+                  'idx_source_protected_semantic_entity',
+                  'idx_source_protection_representation_state',
+                  'idx_source_protection_representation_old_blob'
+              )
+            """
+        )
+    }
+
+    expected_indexes = {
+        "idx_source_protected_semantic_scope",
+        "idx_source_protected_semantic_entity",
+        "idx_source_protection_representation_state",
+        "idx_source_protection_representation_old_blob",
+    }
+
+    if indexes != expected_indexes:
+        raise DatabaseCompatibilityError(
+            "ATHENA Protected Source semantic "
+            "indexes are incomplete."
+        )
+
+    semantic_foreign_keys = {
+        (
+            str(row[3]),
+            str(row[2]),
+            str(row[4]),
+        )
+        for row
+        in connection.execute(
+            """
+            PRAGMA foreign_key_list(
+                source_protected_semantic_payloads
+            )
+            """
+        )
+    }
+
+    expected_semantic_foreign_keys = {
+        (
+            "source_id",
+            "sources",
+            "source_id",
+        ),
+        (
+            "protection_scope_id",
+            "protection_scopes",
+            "protection_scope_id",
+        ),
+        (
+            "protected_payload_id",
+            "protected_payloads",
+            "protected_payload_id",
+        ),
+    }
+
+    if not expected_semantic_foreign_keys.issubset(
+        semantic_foreign_keys
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA Protected Source semantic "
+            "foreign keys are incomplete."
+        )
+
+    transition_foreign_keys = {
+        (
+            str(row[3]),
+            str(row[2]),
+            str(row[4]),
+        )
+        for row
+        in connection.execute(
+            """
+            PRAGMA foreign_key_list(
+                source_protection_representation_blobs
+            )
+            """
+        )
+    }
+
+    expected_transition_foreign_keys = {
+        (
+            "transition_id",
+            "source_protection_transitions",
+            "transition_id",
+        ),
+        (
+            "representation_id",
+            "source_representations",
+            "representation_id",
+        ),
+        (
+            "old_blob_id",
+            "blob_records",
+            "blob_id",
+        ),
+        (
+            "target_blob_id",
+            "blob_records",
+            "blob_id",
+        ),
+    }
+
+    if not expected_transition_foreign_keys.issubset(
+        transition_foreign_keys
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA Protected Source representation "
+            "foreign keys are incomplete."
+        )
+
+    invalid_semantic = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM source_protected_semantic_payloads
+        WHERE length(source_id) != 16
+           OR length(trim(semantic_kind)) = 0
+           OR length(entity_id) != 16
+           OR length(protection_scope_id) != 16
+           OR length(protected_payload_id) != 16
+           OR payload_version < 1
+           OR created_at_us < 0
+        """
+    ).fetchone()
+
+    invalid_transitions = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM source_protection_representation_blobs
+        WHERE length(transition_id) != 16
+           OR length(representation_id) != 16
+           OR length(old_blob_id) != 16
+           OR (
+               target_blob_id IS NOT NULL
+               AND length(target_blob_id) != 16
+           )
+           OR state NOT IN (
+               'pending',
+               'prepared',
+               'swapped'
+           )
+           OR created_at_us < 0
+           OR updated_at_us < created_at_us
+           OR (
+               state = 'pending'
+               AND target_blob_id IS NOT NULL
+           )
+           OR (
+               state IN (
+                   'prepared',
+                   'swapped'
+               )
+               AND target_blob_id IS NULL
+           )
+        """
+    ).fetchone()
+
+    if (
+        invalid_semantic is None
+        or invalid_transitions is None
+        or int(
+            invalid_semantic[0]
+        )
+        != 0
+        or int(
+            invalid_transitions[0]
+        )
+        != 0
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA Protected Source semantic "
+            "state contains invalid records."
+        )
+
+    if connection.execute(
+        "PRAGMA foreign_key_check"
+    ).fetchall():
+        raise DatabaseCompatibilityError(
+            "ATHENA foreign-key verification failed."
+        )
+
+def _verify_schema_v38(
+    connection: sqlite3.Connection,
+    *,
+    schema_version: int = (
+        OPERATIONAL_ERROR_PHYSICAL_CLEANUP_SCHEMA_VERSION
+    ),
+    migration_id: str = (
+        OPERATIONAL_ERROR_PHYSICAL_CLEANUP_MIGRATION_ID
+    ),
+) -> None:
+    _verify_schema_v37(
+        connection,
+        schema_version=schema_version,
+        migration_id=migration_id,
+    )
+
+
 def _verify_schema_v36(
     connection: sqlite3.Connection,
+    *,
+    schema_version: int = DELETION_LEDGER_SCHEMA_VERSION,
+    migration_id: str = DELETION_LEDGER_MIGRATION_ID,
 ) -> None:
     _verify_schema_v35(
         connection,
-        schema_version=DELETION_LEDGER_SCHEMA_VERSION,
-        migration_id=DELETION_LEDGER_MIGRATION_ID,
+        schema_version=schema_version,
+        migration_id=migration_id,
     )
 
     if (

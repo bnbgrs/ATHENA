@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -226,7 +227,7 @@ class ModelRunRepository:
         if status not in {"succeeded", "failed", "cancelled"}:
             raise ValueError("ProcessingRun final status is invalid.")
         finished_at_us = utc_now_us()
-        normalized_error = _optional_text(error_detail)
+        normalized_error = _persisted_error_detail(error_detail)
 
         with self.database.write_transaction() as connection:
             cursor = connection.execute(
@@ -266,6 +267,37 @@ class ModelRunRepository:
         if row is None:
             raise LookupError(f"ModelSignature {model_signature_id} not found.")
         return _signature_from_row(row)
+
+
+_SAFE_ERROR_DETAIL_RE = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_.-]{0,127}\Z",
+    re.ASCII,
+)
+
+
+def _persisted_error_detail(
+    value: str | None,
+) -> str | None:
+    """Reduce durable error detail to an opaque machine-safe identifier."""
+    normalized = _optional_text(value)
+
+    if normalized is None:
+        return None
+
+    candidate = normalized.split(
+        ":",
+        1,
+    )[0].strip()
+
+    if (
+        _SAFE_ERROR_DETAIL_RE.fullmatch(
+            candidate
+        )
+        is None
+    ):
+        return "OperationalError"
+
+    return candidate
 
 
 def _canonical_json(value: Mapping[str, Any]) -> str:

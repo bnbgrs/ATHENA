@@ -34,7 +34,7 @@ def test_job_cli_survives_process_restarts_and_checkpoints(tmp_path) -> None:
         "--priority",
         "4",
         "--scope-json",
-        '{"source_id":"demo"}',
+        '{"source_id":"11111111-1111-4111-8111-111111111111"}',
         "--config-json",
         '{"pipeline_version":1}',
     )
@@ -43,7 +43,7 @@ def test_job_cli_survives_process_restarts_and_checkpoints(tmp_path) -> None:
     assert match is not None
     job_id = match.group(0)
     assert "State: queued" in created.stdout
-    assert 'Scope: {"source_id":"demo"}' in created.stdout
+    assert 'Scope: {"source_id":"11111111-1111-4111-8111-111111111111"}' in created.stdout
 
     leased = _run_cli(
         local_root,

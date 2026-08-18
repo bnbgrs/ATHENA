@@ -1108,5 +1108,4 @@ def _optional_nonnegative_int(value: object, label: str) -> int | None:
 
 
 def _failure_reason(exc: Exception) -> str:
-    detail = f"{type(exc).__name__}: {exc}"
-    return detail[:1000]
+    return type(exc).__name__

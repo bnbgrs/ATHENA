@@ -238,7 +238,7 @@ def test_source_extraction_rejects_invented_sequence_and_marks_run_failed(tmp_pa
             "WHERE run_type = 'source_knowledge_extraction' ORDER BY started_at_us DESC LIMIT 1"
         ).fetchone()
         assert row is not None and row["status"] == "failed"
-        assert "source_sequence_no 99" in str(row["error_detail"])
+        assert row["error_detail"] == "ExtractionValidationError"
         assert app.database.connection.execute("SELECT COUNT(*) FROM knowledge_units").fetchone()[0] == 0
         assert app.database.connection.execute("SELECT COUNT(*) FROM claims").fetchone()[0] == 0
     finally:

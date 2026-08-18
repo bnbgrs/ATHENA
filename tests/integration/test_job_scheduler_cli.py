@@ -310,6 +310,11 @@ def test_scheduler_supervisor_cleans_control_if_provider_fails_before_ready(
     )
     monkeypatch.setattr(
         athena_cli,
+        "_wait_scheduler_child_started",
+        lambda lane, process, started_file: None,
+    )
+    monkeypatch.setattr(
+        athena_cli,
         "_wait_scheduler_child_ready",
         fake_wait_ready,
     )
@@ -504,3 +509,33 @@ def test_scheduler_child_ready_wait_has_bounded_timeout(
         )
 
     assert process.returncode is None
+
+
+def test_scheduler_child_started_wait_has_bounded_timeout(
+    tmp_path,
+) -> None:
+    process = _FakeSchedulerProcess(404)
+
+    with pytest.raises(
+        JobSchedulerError,
+        match="did not enter startup within",
+    ):
+        athena_cli._wait_scheduler_child_started(
+            SchedulerLane.CONTROL,
+            process,
+            tmp_path / "never-started.flag",
+            timeout_seconds=0.01,
+        )
+
+    assert process.returncode is None
+
+
+def test_scheduler_start_and_ready_timeouts_are_separate() -> None:
+    assert (
+        athena_cli._SCHEDULER_CHILD_START_TIMEOUT_SECONDS
+        == 10.0
+    )
+    assert (
+        athena_cli._SCHEDULER_CHILD_READY_TIMEOUT_SECONDS
+        > athena_cli._SCHEDULER_CHILD_START_TIMEOUT_SECONDS
+    )

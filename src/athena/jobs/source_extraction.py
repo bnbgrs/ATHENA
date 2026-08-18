@@ -357,7 +357,7 @@ class DurableSourceHierarchicalExtractionWorker:
             extraction,
             current_stage="extraction_waiting_network",
             last_input={"extraction_id": str(extraction.extraction_id)},
-            last_output={"error": f"{type(exc).__name__}: {exc}"},
+            last_output={"error": type(exc).__name__},
         )
         waiting = self.jobs.wait(
             job.job_id,
@@ -388,7 +388,7 @@ class DurableSourceHierarchicalExtractionWorker:
             extraction,
             current_stage="extraction_waiting_user",
             last_input={"extraction_id": str(extraction.extraction_id)},
-            last_output={"error": f"{type(exc).__name__}: {exc}"},
+            last_output={"error": type(exc).__name__},
         )
         waiting = self.jobs.wait(
             job.job_id,

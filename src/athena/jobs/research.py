@@ -305,7 +305,7 @@ class DurableResearchWorker:
                 work_item,
                 WaitingReason.NETWORK,
                 stage="research_model_unavailable",
-                detail=str(exc),
+                detail=type(exc).__name__,
             )
         except (ModelSelectionError, SourceAnalysisModelDriftError) as exc:
             return self._wait_reason(
@@ -315,7 +315,7 @@ class DurableResearchWorker:
                 work_item,
                 WaitingReason.USER,
                 stage="research_model_drift",
-                detail=str(exc),
+                detail=type(exc).__name__,
             )
         except ModelProviderError as exc:
             return self._wait_reason(
@@ -325,7 +325,7 @@ class DurableResearchWorker:
                 work_item,
                 WaitingReason.USER,
                 stage="research_model_error",
-                detail=str(exc),
+                detail=type(exc).__name__,
             )
 
         analysis_child = self._ensure_analysis_child(
@@ -473,7 +473,7 @@ class DurableResearchWorker:
                 None,
                 WaitingReason.NETWORK,
                 stage="research_synthesis_model_unavailable",
-                detail=str(exc),
+                detail=type(exc).__name__,
             )
         except (ModelSelectionError, SourceAnalysisModelDriftError) as exc:
             return self._wait_reason(
@@ -483,7 +483,7 @@ class DurableResearchWorker:
                 None,
                 WaitingReason.USER,
                 stage="research_synthesis_model_drift",
-                detail=str(exc),
+                detail=type(exc).__name__,
             )
         except ModelProviderError as exc:
             return self._wait_reason(
@@ -493,7 +493,7 @@ class DurableResearchWorker:
                 None,
                 WaitingReason.USER,
                 stage="research_synthesis_model_error",
-                detail=str(exc),
+                detail=type(exc).__name__,
             )
 
         work = self.synthesis.plan_next_synthesis(
@@ -554,7 +554,7 @@ class DurableResearchWorker:
                 None,
                 WaitingReason.NETWORK,
                 stage="research_synthesis_provider_unavailable",
-                detail=str(exc),
+                detail=type(exc).__name__,
             )
         except SourceAnalysisModelDriftError as exc:
             return self._wait_reason(
@@ -564,7 +564,7 @@ class DurableResearchWorker:
                 None,
                 WaitingReason.USER,
                 stage="research_synthesis_model_drift",
-                detail=str(exc),
+                detail=type(exc).__name__,
             )
         except ResearchSynthesisOutputError as exc:
             return self._wait_reason(
@@ -574,7 +574,7 @@ class DurableResearchWorker:
                 None,
                 WaitingReason.USER,
                 stage="research_synthesis_output_invalid",
-                detail=str(exc),
+                detail=type(exc).__name__,
             )
         except ModelProviderError as exc:
             return self._wait_reason(
@@ -584,7 +584,7 @@ class DurableResearchWorker:
                 None,
                 WaitingReason.USER,
                 stage="research_synthesis_model_error",
-                detail=str(exc),
+                detail=type(exc).__name__,
             )
 
         refreshed_scope = self.repository.get_scope(scope.scope_id)
@@ -636,7 +636,7 @@ class DurableResearchWorker:
                 None,
                 WaitingReason.USER,
                 stage="research_synthesis_budget_blocked",
-                detail=str(exc),
+                detail=type(exc).__name__,
             )
         checkpoint = self._checkpoint(
             job,
@@ -1174,11 +1174,6 @@ def _semantic_content_from_final_artifact(raw: str) -> dict[str, object]:
     }
 
 def _child_wait_reason(child: JobRecord) -> WaitingReason:
-    if child.state is not JobState.WAITING or child.blocked_reason is None:
-        return WaitingReason.DEPENDENCY
-    for reason in WaitingReason:
-        if reason.value == child.blocked_reason:
-            if reason is WaitingReason.SCHEDULE:
-                return WaitingReason.DEPENDENCY
-            return reason
+    """A Research parent waits on dependency ownership, never child retry state."""
+    del child
     return WaitingReason.DEPENDENCY

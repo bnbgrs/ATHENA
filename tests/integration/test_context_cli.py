@@ -6,7 +6,7 @@ from athena.__main__ import main
 
 
 def test_context_cli_empty_database_returns_valid_json(capsys, monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("ATHENA_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("ATHENA_LOCAL_ROOT", str(tmp_path))
     exit_code = main(
         [
             "context",
@@ -28,7 +28,7 @@ def test_context_cli_empty_database_returns_valid_json(capsys, monkeypatch, tmp_
 
 
 def test_context_cli_rejects_too_small_budget(capsys, monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("ATHENA_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("ATHENA_LOCAL_ROOT", str(tmp_path))
     exit_code = main(
         [
             "context",

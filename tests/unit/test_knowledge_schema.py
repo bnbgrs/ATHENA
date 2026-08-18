@@ -1,3 +1,4 @@
+import json
 import sqlite3
 
 from athena.common.ids import new_uuid7, uuid_to_blob
@@ -5,6 +6,7 @@ from athena.storage.database import SQLiteDatabase
 from athena.storage.schema import (
     CONSOLIDATED_OPERATIONS_SCHEMA_VERSION,
     DELETION_LEDGER_MIGRATION_ID,
+    DELETION_LEDGER_SCHEMA_VERSION,
     DURABLE_JOBS_SCHEMA_VERSION,
     EXHAUSTIVE_RESEARCH_SCHEMA_VERSION,
     EXTRACTION_SNAPSHOT_SCHEMA_VERSION,
@@ -26,6 +28,7 @@ from athena.storage.schema import (
     PERSONAL_MEMORY_SCHEMA_VERSION,
     PRECISE_RESEARCH_PROVENANCE_MIGRATION_ID,
     PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION,
+    PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
     PROVENANCE_SCHEMA_VERSION,
     RESEARCH_ORCHESTRATION_MIGRATION_ID,
     RESEARCH_ORCHESTRATION_SCHEMA_VERSION,
@@ -145,6 +148,20 @@ def _strip_v36_deletion_ledger_for_legacy_fixture(
     connection: sqlite3.Connection,
 ) -> None:
     """Remove v36-only additions before declaring an older schema boundary."""
+
+    # v39 is additive. Legacy fixtures that construct an
+    # older boundary from a current database must remove
+    # these child objects before removing their v32/v34
+    # parents. Production migrations intentionally remain
+    # fail-closed and do not use CREATE TABLE IF NOT EXISTS.
+    connection.execute(
+        "DROP TABLE IF EXISTS "
+        "source_protection_representation_blobs"
+    )
+    connection.execute(
+        "DROP TABLE IF EXISTS "
+        "source_protected_semantic_payloads"
+    )
     tables = _table_names(
         connection
     )
@@ -190,7 +207,7 @@ def test_fresh_database_contains_semantic_schema(tmp_path) -> None:
     ).fetchone()
     assert tuple(metadata) == (
         SCHEMA_VERSION,
-        DELETION_LEDGER_MIGRATION_ID,
+        PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
         SCHEMA_VERSION,
     )
 
@@ -779,7 +796,7 @@ def test_v14_database_is_upgraded_additively_to_durable_jobs(tmp_path) -> None:
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == DELETION_LEDGER_MIGRATION_ID
+    assert metadata["last_migration_id"] == PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID
     database.stop()
 
 
@@ -956,7 +973,7 @@ def test_v17_database_is_upgraded_additively_to_hierarchical_source_analysis(tmp
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == DELETION_LEDGER_MIGRATION_ID
+    assert metadata["last_migration_id"] == PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID
     database.stop()
 
 
@@ -1019,7 +1036,7 @@ def test_v18_database_is_upgraded_additively_to_source_knowledge_promotion(tmp_p
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == DELETION_LEDGER_MIGRATION_ID
+    assert metadata["last_migration_id"] == PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID
     database.stop()
 
 
@@ -1089,7 +1106,7 @@ def test_v19_database_is_upgraded_additively_to_hierarchical_source_extraction(t
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == DELETION_LEDGER_MIGRATION_ID
+    assert metadata["last_migration_id"] == PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID
     database.stop()
 
 
@@ -1162,7 +1179,7 @@ def test_v20_database_is_upgraded_additively_to_personal_memory(tmp_path) -> Non
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == DELETION_LEDGER_MIGRATION_ID
+    assert metadata["last_migration_id"] == PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID
     database.stop()
 
 
@@ -1244,7 +1261,7 @@ def test_v21_database_is_upgraded_additively_to_exhaustive_research(tmp_path) ->
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == DELETION_LEDGER_MIGRATION_ID
+    assert metadata["last_migration_id"] == PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID
     database.stop()
 
 
@@ -1342,7 +1359,7 @@ def test_v22_database_is_upgraded_additively_to_research_orchestration(
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == DELETION_LEDGER_MIGRATION_ID
+    assert metadata["last_migration_id"] == PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID
     database.stop()
 
 
@@ -1431,7 +1448,7 @@ def test_v23_database_is_upgraded_additively_to_research_synthesis(tmp_path) -> 
         "FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == DELETION_LEDGER_MIGRATION_ID
+    assert metadata["last_migration_id"] == PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID
     assert metadata["minimum_reader_version"] == SCHEMA_VERSION
     assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     database.stop()
@@ -1494,6 +1511,20 @@ def test_v28_database_is_upgraded_additively_to_precise_research_provenance(
     legacy = sqlite3.connect(
         path,
         autocommit=True,
+    )
+
+    # This fixture starts from the current schema and
+    # reconstructs an older boundary. Remove additive
+    # v39 child state before removing older parents or
+    # rewriting schema metadata. Production migration
+    # behavior intentionally remains fail-closed.
+    legacy.execute(
+        "DROP TABLE IF EXISTS "
+        "source_protection_representation_blobs"
+    )
+    legacy.execute(
+        "DROP TABLE IF EXISTS "
+        "source_protected_semantic_payloads"
     )
     legacy.row_factory = sqlite3.Row
 
@@ -1672,7 +1703,7 @@ def test_v28_database_is_upgraded_additively_to_precise_research_provenance(
 
     assert tuple(metadata) == (
         SCHEMA_VERSION,
-        DELETION_LEDGER_MIGRATION_ID,
+        PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
         SCHEMA_VERSION,
     )
 
@@ -1709,6 +1740,20 @@ def test_v29_database_is_upgraded_additively_to_news_event_eligibility(
     legacy = sqlite3.connect(
         path,
         autocommit=True,
+    )
+
+    # This fixture starts from the current schema and
+    # reconstructs an older boundary. Remove additive
+    # v39 child state before removing older parents or
+    # rewriting schema metadata. Production migration
+    # behavior intentionally remains fail-closed.
+    legacy.execute(
+        "DROP TABLE IF EXISTS "
+        "source_protection_representation_blobs"
+    )
+    legacy.execute(
+        "DROP TABLE IF EXISTS "
+        "source_protected_semantic_payloads"
     )
     legacy.row_factory = sqlite3.Row
 
@@ -1857,7 +1902,7 @@ def test_v29_database_is_upgraded_additively_to_news_event_eligibility(
 
     assert tuple(metadata) == (
         SCHEMA_VERSION,
-        DELETION_LEDGER_MIGRATION_ID,
+        PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
         SCHEMA_VERSION,
     )
 
@@ -1880,3 +1925,428 @@ def test_v29_database_is_upgraded_additively_to_news_event_eligibility(
     ).fetchall() == []
 
     upgraded.stop()
+
+
+
+def test_v36_operational_error_text_is_sanitized_without_changing_resume_state(
+    tmp_path,
+) -> None:
+    path = tmp_path / "athena.db"
+
+    current = SQLiteDatabase(
+        path
+    )
+    current.start()
+    current.stop()
+
+    legacy = sqlite3.connect(
+        path,
+        autocommit=True,
+    )
+    legacy.row_factory = sqlite3.Row
+
+    actor_id = new_uuid7()
+    run_id = new_uuid7()
+    job_id = new_uuid7()
+    checkpoint_id = new_uuid7()
+
+    secret = (
+        "ATHENA_P1_04_MIGRATION_SECRET_"
+        "8A3CC681"
+    )
+
+    legacy.execute(
+        """
+        INSERT INTO actors (
+            actor_id,
+            actor_type,
+            display_name,
+            plugin_id,
+            created_at_us,
+            active
+        ) VALUES (?, 'user', NULL, NULL, 1, 1)
+        """,
+        (
+            uuid_to_blob(
+                actor_id
+            ),
+        ),
+    )
+
+    legacy.execute(
+        """
+        INSERT INTO processing_runs (
+            processing_run_id,
+            run_type,
+            started_at_us,
+            finished_at_us,
+            status,
+            trigger_actor_id,
+            pipeline_version,
+            input_snapshot_json,
+            configuration_hash,
+            model_signature_id,
+            prompt_template_id,
+            prompt_template_version,
+            error_detail
+        ) VALUES (
+            ?, 'migration-test',
+            10, 11, 'failed',
+            ?, 'test-v1', '{}', ?,
+            NULL, NULL, NULL, ?
+        )
+        """,
+        (
+            uuid_to_blob(
+                run_id
+            ),
+            uuid_to_blob(
+                actor_id
+            ),
+            bytes(
+                [17]
+            )
+            * 32,
+            (
+                "RuntimeError: "
+                + secret
+            ),
+        ),
+    )
+
+    legacy.execute(
+        """
+        INSERT INTO jobs (
+            job_id,
+            job_type,
+            created_at_us,
+            created_by_actor_id,
+            priority,
+            state,
+            requested_scope_json,
+            processing_run_id,
+            current_stage,
+            last_checkpoint_id,
+            retry_count,
+            next_run_at_us,
+            blocked_reason,
+            pinned_configuration_json,
+            protection_scope_id,
+            protected_payload_id,
+            worker_id,
+            lease_token,
+            lease_acquired_at_us,
+            lease_expires_at_us,
+            heartbeat_at_us,
+            fencing_sequence,
+            updated_at_us
+        ) VALUES (
+            ?, 'source.extract',
+            20, ?, 3, 'failed',
+            '{"stable":"scope"}',
+            NULL,
+            'stable_stage',
+            NULL,
+            4,
+            123456789,
+            ?,
+            '{"stable":"config"}',
+            NULL, NULL,
+            NULL, NULL, NULL, NULL, NULL,
+            7,
+            30
+        )
+        """,
+        (
+            uuid_to_blob(
+                job_id
+            ),
+            uuid_to_blob(
+                actor_id
+            ),
+            "source_processing:SourceProcessingJobError",
+        ),
+    )
+
+    original_output = {
+        "error": (
+            "ProviderRefusalError: "
+            + secret
+        ),
+        "stable": {
+            "resume_value": 42,
+            "error": "semantic error must remain verbatim",
+            "detail": "semantic detail must remain verbatim",
+        },
+    }
+
+    legacy.execute(
+        """
+        INSERT INTO checkpoints (
+            checkpoint_id,
+            job_id,
+            processing_stage_id,
+            created_at_us,
+            progress_state_json,
+            last_confirmed_input_json,
+            last_confirmed_output_json,
+            resume_metadata_json,
+            commit_id,
+            protection_scope_id,
+            protected_payload_id,
+            fencing_sequence
+        ) VALUES (
+            ?, ?, NULL, 25,
+            '{"progress":7}',
+            '{"input":"stable"}',
+            ?,
+            '{"resume":"stable"}',
+            NULL, NULL, NULL, 7
+        )
+        """,
+        (
+            uuid_to_blob(
+                checkpoint_id
+            ),
+            uuid_to_blob(
+                job_id
+            ),
+            json.dumps(
+                original_output,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        ),
+    )
+
+    legacy.execute(
+        """
+        UPDATE jobs
+        SET last_checkpoint_id = ?
+        WHERE job_id = ?
+        """,
+        (
+            uuid_to_blob(
+                checkpoint_id
+            ),
+            uuid_to_blob(
+                job_id
+            ),
+        ),
+    )
+
+    # Remove additive v39 objects before declaring
+    # this current database to be an older schema.
+    # The production migration remains fail-closed.
+    legacy.execute(
+        "DROP TABLE IF EXISTS "
+        "source_protection_representation_blobs"
+    )
+    legacy.execute(
+        "DROP TABLE IF EXISTS "
+        "source_protected_semantic_payloads"
+    )
+
+    legacy.execute(
+        """
+        UPDATE schema_metadata
+        SET schema_version = ?,
+            last_migration_id = ?,
+            minimum_reader_version = ?
+        WHERE singleton_id = 1
+        """,
+        (
+            DELETION_LEDGER_SCHEMA_VERSION,
+            DELETION_LEDGER_MIGRATION_ID,
+            DELETION_LEDGER_SCHEMA_VERSION,
+        ),
+    )
+
+    legacy.execute(
+        f"PRAGMA user_version = "
+        f"{DELETION_LEDGER_SCHEMA_VERSION}"
+    )
+
+    legacy.close()
+
+    upgraded = SQLiteDatabase(
+        path
+    )
+    upgraded.start()
+
+    connection = upgraded.connection
+
+    assert (
+        connection.execute(
+            "PRAGMA user_version"
+        ).fetchone()[0]
+        == SCHEMA_VERSION
+    )
+
+    metadata = connection.execute(
+        """
+        SELECT
+            schema_version,
+            last_migration_id,
+            minimum_reader_version
+        FROM schema_metadata
+        WHERE singleton_id = 1
+        """
+    ).fetchone()
+
+    assert metadata is not None
+
+    assert tuple(
+        metadata
+    ) == (
+        SCHEMA_VERSION,
+        PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
+        SCHEMA_VERSION,
+    )
+
+    run = connection.execute(
+        """
+        SELECT error_detail
+        FROM processing_runs
+        WHERE processing_run_id = ?
+        """,
+        (
+            uuid_to_blob(
+                run_id
+            ),
+        ),
+    ).fetchone()
+
+    assert run is not None
+    assert (
+        run["error_detail"]
+        == "RuntimeError"
+    )
+
+    job = connection.execute(
+        """
+        SELECT
+            state,
+            current_stage,
+            retry_count,
+            next_run_at_us,
+            blocked_reason,
+            requested_scope_json,
+            pinned_configuration_json,
+            last_checkpoint_id,
+            fencing_sequence
+        FROM jobs
+        WHERE job_id = ?
+        """,
+        (
+            uuid_to_blob(
+                job_id
+            ),
+        ),
+    ).fetchone()
+
+    assert job is not None
+
+    assert tuple(
+        job
+    ) == (
+        "failed",
+        "stable_stage",
+        4,
+        123456789,
+        "source_processing:SourceProcessingJobError",
+        '{"stable":"scope"}',
+        '{"stable":"config"}',
+        uuid_to_blob(
+            checkpoint_id
+        ),
+        7,
+    )
+
+    checkpoint = connection.execute(
+        """
+        SELECT
+            progress_state_json,
+            last_confirmed_input_json,
+            last_confirmed_output_json,
+            resume_metadata_json,
+            fencing_sequence
+        FROM checkpoints
+        WHERE checkpoint_id = ?
+        """,
+        (
+            uuid_to_blob(
+                checkpoint_id
+            ),
+        ),
+    ).fetchone()
+
+    assert checkpoint is not None
+
+    assert checkpoint[
+        "progress_state_json"
+    ] == '{"progress":7}'
+
+    assert checkpoint[
+        "last_confirmed_input_json"
+    ] == '{"input":"stable"}'
+
+    assert checkpoint[
+        "resume_metadata_json"
+    ] == '{"resume":"stable"}'
+
+    migrated_output = json.loads(
+        checkpoint[
+            "last_confirmed_output_json"
+        ]
+    )
+
+    assert migrated_output == {
+        "error": "ProviderRefusalError",
+        "stable": {
+            "resume_value": 42,
+            "error": "semantic error must remain verbatim",
+            "detail": "semantic detail must remain verbatim",
+        },
+    }
+
+    assert checkpoint[
+        "fencing_sequence"
+    ] == 7
+
+    database_text = " ".join(
+        str(
+            row[0]
+        )
+        for row in connection.execute(
+            """
+            SELECT error_detail
+            FROM processing_runs
+            WHERE error_detail IS NOT NULL
+            """
+        ).fetchall()
+    )
+
+    assert secret not in database_text
+
+    assert connection.execute(
+        "PRAGMA foreign_key_check"
+    ).fetchall() == []
+
+    upgraded.stop()
+
+    # Opening v37 again must be a pure verification path, not another migration.
+    reopened = SQLiteDatabase(
+        path
+    )
+    reopened.start()
+
+    assert (
+        reopened.connection.execute(
+            "PRAGMA user_version"
+        ).fetchone()[0]
+        == SCHEMA_VERSION
+    )
+
+    reopened.stop()

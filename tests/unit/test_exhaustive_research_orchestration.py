@@ -549,3 +549,112 @@ def test_research_child_identity_unique_index_blocks_duplicate_jobs(
     assert len(rows) == 1
     assert bytes(rows[0]["job_id"]) == first.job_id.bytes
     app.stop()
+
+
+def test_research_parent_does_not_consume_retry_budget_for_waiting_child(
+    tmp_path: Path,
+) -> None:
+    app, _provider = _app(
+        tmp_path / "runtime"
+    )
+
+    _capture(
+        app,
+        tmp_path / "source.txt",
+        "Research child retry ownership evidence.",
+    )
+
+    job = app.research.enqueue_local(
+        query="Exercise child retry ownership."
+    )
+
+    waiting = _advance_parent_until_wait(
+        app,
+        job.job_id,
+    )
+
+    assert waiting.completed_stage == "waiting_source_processing"
+    assert waiting.job.blocked_reason == WaitingReason.DEPENDENCY.value
+    assert waiting.job.retry_count == 0
+
+    scope = app.research.initialize(
+        job.job_id
+    )
+
+    work = app.research_repository.list_work_items(
+        scope.scope_id
+    )
+
+    assert len(work) == 1
+    assert work[0].source_processing_job_id is not None
+
+    child_id = work[0].source_processing_job_id
+    assert child_id is not None
+
+    child = app.jobs.get(
+        child_id
+    )
+
+    assert child.state is JobState.QUEUED
+
+    leased_child = app.jobs.acquire(
+        child_id,
+        worker_id="research-child-retry-owner",
+        lease_seconds=60,
+    )
+
+    assert leased_child.lease_token is not None
+
+    child_waiting = app.jobs.wait(
+        child_id,
+        lease_token=leased_child.lease_token,
+        reason=WaitingReason.NETWORK,
+    )
+
+    assert child_waiting.retry_count == 0
+
+    scheduled_child, retry_at = (
+        app.job_scheduler._schedule_retry_if_allowed(
+            child_waiting,
+            utc_now_us(),
+        )
+    )
+
+    assert retry_at is not None
+    assert scheduled_child.retry_count == 1
+    assert scheduled_child.blocked_reason == WaitingReason.NETWORK.value
+
+    parent_before = app.jobs.get(
+        job.job_id
+    )
+
+    assert parent_before.retry_count == 0
+
+    lease_token = _acquire_parent(
+        app,
+        job.job_id,
+        worker="research-parent-child-retry",
+    )
+
+    reconciled = app.research_worker.step(
+        job.job_id,
+        lease_token=lease_token,
+        extend_seconds=120,
+    )
+
+    assert reconciled.waiting is True
+    assert reconciled.job.state is JobState.WAITING
+    assert (
+        reconciled.job.blocked_reason
+        == WaitingReason.DEPENDENCY.value
+    )
+    assert reconciled.job.retry_count == 0
+
+    child_after = app.jobs.get(
+        child_id
+    )
+
+    assert child_after.retry_count == 1
+    assert child_after.blocked_reason == WaitingReason.NETWORK.value
+
+    app.stop()

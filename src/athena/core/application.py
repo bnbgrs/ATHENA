@@ -212,6 +212,7 @@ class AthenaApplication:
             blob_store=self.blob_store,
             protected_content=self.protected_content,
             chat=self.chat,
+            jobs=self.job_repository,
             runtime_lock_root=self.paths.state_root,
         )
         self.source_representation_repository = SourceRepresentationRepository(self.database)
@@ -235,6 +236,7 @@ class AthenaApplication:
             blob_store=self.blob_store,
             paths=self.paths,
             chat=self.chat,
+            runtime_lock_root=self.paths.state_root,
         )
         self.personal_memory.set_deletion_sync_callback(
             self.backup.sync_all_deletion_ledgers

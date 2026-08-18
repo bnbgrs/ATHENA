@@ -18,7 +18,7 @@ from athena.storage.database import SQLiteDatabase
 from athena.storage.schema import (
     ARCHIVE_REPLICATION_MIGRATION_ID,
     ARCHIVE_REPLICATION_SCHEMA_VERSION,
-    DELETION_LEDGER_MIGRATION_ID,
+    PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
     SCHEMA_VERSION,
 )
 
@@ -158,7 +158,7 @@ def test_fresh_schema_has_v32_security_tables_without_persistent_unlock_state(
             metadata
         ) == (
             SCHEMA_VERSION,
-            DELETION_LEDGER_MIGRATION_ID,
+            PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
             SCHEMA_VERSION,
         )
 
@@ -709,6 +709,20 @@ def test_v31_database_is_upgraded_additively_to_protected_content_v32(
         autocommit=True,
     )
 
+    # This fixture starts from the current schema and
+    # reconstructs an older boundary. Remove additive
+    # v39 child state before removing older parents or
+    # rewriting schema metadata. Production migration
+    # behavior intentionally remains fail-closed.
+    legacy.execute(
+        "DROP TABLE IF EXISTS "
+        "source_protection_representation_blobs"
+    )
+    legacy.execute(
+        "DROP TABLE IF EXISTS "
+        "source_protected_semantic_payloads"
+    )
+
     legacy.row_factory = sqlite3.Row
 
     # Reconstruct exact v31 by removing
@@ -837,7 +851,7 @@ def test_v31_database_is_upgraded_additively_to_protected_content_v32(
             metadata
         ) == (
             SCHEMA_VERSION,
-            DELETION_LEDGER_MIGRATION_ID,
+            PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
             SCHEMA_VERSION,
         )
 

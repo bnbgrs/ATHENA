@@ -20,8 +20,8 @@ from athena.storage.database import SQLiteDatabase
 from athena.storage.schema import (
     BACKUP_RETENTION_MIGRATION_ID,
     BACKUP_RETENTION_SCHEMA_VERSION,
-    DELETION_LEDGER_MIGRATION_ID,
-    DELETION_LEDGER_SCHEMA_VERSION,
+    PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
+    SCHEMA_VERSION,
 )
 
 
@@ -509,6 +509,20 @@ def test_v35_database_migrates_additively_to_v36(
         autocommit=True,
     )
 
+    # This fixture starts from the current schema and
+    # reconstructs an older boundary. Remove additive
+    # v39 child state before removing older parents or
+    # rewriting schema metadata. Production migration
+    # behavior intentionally remains fail-closed.
+    legacy.execute(
+        "DROP TABLE IF EXISTS "
+        "source_protection_representation_blobs"
+    )
+    legacy.execute(
+        "DROP TABLE IF EXISTS "
+        "source_protected_semantic_payloads"
+    )
+
     legacy.execute(
         "DROP TABLE deletion_ledger"
     )
@@ -564,7 +578,7 @@ def test_v35_database_migrates_additively_to_v36(
             connection.execute(
                 "PRAGMA user_version"
             ).fetchone()[0]
-            == DELETION_LEDGER_SCHEMA_VERSION
+            == SCHEMA_VERSION
         )
 
         metadata = connection.execute(
@@ -583,9 +597,9 @@ def test_v35_database_migrates_additively_to_v36(
         assert tuple(
             metadata
         ) == (
-            DELETION_LEDGER_SCHEMA_VERSION,
-            DELETION_LEDGER_MIGRATION_ID,
-            DELETION_LEDGER_SCHEMA_VERSION,
+            SCHEMA_VERSION,
+            PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
+            SCHEMA_VERSION,
         )
 
         columns = {

@@ -97,9 +97,8 @@ class LMStudioEmbeddingProvider:
             with urlopen(request, timeout=self.generation_timeout_seconds) as response:
                 raw = response.read()
         except HTTPError as exc:
-            detail = self.model_provider._http_error_detail(exc)
             raise ModelProviderError(
-                f"LM Studio returned HTTP {exc.code} during embedding generation{detail}."
+                f"LM Studio returned HTTP {exc.code} during embedding generation."
             ) from exc
         except (URLError, TimeoutError, OSError) as exc:
             raise ProviderUnavailableError(

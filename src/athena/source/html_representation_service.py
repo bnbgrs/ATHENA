@@ -231,7 +231,7 @@ class SourceHtmlRepresentationService:
                 self.runs.finish_run(
                     run.processing_run_id,
                     status="failed",
-                    error_detail=f"{type(exc).__name__}: {exc}",
+                    error_detail=type(exc).__name__,
                 )
             raise
 

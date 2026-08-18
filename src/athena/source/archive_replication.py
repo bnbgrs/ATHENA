@@ -639,7 +639,7 @@ class ArchiveReplicationService:
                     self.repository.record_failure(
                         record.outbox_seq,
                         error_code=type(exc).__name__,
-                        error_detail=str(exc),
+                        error_detail=type(exc).__name__,
                     )
                     failed += 1
                     blocked_reason = "archive_root_unavailable"
@@ -648,7 +648,7 @@ class ArchiveReplicationService:
                     self.repository.record_failure(
                         record.outbox_seq,
                         error_code=type(exc).__name__,
-                        error_detail=str(exc),
+                        error_detail=type(exc).__name__,
                     )
                     failed += 1
                     continue

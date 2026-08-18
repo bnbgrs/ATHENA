@@ -123,7 +123,14 @@ def test_lm_studio_classifies_backend_context_overflow() -> None:
     provider = LMStudioProvider("http://127.0.0.1:1234")
     body = io.BytesIO(
         json.dumps(
-            {"error": {"message": "maximum context length exceeded: too many tokens"}}
+            {
+                "error": {
+                    "message": (
+                        "ATHENA_HTTP_SECRET_CANARY "
+                        "maximum context length exceeded: too many tokens"
+                    )
+                }
+            }
         ).encode("utf-8")
     )
     error = HTTPError(
@@ -135,13 +142,18 @@ def test_lm_studio_classifies_backend_context_overflow() -> None:
     )
 
     with patch("athena.model.adapters.lm_studio.urlopen", side_effect=error):
-        with pytest.raises(ProviderContextLimitError, match="context capacity"):
+        with pytest.raises(
+            ProviderContextLimitError,
+            match="context capacity",
+        ) as caught:
             provider.generate_structured(
                 model_id="example/model",
                 messages=(ModelChatMessage(role="user", content="Analyze."),),
                 schema_id="example_schema_v1",
                 json_schema={"type": "object"},
             )
+
+    assert "ATHENA_HTTP_SECRET_CANARY" not in str(caught.value)
 
 
 def test_lm_studio_structured_generation_honors_max_output_tokens() -> None:
@@ -182,7 +194,7 @@ def test_lm_studio_classifies_explicit_structured_refusal() -> None:
                     "message": {
                         "role": "assistant",
                         "content": None,
-                        "refusal": "I cannot comply with that request.",
+                        "refusal": "ATHENA_REFUSAL_SECRET_CANARY",
                     },
                 }
             ]
@@ -194,10 +206,12 @@ def test_lm_studio_classifies_explicit_structured_refusal() -> None:
         with pytest.raises(
             ProviderRefusalError,
             match="refused by the model",
-        ):
+        ) as caught:
             provider.generate_structured(
                 model_id="example/model",
                 messages=(ModelChatMessage(role="user", content="Extract."),),
                 schema_id="example_schema_v1",
                 json_schema={"type": "object"},
             )
+
+    assert "ATHENA_REFUSAL_SECRET_CANARY" not in str(caught.value)

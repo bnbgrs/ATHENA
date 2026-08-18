@@ -1260,6 +1260,19 @@ def test_v29_migration_backfills_legacy_event_assessment_without_model(
         database_path,
         autocommit=True,
     )
+
+    # Normalize additive v39 state before this
+    # fixture declares the database to be an
+    # older schema boundary. Production migration
+    # behavior remains intentionally fail-closed.
+    legacy.execute(
+        "DROP TABLE IF EXISTS "
+        "source_protection_representation_blobs"
+    )
+    legacy.execute(
+        "DROP TABLE IF EXISTS "
+        "source_protected_semantic_payloads"
+    )
     legacy.row_factory = sqlite3.Row
 
     try:

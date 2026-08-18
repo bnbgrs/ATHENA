@@ -190,7 +190,7 @@ def test_extraction_rejects_invented_source_sequence_and_marks_run_failed(tmp_pa
     run = connection.execute("SELECT status, error_detail FROM processing_runs").fetchone()
     assert run is not None
     assert run["status"] == "failed"
-    assert "source_sequence_no 99" in str(run["error_detail"])
+    assert run["error_detail"] == "ExtractionValidationError"
     assert connection.execute("SELECT COUNT(*) FROM knowledge_units").fetchone()[0] == 0
     assert connection.execute("SELECT COUNT(*) FROM claims").fetchone()[0] == 0
     database.stop()
@@ -227,7 +227,7 @@ def test_extraction_rejects_source_quote_not_present_in_cited_message(tmp_path) 
     ).fetchone()
     assert run is not None
     assert run["status"] == "failed"
-    assert "source_quote" in str(run["error_detail"])
+    assert run["error_detail"] == "ExtractionValidationError"
     database.stop()
 
 

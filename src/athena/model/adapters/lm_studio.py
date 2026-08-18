@@ -173,10 +173,10 @@ class LMStudioProvider:
             detail = self._http_error_detail(exc)
             if self._is_context_limit_error(exc.code, detail):
                 raise ProviderContextLimitError(
-                    f"LM Studio rejected chat generation for context capacity{detail}."
+                    "LM Studio rejected chat generation for context capacity."
                 ) from exc
             raise ModelProviderError(
-                f"LM Studio returned HTTP {exc.code} during chat generation{detail}."
+                f"LM Studio returned HTTP {exc.code} during chat generation."
             ) from exc
         except (URLError, TimeoutError, OSError) as exc:
             raise ProviderUnavailableError(
@@ -244,10 +244,10 @@ class LMStudioProvider:
             detail = self._http_error_detail(exc)
             if self._is_context_limit_error(exc.code, detail):
                 raise ProviderContextLimitError(
-                    f"LM Studio rejected structured generation for context capacity{detail}."
+                    "LM Studio rejected structured generation for context capacity."
                 ) from exc
             raise ModelProviderError(
-                f"LM Studio returned HTTP {exc.code} during structured generation{detail}."
+                f"LM Studio returned HTTP {exc.code} during structured generation."
             ) from exc
         except (URLError, TimeoutError, OSError) as exc:
             raise ProviderUnavailableError(
@@ -295,8 +295,7 @@ class LMStudioProvider:
             normalized_refusal = refusal.strip()
             if normalized_refusal:
                 raise ProviderRefusalError(
-                    "LM Studio structured generation was refused by the model: "
-                    f"{normalized_refusal[:500]}"
+                    "LM Studio structured generation was refused by the model."
                 )
 
         # LM Studio can expose reasoning separately from message.content.
@@ -422,10 +421,10 @@ class LMStudioProvider:
             detail = self._http_error_detail(exc)
             if self._is_context_limit_error(exc.code, detail):
                 raise ProviderContextLimitError(
-                    f"LM Studio rejected controlled structured generation for context capacity{detail}."
+                    "LM Studio rejected controlled structured generation for context capacity."
                 ) from exc
             raise ModelProviderError(
-                f"LM Studio returned HTTP {exc.code} during controlled structured generation{detail}."
+                f"LM Studio returned HTTP {exc.code} during controlled structured generation."
             ) from exc
         except (URLError, TimeoutError, OSError) as exc:
             raise ProviderUnavailableError(

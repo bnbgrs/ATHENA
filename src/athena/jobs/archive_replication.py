@@ -303,7 +303,7 @@ class DurableArchiveReplicationWorker:
                     error_code=(
                         type(exc).__name__
                     ),
-                    error_detail=str(exc),
+                    error_detail=type(exc).__name__,
                 )
             )
 
@@ -326,7 +326,7 @@ class DurableArchiveReplicationWorker:
                     error_code=(
                         type(exc).__name__
                     ),
-                    error_detail=str(exc),
+                    error_detail=type(exc).__name__,
                 )
             )
 

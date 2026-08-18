@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -11,6 +12,7 @@ from pathlib import Path
 from athena.chat.service import ChatService
 from athena.common.ids import new_uuid7, uuid_from_blob, uuid_to_blob
 from athena.common.time import utc_now_us
+from athena.jobs.repository import JobRepository
 from athena.lifecycle.runtime_lock import runtime_data_lock
 from athena.security.service import (
     ProtectedContentService,
@@ -40,6 +42,12 @@ class SourceProtectionUnsafeError(SourceProtectionTransitionError):
     """Raised when an existing Source cannot be protected without leakage risk."""
 
 
+class SourceProtectionOperationalBlockerError(
+    SourceProtectionTransitionError
+):
+    """Raised after pending commits while running dependent jobs terminate."""
+
+
 class SourceProtectionTransitionState(str, Enum):
     PENDING = "pending"
     PREPARED = "prepared"
@@ -57,6 +65,15 @@ class SourceProtectionTransitionRecord:
     state: SourceProtectionTransitionState
     created_at_us: int
     updated_at_us: int
+
+
+SourceOperationalStateCutover = Callable[
+    [sqlite3.Connection],
+    tuple[
+        tuple[uuid.UUID, ...],
+        tuple[uuid.UUID, ...],
+    ],
+]
 
 
 class SourceProtectionTransitionRepository:
@@ -139,11 +156,28 @@ class SourceProtectionTransitionRepository:
         *,
         source_id: uuid.UUID,
         protection_scope_id: uuid.UUID,
+        operational_state_cutover: (
+            SourceOperationalStateCutover
+            | None
+        ) = None,
     ) -> SourceProtectionTransitionRecord:
         now_us = utc_now_us()
         transition_id = new_uuid7()
 
-        with self.database.write_transaction() as connection:
+        blockers: tuple[
+            uuid.UUID,
+            ...,
+        ] = ()
+
+        existing_record: (
+            SourceProtectionTransitionRecord
+            | None
+        ) = None
+
+        with (
+            self.database.write_transaction()
+            as connection
+        ):
             existing = connection.execute(
                 """
                 SELECT
@@ -159,139 +193,311 @@ class SourceProtectionTransitionRepository:
                 FROM source_protection_transitions
                 WHERE source_id = ?
                 """,
-                (uuid_to_blob(source_id),),
+                (
+                    uuid_to_blob(
+                        source_id
+                    ),
+                ),
             ).fetchone()
+
             if existing is not None:
-                record = self._record_from_row(existing)
-                if record.protection_scope_id != protection_scope_id:
-                    raise SourceProtectionUnsafeError(
-                        "Source already has a protection transition for another scope."
+                existing_record = (
+                    self._record_from_row(
+                        existing
                     )
-                return record
-
-            protected = connection.execute(
-                """
-                SELECT protection_scope_id
-                FROM protected_sources
-                WHERE source_id = ?
-                """,
-                (uuid_to_blob(source_id),),
-            ).fetchone()
-            if protected is not None:
-                raise SourceProtectionUnsafeError("Source is already protected.")
-
-            row = connection.execute(
-                """
-                SELECT
-                    s.source_id,
-                    s.original_name,
-                    s.source_uri,
-                    s.content_sha256,
-                    s.blob_id,
-                    b.byte_length,
-                    b.integrity_sha256,
-                    b.encryption_state
-                FROM sources AS s
-                JOIN blob_records AS b ON b.blob_id = s.blob_id
-                WHERE s.source_id = ?
-                """,
-                (uuid_to_blob(source_id),),
-            ).fetchone()
-            if row is None:
-                raise LookupError(str(source_id))
-
-            if (
-                row["original_name"] is None
-                or not str(row["original_name"]).strip()
-                or row["source_uri"] is None
-                or not str(row["source_uri"]).strip()
-                or str(row["encryption_state"]) != "none"
-                or bytes(row["content_sha256"]) != bytes(row["integrity_sha256"])
-            ):
-                raise SourceProtectionUnsafeError(
-                    "Source does not have a complete trustworthy unprotected capture."
                 )
 
-            scope = connection.execute(
-                """
-                SELECT lifecycle_state
-                FROM protection_scopes
-                WHERE protection_scope_id = ?
-                """,
-                (uuid_to_blob(protection_scope_id),),
-            ).fetchone()
-            if scope is None or str(scope["lifecycle_state"]) != "active":
-                raise SourceProtectionUnsafeError(
-                    "Protection transition requires an active ProtectionScope."
+                if (
+                    existing_record
+                    .protection_scope_id
+                    != protection_scope_id
+                ):
+                    raise (
+                        SourceProtectionUnsafeError(
+                            "Source already has a "
+                            "protection transition "
+                            "for another scope."
+                        )
+                    )
+
+                if (
+                    existing_record.state
+                    is SourceProtectionTransitionState.PENDING
+                    and operational_state_cutover
+                    is not None
+                ):
+                    (
+                        _migrated,
+                        blockers,
+                    ) = operational_state_cutover(
+                        connection
+                    )
+
+            else:
+                protected = (
+                    connection.execute(
+                        """
+                        SELECT protection_scope_id
+                        FROM protected_sources
+                        WHERE source_id = ?
+                        """,
+                        (
+                            uuid_to_blob(
+                                source_id
+                            ),
+                        ),
+                    ).fetchone()
                 )
 
-            old_blob_id = uuid_from_blob(bytes(row["blob_id"]))
-            source_refs = connection.execute(
-                """
-                SELECT COUNT(*)
-                FROM sources
-                WHERE blob_id = ?
-                """,
-                (uuid_to_blob(old_blob_id),),
-            ).fetchone()
-            representation_refs = connection.execute(
-                """
-                SELECT COUNT(*)
-                FROM source_representations
-                WHERE source_id = ?
-                   OR blob_id = ?
-                """,
-                (
-                    uuid_to_blob(source_id),
-                    uuid_to_blob(old_blob_id),
-                ),
-            ).fetchone()
-            if (
-                source_refs is None
-                or int(source_refs[0]) != 1
-                or representation_refs is None
-                or int(representation_refs[0]) != 0
-            ):
-                raise SourceProtectionUnsafeError(
-                    "Source protection requires an exclusive raw Blob with no persisted representations."
+                if protected is not None:
+                    raise (
+                        SourceProtectionUnsafeError(
+                            "Source is already protected."
+                        )
+                    )
+
+                row = connection.execute(
+                    """
+                    SELECT
+                        s.source_id,
+                        s.original_name,
+                        s.source_uri,
+                        s.content_sha256,
+                        s.blob_id,
+                        b.byte_length,
+                        b.integrity_sha256,
+                        b.encryption_state
+                    FROM sources AS s
+                    JOIN blob_records AS b
+                      ON b.blob_id = s.blob_id
+                    WHERE s.source_id = ?
+                    """,
+                    (
+                        uuid_to_blob(
+                            source_id
+                        ),
+                    ),
+                ).fetchone()
+
+                if row is None:
+                    raise LookupError(
+                        str(
+                            source_id
+                        )
+                    )
+
+                if (
+                    row["original_name"]
+                    is None
+                    or not str(
+                        row[
+                            "original_name"
+                        ]
+                    ).strip()
+                    or row["source_uri"]
+                    is None
+                    or not str(
+                        row[
+                            "source_uri"
+                        ]
+                    ).strip()
+                    or str(
+                        row[
+                            "encryption_state"
+                        ]
+                    )
+                    != "none"
+                    or bytes(
+                        row[
+                            "content_sha256"
+                        ]
+                    )
+                    != bytes(
+                        row[
+                            "integrity_sha256"
+                        ]
+                    )
+                ):
+                    raise (
+                        SourceProtectionUnsafeError(
+                            "Source does not have "
+                            "a complete trustworthy "
+                            "unprotected capture."
+                        )
+                    )
+
+                scope = (
+                    connection.execute(
+                        """
+                        SELECT lifecycle_state
+                        FROM protection_scopes
+                        WHERE protection_scope_id = ?
+                        """,
+                        (
+                            uuid_to_blob(
+                                protection_scope_id
+                            ),
+                        ),
+                    ).fetchone()
                 )
 
-            connection.execute(
-                """
-                INSERT INTO source_protection_transitions (
-                    transition_id,
-                    source_id,
-                    protection_scope_id,
-                    old_blob_id,
-                    target_blob_id,
-                    protected_metadata_payload_id,
-                    state,
-                    created_at_us,
-                    updated_at_us
-                ) VALUES (?, ?, ?, ?, NULL, NULL, 'pending', ?, ?)
-                """,
-                (
-                    uuid_to_blob(transition_id),
-                    uuid_to_blob(source_id),
-                    uuid_to_blob(protection_scope_id),
-                    uuid_to_blob(old_blob_id),
-                    now_us,
-                    now_us,
-                ),
+                if (
+                    scope is None
+                    or str(
+                        scope[
+                            "lifecycle_state"
+                        ]
+                    )
+                    != "active"
+                ):
+                    raise (
+                        SourceProtectionUnsafeError(
+                            "Protection transition "
+                            "requires an active "
+                            "ProtectionScope."
+                        )
+                    )
+
+                old_blob_id = uuid_from_blob(
+                    bytes(
+                        row["blob_id"]
+                    )
+                )
+
+                source_refs = (
+                    connection.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM sources
+                        WHERE blob_id = ?
+                        """,
+                        (
+                            uuid_to_blob(
+                                old_blob_id
+                            ),
+                        ),
+                    ).fetchone()
+                )
+
+                representation_refs = (
+                    connection.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM source_representations
+                        WHERE source_id = ?
+                           OR blob_id = ?
+                        """,
+                        (
+                            uuid_to_blob(
+                                source_id
+                            ),
+                            uuid_to_blob(
+                                old_blob_id
+                            ),
+                        ),
+                    ).fetchone()
+                )
+
+                if (
+                    source_refs is None
+                    or int(
+                        source_refs[0]
+                    )
+                    != 1
+                    or representation_refs
+                    is None
+                    or int(
+                        representation_refs[0]
+                    )
+                    != 0
+                ):
+                    raise (
+                        SourceProtectionUnsafeError(
+                            "Source protection requires "
+                            "an exclusive raw Blob with "
+                            "no persisted representations."
+                        )
+                    )
+
+                connection.execute(
+                    """
+                    INSERT INTO
+                    source_protection_transitions (
+                        transition_id,
+                        source_id,
+                        protection_scope_id,
+                        old_blob_id,
+                        target_blob_id,
+                        protected_metadata_payload_id,
+                        state,
+                        created_at_us,
+                        updated_at_us
+                    ) VALUES (
+                        ?, ?, ?, ?,
+                        NULL, NULL,
+                        'pending', ?, ?
+                    )
+                    """,
+                    (
+                        uuid_to_blob(
+                            transition_id
+                        ),
+                        uuid_to_blob(
+                            source_id
+                        ),
+                        uuid_to_blob(
+                            protection_scope_id
+                        ),
+                        uuid_to_blob(
+                            old_blob_id
+                        ),
+                        now_us,
+                        now_us,
+                    ),
+                )
+
+                if (
+                    operational_state_cutover
+                    is not None
+                ):
+                    (
+                        _migrated,
+                        blockers,
+                    ) = operational_state_cutover(
+                        connection
+                    )
+
+        # Deliberately AFTER the transaction.
+        #
+        # pending + cancel_requested must remain durable
+        # so no new Source-dependent job can race in
+        # while the live worker acknowledges cancellation.
+        if blockers:
+            raise (
+                SourceProtectionOperationalBlockerError(
+                    "Source protection is pending "
+                    "until running dependent jobs "
+                    "have terminated."
+                )
             )
 
-        _reloaded_transition = self.get_for_source(source_id)
-        if _reloaded_transition is None:
-            raise SourceProtectionTransitionError(
-                "Source Protection transition disappeared "
-                "during durable state advancement."
+        if existing_record is not None:
+            return existing_record
+
+        reloaded = self.get_for_source(
+            source_id
+        )
+
+        if reloaded is None:
+            raise (
+                SourceProtectionTransitionError(
+                    "Source Protection transition "
+                    "disappeared during durable "
+                    "state advancement."
+                )
             )
-        record = _reloaded_transition
-        if record is None:
-            raise SourceProtectionTransitionError(
-                "Protection transition disappeared after creation."
-            )
-        return record
+
+        return reloaded
 
     def mark_prepared(
         self,
@@ -1221,17 +1427,28 @@ class SourceProtectionTransitionService:
         blob_store: BlobStore,
         protected_content: ProtectedContentService,
         chat: ChatService,
+        jobs: JobRepository,
         runtime_lock_root: Path | None = None,
     ) -> None:
         self.repository = repository
         self.sources = sources
         self.blob_store = blob_store
-        self.protected_content = protected_content
+        self.protected_content = (
+            protected_content
+        )
         self.chat = chat
-        self.runtime_lock_root = runtime_lock_root
-        self.protected_blobs = ProtectedBlobStore(
-            blob_store=blob_store,
-            protected_content=protected_content,
+        self.jobs = jobs
+        self.runtime_lock_root = (
+            runtime_lock_root
+        )
+
+        self.protected_blobs = (
+            ProtectedBlobStore(
+                blob_store=blob_store,
+                protected_content=(
+                    protected_content
+                ),
+            )
         )
 
     def start(self) -> None:
@@ -1249,41 +1466,187 @@ class SourceProtectionTransitionService:
         source_id: uuid.UUID,
         protection_scope_id: uuid.UUID,
     ) -> SourceCaptureResult:
-        with runtime_data_lock(self.runtime_lock_root):
-            protected_scope = self.repository.protected_scope(source_id)
+        with runtime_data_lock(
+            self.runtime_lock_root
+        ):
+            protected_scope = (
+                self.repository
+                .protected_scope(
+                    source_id
+                )
+            )
+
             if protected_scope is not None:
-                if protected_scope != protection_scope_id:
-                    raise SourceProtectionUnsafeError(
-                        "Source is already protected by another ProtectionScope."
+                if (
+                    protected_scope
+                    != protection_scope_id
+                ):
+                    raise (
+                        SourceProtectionUnsafeError(
+                            "Source is already "
+                            "protected by another "
+                            "ProtectionScope."
+                        )
                     )
-                source, blob = self.sources.get(source_id)
+
+                source, blob = (
+                    self.sources.get(
+                        source_id
+                    )
+                )
+
                 return SourceCaptureResult(
                     source=source,
                     blob=blob,
                     reused_blob=False,
                 )
 
-            transition = self.repository.get_for_source(source_id)
-            if transition is None:
-                if not self.protected_content.is_unlocked(protection_scope_id):
-                    raise ProtectionScopeLockedError("ProtectionScope is locked.")
-                source, blob = self.sources.get(source_id)
-                self._metadata_for_source(source, blob)
-                transition = self.repository.begin(
-                    source_id=source_id,
-                    protection_scope_id=protection_scope_id,
+            transition = (
+                self.repository
+                .get_for_source(
+                    source_id
                 )
-            elif transition.protection_scope_id != protection_scope_id:
-                raise SourceProtectionUnsafeError(
-                    "Source already has a protection transition for another scope."
+            )
+
+            if (
+                transition is not None
+                and transition
+                .protection_scope_id
+                != protection_scope_id
+            ):
+                raise (
+                    SourceProtectionUnsafeError(
+                        "Source already has a "
+                        "protection transition "
+                        "for another scope."
+                    )
                 )
 
-            if transition.state is SourceProtectionTransitionState.PENDING:
-                if not self.protected_content.is_unlocked(protection_scope_id):
-                    raise ProtectionScopeLockedError("ProtectionScope is locked.")
-                transition = self._prepare(transition)
+            if (
+                transition is None
+                or transition.state
+                is SourceProtectionTransitionState.PENDING
+            ):
+                if not (
+                    self.protected_content
+                    .is_unlocked(
+                        protection_scope_id
+                    )
+                ):
+                    raise (
+                        ProtectionScopeLockedError(
+                            "ProtectionScope is locked."
+                        )
+                    )
 
-            return self._finish_transition(transition)
+                if transition is None:
+                    source, blob = (
+                        self.sources.get(
+                            source_id
+                        )
+                    )
+
+                    self._metadata_for_source(
+                        source,
+                        blob,
+                    )
+
+                def operational_cutover(
+                    connection: sqlite3.Connection,
+                ) -> tuple[
+                    tuple[uuid.UUID, ...],
+                    tuple[uuid.UUID, ...],
+                ]:
+                    return (
+                        self._cutover_operational_state(
+                            connection,
+                            source_id=source_id,
+                            protection_scope_id=(
+                                protection_scope_id
+                            ),
+                        )
+                    )
+
+                transition = (
+                    self.repository.begin(
+                        source_id=source_id,
+                        protection_scope_id=(
+                            protection_scope_id
+                        ),
+                        operational_state_cutover=(
+                            operational_cutover
+                        ),
+                    )
+                )
+
+            if (
+                transition.state
+                is SourceProtectionTransitionState.PENDING
+            ):
+                transition = self._prepare(
+                    transition
+                )
+
+            return self._finish_transition(
+                transition
+            )
+
+    def _cutover_operational_state(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        source_id: uuid.UUID,
+        protection_scope_id: uuid.UUID,
+    ) -> tuple[
+        tuple[uuid.UUID, ...],
+        tuple[uuid.UUID, ...],
+    ]:
+        def payload_writer(
+            payload_connection: sqlite3.Connection,
+            plaintext: bytes,
+        ) -> uuid.UUID:
+            if (
+                payload_connection
+                is not connection
+            ):
+                raise (
+                    SourceProtectionTransitionError(
+                        "Operational payload writer "
+                        "left the protection "
+                        "transaction."
+                    )
+                )
+
+            record = (
+                self.protected_content
+                .prepare_payload(
+                    protection_scope_id,
+                    plaintext,
+                )
+            )
+
+            self.protected_content.repository.insert_payload_in_transaction(
+                connection,
+                record,
+            )
+
+            return (
+                record.protected_payload_id
+            )
+
+        return (
+            self.jobs
+            .protect_source_dependency_payloads(
+                connection,
+                source_id=source_id,
+                protection_scope_id=(
+                    protection_scope_id
+                ),
+                payload_writer=(
+                    payload_writer
+                ),
+            )
+        )
 
     def _prepare(
         self,

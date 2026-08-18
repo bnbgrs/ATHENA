@@ -255,14 +255,14 @@ class NewsPersistenceMixin(NewsMixinContext):
                 UPDATE news_discoveries SET state = 'failed', failure_reason = ?
                 WHERE discovery_id = ?
                 """,
-                (f"{type(exc).__name__}: {exc}"[:1000], uuid_to_blob(discovery_id)),
+                (type(exc).__name__, uuid_to_blob(discovery_id)),
             )
 
     def _record_source_failure(
         self, run_id: bytes, news_source_id: bytes, exc: BaseException
     ) -> None:
         now = utc_now_us()
-        detail = f"{type(exc).__name__}: {exc}"[:1000]
+        detail = type(exc).__name__
         row=self.database.connection.execute(
             "SELECT consecutive_failures FROM news_source_states WHERE news_source_id=?",
             (news_source_id,),

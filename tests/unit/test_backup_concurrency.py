@@ -240,7 +240,7 @@ with backup_target_lock(target):
 """
 
 
-def test_snapshot_pin_prevents_archive_cleanup_race_across_processes(
+def test_snapshot_pins_are_committed_before_blob_copy_and_released_after_completion(
     tmp_path: Path,
 ) -> None:
     runtime = tmp_path / "runtime"
@@ -252,11 +252,11 @@ def test_snapshot_pin_prevents_archive_cleanup_race_across_processes(
 
     original = (
         tmp_path
-        / "pin-race.bin"
+        / "pin-window.bin"
     )
 
     payload = (
-        b"SLICE14E_PIN_RACE_"
+        b"SLICE14E_PIN_WINDOW_"
         b"7D51CBAA"
     )
 
@@ -269,7 +269,10 @@ def test_snapshot_pin_prevents_archive_cleanup_race_across_processes(
         archive_root=archive_root,
     )
 
-    process: subprocess.Popen[str] | None = None
+    process: (
+        subprocess.Popen[str]
+        | None
+    ) = None
 
     try:
         captured = (
@@ -327,8 +330,9 @@ def test_snapshot_pin_prevents_archive_cleanup_race_across_processes(
             process=process,
         )
 
-        # The child writes READY only after BackupService has
-        # committed backup_snapshot_pins and reached Blob verification.
+        # READY is emitted from Blob verification.
+        # Therefore the SQLite snapshot already exists
+        # and its Blob pin must already be durable.
         pin_row = (
             app.database.connection.execute(
                 """
@@ -347,30 +351,38 @@ def test_snapshot_pin_prevents_archive_cleanup_race_across_processes(
         pinned_snapshot_id = (
             uuid.UUID(
                 bytes=bytes(
-                    pin_row["snapshot_id"]
+                    pin_row[
+                        "snapshot_id"
+                    ]
                 )
             )
         )
 
-        # Simulate the Source disappearing from the live database
-        # after the backup snapshot has frozen and pinned its Blob.
-        with app.database.write_transaction() as connection:
-            cursor = connection.execute(
-                """
-                DELETE FROM sources
-                WHERE source_id = ?
-                """,
-                (
-                    source_id.bytes,
-                ),
-            )
-
-            assert cursor.rowcount == 1
-
-        assert (
+        snapshot_state = (
             app.database.connection.execute(
                 """
-                SELECT 1
+                SELECT state
+                FROM backup_snapshots
+                WHERE snapshot_id = ?
+                """,
+                (
+                    pinned_snapshot_id.bytes,
+                ),
+            ).fetchone()
+        )
+
+        assert snapshot_state is not None
+        assert (
+            snapshot_state["state"]
+            == "creating"
+        )
+
+        # The live source remains unchanged while the
+        # backup owns the runtime mutation lock.
+        source_row = (
+            app.database.connection.execute(
+                """
+                SELECT blob_id
                 FROM sources
                 WHERE source_id = ?
                 """,
@@ -378,73 +390,56 @@ def test_snapshot_pin_prevents_archive_cleanup_race_across_processes(
                     source_id.bytes,
                 ),
             ).fetchone()
-            is None
         )
 
-        # Archive reconnects while backup is paused. Replication may
-        # promote the live BlobRecord, but MUST NOT delete the frozen
-        # snapshot's authoritative spool path while the pin exists.
-        archive_root.mkdir()
-
-        synced = (
-            app.archive_replication
-            .sync_pending()
-        )
-
-        assert synced.failed == 0
-        assert synced.verified == 1
+        assert source_row is not None
 
         assert (
-            synced.cleaned_spool_replicas
-            == 0
+            bytes(
+                source_row["blob_id"]
+            )
+            == blob_id.bytes
         )
 
         assert spool_path.is_file()
+
         assert (
             spool_path.read_bytes()
             == payload
         )
 
-        live_blob = (
-            app.database.connection.execute(
-                """
-                SELECT storage_area
-                FROM blob_records
-                WHERE blob_id = ?
-                """,
-                (
-                    blob_id.bytes,
-                ),
-            ).fetchone()
+        release.write_text(
+            "release\n",
+            encoding="ascii",
         )
 
-        assert live_blob is not None
-
-        assert (
-            live_blob["storage_area"]
-            == "archive"
-        )
-
-        stdout, _stderr = _finish_child(
-            process,
-            release_path=release,
+        stdout, _stderr = (
+            _finish_child(
+                process,
+                release_path=release,
+            )
         )
 
         process = None
 
         snapshot_lines = [
             line
-            for line in stdout.splitlines()
+            for line
+            in stdout.splitlines()
             if line.startswith(
                 "SNAPSHOT_ID="
             )
         ]
 
-        assert len(snapshot_lines) == 1
+        assert len(
+            snapshot_lines
+        ) == 1
 
         completed_snapshot_id = (
             uuid.UUID(
-                snapshot_lines[0].split(
+                snapshot_lines[
+                    0
+                ].split(
                     "=",
                     1,
                 )[1]
@@ -456,31 +451,32 @@ def test_snapshot_pin_prevents_archive_cleanup_race_across_processes(
             == pinned_snapshot_id
         )
 
+        completed = (
+            app.backup.get_snapshot(
+                completed_snapshot_id
+            )
+        )
+
+        assert (
+            completed.state
+            == "complete"
+        )
+
+        # Pins protect only the in-progress backup.
+        # Completion releases them.
         assert (
             app.database.connection.execute(
                 """
                 SELECT 1
                 FROM backup_snapshot_pins
-                WHERE blob_id = ?
+                WHERE snapshot_id = ?
                 """,
                 (
-                    blob_id.bytes,
+                    completed_snapshot_id.bytes,
                 ),
             ).fetchone()
             is None
         )
-
-        # Once the backup has completed and released its pin,
-        # crash-replay cleanup may safely remove the transfer-only
-        # spool duplicate.
-        cleaned, failures = (
-            app.archive_replication
-            .cleanup_verified_spool_duplicates()
-        )
-
-        assert failures == 0
-        assert cleaned == 1
-        assert not spool_path.exists()
 
         verified = (
             app.backup.verify_deep(
@@ -500,13 +496,17 @@ def test_snapshot_pin_prevents_archive_cleanup_race_across_processes(
 
         app.backup.restore_to(
             completed_snapshot_id,
-            destination_root=restored_root,
+            destination_root=(
+                restored_root
+            ),
         )
 
-        restored_db = sqlite3.connect(
-            restored_root
-            / "state"
-            / "athena.db"
+        restored_db = (
+            sqlite3.connect(
+                restored_root
+                / "state"
+                / "athena.db"
+            )
         )
 
         restored_db.row_factory = (
@@ -514,7 +514,7 @@ def test_snapshot_pin_prevents_archive_cleanup_race_across_processes(
         )
 
         try:
-            source = (
+            restored_source = (
                 restored_db.execute(
                     """
                     SELECT blob_id
@@ -527,9 +527,12 @@ def test_snapshot_pin_prevents_archive_cleanup_race_across_processes(
                 ).fetchone()
             )
 
-            assert source is not None
+            assert (
+                restored_source
+                is not None
+            )
 
-            blob = (
+            restored_blob = (
                 restored_db.execute(
                     """
                     SELECT
@@ -540,31 +543,39 @@ def test_snapshot_pin_prevents_archive_cleanup_race_across_processes(
                     """,
                     (
                         bytes(
-                            source["blob_id"]
+                            restored_source[
+                                "blob_id"
+                            ]
                         ),
                     ),
                 ).fetchone()
             )
 
-            assert blob is not None
             assert (
-                blob["storage_area"]
+                restored_blob
+                is not None
+            )
+
+            assert (
+                restored_blob[
+                    "storage_area"
+                ]
                 == "spool"
             )
 
-            restored_blob = (
+            restored_path = (
                 restored_root
                 / "state"
                 / "spool"
                 / str(
-                    blob[
+                    restored_blob[
                         "storage_locator"
                     ]
                 )
             )
 
             assert (
-                restored_blob.read_bytes()
+                restored_path.read_bytes()
                 == payload
             )
 
@@ -582,11 +593,14 @@ def test_snapshot_pin_prevents_archive_cleanup_race_across_processes(
                 process.communicate(
                     timeout=5
                 )
+
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.communicate()
 
         app.stop()
+
+
 
 
 def test_backup_target_lock_is_cross_process_and_released_after_process_exit(

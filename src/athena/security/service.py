@@ -487,6 +487,23 @@ class ProtectedContentService:
         protection_scope_id: uuid.UUID,
         plaintext: bytes,
     ) -> ProtectedPayloadRecord:
+        record = self.prepare_payload(
+            protection_scope_id,
+            plaintext,
+        )
+
+        self.repository.insert_payload(
+            record
+        )
+
+        return record
+
+    def prepare_payload(
+        self,
+        protection_scope_id: uuid.UUID,
+        plaintext: bytes,
+    ) -> ProtectedPayloadRecord:
+        """Encrypt one payload without persisting it."""
         if not plaintext:
             raise ValueError(
                 "Protected payload must not be empty."
@@ -506,8 +523,7 @@ class ProtectedContentService:
         if (
             current_key.scope_key_id
             != unlocked.scope_key_id
-            or
-            current_key.status
+            or current_key.status
             is not KeyStatus.ACTIVE
         ):
             raise ProtectionScopeLockedError(
@@ -561,15 +577,19 @@ class ProtectedContentService:
                 ),
             )
 
-            record = ProtectedPayloadRecord(
-                protected_payload_id=payload_id,
+            return ProtectedPayloadRecord(
+                protected_payload_id=(
+                    payload_id
+                ),
                 protection_scope_id=(
                     protection_scope_id
                 ),
                 scope_key_id=(
                     unlocked.scope_key_id
                 ),
-                cipher_suite=AES_256_GCM,
+                cipher_suite=(
+                    AES_256_GCM
+                ),
                 ciphertext=(
                     encrypted.ciphertext
                 ),
@@ -587,14 +607,10 @@ class ProtectedContentService:
                         encrypted.ciphertext
                     )
                 ),
-                created_at_us=created_at_us,
+                created_at_us=(
+                    created_at_us
+                ),
             )
-
-            self.repository.insert_payload(
-                record
-            )
-
-            return record
 
         finally:
             _wipe(

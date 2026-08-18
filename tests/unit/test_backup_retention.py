@@ -23,7 +23,7 @@ from athena.config.settings import AthenaSettings
 from athena.core.application import AthenaApplication
 from athena.storage.database import SQLiteDatabase
 from athena.storage.schema import (
-    DELETION_LEDGER_MIGRATION_ID,
+    PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
     SCHEMA_VERSION,
     SOURCE_PROTECTION_TRANSITION_MIGRATION_ID,
     SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
@@ -63,6 +63,20 @@ def test_v34_to_v35_adds_backup_retention_schema(
     legacy = sqlite3.connect(
         database_path,
         autocommit=True,
+    )
+
+    # This fixture starts from the current schema and
+    # reconstructs an older boundary. Remove additive
+    # v39 child state before removing older parents or
+    # rewriting schema metadata. Production migration
+    # behavior intentionally remains fail-closed.
+    legacy.execute(
+        "DROP TABLE IF EXISTS "
+        "source_protection_representation_blobs"
+    )
+    legacy.execute(
+        "DROP TABLE IF EXISTS "
+        "source_protected_semantic_payloads"
     )
 
     try:
@@ -156,7 +170,7 @@ def test_v34_to_v35_adds_backup_retention_schema(
             SCHEMA_VERSION
         )
         assert str(metadata[1]) == (
-            DELETION_LEDGER_MIGRATION_ID
+            PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID
         )
         assert int(metadata[2]) == (
             SCHEMA_VERSION

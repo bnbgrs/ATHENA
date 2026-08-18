@@ -276,7 +276,7 @@ class SourceAnalysisKnowledgeExtractionService:
             self.runs.finish_run(
                 run.processing_run_id,
                 status="failed",
-                error_detail=f"{type(exc).__name__}: {exc}",
+                error_detail=type(exc).__name__,
             )
             raise
         self.context_packages.assert_snapshot_current(
@@ -598,7 +598,7 @@ class SourceAnalysisKnowledgeExtractionService:
             self.runs.finish_run(
                 audit_run.processing_run_id,
                 status="failed",
-                error_detail=f"{type(exc).__name__}: {exc}",
+                error_detail=type(exc).__name__,
             )
             raise
         self.runs.finish_run(audit_run.processing_run_id, status="succeeded")

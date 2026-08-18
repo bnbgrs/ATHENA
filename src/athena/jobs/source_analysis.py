@@ -345,7 +345,7 @@ class DurableSourceAnalysisWorker:
             current_stage="analysis_waiting_network",
             map_planned=True,
             last_input=None,
-            last_output={"reason": type(exc).__name__, "detail": str(exc)[:500]},
+            last_output={"reason": type(exc).__name__, "detail": type(exc).__name__},
         )
         waiting = self.jobs.wait(
             job.job_id,
@@ -376,7 +376,7 @@ class DurableSourceAnalysisWorker:
             current_stage="analysis_waiting_user",
             map_planned=True,
             last_input=None,
-            last_output={"reason": type(exc).__name__, "detail": str(exc)[:500]},
+            last_output={"reason": type(exc).__name__, "detail": type(exc).__name__},
         )
         waiting = self.jobs.wait(
             job.job_id,

@@ -507,55 +507,74 @@ class ProtectionRepository:
         self,
         record: ProtectedPayloadRecord,
     ) -> None:
+        with (
+            self.database.write_transaction()
+            as connection
+        ):
+            self.insert_payload_in_transaction(
+                connection,
+                record,
+            )
+
+    def insert_payload_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        record: ProtectedPayloadRecord,
+    ) -> None:
+        """Insert one encrypted payload inside the caller's transaction."""
+        if not connection.in_transaction:
+            raise RuntimeError(
+                "Protected payload insertion requires "
+                "an active transaction."
+            )
+
         try:
-            with (
-                self.database.write_transaction()
-                as connection
-            ):
-                connection.execute(
-                    """
-                    INSERT INTO protected_payloads (
-                        protected_payload_id,
-                        protection_scope_id,
-                        scope_key_id,
-                        cipher_suite,
-                        ciphertext,
-                        nonce,
-                        wrapped_dek,
-                        dek_wrap_nonce,
-                        aad_version,
-                        ciphertext_hash,
-                        created_at_us
-                    ) VALUES (
-                        ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?
-                    )
-                    """,
-                    (
-                        uuid_to_blob(
-                            record.protected_payload_id
-                        ),
-                        uuid_to_blob(
-                            record.protection_scope_id
-                        ),
-                        uuid_to_blob(
-                            record.scope_key_id
-                        ),
-                        record.cipher_suite,
-                        record.ciphertext,
-                        record.nonce,
-                        record.wrapped_dek,
-                        record.dek_wrap_nonce,
-                        record.aad_version,
-                        record.ciphertext_hash,
-                        record.created_at_us,
-                    ),
+            connection.execute(
+                """
+                INSERT INTO protected_payloads (
+                    protected_payload_id,
+                    protection_scope_id,
+                    scope_key_id,
+                    cipher_suite,
+                    ciphertext,
+                    nonce,
+                    wrapped_dek,
+                    dek_wrap_nonce,
+                    aad_version,
+                    ciphertext_hash,
+                    created_at_us
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?
                 )
+                """,
+                (
+                    uuid_to_blob(
+                        record.protected_payload_id
+                    ),
+                    uuid_to_blob(
+                        record.protection_scope_id
+                    ),
+                    uuid_to_blob(
+                        record.scope_key_id
+                    ),
+                    record.cipher_suite,
+                    record.ciphertext,
+                    record.nonce,
+                    record.wrapped_dek,
+                    record.dek_wrap_nonce,
+                    record.aad_version,
+                    record.ciphertext_hash,
+                    record.created_at_us,
+                ),
+            )
 
         except sqlite3.IntegrityError as exc:
-            raise ProtectionRepositoryIntegrityError(
-                "Protected payload violates "
-                "the Protected-Content schema."
+            raise (
+                ProtectionRepositoryIntegrityError(
+                    "Protected payload violates "
+                    "the Protected-Content schema."
+                )
             ) from exc
 
     def get_payload(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from collections.abc import Callable, Iterable
@@ -18,6 +19,7 @@ from athena.jobs.models import (
 from athena.storage.database import SQLiteDatabase
 
 CanonicalJobWriteFence = Callable[[sqlite3.Connection], None]
+ProtectedOperationalPayloadWriter = Callable[[sqlite3.Connection, bytes], uuid.UUID]
 
 
 class JobNotFoundError(LookupError):
@@ -34,6 +36,10 @@ class JobLeaseError(RuntimeError):
 
 class JobTransitionError(RuntimeError):
     """Raised for invalid durable job-state transitions."""
+
+
+class JobSourceProtectionFenceError(JobTransitionError):
+    """Raised when a new job depends on a protected or transitioning Source."""
 
 
 class JobRepository:
@@ -56,6 +62,10 @@ class JobRepository:
         now_us = utc_now_us()
         with self.database.write_transaction() as connection:
             self._require_active_actor(connection, actor_id)
+            _require_unprotected_job_dependencies(
+                connection,
+                requested_scope_json,
+            )
             connection.execute(
                 """
                 INSERT INTO jobs (
@@ -475,7 +485,7 @@ class JobRepository:
         with self.database.write_transaction() as connection:
             row = self._require_live_lease(connection, job_id, lease_token, now)
             state = JobState(str(row["state"]))
-            if state not in {JobState.RUNNING, JobState.CANCEL_REQUESTED}:
+            if state is not JobState.RUNNING:
                 raise JobLeaseError(
                     f"Job {job_id} cannot checkpoint in state {state.value!r}."
                 )
@@ -621,31 +631,556 @@ class JobRepository:
         now = utc_now_us()
         with self.database.write_transaction() as connection:
             row = self._require_job_row(connection, job_id)
-            state = JobState(str(row["state"]))
-            if state.terminal:
-                raise JobTransitionError(
-                    f"Terminal job {job_id} cannot be cancelled again."
-                )
-            if state in {JobState.QUEUED, JobState.WAITING, JobState.PAUSED}:
-                target = JobState.CANCELLED
-                clear_lease = True
-            elif state is JobState.RUNNING:
-                target = JobState.CANCEL_REQUESTED
-                clear_lease = False
-            elif state is JobState.CANCEL_REQUESTED:
-                return _job_from_row(row)
-            else:
-                raise JobTransitionError(
-                    f"Job {job_id} cannot be cancelled from {state.value!r}."
-                )
-            if clear_lease:
-                self._update_state_and_clear_lease(connection, job_id, target, now)
-            else:
-                connection.execute(
-                    "UPDATE jobs SET state = ?, updated_at_us = ? WHERE job_id = ?",
-                    (target.value, now, uuid_to_blob(job_id)),
-                )
+            self._request_cancel_row(
+                connection,
+                row=row,
+                now_us=now,
+            )
         return self.get(job_id)
+
+    def fence_source_dependencies(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        source_id: uuid.UUID,
+        now_us: int | None = None,
+    ) -> tuple[uuid.UUID, ...]:
+        """Fence every nonterminal durable job that depends on one Source."""
+        if not connection.in_transaction:
+            raise RuntimeError(
+                "Source dependency fencing requires an active transaction."
+            )
+
+        now = utc_now_us() if now_us is None else now_us
+
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM jobs
+            WHERE state IN (
+                'queued',
+                'waiting',
+                'running',
+                'paused',
+                'cancel_requested'
+            )
+            ORDER BY created_at_us ASC, job_id ASC
+            """
+        ).fetchall()
+
+        fenced_ids: list[uuid.UUID] = []
+
+        for row in rows:
+            dependencies = _job_source_dependency_ids(
+                connection,
+                _maybe_text(
+                    row["requested_scope_json"]
+                ),
+            )
+
+            if source_id not in dependencies:
+                continue
+
+            job_id = uuid_from_blob(
+                bytes(
+                    row["job_id"]
+                )
+            )
+
+            self._request_cancel_row(
+                connection,
+                row=row,
+                now_us=now,
+            )
+
+            fenced_ids.append(
+                job_id
+            )
+
+        return tuple(
+            fenced_ids
+        )
+
+    def protect_source_dependency_payloads(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        source_id: uuid.UUID,
+        protection_scope_id: uuid.UUID,
+        payload_writer: ProtectedOperationalPayloadWriter,
+        now_us: int | None = None,
+    ) -> tuple[
+        tuple[uuid.UUID, ...],
+        tuple[uuid.UUID, ...],
+    ]:
+        """Fence and protect durable operational state for one Source."""
+        if not connection.in_transaction:
+            raise RuntimeError(
+                "Protected operational-state cutover "
+                "requires an active transaction."
+            )
+
+        now = (
+            utc_now_us()
+            if now_us is None
+            else now_us
+        )
+
+        self.fence_source_dependencies(
+            connection,
+            source_id=source_id,
+            now_us=now,
+        )
+
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM jobs
+            ORDER BY created_at_us ASC,
+                     job_id ASC
+            """
+        ).fetchall()
+
+        migrated: list[
+            uuid.UUID
+        ] = []
+
+        blockers: list[
+            uuid.UUID
+        ] = []
+
+        for row in rows:
+            requested_scope = _maybe_text(
+                row[
+                    "requested_scope_json"
+                ]
+            )
+
+            # A row already migrated to a protected
+            # payload has no public requested scope
+            # left and therefore needs no second pass.
+            if requested_scope is None:
+                continue
+
+            dependencies = (
+                _job_source_dependency_ids(
+                    connection,
+                    requested_scope,
+                )
+            )
+
+            if source_id not in dependencies:
+                continue
+
+            job_id = uuid_from_blob(
+                bytes(
+                    row["job_id"]
+                )
+            )
+
+            current = connection.execute(
+                """
+                SELECT *
+                FROM jobs
+                WHERE job_id = ?
+                """,
+                (
+                    uuid_to_blob(
+                        job_id
+                    ),
+                ),
+            ).fetchone()
+
+            if current is None:
+                raise JobNotFoundError(
+                    str(job_id)
+                )
+
+            state = JobState(
+                str(
+                    current["state"]
+                )
+            )
+
+            if (
+                state
+                is JobState.CANCEL_REQUESTED
+            ):
+                # The worker still owns its lease.
+                # Keep its scope intact until it has
+                # acknowledged cancellation (or lease
+                # recovery terminalizes it), otherwise
+                # worker contract validation can fail
+                # before the cancel branch is reached.
+                blockers.append(
+                    job_id
+                )
+                continue
+
+            if not state.terminal:
+                raise JobTransitionError(
+                    f"Source dependency fence left "
+                    f"job {job_id} nonterminal in "
+                    f"state {state.value!r}."
+                )
+
+            self._protect_checkpoint_payloads(
+                connection,
+                job_id=job_id,
+                protection_scope_id=(
+                    protection_scope_id
+                ),
+                payload_writer=(
+                    payload_writer
+                ),
+            )
+
+            self._protect_job_payload(
+                connection,
+                row=current,
+                protection_scope_id=(
+                    protection_scope_id
+                ),
+                payload_writer=(
+                    payload_writer
+                ),
+                now_us=now,
+            )
+
+            migrated.append(
+                job_id
+            )
+
+        return (
+            tuple(migrated),
+            tuple(blockers),
+        )
+
+    def _protect_job_payload(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        row: sqlite3.Row,
+        protection_scope_id: uuid.UUID,
+        payload_writer: ProtectedOperationalPayloadWriter,
+        now_us: int,
+    ) -> None:
+        job_id = uuid_from_blob(
+            bytes(
+                row["job_id"]
+            )
+        )
+
+        stored_scope = _maybe_uuid(
+            row[
+                "protection_scope_id"
+            ]
+        )
+
+        stored_payload = _maybe_uuid(
+            row[
+                "protected_payload_id"
+            ]
+        )
+
+        if (
+            stored_scope is not None
+            or stored_payload is not None
+        ):
+            if (
+                stored_scope
+                == protection_scope_id
+                and stored_payload
+                is not None
+            ):
+                return
+
+            raise JobTransitionError(
+                f"Job {job_id} has inconsistent "
+                "Protected Content ownership."
+            )
+
+        payload = (
+            _protected_operational_json(
+                payload_type=(
+                    "athena.job.operational.v1"
+                ),
+                values={
+                    "requested_scope_json": (
+                        _maybe_text(
+                            row[
+                                "requested_scope_json"
+                            ]
+                        )
+                    ),
+                    "pinned_configuration_json": (
+                        _maybe_text(
+                            row[
+                                "pinned_configuration_json"
+                            ]
+                        )
+                    ),
+                    "blocked_reason": (
+                        _maybe_text(
+                            row[
+                                "blocked_reason"
+                            ]
+                        )
+                    ),
+                },
+            )
+        )
+
+        protected_payload_id = (
+            payload_writer(
+                connection,
+                payload,
+            )
+        )
+
+        updated = connection.execute(
+            """
+            UPDATE jobs
+            SET requested_scope_json = NULL,
+                pinned_configuration_json = NULL,
+                blocked_reason = NULL,
+                protection_scope_id = ?,
+                protected_payload_id = ?,
+                updated_at_us = ?
+            WHERE job_id = ?
+              AND protection_scope_id IS NULL
+              AND protected_payload_id IS NULL
+            """,
+            (
+                uuid_to_blob(
+                    protection_scope_id
+                ),
+                uuid_to_blob(
+                    protected_payload_id
+                ),
+                now_us,
+                uuid_to_blob(
+                    job_id
+                ),
+            ),
+        )
+
+        if updated.rowcount != 1:
+            raise JobTransitionError(
+                f"Job {job_id} lost its "
+                "operational-state cutover fence."
+            )
+
+    def _protect_checkpoint_payloads(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        job_id: uuid.UUID,
+        protection_scope_id: uuid.UUID,
+        payload_writer: ProtectedOperationalPayloadWriter,
+    ) -> None:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM checkpoints
+            WHERE job_id = ?
+            ORDER BY created_at_us ASC,
+                     checkpoint_id ASC
+            """,
+            (
+                uuid_to_blob(
+                    job_id
+                ),
+            ),
+        ).fetchall()
+
+        for row in rows:
+            checkpoint_id = uuid_from_blob(
+                bytes(
+                    row[
+                        "checkpoint_id"
+                    ]
+                )
+            )
+
+            stored_scope = _maybe_uuid(
+                row[
+                    "protection_scope_id"
+                ]
+            )
+
+            stored_payload = _maybe_uuid(
+                row[
+                    "protected_payload_id"
+                ]
+            )
+
+            if (
+                stored_scope is not None
+                or stored_payload is not None
+            ):
+                if (
+                    stored_scope
+                    == protection_scope_id
+                    and stored_payload
+                    is not None
+                ):
+                    continue
+
+                raise JobTransitionError(
+                    f"Checkpoint "
+                    f"{checkpoint_id} has "
+                    "inconsistent Protected "
+                    "Content ownership."
+                )
+
+            payload = (
+                _protected_operational_json(
+                    payload_type=(
+                        "athena.checkpoint."
+                        "operational.v1"
+                    ),
+                    values={
+                        "progress_state_json": (
+                            _maybe_text(
+                                row[
+                                    "progress_state_json"
+                                ]
+                            )
+                        ),
+                        "last_confirmed_input_json": (
+                            _maybe_text(
+                                row[
+                                    "last_confirmed_input_json"
+                                ]
+                            )
+                        ),
+                        "last_confirmed_output_json": (
+                            _maybe_text(
+                                row[
+                                    "last_confirmed_output_json"
+                                ]
+                            )
+                        ),
+                        "resume_metadata_json": (
+                            _maybe_text(
+                                row[
+                                    "resume_metadata_json"
+                                ]
+                            )
+                        ),
+                    },
+                )
+            )
+
+            protected_payload_id = (
+                payload_writer(
+                    connection,
+                    payload,
+                )
+            )
+
+            updated = connection.execute(
+                """
+                UPDATE checkpoints
+                SET progress_state_json = NULL,
+                    last_confirmed_input_json = NULL,
+                    last_confirmed_output_json = NULL,
+                    resume_metadata_json = NULL,
+                    protection_scope_id = ?,
+                    protected_payload_id = ?
+                WHERE checkpoint_id = ?
+                  AND protection_scope_id IS NULL
+                  AND protected_payload_id IS NULL
+                """,
+                (
+                    uuid_to_blob(
+                        protection_scope_id
+                    ),
+                    uuid_to_blob(
+                        protected_payload_id
+                    ),
+                    uuid_to_blob(
+                        checkpoint_id
+                    ),
+                ),
+            )
+
+            if updated.rowcount != 1:
+                raise JobTransitionError(
+                    f"Checkpoint "
+                    f"{checkpoint_id} lost its "
+                    "operational-state "
+                    "cutover fence."
+                )
+
+    def _request_cancel_row(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        row: sqlite3.Row,
+        now_us: int,
+    ) -> JobState:
+        job_id = uuid_from_blob(
+            bytes(
+                row["job_id"]
+            )
+        )
+
+        state = JobState(
+            str(
+                row["state"]
+            )
+        )
+
+        if state.terminal:
+            raise JobTransitionError(
+                f"Terminal job {job_id} cannot be cancelled again."
+            )
+
+        if state in {
+            JobState.QUEUED,
+            JobState.WAITING,
+            JobState.PAUSED,
+        }:
+            target = JobState.CANCELLED
+
+            self._update_state_and_clear_lease(
+                connection,
+                job_id,
+                target,
+                now_us,
+            )
+
+            return target
+
+        if state is JobState.RUNNING:
+            target = JobState.CANCEL_REQUESTED
+
+            connection.execute(
+                """
+                UPDATE jobs
+                SET state = ?,
+                    updated_at_us = ?
+                WHERE job_id = ?
+                """,
+                (
+                    target.value,
+                    now_us,
+                    uuid_to_blob(
+                        job_id
+                    ),
+                ),
+            )
+
+            return target
+
+        if state is JobState.CANCEL_REQUESTED:
+            return state
+
+        raise JobTransitionError(
+            f"Job {job_id} cannot be cancelled from {state.value!r}."
+        )
 
     def pause(self, job_id: uuid.UUID) -> JobRecord:
         now = utc_now_us()
@@ -871,6 +1406,227 @@ class JobRepository:
             (state.value, now_us, uuid_to_blob(job_id)),
         )
 
+
+
+def _require_unprotected_job_dependencies(
+    connection: sqlite3.Connection,
+    requested_scope_json: str | None,
+) -> None:
+    source_ids = _job_source_dependency_ids(
+        connection,
+        requested_scope_json,
+    )
+
+    for source_id in source_ids:
+        source_blob = uuid_to_blob(
+            source_id
+        )
+
+        guarded = connection.execute(
+            """
+            SELECT 1
+            FROM source_protection_transitions
+            WHERE source_id = ?
+
+            UNION ALL
+
+            SELECT 1
+            FROM protected_sources
+            WHERE source_id = ?
+
+            LIMIT 1
+            """,
+            (
+                source_blob,
+                source_blob,
+            ),
+        ).fetchone()
+
+        if guarded is not None:
+            raise JobSourceProtectionFenceError(
+                "Durable job creation is blocked because "
+                "a referenced Source is protected or "
+                "has an active protection transition."
+            )
+
+
+def _job_source_dependency_ids(
+    connection: sqlite3.Connection,
+    requested_scope_json: str | None,
+) -> frozenset[uuid.UUID]:
+    if requested_scope_json is None:
+        return frozenset()
+
+    try:
+        payload = json.loads(
+            requested_scope_json
+        )
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "Durable job requested scope must be valid JSON."
+        ) from exc
+
+    if not isinstance(
+        payload,
+        dict,
+    ):
+        return frozenset()
+
+    source_ids: set[
+        uuid.UUID
+    ] = set()
+
+    direct_source_id = _scope_uuid(
+        payload.get(
+            "source_id"
+        ),
+        field_name="source_id",
+    )
+
+    if direct_source_id is not None:
+        source_ids.add(
+            direct_source_id
+        )
+
+    explicit_source_ids = payload.get(
+        "explicit_source_ids"
+    )
+
+    if explicit_source_ids is not None:
+        if not isinstance(
+            explicit_source_ids,
+            list,
+        ):
+            raise ValueError(
+                "Durable job explicit_source_ids "
+                "must be a JSON array."
+            )
+
+        for value in explicit_source_ids:
+            source_id = _scope_uuid(
+                value,
+                field_name=(
+                    "explicit_source_ids"
+                ),
+            )
+
+            if source_id is None:
+                raise ValueError(
+                    "Durable job explicit_source_ids "
+                    "must not contain null."
+                )
+
+            source_ids.add(
+                source_id
+            )
+
+    representation_id = _scope_uuid(
+        payload.get(
+            "representation_id"
+        ),
+        field_name="representation_id",
+    )
+
+    if representation_id is not None:
+        row = connection.execute(
+            """
+            SELECT source_id
+            FROM source_representations
+            WHERE representation_id = ?
+            """,
+            (
+                uuid_to_blob(
+                    representation_id
+                ),
+            ),
+        ).fetchone()
+
+        if row is not None:
+            source_ids.add(
+                uuid_from_blob(
+                    bytes(
+                        row["source_id"]
+                    )
+                )
+            )
+
+    analysis_id = _scope_uuid(
+        payload.get(
+            "analysis_id"
+        ),
+        field_name="analysis_id",
+    )
+
+    if analysis_id is not None:
+        row = connection.execute(
+            """
+            SELECT source_id
+            FROM source_analyses
+            WHERE analysis_id = ?
+            """,
+            (
+                uuid_to_blob(
+                    analysis_id
+                ),
+            ),
+        ).fetchone()
+
+        if row is not None:
+            source_ids.add(
+                uuid_from_blob(
+                    bytes(
+                        row["source_id"]
+                    )
+                )
+            )
+
+    return frozenset(
+        source_ids
+    )
+
+
+def _scope_uuid(
+    value: object,
+    *,
+    field_name: str,
+) -> uuid.UUID | None:
+    if value is None:
+        return None
+
+    if not isinstance(
+        value,
+        str,
+    ):
+        raise ValueError(
+            f"Durable job {field_name} must be a UUID string."
+        )
+
+    try:
+        return uuid.UUID(
+            value
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"Durable job {field_name} must be a valid UUID."
+        ) from exc
+
+
+def _protected_operational_json(
+    *,
+    payload_type: str,
+    values: dict[str, str | None],
+) -> bytes:
+    return json.dumps(
+        {
+            "payload_type": payload_type,
+            "version": 1,
+            "values": values,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
 
 def _job_from_row(row: sqlite3.Row) -> JobRecord:
     return JobRecord(

@@ -1257,6 +1257,11 @@ def build_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     job_scheduler_run.add_argument(
+        "--started-file",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
+    job_scheduler_run.add_argument(
         "--ready-file",
         type=Path,
         help=argparse.SUPPRESS,
@@ -3172,7 +3177,8 @@ _SCHEDULER_SUPERVISOR_LANES = (
     SchedulerLane.PROVIDER,
 )
 _SCHEDULER_PARENT_LOST_EXIT_CODE = 70
-_SCHEDULER_CHILD_READY_TIMEOUT_SECONDS = 10.0
+_SCHEDULER_CHILD_START_TIMEOUT_SECONDS = 10.0
+_SCHEDULER_CHILD_READY_TIMEOUT_SECONDS = 30.0 * 60.0
 
 
 def _start_scheduler_supervisor_watchdog() -> None:
@@ -3246,6 +3252,7 @@ def _scheduler_lane_command(
     lane: SchedulerLane,
     *,
     supervised_child: bool,
+    started_file: Path,
     ready_file: Path,
 ) -> list[str]:
     command = [
@@ -3258,6 +3265,8 @@ def _scheduler_lane_command(
         f"{args.worker}-{lane.value}",
         "--lane",
         lane.value,
+        "--started-file",
+        str(started_file),
         "--ready-file",
         str(ready_file),
     ]
@@ -3289,6 +3298,43 @@ def _stop_scheduler_children(
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+
+
+def _wait_scheduler_child_started(
+    lane: SchedulerLane,
+    process: subprocess.Popen[bytes],
+    started_file: Path,
+    *,
+    timeout_seconds: float = _SCHEDULER_CHILD_START_TIMEOUT_SECONDS,
+) -> None:
+    """Require proof that the supervised child entered its startup boundary."""
+    if timeout_seconds <= 0:
+        raise ValueError(
+            "Scheduler child start timeout must be positive."
+        )
+
+    deadline = time.monotonic() + timeout_seconds
+
+    while not started_file.is_file():
+        returncode = process.poll()
+
+        if returncode is not None:
+            raise JobSchedulerError(
+                f"Scheduler {lane.value} lane exited with code "
+                f"{returncode} before entering startup."
+            )
+
+        remaining = deadline - time.monotonic()
+
+        if remaining <= 0:
+            raise JobSchedulerError(
+                f"Scheduler {lane.value} lane did not enter startup "
+                f"within {timeout_seconds:g} seconds."
+            )
+
+        time.sleep(
+            min(0.05, remaining)
+        )
 
 
 def _wait_scheduler_child_ready(
@@ -3336,34 +3382,48 @@ def _run_scheduler_supervisor(args: argparse.Namespace) -> int:
         ) as temporary_directory:
             ready_root = Path(temporary_directory)
 
+            control_started = ready_root / "control.started"
             control_ready = ready_root / "control.ready"
             control = subprocess.Popen(
                 _scheduler_lane_command(
                     args,
                     SchedulerLane.CONTROL,
                     supervised_child=False,
+                    started_file=control_started,
                     ready_file=control_ready,
                 ),
                 stdin=subprocess.PIPE,
             )
             children.append((SchedulerLane.CONTROL, control))
+            _wait_scheduler_child_started(
+                SchedulerLane.CONTROL,
+                control,
+                control_started,
+            )
             _wait_scheduler_child_ready(
                 SchedulerLane.CONTROL,
                 control,
                 control_ready,
             )
 
+            provider_started = ready_root / "provider.started"
             provider_ready = ready_root / "provider.ready"
             provider = subprocess.Popen(
                 _scheduler_lane_command(
                     args,
                     SchedulerLane.PROVIDER,
                     supervised_child=True,
+                    started_file=provider_started,
                     ready_file=provider_ready,
                 ),
                 stdin=subprocess.PIPE,
             )
             children.append((SchedulerLane.PROVIDER, provider))
+            _wait_scheduler_child_started(
+                SchedulerLane.PROVIDER,
+                provider,
+                provider_started,
+            )
             _wait_scheduler_child_ready(
                 SchedulerLane.PROVIDER,
                 provider,
@@ -3932,6 +3992,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         except SchedulerLaneOwnershipError as exc:
             print(f"ATHENA job error: {exc}", file=sys.stderr)
             return 2
+
+    if (
+        args.command == "job"
+        and args.job_command == "scheduler-run"
+        and args.started_file is not None
+    ):
+        args.started_file.write_text(
+            "started\n",
+            encoding="utf-8",
+        )
 
     try:
         supervised_scheduler_child = (
