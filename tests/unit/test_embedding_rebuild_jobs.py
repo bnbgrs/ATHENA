@@ -235,3 +235,121 @@ def test_embedding_worker_rejects_generic_unpinned_job(tmp_path) -> None:
 
     assert app.jobs.get(job.job_id).state is JobState.RUNNING
     app.stop()
+
+
+def test_embedding_rebuild_uses_keyset_progress_without_quadratic_rewalk(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    app = _app(tmp_path / "runtime")
+    _representation, built = _build_chunks(
+        app,
+        tmp_path,
+        "A06 keyset planner marker.\n\n"
+        + ("planner payload words " * 1200),
+    )
+    assert len(built.chunks) >= 8
+
+    def forbidden_full_text_read(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError(
+            "A-06 snapshot verification must not materialize full retained text."
+        )
+
+    monkeypatch.setattr(
+        app.source_text,
+        "read_text",
+        forbidden_full_text_read,
+    )
+
+    full_build_verifications = 0
+    original_verify = (
+        app.source_chunks.verify_current_profile_build
+    )
+
+    def counted_verify(*args, **kwargs):
+        nonlocal full_build_verifications
+        full_build_verifications += 1
+        return original_verify(*args, **kwargs)
+
+    monkeypatch.setattr(
+        app.source_chunks,
+        "verify_current_profile_build",
+        counted_verify,
+    )
+
+    provider = FakeEmbeddingProvider()
+    worker = _worker(app, provider)
+    job = worker.enqueue(
+        "fake-embed",
+        batch_size=1,
+    )
+
+    completed = worker.run_to_boundary(
+        job.job_id,
+        worker_id="embed-keyset",
+        lease_seconds=60,
+    )
+
+    assert completed.done is True
+    assert completed.job.state is JobState.COMPLETED
+    assert sum(len(call) for call in provider.calls) == len(
+        built.chunks
+    )
+    # One full retained-evidence verification pins the snapshot and one
+    # final verification gates publication, independent of chunk count.
+    assert full_build_verifications == 2
+    app.stop()
+
+
+def test_visibility_change_during_provider_call_waits_dependency(
+    tmp_path,
+) -> None:
+    app = _app(tmp_path / "runtime")
+    _representation, built = _build_chunks(
+        app,
+        tmp_path,
+        "Visibility drift during embedding provider call.\n",
+    )
+    assert built.chunks
+
+    source_id = built.chunks[0].source_id
+    preview = app.lifecycle_deletion.preview(source_id)
+    original_generation = (
+        app.source_chunk_store.current_generation()
+    )
+
+    provider = FakeEmbeddingProvider(
+        before_return=lambda: app.lifecycle_deletion.delete(
+            source_id,
+            preview_digest=preview.preview_digest,
+        )
+    )
+    worker = _worker(app, provider)
+    job = worker.enqueue(
+        "fake-embed",
+        batch_size=2,
+    )
+    leased = app.jobs.acquire(
+        job.job_id,
+        worker_id="embed-a",
+        lease_seconds=60,
+    )
+    assert leased.lease_token is not None
+
+    result = worker.step(
+        job.job_id,
+        lease_token=leased.lease_token,
+    )
+
+    assert result.waiting is True
+    assert result.completed_stage == "visibility_stale"
+    assert result.job.state is JobState.WAITING
+    assert result.job.blocked_reason == "waiting_dependency"
+    assert (
+        app.source_chunk_store.current_generation()
+        == original_generation
+    )
+    status = worker.semantic.status("fake-embed")
+    assert status is None or not status.current
+    app.stop()

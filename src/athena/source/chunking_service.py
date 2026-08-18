@@ -469,6 +469,7 @@ class SourceChunkingService:
             chunk_count=published_count,
         )
 
+
     def verify_current_build(
         self,
         representation_id: uuid.UUID,
@@ -477,10 +478,36 @@ class SourceChunkingService:
         expected_chunk_count: int,
     ) -> int:
         """Stream-verify an arbitrarily large visible build against retained SHA-256."""
+        profile = self._default_profile_for_representation(representation_id)
+        return self.verify_current_profile_build(
+            representation_id,
+            chunking_profile_id=profile.chunking_profile_id,
+            expected_build_signature=expected_build_signature,
+            expected_chunk_count=expected_chunk_count,
+        )
+
+    def verify_current_profile_build(
+        self,
+        representation_id: uuid.UUID,
+        *,
+        chunking_profile_id: uuid.UUID,
+        expected_build_signature: bytes,
+        expected_chunk_count: int,
+    ) -> int:
+        """Stream-verify one exact current profile build against retained evidence."""
         representation, _blob = self.source_text.get(representation_id)
         self.source_text.verify(representation_id)
-        profile = self._default_profile_for_representation(representation_id)
-        current = self.store.current_build(representation_id, profile.chunking_profile_id)
+        profile = self.profiles.get(chunking_profile_id)
+        derived_signature = _build_signature(
+            representation_id=representation.representation_id,
+            representation_hash=representation.content_hash,
+            profile=profile,
+        )
+        if derived_signature != expected_build_signature:
+            raise SourceChunkIntegrityError(
+                "Expected SourceChunk build signature disagrees with retained inputs."
+            )
+        current = self.store.current_build(representation_id, chunking_profile_id)
         if current is None:
             raise SourceChunkIntegrityError("Current SourceChunk build is missing.")
         if current.build_signature != expected_build_signature:
@@ -492,31 +519,48 @@ class SourceChunkingService:
             raise SourceChunkIntegrityError(
                 "Current SourceChunk build references a non-succeeded ProcessingRun."
             )
+
         digest = hashlib.sha256()
         expected_index = 0
         expected_start = 0
         for chunk in self.store.iter_for_representation(
             representation_id,
-            chunking_profile_id=profile.chunking_profile_id,
+            chunking_profile_id=chunking_profile_id,
         ):
             if chunk.chunk_index != expected_index:
-                raise SourceChunkIntegrityError("Current SourceChunk indexes are not contiguous.")
+                raise SourceChunkIntegrityError(
+                    "Current SourceChunk indexes are not contiguous."
+                )
             if chunk.source_id != representation.source_id:
                 raise SourceChunkIntegrityError("Current SourceChunk source_id is invalid.")
+            if chunk.processing_run_id != current.processing_run_id:
+                raise SourceChunkIntegrityError(
+                    "Current SourceChunk processing_run_id disagrees with its build."
+                )
             if chunk.start_anchor_value != expected_start:
-                raise SourceChunkIntegrityError("Current SourceChunk ranges contain a gap or overlap.")
-            if chunk.end_anchor_value - chunk.start_anchor_value != len(chunk.chunk_text):
+                raise SourceChunkIntegrityError(
+                    "Current SourceChunk ranges contain a gap or overlap."
+                )
+            if (
+                chunk.end_anchor_value - chunk.start_anchor_value
+                != len(chunk.chunk_text)
+            ):
                 raise SourceChunkIntegrityError(
                     "Current SourceChunk codepoint range disagrees with its text."
                 )
             raw = chunk.chunk_text.encode("utf-8")
             if hashlib.sha256(raw).digest() != chunk.content_hash:
-                raise SourceChunkIntegrityError("Current SourceChunk content hash is invalid.")
+                raise SourceChunkIntegrityError(
+                    "Current SourceChunk content hash is invalid."
+                )
             if chunk.build_signature != expected_build_signature:
-                raise SourceChunkIntegrityError("Current SourceChunk has a stale build signature.")
+                raise SourceChunkIntegrityError(
+                    "Current SourceChunk has a stale build signature."
+                )
             digest.update(raw)
             expected_start = chunk.end_anchor_value
             expected_index += 1
+
         if expected_index != expected_chunk_count:
             raise SourceChunkIntegrityError("Current SourceChunk stream ended early.")
         if digest.digest() != representation.content_hash:
@@ -524,7 +568,6 @@ class SourceChunkingService:
                 "Concatenated SourceChunks do not reproduce the retained representation hash."
             )
         return expected_index
-
     def _default_profile_for_representation(
         self,
         representation_id: uuid.UUID,

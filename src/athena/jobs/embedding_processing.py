@@ -22,7 +22,9 @@ from athena.model.adapters.lm_studio import (
     ProviderUnavailableError,
 )
 from athena.retrieval.archive import (
+    ArchiveEmbeddingCursorKey,
     ArchiveEmbeddingGenerationChangedError,
+    ArchiveEmbeddingVisibilityChangedError,
     ArchiveSearchError,
     ArchiveSemanticSearchService,
 )
@@ -55,6 +57,7 @@ class EmbeddingRebuildStepResult:
     waiting: bool
 
 
+
 @dataclass(frozen=True, slots=True)
 class _Cursor:
     model_id: str
@@ -64,6 +67,8 @@ class _Cursor:
     indexed_document_count: int = 0
     total_document_count: int = 0
     dimensions: int | None = None
+    target_visibility_commit_seq: int | None = None
+    resume_after: ArchiveEmbeddingCursorKey | None = None
 
 
 class DurableEmbeddingRebuildWorker:
@@ -216,6 +221,20 @@ class DurableEmbeddingRebuildWorker:
                 done=False,
                 waiting=True,
             )
+        except ArchiveEmbeddingVisibilityChangedError:
+            waiting = self.jobs.wait(
+                job_id,
+                lease_token=lease_token,
+                reason=WaitingReason.DEPENDENCY,
+            )
+            return self._result(
+                waiting,
+                cursor,
+                completed_stage="visibility_stale",
+                checkpoint=None,
+                done=False,
+                waiting=True,
+            )
         except ProviderUnavailableError:
             waiting = self.jobs.wait(
                 job_id,
@@ -275,6 +294,7 @@ class DurableEmbeddingRebuildWorker:
             f"Unsupported embedding-rebuild stage {cursor.next_stage!r}."
         )
 
+
     def _batch(
         self,
         job_id: uuid.UUID,
@@ -286,9 +306,24 @@ class DurableEmbeddingRebuildWorker:
         plan = self.semantic.prepare_rebuild_batch(
             cursor.model_id,
             target_chunk_generation=cursor.target_chunk_generation,
+            target_visibility_commit_seq=cursor.target_visibility_commit_seq,
+            resume_after=cursor.resume_after,
+            indexed_document_count=cursor.indexed_document_count,
+            total_document_count=(
+                cursor.total_document_count
+                if cursor.target_visibility_commit_seq is not None
+                else None
+            ),
+            expected_dimensions=cursor.dimensions,
             limit=cursor.batch_size,
         )
+
         if not plan.items:
+            if not plan.complete:
+                raise EmbeddingRebuildJobError(
+                    "Embedding rebuild planner reached no provider work "
+                    "without completing the pinned snapshot."
+                )
             return self._finalize(
                 job_id,
                 lease_token=lease_token,
@@ -301,6 +336,10 @@ class DurableEmbeddingRebuildWorker:
                     indexed_document_count=plan.indexed_document_count,
                     total_document_count=plan.total_document_count,
                     dimensions=plan.expected_dimensions,
+                    target_visibility_commit_seq=(
+                        plan.target_visibility_commit_seq
+                    ),
+                    resume_after=plan.next_cursor,
                 ),
             )
 
@@ -308,15 +347,21 @@ class DurableEmbeddingRebuildWorker:
             model_id=cursor.model_id,
             texts=[item.embedding_input for item in plan.items],
         )
-        # Provider calls can be long. Revalidate the lease/fence before the
-        # reconstructible batch is committed and before any durable checkpoint.
+
         self.jobs.heartbeat(
             job_id,
             lease_token=lease_token,
             extend_seconds=extend_seconds,
         )
-        progress = self.semantic.commit_rebuild_batch(plan, vectors)
-        next_stage = _STAGE_FINALIZE if progress.complete else _STAGE_BATCH
+        progress = self.semantic.commit_rebuild_batch(
+            plan,
+            vectors,
+        )
+        next_stage = (
+            _STAGE_FINALIZE
+            if progress.complete
+            else _STAGE_BATCH
+        )
         checkpoint = self.jobs.checkpoint(
             job_id,
             lease_token=lease_token,
@@ -333,6 +378,9 @@ class DurableEmbeddingRebuildWorker:
                 "batch_documents": len(plan.items),
                 "model_id": cursor.model_id,
                 "target_chunk_generation": cursor.target_chunk_generation,
+                "target_visibility_commit_seq": (
+                    progress.target_visibility_commit_seq
+                ),
             },
             last_confirmed_output={
                 "dimensions": progress.dimensions,
@@ -344,6 +392,10 @@ class DurableEmbeddingRebuildWorker:
                 indexed_document_count=progress.indexed_document_count,
                 total_document_count=progress.total_document_count,
                 dimensions=progress.dimensions,
+                target_visibility_commit_seq=(
+                    progress.target_visibility_commit_seq
+                ),
+                resume_after=progress.next_cursor,
             ),
         )
         current = self.jobs.get(job_id)
@@ -376,9 +428,15 @@ class DurableEmbeddingRebuildWorker:
         status = self.semantic.finalize_resumable_rebuild(
             cursor.model_id,
             target_chunk_generation=cursor.target_chunk_generation,
+            target_visibility_commit_seq=cursor.target_visibility_commit_seq,
+            expected_document_count=(
+                cursor.total_document_count
+                if cursor.target_visibility_commit_seq is not None
+                else None
+            ),
+            expected_dimensions=cursor.dimensions,
         )
-        # If the process dies after index publication but before this checkpoint,
-        # finalize is idempotent and the next fenced worker may safely repeat it.
+
         checkpoint = self.jobs.checkpoint(
             job_id,
             lease_token=lease_token,
@@ -390,12 +448,20 @@ class DurableEmbeddingRebuildWorker:
             last_confirmed_input={
                 "model_id": cursor.model_id,
                 "target_chunk_generation": cursor.target_chunk_generation,
+                "target_visibility_commit_seq": (
+                    status.indexed_visibility_commit_seq
+                ),
             },
             last_confirmed_output={
                 "current": status.current,
                 "dimensions": status.dimensions,
                 "document_count": status.document_count,
-                "indexed_chunk_generation": status.indexed_chunk_generation,
+                "indexed_chunk_generation": (
+                    status.indexed_chunk_generation
+                ),
+                "indexed_visibility_commit_seq": (
+                    status.indexed_visibility_commit_seq
+                ),
             },
             resume_metadata=self._resume_payload(
                 cursor,
@@ -403,6 +469,10 @@ class DurableEmbeddingRebuildWorker:
                 indexed_document_count=status.document_count,
                 total_document_count=status.document_count,
                 dimensions=status.dimensions,
+                target_visibility_commit_seq=(
+                    status.indexed_visibility_commit_seq
+                ),
+                resume_after=cursor.resume_after,
             ),
         )
         current = self.jobs.get(job_id)
@@ -420,17 +490,42 @@ class DurableEmbeddingRebuildWorker:
         )
 
     def _assert_generation_current(self, cursor: _Cursor) -> None:
-        if self.semantic.chunk_store.current_generation() != cursor.target_chunk_generation:
+        if (
+            self.semantic.chunk_store.current_generation()
+            != cursor.target_chunk_generation
+        ):
             raise ArchiveEmbeddingGenerationChangedError(
                 "SourceChunks changed relative to the job's pinned generation."
+            )
+        if (
+            cursor.target_visibility_commit_seq is not None
+            and self.semantic.lexical.current_visibility_commit_seq()
+            != cursor.target_visibility_commit_seq
+        ):
+            raise ArchiveEmbeddingVisibilityChangedError(
+                "Canonical archive visibility changed relative to the "
+                "job's pinned snapshot."
             )
 
     def _cursor(self, job: JobRecord) -> _Cursor:
         self._validate_job_contract(job)
-        config = _require_json_object(job.pinned_configuration_json, "pinned_configuration")
+        config = _require_json_object(
+            job.pinned_configuration_json,
+            "pinned_configuration",
+        )
         model_id = _require_string(config, "model_id")
-        generation = _require_int(config, "target_chunk_generation", minimum=0)
-        batch_size = _require_int(config, "batch_size", minimum=1, maximum=256)
+        generation = _require_int(
+            config,
+            "target_chunk_generation",
+            minimum=0,
+        )
+        batch_size = _require_int(
+            config,
+            "batch_size",
+            minimum=1,
+            maximum=256,
+        )
+
         if job.last_checkpoint_id is None:
             return _Cursor(
                 model_id=model_id,
@@ -438,31 +533,155 @@ class DurableEmbeddingRebuildWorker:
                 batch_size=batch_size,
                 next_stage=_STAGE_BATCH,
             )
-        checkpoint = self.jobs.get_checkpoint(job.last_checkpoint_id)
-        resume = _require_json_object(checkpoint.resume_metadata_json, "resume_metadata")
-        if _require_string(resume, "pipeline_version") != _PIPELINE_VERSION:
-            raise EmbeddingRebuildJobError("Checkpoint pipeline version does not match job.")
+
+        checkpoint = self.jobs.get_checkpoint(
+            job.last_checkpoint_id
+        )
+        resume = _require_json_object(
+            checkpoint.resume_metadata_json,
+            "resume_metadata",
+        )
+        if (
+            _require_string(resume, "pipeline_version")
+            != _PIPELINE_VERSION
+        ):
+            raise EmbeddingRebuildJobError(
+                "Checkpoint pipeline version does not match job."
+            )
         if _require_string(resume, "model_id") != model_id:
-            raise EmbeddingRebuildJobError("Checkpoint model_id does not match job.")
-        if _require_int(resume, "target_chunk_generation", minimum=0) != generation:
+            raise EmbeddingRebuildJobError(
+                "Checkpoint model_id does not match job."
+            )
+        if (
+            _require_int(
+                resume,
+                "target_chunk_generation",
+                minimum=0,
+            )
+            != generation
+        ):
             raise EmbeddingRebuildJobError(
                 "Checkpoint target chunk generation does not match job."
             )
-        next_stage = _require_string(resume, "next_stage")
+
+        next_stage = _require_string(
+            resume,
+            "next_stage",
+        )
         if next_stage not in _ALLOWED_STAGES:
             raise EmbeddingRebuildJobError(
-                f"Checkpoint contains unsupported next_stage {next_stage!r}."
+                "Checkpoint contains unsupported "
+                f"next_stage {next_stage!r}."
             )
-        indexed = _require_int(resume, "indexed_document_count", minimum=0)
-        total = _require_int(resume, "total_document_count", minimum=0)
+
+        indexed = _require_int(
+            resume,
+            "indexed_document_count",
+            minimum=0,
+        )
+        total = _require_int(
+            resume,
+            "total_document_count",
+            minimum=0,
+        )
+
         dimensions_value = resume.get("dimensions")
         dimensions = None
         if dimensions_value is not None:
-            if isinstance(dimensions_value, bool) or not isinstance(dimensions_value, int):
-                raise EmbeddingRebuildJobError("Checkpoint dimensions must be an integer.")
+            if (
+                isinstance(dimensions_value, bool)
+                or not isinstance(dimensions_value, int)
+            ):
+                raise EmbeddingRebuildJobError(
+                    "Checkpoint dimensions must be an integer."
+                )
             if dimensions_value <= 0:
-                raise EmbeddingRebuildJobError("Checkpoint dimensions must be positive.")
+                raise EmbeddingRebuildJobError(
+                    "Checkpoint dimensions must be positive."
+                )
             dimensions = dimensions_value
+
+        visibility_value = resume.get(
+            "target_visibility_commit_seq"
+        )
+        target_visibility_commit_seq: int | None = None
+        if visibility_value is not None:
+            if (
+                isinstance(visibility_value, bool)
+                or not isinstance(visibility_value, int)
+                or visibility_value < 0
+            ):
+                raise EmbeddingRebuildJobError(
+                    "Checkpoint target_visibility_commit_seq "
+                    "must be a non-negative integer."
+                )
+            target_visibility_commit_seq = visibility_value
+
+        resume_after_value = resume.get("resume_after")
+        resume_after: ArchiveEmbeddingCursorKey | None = None
+        if resume_after_value is not None:
+            if not isinstance(resume_after_value, dict):
+                raise EmbeddingRebuildJobError(
+                    "Checkpoint resume_after must be an object."
+                )
+            expected_cursor_keys = {
+                "representation_id",
+                "chunking_profile_id",
+                "chunk_index",
+                "chunk_id",
+            }
+            if set(resume_after_value) != expected_cursor_keys:
+                raise EmbeddingRebuildJobError(
+                    "Checkpoint resume_after has unexpected fields."
+                )
+            try:
+                representation_id = uuid.UUID(
+                    str(resume_after_value["representation_id"])
+                )
+                chunking_profile_id = uuid.UUID(
+                    str(resume_after_value["chunking_profile_id"])
+                )
+                chunk_id = uuid.UUID(
+                    str(resume_after_value["chunk_id"])
+                )
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise EmbeddingRebuildJobError(
+                    "Checkpoint resume_after UUID is invalid."
+                ) from exc
+            chunk_index_value = resume_after_value["chunk_index"]
+            if (
+                isinstance(chunk_index_value, bool)
+                or not isinstance(chunk_index_value, int)
+                or chunk_index_value < 0
+            ):
+                raise EmbeddingRebuildJobError(
+                    "Checkpoint resume_after chunk_index is invalid."
+                )
+            resume_after = ArchiveEmbeddingCursorKey(
+                representation_id=representation_id,
+                chunking_profile_id=chunking_profile_id,
+                chunk_index=chunk_index_value,
+                chunk_id=chunk_id,
+            )
+
+        if (
+            target_visibility_commit_seq is None
+            and resume_after is not None
+        ):
+            raise EmbeddingRebuildJobError(
+                "Legacy embedding checkpoint cannot contain "
+                "a keyset cursor without a visibility fence."
+            )
+
+        # A pre-A-06 checkpoint may already say COMPLETE although its published
+        # index has no visibility watermark. Re-run idempotent finalization once
+        # so the upgraded job cannot complete with a permanently stale v3 state.
+        if (
+            target_visibility_commit_seq is None
+            and next_stage == _STAGE_COMPLETE
+        ):
+            next_stage = _STAGE_FINALIZE
+
         return _Cursor(
             model_id=model_id,
             target_chunk_generation=generation,
@@ -471,7 +690,12 @@ class DurableEmbeddingRebuildWorker:
             indexed_document_count=indexed,
             total_document_count=total,
             dimensions=dimensions,
+            target_visibility_commit_seq=(
+                target_visibility_commit_seq
+            ),
+            resume_after=resume_after,
         )
+
 
     def _validate_job_contract(self, job: JobRecord) -> None:
         if job.job_type != "embedding.rebuild":
@@ -510,6 +734,8 @@ class DurableEmbeddingRebuildWorker:
         indexed_document_count: int,
         total_document_count: int,
         dimensions: int | None,
+        target_visibility_commit_seq: int,
+        resume_after: ArchiveEmbeddingCursorKey | None,
     ) -> dict[str, object]:
         return {
             "batch_size": cursor.batch_size,
@@ -518,7 +744,26 @@ class DurableEmbeddingRebuildWorker:
             "model_id": cursor.model_id,
             "next_stage": next_stage,
             "pipeline_version": _PIPELINE_VERSION,
-            "target_chunk_generation": cursor.target_chunk_generation,
+            "resume_after": (
+                None
+                if resume_after is None
+                else {
+                    "representation_id": str(
+                        resume_after.representation_id
+                    ),
+                    "chunking_profile_id": str(
+                        resume_after.chunking_profile_id
+                    ),
+                    "chunk_index": resume_after.chunk_index,
+                    "chunk_id": str(resume_after.chunk_id),
+                }
+            ),
+            "target_chunk_generation": (
+                cursor.target_chunk_generation
+            ),
+            "target_visibility_commit_seq": (
+                target_visibility_commit_seq
+            ),
             "total_document_count": total_document_count,
         }
 

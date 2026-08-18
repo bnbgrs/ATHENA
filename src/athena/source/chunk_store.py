@@ -13,7 +13,7 @@ from athena.common.ids import uuid_from_blob, uuid_to_blob
 from athena.common.time import utc_now_us
 
 _DERIVED_APPLICATION_ID = 1_096_042_564  # ASCII-ish ATHD
-_DERIVED_SCHEMA_VERSION = 3
+_DERIVED_SCHEMA_VERSION = 4
 
 
 class SourceChunkNotFoundError(LookupError):
@@ -810,7 +810,7 @@ def _initialize(connection: sqlite3.Connection) -> None:
         raise SourceChunkStoreError(
             "Refusing to adopt a non-empty derived search.db without ATHENA application_id."
         )
-    if user_version not in {0, 1, 2, _DERIVED_SCHEMA_VERSION}:
+    if user_version not in {0, 1, 2, 3, _DERIVED_SCHEMA_VERSION}:
         raise SourceChunkStoreError("Derived search.db schema version is unsupported.")
 
     connection.execute("PRAGMA journal_mode = WAL")
@@ -818,15 +818,19 @@ def _initialize(connection: sqlite3.Connection) -> None:
     connection.execute("PRAGMA busy_timeout = 5000")
 
     if user_version == 0:
-        _create_schema_v3(connection)
+        _create_schema_v4(connection)
     elif user_version == 1:
         _migrate_v1_to_v2(connection)
         _migrate_v2_to_v3(connection)
+        _migrate_v3_to_v4(connection)
     elif user_version == 2:
         _migrate_v2_to_v3(connection)
+        _migrate_v3_to_v4(connection)
+    elif user_version == 3:
+        _migrate_v3_to_v4(connection)
 
 
-def _create_schema_v3(connection: sqlite3.Connection) -> None:
+def _create_schema_v4(connection: sqlite3.Connection) -> None:
     connection.executescript(
         f"""
         BEGIN IMMEDIATE;
@@ -896,6 +900,8 @@ def _create_schema_v3(connection: sqlite3.Connection) -> None:
         CREATE TABLE archive_embedding_state (
             model_id TEXT PRIMARY KEY,
             indexed_chunk_generation INTEGER NOT NULL CHECK(indexed_chunk_generation >= 0),
+            indexed_visibility_commit_seq INTEGER NOT NULL DEFAULT -1
+                CHECK(indexed_visibility_commit_seq >= -1),
             dimensions INTEGER NOT NULL CHECK(dimensions > 0),
             document_count INTEGER NOT NULL CHECK(document_count >= 0),
             rebuilt_at_us INTEGER NOT NULL
@@ -1011,7 +1017,7 @@ def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
 
 def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
     connection.executescript(
-        f"""
+        """
         BEGIN IMMEDIATE;
         CREATE TABLE source_chunk_staging_builds (
             build_signature BLOB(32) PRIMARY KEY CHECK(length(build_signature) = 32),
@@ -1047,10 +1053,25 @@ def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
             created_at_us INTEGER NOT NULL,
             PRIMARY KEY(build_signature, chunk_index)
         ) WITHOUT ROWID;
-        PRAGMA user_version = {_DERIVED_SCHEMA_VERSION};
+        PRAGMA user_version = 3;
         COMMIT;
         """
     )
+
+def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        BEGIN IMMEDIATE;
+        ALTER TABLE archive_embedding_state
+            ADD COLUMN indexed_visibility_commit_seq INTEGER NOT NULL
+            DEFAULT -1
+            CHECK(indexed_visibility_commit_seq >= -1);
+        PRAGMA user_version = 4;
+        COMMIT;
+        """
+    )
+
+
 def _plan_from_row(row: sqlite3.Row) -> SourceChunkPlanRecord:
     return SourceChunkPlanRecord(
         chunk_index=int(row["chunk_index"]),

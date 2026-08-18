@@ -362,7 +362,14 @@ def test_derived_v1_store_migrates_and_backfills_archive_fts(tmp_path) -> None:
 
     store = SourceChunkStore(derived_root)
     with store.connect() as migrated:
-        assert int(migrated.execute("PRAGMA user_version").fetchone()[0]) == 3
+        assert int(migrated.execute("PRAGMA user_version").fetchone()[0]) == 4
+        columns = {
+            str(row["name"])
+            for row in migrated.execute(
+                "PRAGMA table_info('archive_embedding_state')"
+            ).fetchall()
+        }
+        assert "indexed_visibility_commit_seq" in columns
         row = migrated.execute(
             "SELECT chunk_id, body FROM fts_archive WHERE fts_archive MATCH 'Berlin'"
         ).fetchone()
@@ -517,5 +524,269 @@ def test_archive_semantic_search_absent_index_requires_explicit_rebuild(
         assert provider.calls == 0
         assert semantic.status("fake-embed") is None
 
+    finally:
+        app.stop()
+
+
+def test_archive_embedding_visibility_change_marks_index_stale_and_rebuilds(
+    tmp_path,
+) -> None:
+    app = _started_app(tmp_path)
+    try:
+        source_a, _representation_a, built_a = _build_chunks(
+            app,
+            tmp_path,
+            "visibility-a.txt",
+            "Berlin visibility alpha.\n",
+        )
+        source_b, _representation_b, built_b = _build_chunks(
+            app,
+            tmp_path,
+            "visibility-b.txt",
+            "Berlin visibility beta.\n",
+        )
+        provider = FakeEmbeddingProvider()
+        semantic = ArchiveSemanticSearchService(
+            lexical=app.archive_search,
+            provider=provider,
+            batch_size=2,
+        )
+        published = semantic.rebuild("fake-embed")
+        assert published.current
+        assert published.document_count == (
+            len(built_a.chunks) + len(built_b.chunks)
+        )
+
+        generation_before = app.source_chunk_store.current_generation()
+        preview = app.lifecycle_deletion.preview(source_a.source_id)
+        app.lifecycle_deletion.delete(
+            source_a.source_id,
+            preview_digest=preview.preview_digest,
+        )
+        assert app.source_chunk_store.current_generation() == generation_before
+
+        stale = semantic.status("fake-embed")
+        assert stale is not None
+        assert not stale.current
+        assert (
+            stale.current_visibility_commit_seq
+            > stale.indexed_visibility_commit_seq
+        )
+
+        calls_before_search = provider.calls
+        with pytest.raises(
+            ArchiveSearchError,
+            match="stale",
+        ):
+            semantic.search(
+                "Berlin",
+                model_id="fake-embed",
+                limit=10,
+            )
+        assert provider.calls == calls_before_search
+
+        calls_before_repair = provider.calls
+        repaired = semantic.ensure_current("fake-embed")
+        assert repaired.current
+        assert provider.calls == calls_before_repair
+        assert repaired.document_count == len(built_b.chunks)
+        assert (
+            repaired.indexed_visibility_commit_seq
+            == repaired.current_visibility_commit_seq
+        )
+
+        results = semantic.search(
+            "Berlin",
+            model_id="fake-embed",
+            limit=10,
+        )
+        assert results
+        assert {item.source_id for item in results} == {
+            source_b.source_id
+        }
+
+        with app.source_chunk_store.connect() as connection:
+            persisted = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM archive_embeddings
+                    WHERE model_id LIKE ?
+                      AND indexed_chunk_generation = ?
+                    """,
+                    (
+                        "fake-embed::%",
+                        repaired.indexed_chunk_generation,
+                    ),
+                ).fetchone()[0]
+            )
+        assert persisted == repaired.document_count
+    finally:
+        app.stop()
+
+
+def test_archive_embedding_visibility_watermark_ignores_non_source_commits(
+    tmp_path,
+) -> None:
+    app = _started_app(tmp_path)
+    try:
+        _build_chunks(
+            app,
+            tmp_path,
+            "visibility-unrelated.txt",
+            "Berlin remains visible across unrelated commits.\n",
+        )
+        provider = FakeEmbeddingProvider()
+        semantic = ArchiveSemanticSearchService(
+            lexical=app.archive_search,
+            provider=provider,
+        )
+        published = semantic.rebuild("fake-embed")
+        assert published.current
+
+        generation_before = app.source_chunk_store.current_generation()
+        visibility_before = published.current_visibility_commit_seq
+        provider_calls_before = provider.calls
+
+        chat_id = app.chat.create_chat()
+        app.chat.add_user_message(
+            chat_id=chat_id,
+            content="Unrelated canonical chat commit.",
+        )
+
+        assert (
+            app.source_chunk_store.current_generation()
+            == generation_before
+        )
+
+        after = semantic.status("fake-embed")
+        assert after is not None
+        assert after.current
+        assert (
+            after.current_visibility_commit_seq
+            == visibility_before
+        )
+        assert (
+            after.indexed_visibility_commit_seq
+            == visibility_before
+        )
+
+        ensured = semantic.ensure_current("fake-embed")
+        assert ensured.current
+        assert provider.calls == provider_calls_before
+    finally:
+        app.stop()
+
+
+def test_v3_archive_embedding_state_migrates_visibility_watermark_fail_closed(
+    tmp_path,
+) -> None:
+    derived_root = tmp_path / "derived-v3"
+    derived_root.mkdir(parents=True)
+    path = derived_root / "search.db"
+
+    connection = sqlite3.connect(path, autocommit=True)
+    connection.executescript(
+        """
+        PRAGMA application_id = 1096042564;
+
+        CREATE TABLE archive_embedding_state (
+            model_id TEXT PRIMARY KEY,
+            indexed_chunk_generation INTEGER NOT NULL
+                CHECK(indexed_chunk_generation >= 0),
+            dimensions INTEGER NOT NULL CHECK(dimensions > 0),
+            document_count INTEGER NOT NULL
+                CHECK(document_count >= 0),
+            rebuilt_at_us INTEGER NOT NULL
+        ) WITHOUT ROWID;
+
+        INSERT INTO archive_embedding_state (
+            model_id,
+            indexed_chunk_generation,
+            dimensions,
+            document_count,
+            rebuilt_at_us
+        ) VALUES (
+            'legacy-v3-model',
+            7,
+            3,
+            2,
+            123
+        );
+
+        PRAGMA user_version = 3;
+        """
+    )
+    connection.close()
+
+    store = SourceChunkStore(derived_root)
+
+    with store.connect() as migrated:
+        assert (
+            int(
+                migrated.execute(
+                    "PRAGMA user_version"
+                ).fetchone()[0]
+            )
+            == 4
+        )
+
+        row = migrated.execute(
+            """
+            SELECT
+                indexed_chunk_generation,
+                indexed_visibility_commit_seq,
+                dimensions,
+                document_count
+            FROM archive_embedding_state
+            WHERE model_id = 'legacy-v3-model'
+            """
+        ).fetchone()
+
+        assert row is not None
+        assert tuple(row) == (7, -1, 3, 2)
+
+def test_archive_embedding_snapshot_rejects_derived_source_id_mismatch(
+    tmp_path,
+) -> None:
+    app = _started_app(tmp_path)
+    try:
+        source, representation, built = _build_chunks(
+            app,
+            tmp_path,
+            "source-id-mismatch.txt",
+            "Berlin source identity must remain canonical.\n",
+        )
+        assert built.chunks
+
+        wrong_source_id = uuid.uuid4()
+        assert wrong_source_id != source.source_id
+
+        with app.source_chunk_store.connect() as connection:
+            connection.execute(
+                """
+                UPDATE source_chunks
+                SET source_id = ?
+                WHERE representation_id = ?
+                """,
+                (
+                    wrong_source_id.bytes,
+                    representation.representation_id.bytes,
+                ),
+            )
+
+        provider = FakeEmbeddingProvider()
+        semantic = ArchiveSemanticSearchService(
+            lexical=app.archive_search,
+            provider=provider,
+        )
+
+        with pytest.raises(
+            ArchiveSearchError,
+            match="source_id",
+        ):
+            semantic.rebuild("fake-embed")
+
+        assert provider.calls == 0
     finally:
         app.stop()

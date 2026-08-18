@@ -19,7 +19,7 @@ from athena.storage.schema import SCHEMA_VERSION
 # unpublished chunk staging. Recovery therefore validates the existing file
 # read-only and never deletes/recreates an invalid store implicitly.
 _DERIVED_APPLICATION_ID = 1_096_042_564
-_DERIVED_SCHEMA_VERSION = 3
+_DERIVED_SCHEMA_VERSION = 4
 
 _HNSW_FORMAT_VERSION = 1
 _KNOWLEDGE_HNSW_NAMESPACE = "knowledge"
@@ -144,6 +144,9 @@ class DerivedRecoveryService:
         with _open_read_only(self.database_path) as canonical:
             canonical_fts = _inspect_canonical_fts(canonical)
             visible_pairs = _visible_representation_pairs(canonical)
+            archive_visibility_commit_seq = (
+                _archive_visibility_commit_seq(canonical)
+            )
             canonical_embeddings = _inspect_canonical_embeddings(
                 canonical,
                 canonical_fts=canonical_fts,
@@ -154,6 +157,9 @@ class DerivedRecoveryService:
                 self.archive_database_path,
                 hnsw_root=self.hnsw_root,
                 visible_pairs=visible_pairs,
+                current_visibility_commit_seq=(
+                    archive_visibility_commit_seq
+                ),
             )
 
         return DerivedRecoveryReport(
@@ -729,6 +735,25 @@ def _global_commit_seq(
     )
 
 
+
+def _archive_visibility_commit_seq(
+    connection: sqlite3.Connection,
+) -> int:
+    row = connection.execute(
+        """
+        SELECT COALESCE(MAX(changes.commit_seq), 0) AS commit_seq
+        FROM commit_changes AS changes
+        JOIN entity_registry AS registry
+          ON registry.entity_id = changes.entity_id
+        WHERE registry.entity_type IN (
+            'source',
+            'source_representation'
+        )
+        """
+    ).fetchone()
+    return 0 if row is None else int(row["commit_seq"])
+
+
 def _visible_representation_pairs(
     connection: sqlite3.Connection,
 ) -> frozenset[tuple[bytes, bytes]]:
@@ -768,6 +793,7 @@ def _inspect_archive(
     *,
     hnsw_root: Path,
     visible_pairs: frozenset[tuple[bytes, bytes]],
+    current_visibility_commit_seq: int,
 ) -> _ArchiveInspection:
     if not os.path.lexists(path):
         return _ArchiveInspection(
@@ -824,7 +850,10 @@ def _inspect_archive(
                     "Derived search.db application_id is not ATHENA."
                 )
 
-            if schema_version != _DERIVED_SCHEMA_VERSION:
+            if schema_version not in {
+                3,
+                _DERIVED_SCHEMA_VERSION,
+            }:
                 return _invalid_archive(
                     "Derived search.db schema requires a separate "
                     "migration/regeneration decision."
@@ -900,6 +929,9 @@ def _inspect_archive(
                 hnsw_root=hnsw_root,
                 visible_pairs=visible_pairs,
                 chunk_rows=chunk_rows,
+                current_visibility_commit_seq=(
+                    current_visibility_commit_seq
+                ),
             )
 
             return _ArchiveInspection(
@@ -1264,6 +1296,7 @@ def _inspect_archive_embeddings(
     hnsw_root: Path,
     visible_pairs: frozenset[tuple[bytes, bytes]],
     chunk_rows: list[sqlite3.Row],
+    current_visibility_commit_seq: int,
 ) -> tuple[DerivedEmbeddingReport, ...]:
     current_snapshot = (
         0
@@ -1289,11 +1322,24 @@ def _inspect_archive_embeddings(
         if visible
     )
 
+    state_columns = {
+        str(row["name"])
+        for row in connection.execute(
+            "PRAGMA table_info('archive_embedding_state')"
+        ).fetchall()
+    }
+    visibility_projection = (
+        "indexed_visibility_commit_seq"
+        if "indexed_visibility_commit_seq" in state_columns
+        else "-1 AS indexed_visibility_commit_seq"
+    )
+
     state_rows = connection.execute(
-        """
+        f"""
         SELECT
             model_id,
             indexed_chunk_generation,
+            {visibility_projection},
             dimensions,
             document_count
         FROM archive_embedding_state
@@ -1364,6 +1410,9 @@ def _inspect_archive_embeddings(
         indexed_snapshot = int(
             state["indexed_chunk_generation"]
         )
+        indexed_visibility_commit_seq = int(
+            state["indexed_visibility_commit_seq"]
+        )
         dimensions = int(state["dimensions"])
         document_count = int(state["document_count"])
 
@@ -1389,9 +1438,10 @@ def _inspect_archive_embeddings(
 
         embeddings_current = (
             persisted_valid
-            and store_status is DerivedLayerStatus.CURRENT
             and archive_fts.status is DerivedLayerStatus.CURRENT
             and indexed_snapshot == current_snapshot
+            and indexed_visibility_commit_seq
+            == current_visibility_commit_seq
             and document_count == visible_document_count
         )
 

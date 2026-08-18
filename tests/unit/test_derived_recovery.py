@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -726,6 +727,95 @@ def test_legacy_global_fts_watermark_remains_valid_when_projection_matches(
             report.canonical_fts.indexed_snapshot
             == global_snapshot
         )
+
+    finally:
+        app.stop()
+
+
+def test_recovery_accepts_visibility_projected_archive_embeddings(
+    tmp_path: Path,
+) -> None:
+    app = _app(
+        tmp_path / "runtime"
+    )
+
+    try:
+        _prepare_public_data(
+            app,
+            tmp_path,
+        )
+
+        second_path = tmp_path / "visibility-second-source.txt"
+        second_path.write_text(
+            "Berlin second visible archive source.\n",
+            encoding="utf-8",
+        )
+        second = app.sources.capture_file(second_path)
+        represented = app.source_text.build(
+            second.source.source_id
+        )
+        app.source_chunks.build_default(
+            represented.result.representation.representation_id
+        )
+
+        provider = _FakeEmbeddingProvider()
+        archive_semantic = ArchiveSemanticSearchService(
+            lexical=app.archive_search,
+            provider=provider,
+        )
+        published = archive_semantic.rebuild(
+            "visibility-recovery-embed"
+        )
+        assert published.current
+        assert published.document_count >= 2
+
+        source_rows = app.database.connection.execute(
+            """
+            SELECT source_id
+            FROM sources
+            WHERE source_id != ?
+            ORDER BY created_at_us, source_id
+            LIMIT 1
+            """,
+            (second.source.source_id.bytes,),
+        ).fetchall()
+        assert len(source_rows) == 1
+        deleted_source_id = uuid.UUID(
+            bytes=bytes(source_rows[0]["source_id"])
+        )
+
+        preview = app.lifecycle_deletion.preview(
+            deleted_source_id
+        )
+        app.lifecycle_deletion.delete(
+            deleted_source_id,
+            preview_digest=preview.preview_digest,
+        )
+
+        repaired = archive_semantic.ensure_current(
+            "visibility-recovery-embed"
+        )
+        assert repaired.current
+
+        service = DerivedRecoveryService(
+            database_path=app.paths.database_path,
+            derived_root=app.paths.derived_root,
+        )
+        report = service.inspect()
+
+        # SourceChunks remain reconstructible but hidden after logical
+        # deletion, so the store-level report stays stale. The semantic
+        # projection itself is nevertheless current because its persisted
+        # visibility watermark and vector set exactly match public evidence.
+        assert (
+            report.archive_store_status
+            is DerivedLayerStatus.STALE
+        )
+        assert len(report.archive_embeddings) == 1
+        archive_embedding = report.archive_embeddings[0]
+        assert archive_embedding.embeddings_current
+        assert archive_embedding.hnsw_files_plausible
+        assert not archive_embedding.embedding_rebuild_required
 
     finally:
         app.stop()
