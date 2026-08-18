@@ -266,6 +266,7 @@ class DurableSourceHierarchicalExtractionWorker:
                 extraction=extraction,
                 model=model,
                 prepared=prepared,
+                extend_seconds=extend_seconds,
             )
         except ProviderContextLimitError as exc:
             return self._wait_user(job, lease_token, extraction, exc)

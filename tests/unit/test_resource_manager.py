@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from athena.common.ids import new_uuid7
 from athena.common.time import utc_now_us
 from athena.config.settings import AthenaSettings
 from athena.core.application import AthenaApplication
+from athena.jobs.capabilities import requires_provider_isolation
 from athena.jobs.models import JobPriority, JobState, WaitingReason
+from athena.news.models import NEWS_JOB_TYPE, NEWS_PERIOD_JOB_TYPE
 from athena.resources.manager import (
     ResourceManager,
     ResourceMode,
@@ -362,3 +365,57 @@ def test_forced_interactive_renewal_refreshes_before_retry(
         lease.lease_id
     )
     app.stop()
+
+def test_interactive_demand_fail_closed_for_news_and_future_provider_jobs(
+    tmp_path: Path,
+) -> None:
+    app = AthenaApplication(
+        settings=AthenaSettings(
+            local_root=tmp_path / "provider-guard-runtime"
+        )
+    )
+    app.start()
+    try:
+        base = app.jobs.create(
+            job_type="source.process",
+            priority=JobPriority.BACKGROUND,
+            requested_scope={"sentinel": "classification-template"},
+            pinned_configuration={"sentinel": "classification-template"},
+        )
+        provider_jobs = tuple(
+            replace(
+                base,
+                job_type=job_type,
+            )
+            for job_type in (
+                NEWS_JOB_TYPE,
+                NEWS_PERIOD_JOB_TYPE,
+                "future.provider-bound",
+            )
+        )
+
+        with app.resources.interactive_session(
+            purpose="provider_guard_test"
+        ):
+            decisions = tuple(
+                app.resources.admit(job)
+                for job in provider_jobs
+            )
+
+        assert all(
+            not decision.admitted
+            for decision in decisions
+        )
+        assert all(
+            decision.reason
+            == "interactive chat demand has priority"
+            for decision in decisions
+        )
+        assert not requires_provider_isolation("source.process")
+        assert not requires_provider_isolation("backup.create")
+        assert not requires_provider_isolation("archive.replicate")
+        assert requires_provider_isolation(NEWS_JOB_TYPE)
+        assert requires_provider_isolation(NEWS_PERIOD_JOB_TYPE)
+        assert requires_provider_isolation("future.provider-bound")
+    finally:
+        app.stop()

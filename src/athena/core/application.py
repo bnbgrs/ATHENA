@@ -595,7 +595,11 @@ class AthenaApplication:
         )
         self.services = ServiceManager(bootstrap_services + services)
 
-    def start(self) -> None:
+    def start(
+        self,
+        *,
+        run_startup_maintenance: bool = True,
+    ) -> None:
         """Start ATHENA and all registered services safely."""
         if self.state is ApplicationState.RUNNING:
             return
@@ -616,25 +620,26 @@ class AthenaApplication:
             inspect_database_read_only(self.paths.database_path)
             self.services.start_all()
             self.news.start()
-            recovered_backups = self.backup.recover_incomplete()
-            self.backup.sync_all_deletion_ledgers()
-            if recovered_backups:
-                logger.warning(
-                    "Recovered interrupted backup publication",
-                    extra={
-                        "event": "backup.startup_recovered",
-                        "recovered_backup_count": len(recovered_backups),
-                    },
-                )
-            recovered_jobs = self.jobs.recover_startup()
-            if recovered_jobs:
-                logger.warning(
-                    "Recovered expired durable job leases",
-                    extra={
-                        "event": "jobs.startup_recovered",
-                        "recovered_job_count": len(recovered_jobs),
-                    },
-                )
+            if run_startup_maintenance:
+                recovered_backups = self.backup.recover_incomplete()
+                self.backup.sync_all_deletion_ledgers()
+                if recovered_backups:
+                    logger.warning(
+                        "Recovered interrupted backup publication",
+                        extra={
+                            "event": "backup.startup_recovered",
+                            "recovered_backup_count": len(recovered_backups),
+                        },
+                    )
+                recovered_jobs = self.jobs.recover_startup()
+                if recovered_jobs:
+                    logger.warning(
+                        "Recovered expired durable job leases",
+                        extra={
+                            "event": "jobs.startup_recovered",
+                            "recovered_job_count": len(recovered_jobs),
+                        },
+                    )
         except Exception as exc:
             recovery_error = _database_recovery_error(exc)
 

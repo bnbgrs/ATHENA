@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
+import subprocess
 import sys
+import tempfile
+import threading
+import time
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
@@ -23,6 +29,10 @@ from athena.jobs.embedding_processing import (
     EmbeddingRebuildJobError,
     EmbeddingRebuildStepResult,
 )
+from athena.jobs.lane_lock import (
+    SchedulerLaneOwnershipError,
+    SchedulerLaneProcessLock,
+)
 from athena.jobs.models import JobPriority, JobRecord, WaitingReason
 from athena.jobs.repository import (
     CheckpointNotFoundError,
@@ -32,6 +42,7 @@ from athena.jobs.repository import (
 )
 from athena.jobs.scheduler import (
     JobSchedulerError,
+    SchedulerLane,
     SchedulerRunResult,
     SchedulerTickResult,
 )
@@ -1225,6 +1236,35 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-ticks",
         type=int,
         help="Optional bounded tick count for diagnostics/tests.",
+    )
+    job_scheduler_run.add_argument(
+        "--lane",
+        choices=(
+            "supervisor",
+            SchedulerLane.ALL.value,
+            SchedulerLane.CONTROL.value,
+            SchedulerLane.PROVIDER.value,
+        ),
+        default="supervisor",
+        help=(
+            "Scheduler execution lane. The default supervisor runs one "
+            "provider lane and one control lane in separate processes."
+        ),
+    )
+    job_scheduler_run.add_argument(
+        "--supervised-child",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    job_scheduler_run.add_argument(
+        "--ready-file",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
+    job_scheduler_run.add_argument(
+        "--supervisor-watchdog",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     job_commands.add_parser(
         "recover",
@@ -3127,6 +3167,264 @@ def _print_scheduler_run(result: SchedulerRunResult) -> None:
     print(f"Idle: {result.idle}")
 
 
+_SCHEDULER_SUPERVISOR_LANES = (
+    SchedulerLane.CONTROL,
+    SchedulerLane.PROVIDER,
+)
+_SCHEDULER_PARENT_LOST_EXIT_CODE = 70
+
+
+def _start_scheduler_supervisor_watchdog() -> None:
+    """Terminate a scheduler child immediately when its supervisor pipe closes."""
+
+    def watch_parent() -> None:
+        try:
+            while os.read(sys.stdin.fileno(), 1):
+                pass
+        except (OSError, ValueError):
+            pass
+        os._exit(_SCHEDULER_PARENT_LOST_EXIT_CODE)
+
+    thread = threading.Thread(
+        target=watch_parent,
+        name="athena-scheduler-supervisor-watchdog",
+        daemon=True,
+    )
+    thread.start()
+
+
+def _scheduler_run_owned_lanes(
+    lane: SchedulerLane,
+) -> tuple[SchedulerLane, ...]:
+    normalized_lane = SchedulerLane(lane)
+    if normalized_lane is SchedulerLane.ALL:
+        return _SCHEDULER_SUPERVISOR_LANES
+    return (normalized_lane,)
+
+
+def _scheduler_lane_lock_root(
+    app: AthenaApplication,
+) -> Path:
+    """Return a runtime-specific lock root outside ATHENA canonical/runtime state."""
+    local_root = str(app.paths.local_root.resolve())
+    if os.name == "nt":
+        local_root = os.path.normcase(local_root)
+    runtime_key = hashlib.sha256(
+        local_root.encode("utf-8")
+    ).hexdigest()
+    return (
+        Path(tempfile.gettempdir())
+        / "athena-scheduler-lanes"
+        / runtime_key
+    )
+
+
+def _acquire_scheduler_run_lane_locks(
+    app: AthenaApplication,
+    lane: SchedulerLane,
+) -> tuple[SchedulerLaneProcessLock, ...]:
+    locks: list[SchedulerLaneProcessLock] = []
+    lock_root = _scheduler_lane_lock_root(app)
+    try:
+        for owned_lane in _scheduler_run_owned_lanes(lane):
+            locks.append(
+                SchedulerLaneProcessLock.acquire(
+                    lock_root / f"{owned_lane.value}.lock",
+                    lane_name=owned_lane.value,
+                )
+            )
+    except Exception:
+        for lock in reversed(locks):
+            lock.close()
+        raise
+    return tuple(locks)
+
+
+def _scheduler_lane_command(
+    args: argparse.Namespace,
+    lane: SchedulerLane,
+    *,
+    supervised_child: bool,
+    ready_file: Path,
+) -> list[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "athena",
+        "job",
+        "scheduler-run",
+        "--worker",
+        f"{args.worker}-{lane.value}",
+        "--lane",
+        lane.value,
+        "--ready-file",
+        str(ready_file),
+    ]
+    if supervised_child:
+        command.append("--supervised-child")
+    command.append("--supervisor-watchdog")
+    if args.max_ticks is not None:
+        command.extend(
+            [
+                "--max-ticks",
+                str(args.max_ticks),
+            ]
+        )
+    return command
+
+
+def _stop_scheduler_children(
+    children: list[tuple[SchedulerLane, subprocess.Popen[bytes]]],
+) -> None:
+    for _lane, process in children:
+        if process.poll() is None:
+            process.terminate()
+
+    for _lane, process in children:
+        if process.poll() is not None:
+            continue
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def _wait_scheduler_child_ready(
+    lane: SchedulerLane,
+    process: subprocess.Popen[bytes],
+    ready_file: Path,
+) -> None:
+    while not ready_file.is_file():
+        returncode = process.poll()
+        if returncode is not None:
+            raise JobSchedulerError(
+                f"Scheduler {lane.value} lane exited with code "
+                f"{returncode} before becoming ready."
+            )
+        time.sleep(0.05)
+
+
+def _run_scheduler_supervisor(args: argparse.Namespace) -> int:
+    children: list[
+        tuple[SchedulerLane, subprocess.Popen[bytes]]
+    ] = []
+
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="athena-scheduler-supervisor-"
+        ) as temporary_directory:
+            ready_root = Path(temporary_directory)
+
+            control_ready = ready_root / "control.ready"
+            control = subprocess.Popen(
+                _scheduler_lane_command(
+                    args,
+                    SchedulerLane.CONTROL,
+                    supervised_child=False,
+                    ready_file=control_ready,
+                ),
+                stdin=subprocess.PIPE,
+            )
+            children.append((SchedulerLane.CONTROL, control))
+            _wait_scheduler_child_ready(
+                SchedulerLane.CONTROL,
+                control,
+                control_ready,
+            )
+
+            provider_ready = ready_root / "provider.ready"
+            provider = subprocess.Popen(
+                _scheduler_lane_command(
+                    args,
+                    SchedulerLane.PROVIDER,
+                    supervised_child=True,
+                    ready_file=provider_ready,
+                ),
+                stdin=subprocess.PIPE,
+            )
+            children.append((SchedulerLane.PROVIDER, provider))
+            _wait_scheduler_child_ready(
+                SchedulerLane.PROVIDER,
+                provider,
+                provider_ready,
+            )
+
+            print(
+                "Scheduler supervisor lanes started: "
+                + ", ".join(
+                    f"{lane.value}=pid:{process.pid}"
+                    for lane, process in children
+                ),
+                flush=True,
+            )
+
+            while True:
+                states = [
+                    (lane, process, process.poll())
+                    for lane, process in children
+                ]
+
+                failed = [
+                    (lane, returncode)
+                    for lane, _process, returncode in states
+                    if returncode not in (None, 0)
+                ]
+                if failed:
+                    _stop_scheduler_children(children)
+                    lane, returncode = failed[0]
+                    raise JobSchedulerError(
+                        "Scheduler "
+                        f"{lane.value} lane exited with code "
+                        f"{returncode}."
+                    )
+
+                if (
+                    args.max_ticks is not None
+                    and all(
+                        returncode == 0
+                        for _lane, _process, returncode in states
+                    )
+                ):
+                    print(
+                        "Scheduler supervisor lanes completed: "
+                        "control, provider",
+                        flush=True,
+                    )
+                    return 0
+
+                if args.max_ticks is None:
+                    clean_exit = next(
+                        (
+                            lane
+                            for lane, _process, returncode in states
+                            if returncode == 0
+                        ),
+                        None,
+                    )
+                    if clean_exit is not None:
+                        _stop_scheduler_children(children)
+                        raise JobSchedulerError(
+                            "Long-lived scheduler "
+                            f"{clean_exit.value} lane exited unexpectedly."
+                        )
+
+                time.sleep(0.05)
+
+    except KeyboardInterrupt:
+        _stop_scheduler_children(children)
+        print("Scheduler supervisor interrupted.")
+        return 130
+    except OSError as exc:
+        _stop_scheduler_children(children)
+        raise JobSchedulerError(
+            "Scheduler supervisor could not start both lanes."
+        ) from exc
+    except Exception:
+        _stop_scheduler_children(children)
+        raise
+
+
 def _run_job_command(app: AthenaApplication, args: argparse.Namespace) -> int:
     if args.job_command == "create":
         job = app.jobs.create(
@@ -3470,10 +3768,18 @@ def _run_job_command(app: AthenaApplication, args: argparse.Namespace) -> int:
         return 0
 
     if args.job_command == "scheduler-run":
+        if args.lane == "supervisor":
+            raise JobSchedulerError(
+                "Scheduler supervisor must be launched before "
+                "AthenaApplication startup."
+            )
+
+        lane = SchedulerLane(args.lane)
         try:
             scheduler_run = app.job_scheduler.run_loop(
                 worker_id=args.worker,
                 max_ticks=args.max_ticks,
+                lane=lane,
             )
         except KeyboardInterrupt:
             print("Scheduler interrupted.")
@@ -3533,14 +3839,98 @@ def main(argv: Sequence[str] | None = None) -> int:
             destination_root=args.destination_root,
         )
 
+    if (
+        args.command == "job"
+        and args.job_command == "scheduler-run"
+        and args.supervisor_watchdog
+        and (
+            args.lane
+            not in {
+                SchedulerLane.CONTROL.value,
+                SchedulerLane.PROVIDER.value,
+            }
+            or args.ready_file is None
+        )
+    ):
+        print(
+            "ATHENA job error: --supervisor-watchdog is reserved for "
+            "supervisor-owned control/provider children.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if (
+        args.command == "job"
+        and args.job_command == "scheduler-run"
+        and args.supervisor_watchdog
+    ):
+        _start_scheduler_supervisor_watchdog()
+
+    if (
+        args.command == "job"
+        and args.job_command == "scheduler-run"
+        and args.supervised_child
+        and (
+            args.lane != SchedulerLane.PROVIDER.value
+            or args.ready_file is None
+        )
+    ):
+        print(
+            "ATHENA job error: --supervised-child is reserved for "
+            "provider-lane supervisor children.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if (
+        args.command == "job"
+        and args.job_command == "scheduler-run"
+        and args.lane == "supervisor"
+    ):
+        try:
+            return _run_scheduler_supervisor(args)
+        except JobSchedulerError as exc:
+            print(f"ATHENA job error: {exc}", file=sys.stderr)
+            return 2
+
     try:
         app = AthenaApplication()
     except ConfigurationError as exc:
         print(f"ATHENA configuration error: {exc}", file=sys.stderr)
         return 2
 
+    scheduler_lane_locks: tuple[SchedulerLaneProcessLock, ...] = ()
+    if (
+        args.command == "job"
+        and args.job_command == "scheduler-run"
+    ):
+        try:
+            scheduler_lane_locks = _acquire_scheduler_run_lane_locks(
+                app,
+                SchedulerLane(args.lane),
+            )
+        except SchedulerLaneOwnershipError as exc:
+            print(f"ATHENA job error: {exc}", file=sys.stderr)
+            return 2
+
     try:
-        app.start()
+        supervised_scheduler_child = (
+            args.command == "job"
+            and args.job_command == "scheduler-run"
+            and bool(args.supervised_child)
+        )
+        app.start(
+            run_startup_maintenance=not supervised_scheduler_child
+        )
+        if (
+            args.command == "job"
+            and args.job_command == "scheduler-run"
+            and args.ready_file is not None
+        ):
+            args.ready_file.write_text(
+                "ready\n",
+                encoding="utf-8",
+            )
 
         if args.command == "chat":
             try:
@@ -3731,8 +4121,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         return 0
     finally:
-        if app.state.value != "stopped":
-            app.stop()
+        try:
+            if app.state.value != "stopped":
+                app.stop()
+        finally:
+            for scheduler_lane_lock in reversed(
+                scheduler_lane_locks
+            ):
+                scheduler_lane_lock.close()
 
 
 if __name__ == "__main__":

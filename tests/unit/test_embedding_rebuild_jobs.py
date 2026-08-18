@@ -6,6 +6,7 @@ from typing import Callable
 
 import pytest
 
+from athena.common.time import utc_now_us
 from athena.config.settings import AthenaSettings
 from athena.core.application import AthenaApplication
 from athena.jobs.embedding_processing import (
@@ -22,6 +23,7 @@ from athena.retrieval.archive import ArchiveSemanticSearchService
 class FakeEmbeddingProvider:
     calls: list[tuple[str, ...]] = field(default_factory=list)
     before_return: Callable[[], None] | None = None
+    generation_timeout_seconds: float | None = None
 
     def embed(self, *, model_id: str, texts):
         captured = tuple(texts)
@@ -353,3 +355,59 @@ def test_visibility_change_during_provider_call_waits_dependency(
     status = worker.semantic.status("fake-embed")
     assert status is None or not status.current
     app.stop()
+
+def test_embedding_provider_call_extends_lease_before_blocking_boundary(
+    tmp_path,
+) -> None:
+    app = _app(tmp_path / "provider-lease-runtime")
+    try:
+        _representation, built = _build_chunks(
+            app,
+            tmp_path,
+            "Embedding provider lease guard marker.\n\n"
+            + ("lease payload " * 400),
+        )
+        assert built.chunks
+
+        provider = FakeEmbeddingProvider(
+            generation_timeout_seconds=5.0,
+        )
+        worker = _worker(app, provider)
+        job = worker.enqueue(
+            "fake-embed",
+            batch_size=1,
+        )
+        leased = app.jobs.acquire(
+            job.job_id,
+            worker_id="provider-lease",
+            lease_seconds=1,
+        )
+        assert leased.lease_token is not None
+
+        def assert_provider_lease_is_protected() -> None:
+            current = app.jobs.get(job.job_id)
+            assert current.lease_expires_at_us is not None
+            now_us = utc_now_us()
+            assert current.lease_expires_at_us > now_us + 4_000_000
+
+            recovered = app.jobs.recover_startup(
+                now_us=now_us + 2_000_000
+            )
+            assert job.job_id not in {
+                item.job_id
+                for item in recovered
+            }
+
+        provider.before_return = assert_provider_lease_is_protected
+
+        result = worker.step(
+            job.job_id,
+            lease_token=leased.lease_token,
+            extend_seconds=1,
+        )
+
+        assert result.completed_stage == "batch"
+        assert result.job.state is JobState.RUNNING
+        assert len(provider.calls) == 1
+    finally:
+        app.stop()

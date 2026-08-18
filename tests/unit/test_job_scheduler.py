@@ -6,10 +6,17 @@ from pathlib import Path
 from athena.common.time import utc_now_us
 from athena.config.settings import AthenaSettings
 from athena.core.application import AthenaApplication
+from athena.jobs import scheduler as scheduler_module
+from athena.jobs.capabilities import CONTROL_LANE_JOB_TYPES
 from athena.jobs.embedding_processing import DurableEmbeddingRebuildWorker
 from athena.jobs.models import JobPriority, JobState, WaitingReason
-from athena.jobs.scheduler import DurableJobScheduler, SchedulerPolicy
+from athena.jobs.scheduler import (
+    DurableJobScheduler,
+    SchedulerLane,
+    SchedulerPolicy,
+)
 from athena.model.adapters.lm_studio import ProviderUnavailableError
+from athena.news.models import NEWS_JOB_TYPE, NEWS_PERIOD_JOB_TYPE
 from athena.resources.manager import AdmissionDecision
 from athena.retrieval.archive import ArchiveSemanticSearchService
 
@@ -394,3 +401,245 @@ def test_running_gpu_job_yields_at_next_boundary_for_interactive_chat(
     assert resumed.completed_jobs == 1
     assert app.jobs.get(job.job_id).state is JobState.COMPLETED
     app.stop()
+
+def test_control_lane_skips_provider_bound_jobs(
+    tmp_path,
+) -> None:
+    app = _app(tmp_path / "control-lane-runtime")
+    try:
+        provider_job = app.jobs.create(
+            job_type="embedding.rebuild",
+            priority=JobPriority.DATA_SAFETY,
+        )
+        source = _capture_source(
+            app,
+            tmp_path / "control-lane-source.md",
+            "Control lane source processing marker.\n",
+        )
+        control_job = app.source_processing.enqueue(
+            source.source_id,
+            priority=JobPriority.NORMAL,
+        )
+
+        tick = app.job_scheduler.tick(
+            worker_id="control-lane",
+            lane=SchedulerLane.CONTROL,
+        )
+
+        assert tick.selected_job_id == control_job.job_id
+        assert tick.final_state is JobState.COMPLETED
+        assert app.jobs.get(provider_job.job_id).state is JobState.QUEUED
+    finally:
+        app.stop()
+
+
+def test_provider_lane_skips_control_jobs(
+    tmp_path,
+) -> None:
+    app = _app(tmp_path / "provider-lane-runtime")
+    try:
+        embedding_source = _capture_source(
+            app,
+            tmp_path / "provider-lane-embedding.md",
+            "Provider lane embedding marker.\n\n"
+            + ("provider payload " * 500),
+        )
+        represented = app.source_text.build(
+            embedding_source.source_id
+        )
+        built = app.source_chunks.build_default(
+            represented.result.representation.representation_id
+        )
+        assert len(built.chunks) >= 2
+
+        control_source = _capture_source(
+            app,
+            tmp_path / "provider-lane-control.md",
+            "Provider lane must not dispatch this source job.\n",
+        )
+        control_job = app.source_processing.enqueue(
+            control_source.source_id,
+            priority=JobPriority.DATA_SAFETY,
+        )
+
+        provider = FakeEmbeddingProvider()
+        scheduler, embedding = _embedding_scheduler(
+            app,
+            provider,
+            policy=SchedulerPolicy(
+                max_boundaries_per_dispatch=1,
+            ),
+        )
+        provider_job = embedding.enqueue(
+            "provider-lane-embed",
+            batch_size=1,
+            priority=JobPriority.BACKGROUND,
+        )
+
+        tick = scheduler.tick(
+            worker_id="provider-lane",
+            lane=SchedulerLane.PROVIDER,
+        )
+
+        assert tick.selected_job_id == provider_job.job_id
+        assert tick.action == "yielded"
+        assert len(provider.calls) == 1
+        assert app.jobs.get(control_job.job_id).state is JobState.QUEUED
+    finally:
+        app.stop()
+
+def test_news_jobs_are_provider_lane_only(
+    tmp_path,
+) -> None:
+    app = _app(tmp_path / "news-lane-runtime")
+    try:
+        provider_types = app.job_scheduler.job_types_for_lane(
+            SchedulerLane.PROVIDER
+        )
+        control_types = app.job_scheduler.job_types_for_lane(
+            SchedulerLane.CONTROL
+        )
+
+        assert NEWS_JOB_TYPE in provider_types
+        assert NEWS_PERIOD_JOB_TYPE in provider_types
+        assert NEWS_JOB_TYPE not in control_types
+        assert NEWS_PERIOD_JOB_TYPE not in control_types
+    finally:
+        app.stop()
+
+def test_provider_lane_skips_global_housekeeping(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    app = _app(tmp_path / "provider-housekeeping-runtime")
+    try:
+        def forbidden(*args, **kwargs):
+            del args, kwargs
+            raise AssertionError(
+                "Provider lane must not own global scheduler housekeeping."
+            )
+
+        monkeypatch.setattr(
+            app.backup_worker,
+            "schedule_due",
+            forbidden,
+        )
+        monkeypatch.setattr(
+            app.news,
+            "schedule_due",
+            forbidden,
+        )
+        monkeypatch.setattr(
+            app.news,
+            "reconcile_dependencies",
+            forbidden,
+        )
+        monkeypatch.setattr(
+            app.jobs,
+            "recover_startup",
+            forbidden,
+        )
+        monkeypatch.setattr(
+            app.archive_replication_worker,
+            "reconcile_pending",
+            forbidden,
+        )
+        monkeypatch.setattr(
+            app.job_scheduler,
+            "_schedule_orphaned_retry_waiters",
+            forbidden,
+        )
+        monkeypatch.setattr(
+            app.jobs,
+            "wake_due_waiting",
+            forbidden,
+        )
+        monkeypatch.setattr(
+            app.job_scheduler,
+            "_wake_legacy_research_synthesis_waiters",
+            forbidden,
+        )
+
+        result = app.job_scheduler.tick(
+            worker_id="provider-housekeeping",
+            lane=SchedulerLane.PROVIDER,
+        )
+
+        assert result.idle is True
+        assert result.recovered_jobs == 0
+        assert result.scheduled_retries == 0
+        assert result.woken_jobs == 0
+    finally:
+        app.stop()
+
+
+def test_worker_start_can_skip_global_startup_maintenance(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    app = AthenaApplication(
+        settings=AthenaSettings(
+            local_root=tmp_path / "worker-start-runtime"
+        )
+    )
+
+    def forbidden(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError(
+            "Supervised worker start must skip global startup maintenance."
+        )
+
+    monkeypatch.setattr(
+        app.backup,
+        "recover_incomplete",
+        forbidden,
+    )
+    monkeypatch.setattr(
+        app.backup,
+        "sync_all_deletion_ledgers",
+        forbidden,
+    )
+    monkeypatch.setattr(
+        app.jobs,
+        "recover_startup",
+        forbidden,
+    )
+
+    app.start(
+        run_startup_maintenance=False,
+    )
+    try:
+        assert app.news.profile()["name"] == "default"
+    finally:
+        app.stop()
+
+def test_future_supported_job_type_fails_closed_to_provider_lane(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    app = _app(tmp_path / "future-lane-runtime")
+    try:
+        future_job_type = "future.provider-bound"
+        monkeypatch.setattr(
+            scheduler_module,
+            "_SUPPORTED_JOB_TYPES",
+            scheduler_module._SUPPORTED_JOB_TYPES
+            | frozenset({future_job_type}),
+        )
+
+        supported = app.job_scheduler.supported_job_types
+        control = app.job_scheduler.job_types_for_lane(
+            SchedulerLane.CONTROL
+        )
+        provider = app.job_scheduler.job_types_for_lane(
+            SchedulerLane.PROVIDER
+        )
+
+        assert control == supported & CONTROL_LANE_JOB_TYPES
+        assert provider == supported - control
+        assert control.isdisjoint(provider)
+        assert control | provider == supported
+        assert future_job_type in provider
+        assert future_job_type not in control
+    finally:
+        app.stop()

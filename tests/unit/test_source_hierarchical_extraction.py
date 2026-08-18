@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from athena.common.time import utc_now_us
 from athena.config.settings import AthenaSettings
 from athena.core.application import AthenaApplication
 from athena.jobs.models import JobState
@@ -26,6 +27,7 @@ from athena.source.analysis_models import SourceAnalysisState
 class FakeHierarchicalExtractionProvider:
     context_capacity: int = 6000
     quantization: str = "Q4"
+    generation_timeout_seconds: float = 300.0
     deduplicate_claims: bool = False
     invalid_grounding: bool = False
     calls: list[tuple[str, tuple[ModelChatMessage, ...], int | None]] = field(default_factory=list)
@@ -677,3 +679,60 @@ def test_restart_does_not_replay_completed_extraction_batch(tmp_path: Path) -> N
         assert len(extraction_calls) == total_batches - 1
     finally:
         resumed_app.stop()
+
+def test_hierarchical_extraction_extends_lease_before_provider_call(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app, provider = _app(tmp_path / "provider-lease-runtime")
+    try:
+        analysis, _chunks = _completed_analysis(
+            app,
+            tmp_path,
+        )
+        provider.calls.clear()
+        provider.controlled_calls.clear()
+        provider.generation_timeout_seconds = 5.0
+
+        job = _enqueue_extraction(
+            app,
+            analysis.analysis_id,
+        )
+        original = provider.generate_controlled_structured
+        checked_calls = 0
+
+        def guarded_call(*args, **kwargs):
+            nonlocal checked_calls
+            checked_calls += 1
+
+            current = app.jobs.get(job.job_id)
+            assert current.lease_expires_at_us is not None
+            now_us = utc_now_us()
+            assert current.lease_expires_at_us > now_us + 4_000_000
+
+            recovered = app.jobs.recover_startup(
+                now_us=now_us + 2_000_000
+            )
+            assert job.job_id not in {
+                item.job_id
+                for item in recovered
+            }
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(
+            provider,
+            "generate_controlled_structured",
+            guarded_call,
+        )
+
+        result = app.source_hierarchical_extraction.run_to_completion(
+            job.job_id,
+            worker_id="hierarchical-provider-lease",
+            lease_seconds=1,
+        )
+
+        assert result.done is True
+        assert result.job.state is JobState.COMPLETED
+        assert checked_calls >= 1
+    finally:
+        app.stop()

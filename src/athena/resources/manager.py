@@ -17,6 +17,7 @@ from typing import Protocol
 from athena.chat.service import ChatService
 from athena.common.ids import new_uuid7, uuid_from_blob, uuid_to_blob
 from athena.common.time import utc_now_us
+from athena.jobs.capabilities import requires_provider_isolation
 from athena.jobs.models import JobPriority, JobRecord
 from athena.model.ports import ChatModelProvider
 from athena.storage.database import SQLiteDatabase
@@ -130,10 +131,6 @@ class ResourceManager:
         "research.exhaustive": 1024 * 1024 * 1024,
         "embedding.rebuild": 512 * 1024 * 1024,
     }
-    _GPU_JOBS = frozenset(
-        {"source.analyze", "source.extract", "research.exhaustive", "embedding.rebuild"}
-    )
-
     def __init__(
         self,
         *,
@@ -364,7 +361,7 @@ class ResourceManager:
     ) -> bool:
         if job.priority <= JobPriority.INTERACTIVE:
             return False
-        if job.job_type not in self._GPU_JOBS:
+        if not requires_provider_isolation(job.job_type):
             return False
         return self.interactive_demand_active(now_us=now_us)
 
@@ -514,7 +511,7 @@ class ResourceManager:
 
         if (
             policy.mode is ResourceMode.QUIET
-            and job.job_type in self._GPU_JOBS
+            and requires_provider_isolation(job.job_type)
             and job.priority >= JobPriority.NORMAL
         ):
             return AdmissionDecision(False, "quiet mode defers non-urgent GPU work", 60)
@@ -539,7 +536,7 @@ class ResourceManager:
         if snapshot.disk_free_bytes < disk_headroom:
             return AdmissionDecision(False, "insufficient disk headroom", 60)
 
-        if job.job_type in self._GPU_JOBS:
+        if requires_provider_isolation(job.job_type):
             if (
                 snapshot.gpu_utilization_fraction is not None
                 and snapshot.gpu_utilization_fraction

@@ -7,6 +7,7 @@ import uuid
 from dataclasses import dataclass
 from typing import cast
 
+from athena.jobs.lease_guard import blocking_operation_lease_seconds
 from athena.jobs.models import (
     CheckpointRecord,
     JobPriority,
@@ -342,6 +343,20 @@ class DurableEmbeddingRebuildWorker:
                     resume_after=plan.next_cursor,
                 ),
             )
+
+        provider_lease_seconds = blocking_operation_lease_seconds(
+            timeout_seconds=getattr(
+                self.semantic.provider,
+                "generation_timeout_seconds",
+                None,
+            ),
+            base_extend_seconds=extend_seconds,
+        )
+        self.jobs.heartbeat(
+            job_id,
+            lease_token=lease_token,
+            extend_seconds=provider_lease_seconds,
+        )
 
         vectors = self.semantic.provider.embed(
             model_id=cursor.model_id,

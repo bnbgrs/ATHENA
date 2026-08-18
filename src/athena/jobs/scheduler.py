@@ -7,6 +7,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
+from enum import Enum
 from typing import Protocol
 
 from athena.common.time import utc_now_us
@@ -19,6 +20,7 @@ from athena.jobs.backup import (
     BACKUP_CREATE_JOB_TYPE,
     DurableBackupWorker,
 )
+from athena.jobs.capabilities import CONTROL_LANE_JOB_TYPES
 from athena.jobs.embedding_processing import (
     DurableEmbeddingRebuildWorker,
     EmbeddingRebuildJobError,
@@ -65,6 +67,14 @@ class DurableNewsSchedulerWorker(Protocol):
     def schedule_due(self) -> tuple[uuid.UUID, ...]: ...
     def reconcile_dependencies(self) -> int: ...
     def process_leased(self, job: JobRecord) -> JobRecord: ...
+
+class SchedulerLane(str, Enum):
+    """Disjoint long-lived scheduler lanes for blocking provider isolation."""
+
+    ALL = "all"
+    CONTROL = "control"
+    PROVIDER = "provider"
+
 
 class JobSchedulerError(RuntimeError):
     """Raised when scheduler orchestration cannot continue safely."""
@@ -213,45 +223,78 @@ class DurableJobScheduler:
 
         return supported
 
+    def job_types_for_lane(
+        self,
+        lane: SchedulerLane,
+    ) -> frozenset[str]:
+        """Return the supported job subset owned by one scheduler lane."""
+        normalized_lane = SchedulerLane(lane)
+        supported = self.supported_job_types
+        if normalized_lane is SchedulerLane.ALL:
+            return supported
+
+        control = supported & CONTROL_LANE_JOB_TYPES
+        if normalized_lane is SchedulerLane.CONTROL:
+            return control
+
+        # Fail closed: any newly supported job stays serialized on the
+        # provider lane until it is explicitly reviewed as control-safe.
+        return supported - control
+
     def tick(
         self,
         *,
         worker_id: str,
         now_us: int | None = None,
+        lane: SchedulerLane = SchedulerLane.ALL,
     ) -> SchedulerTickResult:
         """Run one durable scheduler selection/dispatch cycle."""
         normalized_worker_id = worker_id.strip()
         if not normalized_worker_id:
             raise ValueError("Scheduler worker_id must not be empty.")
         now = utc_now_us() if now_us is None else now_us
+        lane = SchedulerLane(lane)
 
-        if self.backup_worker is not None:
+        owns_control_housekeeping = lane is not SchedulerLane.PROVIDER
+
+        if owns_control_housekeeping and self.backup_worker is not None:
             self.backup_worker.schedule_due(
                 now_us=now,
             )
 
         news_woken = 0
-        if self.news_worker is not None:
+        if owns_control_housekeeping and self.news_worker is not None:
             try:
                 self.news_worker.schedule_due()
             except NewsConsentRequired:
                 pass
             news_woken = self.news_worker.reconcile_dependencies()
 
-        recovered = self.jobs.recover_startup(now_us=now)
+        if owns_control_housekeeping:
+            recovered = self.jobs.recover_startup(now_us=now)
+        else:
+            recovered = ()
 
-        if self.archive_replication_worker is not None:
+        if (
+            owns_control_housekeeping
+            and self.archive_replication_worker is not None
+        ):
             self.archive_replication_worker.reconcile_pending()
 
-        scheduled_retries = self._schedule_orphaned_retry_waiters(now)
-        woken = self.jobs.wake_due_waiting(now_us=now)
-        legacy_research_woken = (
-            self._wake_legacy_research_synthesis_waiters()
-        )
+        if owns_control_housekeeping:
+            scheduled_retries = self._schedule_orphaned_retry_waiters(now)
+            woken = self.jobs.wake_due_waiting(now_us=now)
+            legacy_research_woken = (
+                self._wake_legacy_research_synthesis_waiters()
+            )
+        else:
+            scheduled_retries = 0
+            woken = ()
+            legacy_research_woken = 0
 
         candidates = self.jobs.eligible_queued(
             now_us=now,
-            job_types=self.supported_job_types,
+            job_types=self.job_types_for_lane(lane),
             limit=self.policy.candidate_limit,
         )
         ranked = sorted(candidates, key=lambda job: self._rank_key(job, now))
@@ -452,6 +495,7 @@ class DurableJobScheduler:
         *,
         worker_id: str,
         max_jobs: int = 100,
+        lane: SchedulerLane = SchedulerLane.ALL,
     ) -> SchedulerRunResult:
         """Process currently eligible work until idle or a bounded job count is reached."""
         if max_jobs <= 0:
@@ -465,7 +509,10 @@ class DurableJobScheduler:
         idle = False
 
         while dispatched < max_jobs:
-            result = self.tick(worker_id=worker_id)
+            result = self.tick(
+                worker_id=worker_id,
+                lane=lane,
+            )
             ticks += 1
             if result.idle:
                 idle = True
@@ -495,6 +542,7 @@ class DurableJobScheduler:
         *,
         worker_id: str,
         max_ticks: int | None = None,
+        lane: SchedulerLane = SchedulerLane.ALL,
     ) -> SchedulerRunResult:
         """Run a low-frequency persistent scheduler loop until interrupted/bounded."""
         if max_ticks is not None and max_ticks <= 0:
@@ -508,10 +556,15 @@ class DurableJobScheduler:
         last_idle = False
 
         while max_ticks is None or ticks < max_ticks:
-            result = self.tick(worker_id=worker_id)
+            result = self.tick(
+                worker_id=worker_id,
+                lane=lane,
+            )
             ticks += 1
             last_idle = result.idle
             if result.idle:
+                if max_ticks is not None and ticks >= max_ticks:
+                    break
                 time.sleep(self.policy.idle_poll_seconds)
                 continue
             dispatched += 1

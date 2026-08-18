@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from itertools import combinations
 from typing import Any, cast
 
+from athena.jobs.lease_guard import blocking_operation_lease_seconds
 from athena.jobs.models import JobPriority, JobRecord
 from athena.jobs.service import DurableJobService
 from athena.knowledge.extraction_models import (
@@ -796,6 +797,7 @@ class SourceHierarchicalExtractionService:
         extraction: SourceHierarchicalExtractionRecord,
         model: ModelInfo,
         prepared: PreparedHierarchicalExtractionCall,
+        extend_seconds: int = 120,
     ) -> SourceHierarchicalExtractionArtifact:
         package = self._context_package_for_prepared(
             extraction=extraction,
@@ -866,6 +868,21 @@ class SourceHierarchicalExtractionService:
             )
             structured_schema = package.structured_schema()
             assert structured_schema is not None
+
+            provider_lease_seconds = blocking_operation_lease_seconds(
+                timeout_seconds=getattr(
+                    self.provider,
+                    "generation_timeout_seconds",
+                    None,
+                ),
+                base_extend_seconds=extend_seconds,
+            )
+            self.jobs.heartbeat(
+                job.job_id,
+                lease_token=lease_token,
+                extend_seconds=provider_lease_seconds,
+            )
+
             raw = self.provider.generate_controlled_structured(
                 model_id=model.backend_model_id,
                 messages=package.model_messages(),
