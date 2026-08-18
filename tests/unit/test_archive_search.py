@@ -184,6 +184,7 @@ def test_archive_semantic_search_finds_nonlexical_related_chunk(tmp_path) -> Non
             provider=provider,
             batch_size=2,
         )
+        semantic.rebuild("fake-embed")
 
         results = semantic.search("Hauptstadt", model_id="fake-embed", limit=10)
 
@@ -216,10 +217,24 @@ def test_archive_embedding_index_becomes_stale_after_chunk_rebuild(tmp_path) -> 
         assert not stale.current
         assert stale.current_chunk_generation > first.indexed_chunk_generation
 
+        calls_before_search = provider.calls
+
+        with pytest.raises(
+            ArchiveSearchError,
+            match="stale",
+        ):
+            semantic.search(
+                "Berlin",
+                model_id="fake-embed",
+                limit=10,
+            )
+
+        assert provider.calls == calls_before_search
+
         second = semantic.ensure_current("fake-embed")
         assert second.current
         assert second.indexed_chunk_generation > first.indexed_chunk_generation
-        assert provider.calls >= 2
+        assert provider.calls > calls_before_search
     finally:
         app.stop()
 
@@ -232,6 +247,9 @@ def test_archive_nomic_embeddings_use_document_and_query_prefixes(tmp_path) -> N
         semantic = ArchiveSemanticSearchService(
             lexical=app.archive_search,
             provider=provider,
+        )
+        semantic.rebuild(
+            "text-embedding-nomic-embed-text-v1.5"
         )
 
         semantic.search(
@@ -260,6 +278,7 @@ def test_archive_hybrid_can_return_semantic_only_candidate(tmp_path) -> None:
             lexical=app.archive_search,
             provider=FakeEmbeddingProvider(),
         )
+        semantic.rebuild("fake-embed")
         hybrid = ArchiveHybridRetrievalService(app.archive_search, semantic)
 
         results = hybrid.search("Hauptstadt", model_id="fake-embed", limit=10)
@@ -381,6 +400,22 @@ def test_archive_hnsw_sidecar_rebuilds_without_reembedding(tmp_path) -> None:
         assert not missing.hnsw_ready
         assert not missing.current
 
+        with pytest.raises(
+            ArchiveSearchError,
+            match="HNSW",
+        ):
+            semantic.search(
+                "Berlin",
+                model_id="fake-embed",
+                limit=10,
+            )
+
+        assert provider.calls == calls_after_embedding_rebuild
+
+        still_missing = semantic.status("fake-embed")
+        assert still_missing is not None
+        assert not still_missing.hnsw_ready
+
         restored = semantic.ensure_current("fake-embed")
         assert restored.current
         assert restored.hnsw_ready
@@ -409,8 +444,15 @@ def test_archive_hybrid_degrades_only_after_verified_lexical_path_succeeds(
         )
         semantic = ArchiveSemanticSearchService(
             lexical=app.archive_search,
-            provider=FailingArchiveEmbeddingProvider(),
+            provider=RecordingEmbeddingProvider(inputs=[]),
         )
+        semantic.rebuild("broken-embed")
+
+        # Establish a valid index first, then simulate only query-time
+        # provider failure. This keeps provider outage distinct from the new
+        # absent/stale-index contract.
+        semantic.provider = FailingArchiveEmbeddingProvider()
+
         hybrid = ArchiveHybridRetrievalService(
             app.archive_search,
             semantic,
@@ -439,5 +481,41 @@ def test_archive_hybrid_degrades_only_after_verified_lexical_path_succeeds(
         )
         assert result.lexical_score > 0.0
         assert result.semantic_score == 0.0
+    finally:
+        app.stop()
+
+def test_archive_semantic_search_absent_index_requires_explicit_rebuild(
+    tmp_path,
+) -> None:
+    app = _started_app(tmp_path)
+
+    try:
+        _build_chunks(
+            app,
+            tmp_path,
+            "archive-absent.txt",
+            "Berlin archive evidence.\n",
+        )
+
+        provider = FakeEmbeddingProvider()
+
+        semantic = ArchiveSemanticSearchService(
+            lexical=app.archive_search,
+            provider=provider,
+        )
+
+        with pytest.raises(
+            ArchiveSearchError,
+            match="absent",
+        ):
+            semantic.search(
+                "Berlin",
+                model_id="fake-embed",
+                limit=10,
+            )
+
+        assert provider.calls == 0
+        assert semantic.status("fake-embed") is None
+
     finally:
         app.stop()

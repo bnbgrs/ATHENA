@@ -869,7 +869,23 @@ class ArchiveSemanticSearchService:
         if not 1 <= limit <= 500:
             raise ArchiveSearchError("Archive semantic limit must be between 1 and 500.")
         normalized_model_id = _require_model_id(model_id)
-        status = self.ensure_current(normalized_model_id)
+        status = self.status(normalized_model_id)
+        if status is None:
+            raise ArchiveSearchError(
+                "Archive semantic index is absent; explicit rebuild required."
+            )
+        if (
+            status.indexed_chunk_generation
+            != status.current_chunk_generation
+        ):
+            raise ArchiveSearchError(
+                "Archive semantic index is stale; durable rebuild required."
+            )
+        if not status.hnsw_ready:
+            raise ArchiveSearchError(
+                "Archive semantic HNSW sidecar is unavailable; "
+                "explicit maintenance required."
+            )
         if status.document_count == 0:
             return ()
 

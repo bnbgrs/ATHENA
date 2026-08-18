@@ -2,13 +2,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import pytest
+
 from athena.chat.repository import ChatRepository
 from athena.chat.service import ChatService
 from athena.knowledge.models import KnowledgeKind
 from athena.knowledge.repository import KnowledgeRepository
 from athena.knowledge.service import KnowledgeService
 from athena.retrieval.search import SearchEntityType
-from athena.retrieval.semantic import LocalSemanticSearchService
+from athena.retrieval.semantic import (
+    LocalSemanticSearchService,
+    SemanticSearchError,
+)
 from athena.storage.database import SQLiteDatabase
 
 
@@ -50,6 +55,7 @@ def test_semantic_search_finds_nonlexical_related_document(tmp_path) -> None:
 
         provider = FakeEmbeddingProvider()
         semantic = LocalSemanticSearchService(database, provider, batch_size=2)
+        semantic.rebuild("fake-embed")
         results = semantic.search(
             "Hauptstadt Deutschland",
             model_id="fake-embed",
@@ -90,9 +96,25 @@ def test_semantic_index_rebuilds_after_canonical_change(tmp_path) -> None:
             knowledge_id=revision.knowledge_id,
             body="Berlin ist der Regierungssitz Deutschlands.",
         )
+
+        calls_before_search = provider.calls
+
+        with pytest.raises(
+            SemanticSearchError,
+            match="stale",
+        ):
+            semantic.search(
+                "Berlin",
+                model_id="fake-embed",
+                limit=10,
+            )
+
+        # A normal read must not re-embed the corpus.
+        assert provider.calls == calls_before_search
+
         second = semantic.ensure_current("fake-embed")
         assert second.indexed_commit_seq > first.indexed_commit_seq
-        assert provider.calls >= 2
+        assert provider.calls > calls_before_search
     finally:
         database.stop()
 
@@ -103,6 +125,7 @@ def test_empty_semantic_index_returns_no_results(tmp_path) -> None:
     try:
         provider = FakeEmbeddingProvider()
         semantic = LocalSemanticSearchService(database, provider)
+        semantic.rebuild("fake-embed")
         results = semantic.search(
             "anything",
             model_id="fake-embed",
@@ -146,6 +169,9 @@ def test_nomic_retrieval_uses_required_task_prefixes(tmp_path) -> None:
 
         provider = RecordingEmbeddingProvider(inputs=[])
         semantic = LocalSemanticSearchService(database, provider)
+        semantic.rebuild(
+            "text-embedding-nomic-embed-text-v1.5"
+        )
         semantic.search(
             "Hauptstadt Deutschlands",
             model_id="text-embedding-nomic-embed-text-v1.5",
@@ -216,9 +242,124 @@ def test_hnsw_sidecar_rebuilds_from_persisted_vectors_without_reembedding(tmp_pa
         assert not missing.hnsw_ready
         assert not missing.current
 
+        with pytest.raises(
+            SemanticSearchError,
+            match="HNSW",
+        ):
+            semantic.search(
+                "Berlin",
+                model_id="fake-embed",
+                limit=10,
+            )
+
+        # Search must neither re-embed nor repair HNSW.
+        assert provider.calls == calls_after_embedding_rebuild
+
+        still_missing = semantic.status("fake-embed")
+        assert still_missing is not None
+        assert not still_missing.hnsw_ready
+
         restored = semantic.ensure_current("fake-embed")
         assert restored.current
         assert restored.hnsw_ready
         assert provider.calls == calls_after_embedding_rebuild
+    finally:
+        database.stop()
+
+def test_semantic_snapshot_ignores_unrelated_empty_chat_commit(
+    tmp_path,
+) -> None:
+    database = SQLiteDatabase(
+        tmp_path / "athena.db"
+    )
+    database.start()
+
+    try:
+        chat = ChatService(
+            ChatRepository(
+                database
+            )
+        )
+        knowledge = KnowledgeService(
+            KnowledgeRepository(
+                database
+            ),
+            chat,
+        )
+
+        chat_id = chat.create_chat()
+
+        message = chat.add_user_message(
+            chat_id=chat_id,
+            content="Berlin bleibt im semantischen Snapshot.",
+        )
+
+        knowledge.promote_chat_message(
+            chat_id=chat_id,
+            sequence_no=message.sequence_no,
+            knowledge_kind=KnowledgeKind.FACT,
+        )
+
+        provider = FakeEmbeddingProvider()
+
+        semantic = LocalSemanticSearchService(
+            database,
+            provider,
+        )
+
+        before = semantic.rebuild(
+            "fake-embed"
+        )
+
+        # Creating an empty Chat advances canonical commit_records but changes
+        # no Knowledge/Claim/ChatMessage search document.
+        chat.create_chat()
+
+        after = semantic.status(
+            "fake-embed"
+        )
+
+        assert after is not None
+        assert after.current
+        assert (
+            after.current_commit_seq
+            == before.current_commit_seq
+        )
+        assert (
+            after.indexed_commit_seq
+            == before.indexed_commit_seq
+        )
+
+    finally:
+        database.stop()
+
+def test_semantic_search_absent_index_requires_explicit_rebuild(
+    tmp_path,
+) -> None:
+    database = SQLiteDatabase(
+        tmp_path / "athena.db"
+    )
+    database.start()
+
+    try:
+        provider = FakeEmbeddingProvider()
+        semantic = LocalSemanticSearchService(
+            database,
+            provider,
+        )
+
+        with pytest.raises(
+            SemanticSearchError,
+            match="absent",
+        ):
+            semantic.search(
+                "anything",
+                model_id="fake-embed",
+                limit=10,
+            )
+
+        assert provider.calls == 0
+        assert semantic.status("fake-embed") is None
+
     finally:
         database.stop()

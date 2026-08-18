@@ -650,3 +650,82 @@ if loaded:
         completed.stdout
         + completed.stderr
     )
+
+def test_legacy_global_fts_watermark_remains_valid_when_projection_matches(
+    tmp_path: Path,
+) -> None:
+    app = _app(
+        tmp_path / "runtime"
+    )
+
+    try:
+        _prepare_public_data(
+            app,
+            tmp_path,
+        )
+
+        service = DerivedRecoveryService(
+            database_path=app.paths.database_path,
+            derived_root=app.paths.derived_root,
+        )
+
+        initial = service.inspect()
+
+        assert (
+            initial.canonical_fts.status
+            is DerivedLayerStatus.CURRENT
+        )
+
+        projection_snapshot = (
+            initial.canonical_fts.current_snapshot
+        )
+
+        assert projection_snapshot is not None
+
+        global_row = app.database.connection.execute(
+            """
+            SELECT COALESCE(MAX(commit_seq), 0) AS commit_seq
+            FROM commit_records
+            """
+        ).fetchone()
+
+        assert global_row is not None
+
+        global_snapshot = int(
+            global_row["commit_seq"]
+        )
+
+        # _prepare_public_data performs Source-side canonical commits after the
+        # searchable Knowledge change. This reproduces the old global-watermark
+        # format without changing deterministic FTS content.
+        assert global_snapshot >= projection_snapshot
+
+        with app.database.write_transaction() as connection:
+            connection.execute(
+                """
+                UPDATE search_index_state
+                SET indexed_commit_seq = ?
+                WHERE singleton_id = 1
+                """,
+                (
+                    global_snapshot,
+                ),
+            )
+
+        report = service.inspect()
+
+        assert (
+            report.canonical_fts.status
+            is DerivedLayerStatus.CURRENT
+        )
+        assert (
+            report.canonical_fts.current_snapshot
+            == projection_snapshot
+        )
+        assert (
+            report.canonical_fts.indexed_snapshot
+            == global_snapshot
+        )
+
+    finally:
+        app.stop()

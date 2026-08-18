@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import math
-import sqlite3
 import struct
 import uuid
 from dataclasses import dataclass
@@ -14,7 +13,10 @@ from athena.common.ids import uuid_to_blob
 from athena.common.time import utc_now_us
 from athena.model.adapters.lm_studio_embeddings import LMStudioEmbeddingProvider
 from athena.retrieval.hnsw import HnswIndexError, HnswIndexStore
-from athena.retrieval.search import SearchEntityType
+from athena.retrieval.search import (
+    SearchEntityType,
+    current_search_projection_commit_seq,
+)
 from athena.storage.database import SQLiteDatabase
 
 _SEMANTIC_TYPE_PRIORITY = {
@@ -100,7 +102,7 @@ class LocalSemanticSearchService:
         return EmbeddingIndexStatus(
             model_id=normalized_model_id,
             indexed_commit_seq=indexed_commit_seq,
-            current_commit_seq=self._current_commit_seq(self.database.connection),
+            current_commit_seq=current_search_projection_commit_seq(self.database.connection),
             dimensions=dimensions,
             document_count=document_count,
             rebuilt_at_us=int(row["rebuilt_at_us"]),
@@ -130,7 +132,7 @@ class LocalSemanticSearchService:
         while True:
             self._ensure_fts_current()
             with self.database.write_transaction() as connection:
-                current_commit_seq = self._current_commit_seq(connection)
+                current_commit_seq = current_search_projection_commit_seq(connection)
                 state = connection.execute(
                     """
                     SELECT indexed_commit_seq
@@ -189,7 +191,7 @@ class LocalSemanticSearchService:
         with self.database.write_transaction() as connection:
             # Fail closed if canonical state changed while external embedding
             # generation was running.
-            if self._current_commit_seq(connection) != current_commit_seq:
+            if current_search_projection_commit_seq(connection) != current_commit_seq:
                 raise SemanticSearchError(
                     "Canonical state changed during embedding rebuild; retry required."
                 )
@@ -271,7 +273,7 @@ class LocalSemanticSearchService:
     def ensure_current(self, model_id: str) -> EmbeddingIndexStatus:
         normalized_model_id = model_id.strip()
         status = self.status(normalized_model_id)
-        current_commit_seq = self._current_commit_seq(self.database.connection)
+        current_commit_seq = current_search_projection_commit_seq(self.database.connection)
         if status is None or status.indexed_commit_seq < current_commit_seq:
             return self.rebuild(normalized_model_id)
         if not status.hnsw_ready:
@@ -302,7 +304,20 @@ class LocalSemanticSearchService:
         if not 1 <= limit <= 500:
             raise SemanticSearchError("Semantic search limit must be between 1 and 500.")
 
-        status = self.ensure_current(model_id)
+        status = self.status(model_id)
+        if status is None:
+            raise SemanticSearchError(
+                "Semantic index is absent; explicit rebuild required."
+            )
+        if status.indexed_commit_seq < status.current_commit_seq:
+            raise SemanticSearchError(
+                "Semantic index is stale; explicit rebuild required."
+            )
+        if not status.hnsw_ready:
+            raise SemanticSearchError(
+                "Semantic HNSW sidecar is unavailable; "
+                "explicit maintenance required."
+            )
         if status.document_count == 0:
             return ()
 
@@ -442,17 +457,6 @@ class LocalSemanticSearchService:
         from athena.retrieval.search import LocalSearchService
 
         LocalSearchService(self.database)._ensure_current()
-
-    @staticmethod
-    def _current_commit_seq(connection: sqlite3.Connection) -> int:
-        row = connection.execute(
-            "SELECT COALESCE(MAX(commit_seq), 0) AS commit_seq FROM commit_records"
-        ).fetchone()
-        if row is None:
-            return 0
-        return int(row["commit_seq"])
-
-
 
 _REFERENCE_TYPE_CODE = {
     SearchEntityType.KNOWLEDGE: 1,

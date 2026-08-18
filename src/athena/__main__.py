@@ -91,6 +91,9 @@ from athena.operations.cli import (
 )
 from athena.retrieval.archive import ArchiveSearchError
 from athena.retrieval.context import ContextBuilderError
+from athena.retrieval.degradation import (
+    SemanticRetrievalUnavailableError,
+)
 from athena.retrieval.search import SearchEntityType, SearchError
 from athena.retrieval.semantic import SemanticSearchError
 from athena.source.analysis_repository import SourceAnalysisNotFoundError
@@ -3631,6 +3634,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ContextBuilderError,
                 ModelProviderError,
                 SearchError,
+                SemanticRetrievalUnavailableError,
                 SemanticSearchError,
             ) as exc:
                 print(f"ATHENA context error: {exc}", file=sys.stderr)
@@ -3639,7 +3643,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "search":
             try:
                 return _run_search_command(app, args)
-            except (SearchError, ModelProviderError) as exc:
+            except (
+                SearchError,
+                ModelProviderError,
+                SemanticRetrievalUnavailableError,
+            ) as exc:
                 print(f"ATHENA search error: {exc}", file=sys.stderr)
                 return 2
             except SemanticSearchError as exc:
@@ -3692,6 +3700,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 SourceChunkIntegrityError,
                 ArchiveSearchError,
                 ModelProviderError,
+                SemanticRetrievalUnavailableError,
                 TextRepresentationError,
                 ValueError,
             ) as exc:

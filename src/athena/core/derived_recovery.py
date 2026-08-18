@@ -499,7 +499,11 @@ def _inspect_canonical_fts(
             _actual_canonical_fts_digest(connection)
         )
 
-        if indexed_snapshot > current_snapshot:
+        global_snapshot = _global_commit_seq(
+            connection
+        )
+
+        if indexed_snapshot > global_snapshot:
             status = DerivedLayerStatus.INVALID
             detail = "Canonical FTS watermark is ahead of canonical commits."
         elif (
@@ -695,6 +699,20 @@ def _actual_canonical_fts_digest(
 def _current_commit_seq(
     connection: sqlite3.Connection,
 ) -> int:
+    # Lazy import keeps recovery diagnosis independent from model/runtime
+    # construction while sharing the exact normal search freshness contract.
+    from athena.retrieval.search import (
+        current_search_projection_commit_seq,
+    )
+
+    return current_search_projection_commit_seq(
+        connection
+    )
+
+
+def _global_commit_seq(
+    connection: sqlite3.Connection,
+) -> int:
     row = connection.execute(
         """
         SELECT COALESCE(MAX(commit_seq), 0) AS commit_seq
@@ -702,7 +720,13 @@ def _current_commit_seq(
         """
     ).fetchone()
 
-    return 0 if row is None else int(row["commit_seq"])
+    return (
+        0
+        if row is None
+        else int(
+            row["commit_seq"]
+        )
+    )
 
 
 def _visible_representation_pairs(
@@ -1191,7 +1215,7 @@ def _inspect_canonical_embeddings(
         embeddings_current = (
             persisted_valid
             and canonical_fts.status is DerivedLayerStatus.CURRENT
-            and indexed_snapshot == current_snapshot
+            and indexed_snapshot >= current_snapshot
             and expected_document_count == document_count
         )
 

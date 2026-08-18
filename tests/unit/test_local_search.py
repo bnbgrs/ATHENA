@@ -7,7 +7,12 @@ from athena.knowledge.claim_service import ClaimService
 from athena.knowledge.models import ClaimKind, KnowledgeKind
 from athena.knowledge.repository import KnowledgeRepository
 from athena.knowledge.service import KnowledgeService
-from athena.retrieval.search import LocalSearchService, SearchEntityType, SearchError
+from athena.retrieval.search import (
+    LocalSearchService,
+    SearchEntityType,
+    SearchError,
+    current_search_projection_commit_seq,
+)
 from athena.storage.database import SQLiteDatabase
 
 
@@ -53,7 +58,10 @@ def test_search_indexes_current_knowledge_claim_and_chat_heads(tmp_path) -> None
         database.stop()
 
 
-def test_search_rebuilds_after_current_knowledge_revision_changes(tmp_path) -> None:
+def test_search_refreshes_changed_knowledge_without_full_rebuild(
+    tmp_path,
+    monkeypatch,
+) -> None:
     database, chat, knowledge, _claims, search = _services(tmp_path)
     try:
         chat_id = chat.create_chat()
@@ -66,6 +74,17 @@ def test_search_rebuilds_after_current_knowledge_revision_changes(tmp_path) -> N
         assert any(
             item.entity_type is SearchEntityType.KNOWLEDGE
             for item in search.search("Mars")
+        )
+
+        def reject_full_rebuild(_connection) -> int:
+            raise AssertionError(
+                "Normal search attempted a full FTS rebuild."
+            )
+
+        monkeypatch.setattr(
+            search,
+            "_rebuild_in_transaction",
+            reject_full_rebuild,
         )
 
         knowledge.revise(
@@ -206,6 +225,79 @@ def test_search_projection_excludes_turn_local_markers_from_all_chat_messages(
                 SearchEntityType.CHAT_MESSAGE
             ),
         ) == ()
+
+    finally:
+        database.stop()
+
+def test_unrelated_commit_does_not_invalidate_search_projection(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    database, chat, _knowledge, _claims, search = _services(
+        tmp_path
+    )
+
+    try:
+        chat_id = chat.create_chat()
+
+        chat.add_user_message(
+            chat_id=chat_id,
+            content="Saturn bleibt im lokalen Suchindex.",
+        )
+
+        assert search.search(
+            "Saturn",
+            entity_type=SearchEntityType.CHAT_MESSAGE,
+        )
+
+        indexed_before = search.indexed_commit_seq()
+
+        assert (
+            current_search_projection_commit_seq(
+                database.connection
+            )
+            == indexed_before
+        )
+
+        def reject_full_rebuild(_connection) -> int:
+            raise AssertionError(
+                "Unrelated commit triggered a full FTS rebuild."
+            )
+
+        monkeypatch.setattr(
+            search,
+            "_rebuild_in_transaction",
+            reject_full_rebuild,
+        )
+
+        # A Chat container itself is not searchable. This advances the global
+        # commit sequence but must not invalidate Knowledge/Claim/Message FTS.
+        chat.create_chat()
+
+        global_row = database.connection.execute(
+            """
+            SELECT COALESCE(MAX(commit_seq), 0) AS commit_seq
+            FROM commit_records
+            """
+        ).fetchone()
+
+        assert global_row is not None
+        assert int(global_row["commit_seq"]) > indexed_before
+
+        assert (
+            current_search_projection_commit_seq(
+                database.connection
+            )
+            == indexed_before
+        )
+
+        results = search.search(
+            "Saturn",
+            entity_type=SearchEntityType.CHAT_MESSAGE,
+        )
+
+        assert len(results) == 1
+        assert search.indexed_commit_seq() == indexed_before
 
     finally:
         database.stop()

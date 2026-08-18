@@ -41,9 +41,11 @@ class SearchResult:
 class LocalSearchService:
     """Current-head FTS5 search with a reconstructible derived index.
 
-    The FTS index is not canonical state. A commit-sequence watermark detects
-    canonical changes and causes a deterministic full rebuild before querying.
-    Protected payloads are excluded from this unprotected search path.
+    The FTS index is not canonical state. A projection-specific commit
+    watermark tracks only text/visibility changes that can affect this index.
+    Normal reads catch up changed entities incrementally; complete rebuilds are
+    reserved for explicit maintenance and recovery. Protected payloads remain
+    excluded from this unprotected search path.
     """
 
     def __init__(self, database: SQLiteDatabase) -> None:
@@ -120,13 +122,25 @@ class LocalSearchService:
         return int(row["indexed_commit_seq"])
 
     def _ensure_current(self) -> None:
-        current_commit_seq = self._current_commit_seq(self.database.connection)
-        if self.indexed_commit_seq() >= current_commit_seq:
+        current_commit_seq = (
+            current_search_projection_commit_seq(
+                self.database.connection
+            )
+        )
+        indexed_commit_seq = self.indexed_commit_seq()
+
+        if indexed_commit_seq >= current_commit_seq:
             return
 
         with self.database.write_transaction() as connection:
-            # Re-check after obtaining the writer lock.
-            current_commit_seq = self._current_commit_seq(connection)
+            # Re-check after obtaining the writer lock. Canonical writers are
+            # blocked while this bounded Derived-State delta is projected.
+            current_commit_seq = (
+                current_search_projection_commit_seq(
+                    connection
+                )
+            )
+
             row = connection.execute(
                 """
                 SELECT indexed_commit_seq
@@ -134,10 +148,245 @@ class LocalSearchService:
                 WHERE singleton_id = 1
                 """
             ).fetchone()
+
             if row is None:
-                raise SearchError("Search index state is missing.")
-            if int(row["indexed_commit_seq"]) < current_commit_seq:
-                self._rebuild_in_transaction(connection)
+                raise SearchError(
+                    "Search index state is missing."
+                )
+
+            indexed_commit_seq = int(
+                row["indexed_commit_seq"]
+            )
+
+            if indexed_commit_seq >= current_commit_seq:
+                return
+
+            self._refresh_in_transaction(
+                connection,
+                after_commit_seq=indexed_commit_seq,
+                through_commit_seq=current_commit_seq,
+            )
+
+    def _refresh_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        after_commit_seq: int,
+        through_commit_seq: int,
+    ) -> int:
+        """Project only searchable entities changed in the commit interval."""
+
+        if after_commit_seq < 0:
+            raise SearchError(
+                "Search index watermark must not be negative."
+            )
+
+        if through_commit_seq < after_commit_seq:
+            raise SearchError(
+                "Search refresh watermark moved backwards."
+            )
+
+        changed_rows = connection.execute(
+            """
+            SELECT DISTINCT cc.entity_id
+            FROM commit_changes AS cc
+            WHERE cc.commit_seq > ?
+              AND cc.commit_seq <= ?
+              AND cc.change_type IN (
+                    'create',
+                    'revise',
+                    'deleted'
+              )
+              AND (
+                    EXISTS (
+                        SELECT 1
+                        FROM knowledge_units AS k
+                        WHERE k.knowledge_id = cc.entity_id
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                        FROM claims AS c
+                        WHERE c.claim_id = cc.entity_id
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                        FROM chat_messages AS m
+                        WHERE m.message_id = cc.entity_id
+                    )
+              )
+            ORDER BY cc.entity_id
+            """,
+            (
+                after_commit_seq,
+                through_commit_seq,
+            ),
+        ).fetchall()
+
+        for changed_row in changed_rows:
+            entity_blob = bytes(
+                changed_row["entity_id"]
+            )
+            entity_hex = entity_blob.hex()
+
+            # An entity has at most one current FTS projection. Delete only
+            # that entity, never the complete corpus.
+            connection.execute(
+                """
+                DELETE FROM search_fts
+                WHERE entity_id = ?
+                """,
+                (entity_hex,),
+            )
+
+            projection = connection.execute(
+                """
+                SELECT
+                    'knowledge' AS entity_type,
+                    lower(hex(k.knowledge_id)) AS entity_id,
+                    lower(hex(h.current_revision_id)) AS revision_id,
+                    COALESCE(kr.title, '') AS title,
+                    kr.body AS body,
+                    NULL AS message_type
+                FROM knowledge_units AS k
+                JOIN entity_registry AS e
+                  ON e.entity_id = k.knowledge_id
+                JOIN entity_heads AS h
+                  ON h.entity_id = k.knowledge_id
+                JOIN knowledge_unit_revisions AS kr
+                  ON kr.revision_id = h.current_revision_id
+                WHERE k.knowledge_id = ?
+                  AND e.lifecycle_state = 'active'
+                  AND kr.protected_payload_id IS NULL
+                  AND kr.body IS NOT NULL
+                  AND length(trim(kr.body)) > 0
+
+                UNION ALL
+
+                SELECT
+                    'claim' AS entity_type,
+                    lower(hex(c.claim_id)) AS entity_id,
+                    lower(hex(h.current_revision_id)) AS revision_id,
+                    '' AS title,
+                    cr.statement AS body,
+                    NULL AS message_type
+                FROM claims AS c
+                JOIN entity_registry AS e
+                  ON e.entity_id = c.claim_id
+                JOIN entity_heads AS h
+                  ON h.entity_id = c.claim_id
+                JOIN claim_revisions AS cr
+                  ON cr.revision_id = h.current_revision_id
+                WHERE c.claim_id = ?
+                  AND e.lifecycle_state = 'active'
+                  AND cr.protected_payload_id IS NULL
+                  AND cr.statement IS NOT NULL
+                  AND length(trim(cr.statement)) > 0
+
+                UNION ALL
+
+                SELECT
+                    'chat_message' AS entity_type,
+                    lower(hex(m.message_id)) AS entity_id,
+                    lower(hex(h.current_revision_id)) AS revision_id,
+                    'Chat message ' || CAST(m.sequence_no AS TEXT) AS title,
+                    mr.content AS body,
+                    m.message_type AS message_type
+                FROM chat_messages AS m
+                JOIN chats AS ch
+                  ON ch.chat_id = m.chat_id
+                JOIN entity_registry AS e
+                  ON e.entity_id = m.message_id
+                JOIN entity_heads AS h
+                  ON h.entity_id = m.message_id
+                JOIN chat_message_revisions AS mr
+                  ON mr.revision_id = h.current_revision_id
+                WHERE m.message_id = ?
+                  AND e.lifecycle_state = 'active'
+                  AND ch.lifecycle_state = 'active'
+                  AND ch.archive_mode = 'standard'
+                  AND mr.protected_payload_id IS NULL
+                  AND mr.content IS NOT NULL
+                  AND length(trim(mr.content)) > 0
+                """,
+                (
+                    entity_blob,
+                    entity_blob,
+                    entity_blob,
+                ),
+            ).fetchone()
+
+            # Deleted or otherwise non-visible entities intentionally have no
+            # replacement FTS row.
+            if projection is None:
+                continue
+
+            entity_type = str(
+                projection["entity_type"]
+            )
+            body = str(
+                projection["body"]
+            )
+
+            if entity_type == "chat_message":
+                body = _searchable_chat_text(
+                    str(
+                        projection[
+                            "message_type"
+                        ]
+                    ),
+                    body,
+                )
+
+            connection.execute(
+                """
+                INSERT INTO search_fts (
+                    entity_id,
+                    revision_id,
+                    entity_type,
+                    title,
+                    body
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(
+                        projection[
+                            "entity_id"
+                        ]
+                    ),
+                    str(
+                        projection[
+                            "revision_id"
+                        ]
+                    ),
+                    entity_type,
+                    str(
+                        projection[
+                            "title"
+                        ]
+                    ),
+                    body,
+                ),
+            )
+
+        updated = connection.execute(
+            """
+            UPDATE search_index_state
+            SET indexed_commit_seq = ?,
+                rebuilt_at_us = ?
+            WHERE singleton_id = 1
+            """,
+            (
+                through_commit_seq,
+                utc_now_us(),
+            ),
+        )
+
+        if updated.rowcount != 1:
+            raise SearchError(
+                "Search index state is missing."
+            )
+
+        return len(changed_rows)
 
     def _rebuild_in_transaction(self, connection: sqlite3.Connection) -> int:
         connection.execute("DELETE FROM search_fts")
@@ -244,7 +493,11 @@ class LocalSearchService:
             ),
         )
 
-        indexed_commit_seq = self._current_commit_seq(connection)
+        indexed_commit_seq = (
+            current_search_projection_commit_seq(
+                connection
+            )
+        )
         connection.execute(
             """
             UPDATE search_index_state
@@ -259,15 +512,6 @@ class LocalSearchService:
         return int(row["n"])
 
     @staticmethod
-    def _current_commit_seq(connection: sqlite3.Connection) -> int:
-        row = connection.execute(
-            "SELECT COALESCE(MAX(commit_seq), 0) AS commit_seq FROM commit_records"
-        ).fetchone()
-        if row is None:
-            return 0
-        return int(row["commit_seq"])
-
-    @staticmethod
     def _row_to_result(row: sqlite3.Row) -> SearchResult:
         entity_type = SearchEntityType(str(row["entity_type"]))
         return SearchResult(
@@ -280,6 +524,48 @@ class LocalSearchService:
             score=float(row["score"]),
             contradiction_count=int(row["contradiction_count"]),
         )
+
+
+def current_search_projection_commit_seq(
+    connection: sqlite3.Connection,
+) -> int:
+    """Return the newest commit that can change the unprotected search corpus."""
+
+    row = connection.execute(
+        """
+        SELECT COALESCE(MAX(cc.commit_seq), 0) AS commit_seq
+        FROM commit_changes AS cc
+        WHERE cc.change_type IN (
+            'create',
+            'revise',
+            'deleted'
+        )
+          AND (
+                EXISTS (
+                    SELECT 1
+                    FROM knowledge_units AS k
+                    WHERE k.knowledge_id = cc.entity_id
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM claims AS c
+                    WHERE c.claim_id = cc.entity_id
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM chat_messages AS m
+                    WHERE m.message_id = cc.entity_id
+                )
+          )
+        """
+    ).fetchone()
+
+    if row is None:
+        return 0
+
+    return int(
+        row["commit_seq"]
+    )
 
 
 def _searchable_chat_text(

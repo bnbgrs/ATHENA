@@ -137,6 +137,7 @@ def _source_chat(
         lexical=app.archive_search,
         provider=embedding,  # type: ignore[arg-type]
     )
+    semantic.rebuild("fake-embed")
     archive = ArchiveHybridRetrievalService(app.archive_search, semantic)
     return SourceGroundedChatService(
         chat_generation=ChatGenerationService(app.chat, provider),  # type: ignore[arg-type]

@@ -32,6 +32,7 @@ from athena.retrieval.context_package import (
     ContextTokenEstimates,
     ExcludedCandidateSummary,
 )
+from athena.retrieval.search import current_search_projection_commit_seq
 from athena.retrieval.semantic import LocalSemanticSearchService, SemanticSearchError
 from athena.storage.database import SQLiteDatabase
 from athena.storage.schema import DatabaseCompatibilityError
@@ -670,7 +671,7 @@ def test_semantic_rebuild_retries_if_canonical_changes_before_snapshot_lock(
 
         assert ensure_calls >= 2
         assert status.current
-        assert status.indexed_commit_seq == semantic._current_commit_seq(
+        assert status.indexed_commit_seq == current_search_projection_commit_seq(
             app.database.connection
         )
         assert len(provider.inputs) == 1

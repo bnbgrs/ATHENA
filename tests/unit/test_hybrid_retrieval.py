@@ -34,6 +34,22 @@ class FakeEmbeddingProvider:
         return tuple(vectors)
 
 
+@dataclass
+class StableEmbeddingProvider:
+    """Return valid deterministic vectors for index setup only."""
+
+    calls: int = 0
+
+    def embed(self, *, model_id: str, texts):
+        del model_id
+        captured = tuple(texts)
+        self.calls += 1
+        return tuple(
+            (1.0, 0.0, 0.0)
+            for _ in captured
+        )
+
+
 def test_hybrid_retrieval_adds_semantic_only_candidate(tmp_path) -> None:
     database = SQLiteDatabase(tmp_path / "athena.db")
     database.start()
@@ -65,6 +81,7 @@ def test_hybrid_retrieval_adds_semantic_only_candidate(tmp_path) -> None:
 
         lexical = RetrievalRankingService(LocalSearchService(database))
         semantic = LocalSemanticSearchService(database, FakeEmbeddingProvider())
+        semantic.rebuild("fake-embed")
         hybrid = HybridRetrievalService(lexical, semantic)
 
         results = hybrid.search(
@@ -103,6 +120,7 @@ def test_hybrid_duplicate_count_does_not_double_count_same_entities(tmp_path) ->
 
         lexical = RetrievalRankingService(LocalSearchService(database))
         semantic = LocalSemanticSearchService(database, FakeEmbeddingProvider())
+        semantic.rebuild("fake-embed")
         hybrid = HybridRetrievalService(lexical, semantic)
 
         lexical_results = lexical.search("Berlin")
@@ -161,8 +179,14 @@ def test_hybrid_retrieval_exposes_safe_lexical_fallback_after_semantic_outage(
         )
         semantic = LocalSemanticSearchService(
             database,
-            FailingEmbeddingProvider(),
+            StableEmbeddingProvider(),
         )
+        semantic.rebuild("broken-embed")
+
+        # Keep this as a real query-time embedding outage rather than merely
+        # exercising the absent-index branch.
+        semantic.provider = FailingEmbeddingProvider()
+
         hybrid = HybridRetrievalService(
             lexical,
             semantic,
@@ -191,5 +215,86 @@ def test_hybrid_retrieval_exposes_safe_lexical_fallback_after_semantic_outage(
         )
         assert result.lexical_score > 0.0
         assert result.semantic_score == 0.0
+    finally:
+        database.stop()
+
+def test_hybrid_exposes_stale_semantic_state_and_lexical_fallback(
+    tmp_path,
+) -> None:
+    database = SQLiteDatabase(
+        tmp_path / "athena.db"
+    )
+    database.start()
+
+    try:
+        chat = ChatService(
+            ChatRepository(database)
+        )
+        knowledge = KnowledgeService(
+            KnowledgeRepository(database),
+            chat,
+        )
+
+        chat_id = chat.create_chat()
+
+        message = chat.add_user_message(
+            chat_id=chat_id,
+            content="Project Borealis has assigned code 4404.",
+        )
+
+        promoted = knowledge.promote_chat_message(
+            chat_id=chat_id,
+            sequence_no=message.sequence_no,
+            knowledge_kind=KnowledgeKind.FACT,
+        )
+
+        lexical = RetrievalRankingService(
+            LocalSearchService(database)
+        )
+
+        semantic = LocalSemanticSearchService(
+            database,
+            StableEmbeddingProvider(),
+        )
+
+        semantic.rebuild("fake-embed")
+
+        hybrid_service = HybridRetrievalService(
+            lexical,
+            semantic,
+        )
+
+        knowledge.revise(
+            knowledge_id=promoted.knowledge_id,
+            body="Project Borealis has assigned code 5505.",
+        )
+
+        with pytest.raises(
+            SemanticRetrievalUnavailableError,
+            match="knowledge_semantic_unavailable",
+        ):
+            hybrid_service.search(
+                "Borealis code",
+                model_id="fake-embed",
+                limit=10,
+            )
+
+        fallback = hybrid_service.search_lexical(
+            "Borealis code",
+            limit=10,
+        )
+
+        assert fallback
+
+        result = next(
+            item
+            for item in fallback
+            if item.entity_id == promoted.knowledge_id
+        )
+
+        assert result.lexical_score > 0.0
+        assert result.semantic_score == 0.0
+        assert "5505" in result.text
+
     finally:
         database.stop()
