@@ -485,3 +485,22 @@ def test_scheduler_child_exits_when_supervisor_pipe_closes(
         "1",
     )
     assert released.returncode == 0, released.stderr
+
+
+def test_scheduler_child_ready_wait_has_bounded_timeout(
+    tmp_path,
+) -> None:
+    process = _FakeSchedulerProcess(303)
+
+    with pytest.raises(
+        JobSchedulerError,
+        match="did not become ready within",
+    ):
+        athena_cli._wait_scheduler_child_ready(
+            SchedulerLane.CONTROL,
+            process,
+            tmp_path / "never-ready.flag",
+            timeout_seconds=0.01,
+        )
+
+    assert process.returncode is None

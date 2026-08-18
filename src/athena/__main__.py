@@ -3172,6 +3172,7 @@ _SCHEDULER_SUPERVISOR_LANES = (
     SchedulerLane.PROVIDER,
 )
 _SCHEDULER_PARENT_LOST_EXIT_CODE = 70
+_SCHEDULER_CHILD_READY_TIMEOUT_SECONDS = 10.0
 
 
 def _start_scheduler_supervisor_watchdog() -> None:
@@ -3294,7 +3295,16 @@ def _wait_scheduler_child_ready(
     lane: SchedulerLane,
     process: subprocess.Popen[bytes],
     ready_file: Path,
+    *,
+    timeout_seconds: float = _SCHEDULER_CHILD_READY_TIMEOUT_SECONDS,
 ) -> None:
+    if timeout_seconds <= 0:
+        raise ValueError(
+            "Scheduler child readiness timeout must be positive."
+        )
+
+    deadline = time.monotonic() + timeout_seconds
+
     while not ready_file.is_file():
         returncode = process.poll()
         if returncode is not None:
@@ -3302,7 +3312,17 @@ def _wait_scheduler_child_ready(
                 f"Scheduler {lane.value} lane exited with code "
                 f"{returncode} before becoming ready."
             )
-        time.sleep(0.05)
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise JobSchedulerError(
+                f"Scheduler {lane.value} lane did not become ready "
+                f"within {timeout_seconds:g} seconds."
+            )
+
+        time.sleep(
+            min(0.05, remaining)
+        )
 
 
 def _run_scheduler_supervisor(args: argparse.Namespace) -> int:
