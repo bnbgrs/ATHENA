@@ -5,9 +5,11 @@ import uuid
 import zipfile
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import athena.retrieval.protected_source as protected_source
 from athena.config.settings import AthenaSettings
 from athena.core.application import AthenaApplication
 from athena.retrieval.protected_source import (
@@ -1498,3 +1500,117 @@ def test_protected_pdf_input_limit_precedes_plaintext_read(
 
     finally:
         app.stop()
+
+
+def test_runtime_search_does_not_materialize_all_matching_results() -> None:
+    scope_id = uuid.uuid4()
+    source_id = uuid.uuid4()
+
+    source = SimpleNamespace(
+        source_id=source_id,
+        protection_scope_id=scope_id,
+        lifecycle_state=protected_source.SourceLifecycleState.READY,
+    )
+
+    class FakeProtectedContent:
+        context = SimpleNamespace(
+            unlocked_protection_scopes=frozenset({scope_id})
+        )
+
+        def is_unlocked(self, protection_scope_id: uuid.UUID) -> bool:
+            return protection_scope_id == scope_id
+
+    class FakeRepository:
+        def list_protected_in_scopes(self, protection_scope_ids, *, limit):
+            return ((source, None),)
+
+    service = protected_source.ProtectedRuntimeSourceSearchService(
+        protected_content=FakeProtectedContent(),
+        sources=object(),
+        repository=FakeRepository(),
+    )
+
+    document = protected_source._RuntimeDocument(
+        source_id=source_id,
+        protection_scope_id=scope_id,
+        source_name="synthetic.txt",
+        source_uri="synthetic://a08",
+        mime_type="text/plain",
+        text=("needle " * 100_000),
+        document_hash=b"\x01" * 32,
+    )
+
+    service.load_document = lambda source_id, expected_scope_id=None: document
+
+    original_result = protected_source.ProtectedRuntimeSearchResult
+    constructed = 0
+
+    def counted_result(**kwargs):
+        nonlocal constructed
+        constructed += 1
+        return original_result(**kwargs)
+
+    protected_source.ProtectedRuntimeSearchResult = counted_result
+
+    try:
+        results = service.search(
+            "needle",
+            protection_scope_ids=frozenset({scope_id}),
+            limit=8,
+        )
+    finally:
+        protected_source.ProtectedRuntimeSearchResult = original_result
+
+    assert len(results) == 8
+    assert constructed == 8
+
+
+def test_runtime_search_fails_closed_when_scan_capacity_is_exceeded() -> None:
+    scope_id = uuid.uuid4()
+    source_id = uuid.uuid4()
+
+    source = SimpleNamespace(
+        source_id=source_id,
+        protection_scope_id=scope_id,
+        lifecycle_state=protected_source.SourceLifecycleState.READY,
+    )
+
+    class FakeProtectedContent:
+        context = SimpleNamespace(
+            unlocked_protection_scopes=frozenset({scope_id})
+        )
+
+        def is_unlocked(self, protection_scope_id: uuid.UUID) -> bool:
+            return protection_scope_id == scope_id
+
+    class FakeRepository:
+        def list_protected_in_scopes(self, protection_scope_ids, *, limit):
+            return ((source, None),)
+
+    service = protected_source.ProtectedRuntimeSourceSearchService(
+        protected_content=FakeProtectedContent(),
+        sources=object(),
+        repository=FakeRepository(),
+        max_scanned_chars=100,
+    )
+
+    document = protected_source._RuntimeDocument(
+        source_id=source_id,
+        protection_scope_id=scope_id,
+        source_name="oversized.txt",
+        source_uri="synthetic://capacity",
+        mime_type="text/plain",
+        text="needle " * 100,
+        document_hash=b"\x01" * 32,
+    )
+
+    service.load_document = lambda source_id, expected_scope_id=None: document
+
+    with pytest.raises(
+        protected_source.ProtectedRuntimeSearchCapacityError
+    ):
+        service.search(
+            "needle",
+            protection_scope_ids=frozenset({scope_id}),
+            limit=8,
+        )

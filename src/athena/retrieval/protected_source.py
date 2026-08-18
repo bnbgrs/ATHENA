@@ -7,11 +7,13 @@ this module are deliberately ephemeral. Nothing here is canonical or persisted.
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import math
 import re
 import uuid
 from collections import Counter
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
@@ -234,6 +236,7 @@ class ProtectedRuntimeSourceSearchService:
         max_sources: int = 5000,
         chunk_chars: int = 2400,
         overlap_chars: int = 240,
+        max_scanned_chars: int = 64 * 1024 * 1024,
     ) -> None:
         if not 1 <= max_sources <= 10000:
             raise ValueError(
@@ -242,6 +245,10 @@ class ProtectedRuntimeSourceSearchService:
         if chunk_chars < 256:
             raise ValueError(
                 "Protected runtime chunk_chars must be at least 256."
+            )
+        if max_scanned_chars <= 0:
+            raise ValueError(
+                "Protected runtime max_scanned_chars must be positive."
             )
         if overlap_chars < 0 or overlap_chars >= chunk_chars:
             raise ValueError(
@@ -255,6 +262,7 @@ class ProtectedRuntimeSourceSearchService:
         self.max_sources = max_sources
         self.chunk_chars = chunk_chars
         self.overlap_chars = overlap_chars
+        self.max_scanned_chars = max_scanned_chars
 
     def search(
         self,
@@ -287,7 +295,16 @@ class ProtectedRuntimeSourceSearchService:
                 "refusing to claim a complete result."
             )
 
-        results: list[ProtectedRuntimeSearchResult] = []
+        scanned_chars = 0
+
+        ranked: list[
+            tuple[
+                tuple[float, int, int, int],
+                int,
+                ProtectedRuntimeSearchResult,
+            ]
+        ] = []
+        insertion_order = 0
 
         for source, _blob in records:
             scope_id = source.protection_scope_id
@@ -310,6 +327,14 @@ class ProtectedRuntimeSourceSearchService:
                 expected_scope_id=scope_id,
             )
 
+            scanned_chars += len(document.text)
+
+            if scanned_chars > self.max_scanned_chars:
+                raise ProtectedRuntimeSearchCapacityError(
+                    "Protected runtime search character scan limit was exceeded; "
+                    "refusing to claim a complete result."
+                )
+
             for chunk in _runtime_chunks(
                 document.text,
                 target_chars=self.chunk_chars,
@@ -323,30 +348,64 @@ class ProtectedRuntimeSourceSearchService:
                 if score <= 0.0:
                     continue
 
+                ranking_key = (
+                    score,
+                    -document.source_id.int,
+                    -chunk.start_offset,
+                    -chunk.end_offset,
+                )
+
+                if (
+                    len(ranked) >= limit
+                    and ranking_key <= ranked[0][0]
+                ):
+                    continue
+
                 quoted_hash = hashlib.sha256(
                     chunk.text.encode("utf-8")
                 ).digest()
 
-                results.append(
-                    ProtectedRuntimeSearchResult(
-                        source_id=document.source_id,
-                        protection_scope_id=document.protection_scope_id,
-                        source_name=document.source_name,
-                        source_uri=document.source_uri,
-                        mime_type=document.mime_type,
-                        document_hash=document.document_hash,
-                        start_offset=chunk.start_offset,
-                        end_offset=chunk.end_offset,
-                        quoted_hash=quoted_hash,
-                        text=chunk.text,
-                        score=score,
-                        matched_terms=matched_terms,
-                    )
+                result = ProtectedRuntimeSearchResult(
+                    source_id=document.source_id,
+                    protection_scope_id=document.protection_scope_id,
+                    source_name=document.source_name,
+                    source_uri=document.source_uri,
+                    mime_type=document.mime_type,
+                    document_hash=document.document_hash,
+                    start_offset=chunk.start_offset,
+                    end_offset=chunk.end_offset,
+                    quoted_hash=quoted_hash,
+                    text=chunk.text,
+                    score=score,
+                    matched_terms=matched_terms,
                 )
+
+                entry = (
+                    ranking_key,
+                    insertion_order,
+                    result,
+                )
+                insertion_order += 1
+
+                if len(ranked) < limit:
+                    heapq.heappush(
+                        ranked,
+                        entry,
+                    )
+                else:
+                    heapq.heapreplace(
+                        ranked,
+                        entry,
+                    )
 
         self._require_scopes_unlocked(
             scopes
         )
+
+        results = [
+            entry[2]
+            for entry in ranked
+        ]
 
         results.sort(
             key=lambda item: (
@@ -358,7 +417,7 @@ class ProtectedRuntimeSourceSearchService:
         )
 
         return tuple(
-            results[:limit]
+            results
         )
 
     def load_document(
@@ -974,11 +1033,10 @@ def _runtime_chunks(
     *,
     target_chars: int,
     overlap_chars: int,
-) -> tuple[_RuntimeChunk, ...]:
+) -> Iterator[_RuntimeChunk]:
     if not text:
-        return ()
+        return
 
-    chunks: list[_RuntimeChunk] = []
     start = 0
     text_length = len(
         text
@@ -1048,14 +1106,12 @@ def _runtime_chunks(
         )
 
         if actual_end > actual_start:
-            chunks.append(
-                _RuntimeChunk(
-                    start_offset=actual_start,
-                    end_offset=actual_end,
-                    text=text[
-                        actual_start:actual_end
-                    ],
-                )
+            yield _RuntimeChunk(
+                start_offset=actual_start,
+                end_offset=actual_end,
+                text=text[
+                    actual_start:actual_end
+                ],
             )
 
         if end >= text_length:
@@ -1072,11 +1128,6 @@ def _runtime_chunks(
             )
 
         start = next_start
-
-    return tuple(
-        chunks
-    )
-
 
 def _is_pdf_metadata(
     metadata: ProtectedSourceMetadata,
