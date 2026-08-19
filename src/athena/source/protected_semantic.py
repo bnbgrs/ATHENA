@@ -59,6 +59,21 @@ _NEUTRAL_EXTRACTION_EVIDENCE_HASH_DOMAIN = (
     b"EXTRACTION_EVIDENCE_V1:"
 )
 
+ANALYSIS_SEMANTIC_KIND = "source_analysis"
+ANALYSIS_PAYLOAD_VERSION = 1
+ANALYSIS_ARTIFACT_SEMANTIC_KIND = "source_analysis_artifact"
+ANALYSIS_ARTIFACT_PAYLOAD_VERSION = 1
+ANALYSIS_NEUTRAL_ARTIFACT_CONTENT_JSON = "{}"
+
+_NEUTRAL_ANALYSIS_QUESTION_DOMAIN = (
+    b"ATHENA_PROTECTED_SOURCE_"
+    b"ANALYSIS_QUESTION_V1:"
+)
+_NEUTRAL_ANALYSIS_ARTIFACT_HASH_DOMAIN = (
+    b"ATHENA_PROTECTED_SOURCE_"
+    b"ANALYSIS_ARTIFACT_V1:"
+)
+
 class SourceProtectedSemanticError(
     RuntimeError
 ):
@@ -583,6 +598,208 @@ def decode_source_extraction_evidence_semantics(
         evidence=tuple(evidence),
     )
 
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectedSourceAnalysisSemantics:
+    analysis_id: uuid.UUID
+    question: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectedSourceAnalysisArtifactSemantics:
+    artifact_id: uuid.UUID
+    analysis_id: uuid.UUID
+    content_json: str
+    content_hash: bytes
+
+
+def analysis_neutral_question(analysis_id: uuid.UUID) -> str:
+    """Return a deterministic non-content SourceAnalysis question placeholder."""
+    digest = hashlib.sha256(
+        _NEUTRAL_ANALYSIS_QUESTION_DOMAIN + analysis_id.bytes
+    ).hexdigest()
+    return f"protected-source-analysis:{digest}"
+
+
+def analysis_artifact_neutral_content_hash(
+    artifact_id: uuid.UUID,
+) -> bytes:
+    """Return a deterministic non-content SourceAnalysis artifact hash."""
+    return hashlib.sha256(
+        _NEUTRAL_ANALYSIS_ARTIFACT_HASH_DOMAIN + artifact_id.bytes
+    ).digest()
+
+
+def decode_source_analysis_semantics(
+    plaintext: bytes,
+) -> ProtectedSourceAnalysisSemantics:
+    """Validate and decode one protected SourceAnalysis question payload."""
+    try:
+        payload = json.loads(plaintext.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceAnalysis payload is not valid canonical JSON."
+        ) from exc
+
+    if (
+        not isinstance(payload, dict)
+        or set(payload)
+        != {
+            "entity_id",
+            "fields",
+            "payload_version",
+            "semantic_kind",
+        }
+    ):
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceAnalysis payload has an invalid envelope."
+        )
+
+    if (
+        payload["semantic_kind"] != ANALYSIS_SEMANTIC_KIND
+        or payload["payload_version"] != ANALYSIS_PAYLOAD_VERSION
+    ):
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceAnalysis payload version is unsupported."
+        )
+
+    try:
+        analysis_id = uuid.UUID(str(payload["entity_id"]))
+    except ValueError as exc:
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceAnalysis payload has an invalid entity ID."
+        ) from exc
+
+    fields = payload["fields"]
+
+    if not isinstance(fields, dict) or set(fields) != {"question"}:
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceAnalysis payload fields are invalid."
+        )
+
+    question = fields["question"]
+
+    if not isinstance(question, str) or not question.strip():
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceAnalysis question is invalid."
+        )
+
+    return ProtectedSourceAnalysisSemantics(
+        analysis_id=analysis_id,
+        question=question,
+    )
+
+
+def decode_source_analysis_artifact_semantics(
+    plaintext: bytes,
+) -> ProtectedSourceAnalysisArtifactSemantics:
+    """Validate and decode one protected SourceAnalysis artifact payload."""
+    try:
+        payload = json.loads(plaintext.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceAnalysis artifact payload is not valid canonical JSON."
+        ) from exc
+
+    if (
+        not isinstance(payload, dict)
+        or set(payload)
+        != {
+            "entity_id",
+            "fields",
+            "payload_version",
+            "semantic_kind",
+        }
+    ):
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceAnalysis artifact payload has an invalid envelope."
+        )
+
+    if (
+        payload["semantic_kind"] != ANALYSIS_ARTIFACT_SEMANTIC_KIND
+        or payload["payload_version"] != ANALYSIS_ARTIFACT_PAYLOAD_VERSION
+    ):
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceAnalysis artifact payload version is unsupported."
+        )
+
+    try:
+        artifact_id = uuid.UUID(str(payload["entity_id"]))
+    except ValueError as exc:
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceAnalysis artifact payload has an invalid entity ID."
+        ) from exc
+
+    fields = payload["fields"]
+
+    if (
+        not isinstance(fields, dict)
+        or set(fields)
+        != {
+            "analysis_id",
+            "content_hash_hex",
+            "content_json",
+        }
+    ):
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceAnalysis artifact payload fields are invalid."
+        )
+
+    try:
+        analysis_id = uuid.UUID(str(fields["analysis_id"]))
+    except ValueError as exc:
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceAnalysis artifact has an invalid Analysis ID."
+        ) from exc
+
+    content_json = fields["content_json"]
+    content_hash_hex = fields["content_hash_hex"]
+
+    if not isinstance(content_json, str):
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceAnalysis artifact content is invalid."
+        )
+
+    try:
+        json.loads(content_json)
+    except json.JSONDecodeError as exc:
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceAnalysis artifact content is not valid JSON."
+        ) from exc
+
+    if not isinstance(content_hash_hex, str):
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceAnalysis artifact hash is invalid."
+        )
+
+    try:
+        content_hash = bytes.fromhex(content_hash_hex)
+    except ValueError as exc:
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceAnalysis artifact hash is invalid."
+        ) from exc
+
+    if len(content_hash) != 32:
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceAnalysis artifact hash is not SHA-256."
+        )
+
+    expected_hash = hashlib.sha256(
+        content_json.encode("utf-8")
+    ).digest()
+
+    if content_hash != expected_hash:
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceAnalysis artifact hash disagrees with content."
+        )
+
+    return ProtectedSourceAnalysisArtifactSemantics(
+        artifact_id=artifact_id,
+        analysis_id=analysis_id,
+        content_json=content_json,
+        content_hash=content_hash,
+    )
 
 def page_neutral_content_hash(
     representation_id: uuid.UUID,
@@ -1874,6 +2091,393 @@ class SourceProtectedSemanticRepository:
 
         return mapping
 
+    def protect_analysis_semantics(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        source_id: uuid.UUID,
+        analysis_id: uuid.UUID,
+        protection_scope_id: uuid.UUID,
+        payload_writer: ProtectedSemanticPayloadWriter,
+        now_us: int | None = None,
+    ) -> tuple[SourceProtectedSemanticMapping, ...]:
+        """Protect one SourceAnalysis question and all persisted artifacts."""
+        if not connection.in_transaction:
+            raise RuntimeError(
+                "Protected Source semantic cutover requires an active transaction."
+            )
+
+        row = connection.execute(
+            """
+            SELECT analysis_id, source_id, question
+            FROM source_analyses
+            WHERE analysis_id = ?
+            """,
+            (uuid_to_blob(analysis_id),),
+        ).fetchone()
+
+        if row is None:
+            raise SourceProtectedSemanticNotFoundError(str(analysis_id))
+
+        actual_source_id = uuid_from_blob(bytes(row["source_id"]))
+
+        if actual_source_id != source_id:
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceAnalysis does not belong to the requested Source."
+            )
+
+        self._require_active_scope(
+            connection,
+            protection_scope_id,
+        )
+
+        created_at_us = utc_now_us() if now_us is None else now_us
+
+        question_mapping = self._protect_analysis_question_row(
+            connection,
+            row=row,
+            source_id=source_id,
+            analysis_id=analysis_id,
+            protection_scope_id=protection_scope_id,
+            payload_writer=payload_writer,
+            created_at_us=created_at_us,
+        )
+
+        artifact_rows = self._analysis_artifact_rows(
+            connection,
+            analysis_id,
+        )
+
+        artifact_mappings = tuple(
+            self._protect_analysis_artifact_row(
+                connection,
+                row=artifact_row,
+                source_id=source_id,
+                analysis_id=analysis_id,
+                protection_scope_id=protection_scope_id,
+                payload_writer=payload_writer,
+                created_at_us=created_at_us,
+            )
+            for artifact_row in artifact_rows
+        )
+
+        return (
+            question_mapping,
+            *artifact_mappings,
+        )
+
+    def protect_source_analysis_semantics(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        source_id: uuid.UUID,
+        protection_scope_id: uuid.UUID,
+        payload_writer: ProtectedSemanticPayloadWriter,
+        now_us: int | None = None,
+    ) -> tuple[SourceProtectedSemanticMapping, ...]:
+        """Protect every persisted SourceAnalysis semantic row for one Source."""
+        if not connection.in_transaction:
+            raise RuntimeError(
+                "Protected Source semantic cutover requires an active transaction."
+            )
+
+        self._require_source(
+            connection,
+            source_id,
+        )
+        self._require_active_scope(
+            connection,
+            protection_scope_id,
+        )
+
+        rows = connection.execute(
+            """
+            SELECT analysis_id
+            FROM source_analyses
+            WHERE source_id = ?
+            ORDER BY analysis_id
+            """,
+            (uuid_to_blob(source_id),),
+        ).fetchall()
+
+        if not rows:
+            return ()
+
+        created_at_us = utc_now_us() if now_us is None else now_us
+        mappings: list[SourceProtectedSemanticMapping] = []
+
+        for row in rows:
+            analysis_id = uuid_from_blob(bytes(row["analysis_id"]))
+            mappings.extend(
+                self.protect_analysis_semantics(
+                    connection,
+                    source_id=source_id,
+                    analysis_id=analysis_id,
+                    protection_scope_id=protection_scope_id,
+                    payload_writer=payload_writer,
+                    now_us=created_at_us,
+                )
+            )
+
+        return tuple(mappings)
+
+    @staticmethod
+    def _analysis_artifact_rows(
+        connection: sqlite3.Connection,
+        analysis_id: uuid.UUID,
+    ) -> list[sqlite3.Row]:
+        return connection.execute(
+            """
+            SELECT
+                a.artifact_id,
+                a.analysis_id,
+                a.content_json,
+                a.content_hash,
+                s.source_id
+            FROM source_analysis_artifacts AS a
+            JOIN source_analyses AS s
+              ON s.analysis_id = a.analysis_id
+            WHERE a.analysis_id = ?
+            ORDER BY a.artifact_id
+            """,
+            (uuid_to_blob(analysis_id),),
+        ).fetchall()
+
+    def _protect_analysis_question_row(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        row: sqlite3.Row,
+        source_id: uuid.UUID,
+        analysis_id: uuid.UUID,
+        protection_scope_id: uuid.UUID,
+        payload_writer: ProtectedSemanticPayloadWriter,
+        created_at_us: int,
+    ) -> SourceProtectedSemanticMapping:
+        actual_analysis_id = uuid_from_blob(bytes(row["analysis_id"]))
+        actual_source_id = uuid_from_blob(bytes(row["source_id"]))
+
+        if actual_analysis_id != analysis_id or actual_source_id != source_id:
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceAnalysis identity changed during semantic cutover."
+            )
+
+        question = str(row["question"])
+        neutral_question = analysis_neutral_question(analysis_id)
+
+        existing = self._mapping_for(
+            connection,
+            source_id=source_id,
+            semantic_kind=ANALYSIS_SEMANTIC_KIND,
+            entity_id=analysis_id,
+        )
+
+        if existing is not None:
+            self._require_existing_mapping(
+                connection,
+                existing,
+                semantic_kind=ANALYSIS_SEMANTIC_KIND,
+                payload_version=ANALYSIS_PAYLOAD_VERSION,
+                protection_scope_id=protection_scope_id,
+            )
+
+            if question != neutral_question:
+                raise SourceProtectedSemanticIntegrityError(
+                    "Protected SourceAnalysis is not fully neutralized."
+                )
+
+            return existing
+
+        if not question.strip():
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceAnalysis question is empty."
+            )
+
+        if question == neutral_question:
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceAnalysis appears neutralized without a protected mapping."
+            )
+
+        plaintext = self._encode_analysis_semantics(
+            analysis_id=analysis_id,
+            question=question,
+        )
+        protected_payload_id = payload_writer(
+            connection,
+            plaintext,
+        )
+        self._require_payload_scope(
+            connection,
+            protected_payload_id=protected_payload_id,
+            protection_scope_id=protection_scope_id,
+        )
+        mapping = self._insert_semantic_mapping(
+            connection,
+            source_id=source_id,
+            semantic_kind=ANALYSIS_SEMANTIC_KIND,
+            entity_id=analysis_id,
+            protection_scope_id=protection_scope_id,
+            protected_payload_id=protected_payload_id,
+            payload_version=ANALYSIS_PAYLOAD_VERSION,
+            created_at_us=created_at_us,
+        )
+
+        updated = connection.execute(
+            """
+            UPDATE source_analyses
+            SET question = ?
+            WHERE analysis_id = ?
+              AND source_id = ?
+              AND question = ?
+            """,
+            (
+                neutral_question,
+                uuid_to_blob(analysis_id),
+                uuid_to_blob(source_id),
+                question,
+            ),
+        )
+
+        if updated.rowcount != 1:
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceAnalysis changed during semantic cutover."
+            )
+
+        return mapping
+
+    def _protect_analysis_artifact_row(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        row: sqlite3.Row,
+        source_id: uuid.UUID,
+        analysis_id: uuid.UUID,
+        protection_scope_id: uuid.UUID,
+        payload_writer: ProtectedSemanticPayloadWriter,
+        created_at_us: int,
+    ) -> SourceProtectedSemanticMapping:
+        artifact_id = uuid_from_blob(bytes(row["artifact_id"]))
+        actual_analysis_id = uuid_from_blob(bytes(row["analysis_id"]))
+        actual_source_id = uuid_from_blob(bytes(row["source_id"]))
+
+        if actual_analysis_id != analysis_id or actual_source_id != source_id:
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceAnalysis artifact crossed the requested Source."
+            )
+
+        content_json = str(row["content_json"])
+        content_hash = bytes(row["content_hash"])
+        neutral_hash = analysis_artifact_neutral_content_hash(artifact_id)
+
+        existing = self._mapping_for(
+            connection,
+            source_id=source_id,
+            semantic_kind=ANALYSIS_ARTIFACT_SEMANTIC_KIND,
+            entity_id=artifact_id,
+        )
+
+        if existing is not None:
+            self._require_existing_mapping(
+                connection,
+                existing,
+                semantic_kind=ANALYSIS_ARTIFACT_SEMANTIC_KIND,
+                payload_version=ANALYSIS_ARTIFACT_PAYLOAD_VERSION,
+                protection_scope_id=protection_scope_id,
+            )
+
+            if (
+                content_json != ANALYSIS_NEUTRAL_ARTIFACT_CONTENT_JSON
+                or content_hash != neutral_hash
+            ):
+                raise SourceProtectedSemanticIntegrityError(
+                    "Protected SourceAnalysis artifact is not fully neutralized."
+                )
+
+            return existing
+
+        if len(content_hash) != 32:
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceAnalysis artifact hash is invalid."
+            )
+
+        try:
+            json.loads(content_json)
+        except json.JSONDecodeError as exc:
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceAnalysis artifact content is not valid JSON."
+            ) from exc
+
+        expected_hash = hashlib.sha256(
+            content_json.encode("utf-8")
+        ).digest()
+
+        if content_hash != expected_hash:
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceAnalysis artifact hash disagrees with content."
+            )
+
+        if (
+            content_json == ANALYSIS_NEUTRAL_ARTIFACT_CONTENT_JSON
+            and content_hash == neutral_hash
+        ):
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceAnalysis artifact appears neutralized "
+                "without a protected mapping."
+            )
+
+        plaintext = self._encode_analysis_artifact_semantics(
+            artifact_id=artifact_id,
+            analysis_id=analysis_id,
+            content_json=content_json,
+            content_hash=content_hash,
+        )
+        protected_payload_id = payload_writer(
+            connection,
+            plaintext,
+        )
+        self._require_payload_scope(
+            connection,
+            protected_payload_id=protected_payload_id,
+            protection_scope_id=protection_scope_id,
+        )
+        mapping = self._insert_semantic_mapping(
+            connection,
+            source_id=source_id,
+            semantic_kind=ANALYSIS_ARTIFACT_SEMANTIC_KIND,
+            entity_id=artifact_id,
+            protection_scope_id=protection_scope_id,
+            protected_payload_id=protected_payload_id,
+            payload_version=ANALYSIS_ARTIFACT_PAYLOAD_VERSION,
+            created_at_us=created_at_us,
+        )
+
+        updated = connection.execute(
+            """
+            UPDATE source_analysis_artifacts
+            SET content_json = ?,
+                content_hash = ?
+            WHERE artifact_id = ?
+              AND analysis_id = ?
+              AND content_json = ?
+              AND content_hash = ?
+            """,
+            (
+                ANALYSIS_NEUTRAL_ARTIFACT_CONTENT_JSON,
+                neutral_hash,
+                uuid_to_blob(artifact_id),
+                uuid_to_blob(analysis_id),
+                content_json,
+                content_hash,
+            ),
+        )
+
+        if updated.rowcount != 1:
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceAnalysis artifact changed during semantic cutover."
+            )
+
+        return mapping
+
     def _protect_page_map_semantics(
         self,
         connection: sqlite3.Connection,
@@ -2302,6 +2906,78 @@ class SourceProtectedSemanticRepository:
             separators=(",", ":"),
             allow_nan=False,
         ).encode("utf-8")
+    @staticmethod
+    def _encode_analysis_semantics(
+        *,
+        analysis_id: uuid.UUID,
+        question: str,
+    ) -> bytes:
+        if not question.strip():
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceAnalysis question is empty."
+            )
+
+        payload = {
+            "entity_id": str(analysis_id),
+            "fields": {
+                "question": question,
+            },
+            "payload_version": ANALYSIS_PAYLOAD_VERSION,
+            "semantic_kind": ANALYSIS_SEMANTIC_KIND,
+        }
+
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+
+    @staticmethod
+    def _encode_analysis_artifact_semantics(
+        *,
+        artifact_id: uuid.UUID,
+        analysis_id: uuid.UUID,
+        content_json: str,
+        content_hash: bytes,
+    ) -> bytes:
+        if len(content_hash) != 32:
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceAnalysis artifact hash is invalid."
+            )
+
+        try:
+            json.loads(content_json)
+        except json.JSONDecodeError as exc:
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceAnalysis artifact content is not valid JSON."
+            ) from exc
+
+        if hashlib.sha256(content_json.encode("utf-8")).digest() != content_hash:
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceAnalysis artifact hash disagrees with content."
+            )
+
+        payload = {
+            "entity_id": str(artifact_id),
+            "fields": {
+                "analysis_id": str(analysis_id),
+                "content_hash_hex": content_hash.hex(),
+                "content_json": content_json,
+            },
+            "payload_version": ANALYSIS_ARTIFACT_PAYLOAD_VERSION,
+            "semantic_kind": ANALYSIS_ARTIFACT_SEMANTIC_KIND,
+        }
+
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+
     @staticmethod
     def _encode_anchor_semantics(
         *,

@@ -22,6 +22,12 @@ from athena.source.analysis_models import (
     SourceAnalysisWorkInput,
     SourceAnalysisWorkItem,
 )
+from athena.source.protected_semantic import (
+    ANALYSIS_NEUTRAL_ARTIFACT_CONTENT_JSON,
+    ANALYSIS_SEMANTIC_KIND,
+    analysis_artifact_neutral_content_hash,
+    analysis_neutral_question,
+)
 from athena.storage.database import SQLiteDatabase
 
 
@@ -459,6 +465,26 @@ class SourceAnalysisRepository:
             if row is None:
                 raise SourceAnalysisNotFoundError(f"Analysis work item {work_item_id} not found.")
             item = _work_item_from_row(row)
+
+            protected = connection.execute(
+                """
+                SELECT 1
+                FROM source_protected_semantic_payloads
+                WHERE semantic_kind = ?
+                  AND entity_id = ?
+                LIMIT 1
+                """,
+                (
+                    ANALYSIS_SEMANTIC_KIND,
+                    uuid_to_blob(item.analysis_id),
+                ),
+            ).fetchone()
+
+            if protected is not None:
+                raise SourceAnalysisInvariantError(
+                    "Protected SourceAnalysis cannot accept new semantic artifacts."
+                )
+
             existing = connection.execute(
                 "SELECT * FROM source_analysis_artifacts WHERE work_item_id = ?",
                 (uuid_to_blob(work_item_id),),
@@ -821,12 +847,20 @@ def _canonical_json(value: Mapping[str, Any]) -> str:
 
 
 def _analysis_from_row(row: sqlite3.Row) -> SourceAnalysisRecord:
+    analysis_id = uuid_from_blob(bytes(row["analysis_id"]))
+    question = str(row["question"])
+
+    if question == analysis_neutral_question(analysis_id):
+        raise SourceAnalysisInvariantError(
+            "Protected SourceAnalysis semantics are unavailable through the public reader."
+        )
+
     return SourceAnalysisRecord(
-        analysis_id=uuid_from_blob(bytes(row["analysis_id"])),
+        analysis_id=analysis_id,
         job_id=uuid_from_blob(bytes(row["job_id"])),
         source_id=uuid_from_blob(bytes(row["source_id"])),
         representation_id=uuid_from_blob(bytes(row["representation_id"])),
-        question=str(row["question"]),
+        question=question,
         state=SourceAnalysisState(str(row["state"])),
         model_signature_id=uuid_from_blob(bytes(row["model_signature_id"])),
         pipeline_version=str(row["pipeline_version"]),
@@ -865,15 +899,28 @@ def _work_item_from_row(row: sqlite3.Row) -> SourceAnalysisWorkItem:
 
 
 def _artifact_from_row(row: sqlite3.Row) -> SourceAnalysisArtifact:
+    artifact_id = uuid_from_blob(bytes(row["artifact_id"]))
+    content_json = str(row["content_json"])
+    content_hash = bytes(row["content_hash"])
+
+    if (
+        content_json == ANALYSIS_NEUTRAL_ARTIFACT_CONTENT_JSON
+        and content_hash == analysis_artifact_neutral_content_hash(artifact_id)
+    ):
+        raise SourceAnalysisInvariantError(
+            "Protected SourceAnalysis artifact semantics are unavailable "
+            "through the public reader."
+        )
+
     return SourceAnalysisArtifact(
-        artifact_id=uuid_from_blob(bytes(row["artifact_id"])),
+        artifact_id=artifact_id,
         analysis_id=uuid_from_blob(bytes(row["analysis_id"])),
         work_item_id=uuid_from_blob(bytes(row["work_item_id"])),
         artifact_kind=AnalysisStage(str(row["artifact_kind"])),
         level=int(row["level"]),
         ordinal=int(row["ordinal"]),
-        content_json=str(row["content_json"]),
-        content_hash=bytes(row["content_hash"]),
+        content_json=content_json,
+        content_hash=content_hash,
         processing_run_id=uuid_from_blob(bytes(row["processing_run_id"])),
         created_at_us=int(row["created_at_us"]),
     )
