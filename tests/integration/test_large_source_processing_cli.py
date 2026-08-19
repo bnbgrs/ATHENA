@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from athena.jobs.models import JobPriority
+
 _UUID_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 )
@@ -25,10 +27,10 @@ def _run_cli(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _neutralize_environmental_resource_headroom(
+def _neutralize_environmental_resource_admission(
     root: Path,
 ) -> None:
-    """Keep pipeline integration tests independent of host RAM/disk fluctuations."""
+    """Keep checkpoint integration independent of host resource telemetry."""
     database = (
         root
         / "state"
@@ -38,7 +40,7 @@ def _neutralize_environmental_resource_headroom(
     with sqlite3.connect(
         database
     ) as connection:
-        cursor = connection.execute(
+        policy_cursor = connection.execute(
             """
             UPDATE resource_policy
             SET ram_headroom_bytes = 0,
@@ -47,10 +49,31 @@ def _neutralize_environmental_resource_headroom(
             """
         )
 
-        if cursor.rowcount != 1:
+        if policy_cursor.rowcount != 1:
             raise RuntimeError(
                 "ATHENA resource_policy row "
                 "is missing from test runtime."
+            )
+
+        # This test validates source-processing checkpoint boundaries and
+        # atomic publication, not host resource admission. DATA_SAFETY is
+        # deliberately exempt from ResourceManager admission checks, so the
+        # isolated fixture remains deterministic even when the developer
+        # machine is under genuine RAM/disk pressure.
+        job_cursor = connection.execute(
+            """
+            UPDATE jobs
+            SET priority = ?
+            WHERE job_type = 'source.process'
+              AND state = 'queued'
+            """,
+            (int(JobPriority.DATA_SAFETY),),
+        )
+
+        if job_cursor.rowcount != 1:
+            raise RuntimeError(
+                "Expected exactly one queued source.process "
+                "job in the isolated test runtime."
             )
 
         connection.commit()
@@ -104,7 +127,7 @@ def test_large_source_scheduler_checkpoints_batches_and_publishes_atomically(
 
     # This test validates source-processing/checkpoint semantics,
     # not the machine's instantaneous free RAM/disk state.
-    _neutralize_environmental_resource_headroom(
+    _neutralize_environmental_resource_admission(
         local_root
     )
 

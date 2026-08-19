@@ -49,6 +49,11 @@ from athena.source.analysis_models import (
 from athena.source.analysis_repository import SourceAnalysisRepository
 from athena.source.anchor_service import SourceAnchorService
 from athena.source.models import SourceAnchorRecord
+from athena.source.protected_semantic import (
+    EXTRACTION_SNAPSHOT_NEUTRAL_EVIDENCE_JSON,
+    EXTRACTION_SNAPSHOT_NEUTRAL_PROPOSALS_JSON,
+    EXTRACTION_SNAPSHOT_SEMANTIC_KIND,
+)
 from athena.storage.database import SQLiteDatabase
 
 SOURCE_EXTRACTION_SCHEMA_ID = "athena_source_analysis_knowledge_extraction_v1"
@@ -694,6 +699,27 @@ class SourceExtractionSnapshotRepository:
         )
         proposals_json = _canonical_json(_proposal_payload(result.proposals))
         with self.database.write_transaction() as connection:
+            protected = connection.execute(
+                """
+                SELECT 1
+                FROM source_protected_semantic_payloads
+                WHERE source_id = ?
+                  AND semantic_kind = ?
+                  AND entity_id = ?
+                LIMIT 1
+                """,
+                (
+                    uuid_to_blob(result.source_id),
+                    EXTRACTION_SNAPSHOT_SEMANTIC_KIND,
+                    uuid_to_blob(result.analysis_id),
+                ),
+            ).fetchone()
+
+            if protected is not None:
+                raise SourceExtractionError(
+                    "Protected SourceAnalysis cannot accept new extraction snapshots."
+                )
+
             existing = connection.execute(
                 """
                 SELECT analysis_id, final_artifact_id, model_json, evidence_json, proposals_json
@@ -754,6 +780,33 @@ class SourceExtractionSnapshotRepository:
             raise SourceExtractionSnapshotNotFoundError(
                 f"No frozen source extraction snapshot for ProcessingRun {processing_run_id}."
             )
+
+        protected = self.database.connection.execute(
+            """
+            SELECT 1
+            FROM source_protected_semantic_payloads
+            WHERE source_id = ?
+              AND semantic_kind = ?
+              AND entity_id = ?
+            LIMIT 1
+            """,
+            (
+                bytes(row["source_id"]),
+                EXTRACTION_SNAPSHOT_SEMANTIC_KIND,
+                bytes(row["analysis_id"]),
+            ),
+        ).fetchone()
+
+        if (
+            protected is not None
+            or str(row["evidence_json"]) == EXTRACTION_SNAPSHOT_NEUTRAL_EVIDENCE_JSON
+            or str(row["proposals_json"]) == EXTRACTION_SNAPSHOT_NEUTRAL_PROPOSALS_JSON
+        ):
+            raise SourceExtractionSnapshotNotFoundError(
+                "Protected source extraction snapshot semantics are unavailable "
+                "through the public reader."
+            )
+
         run = self.runs.load_run(processing_run_id)
         if run.status != "succeeded" or run.model_signature_id is None:
             raise SourceExtractionSnapshotNotFoundError(

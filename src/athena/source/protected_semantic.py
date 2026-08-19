@@ -82,6 +82,11 @@ _NEUTRAL_EXTRACTION_ARTIFACT_HASH_DOMAIN = (
     b"EXTRACTION_ARTIFACT_V1:"
 )
 
+EXTRACTION_SNAPSHOT_SEMANTIC_KIND = "source_extraction_snapshots"
+EXTRACTION_SNAPSHOT_PAYLOAD_VERSION = 1
+EXTRACTION_SNAPSHOT_NEUTRAL_EVIDENCE_JSON = "{}"
+EXTRACTION_SNAPSHOT_NEUTRAL_PROPOSALS_JSON = "{}"
+
 
 class SourceProtectedSemanticError(
     RuntimeError
@@ -970,6 +975,228 @@ def decode_source_extraction_artifact_semantics(
     return ProtectedSourceExtractionArtifactSemantics(
         extraction_id=extraction_id,
         artifacts=tuple(artifacts),
+    )
+
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectedSourceExtractionSnapshotEntry:
+    processing_run_id: uuid.UUID
+    final_artifact_id: uuid.UUID
+    evidence_json: str
+    proposals_json: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectedSourceExtractionSnapshotSemantics:
+    analysis_id: uuid.UUID
+    snapshots: tuple[ProtectedSourceExtractionSnapshotEntry, ...]
+
+
+def _validate_source_extraction_snapshot_semantic_json(
+    evidence_json: str,
+    proposals_json: str,
+) -> None:
+    try:
+        evidence = json.loads(evidence_json)
+        proposals = json.loads(proposals_json)
+    except json.JSONDecodeError as exc:
+        raise SourceProtectedSemanticIntegrityError(
+            "SourceExtraction snapshot semantics are not valid JSON."
+        ) from exc
+
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence) != {"items"}
+        or not isinstance(evidence["items"], list)
+    ):
+        raise SourceProtectedSemanticIntegrityError(
+            "SourceExtraction snapshot evidence is invalid."
+        )
+
+    seen_anchor_ids: set[uuid.UUID] = set()
+    for expected_sequence, item in enumerate(evidence["items"], 1):
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"anchor_id", "quoted_hash", "sequence_no"}
+            or item["sequence_no"] != expected_sequence
+            or isinstance(item["sequence_no"], bool)
+        ):
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceExtraction snapshot evidence slots are invalid."
+            )
+
+        try:
+            anchor_id = uuid.UUID(str(item["anchor_id"]))
+        except ValueError as exc:
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceExtraction snapshot evidence has an invalid SourceAnchor ID."
+            ) from exc
+
+        if anchor_id in seen_anchor_ids:
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceExtraction snapshot evidence contains duplicate SourceAnchors."
+            )
+        seen_anchor_ids.add(anchor_id)
+
+        quoted_hash = item["quoted_hash"]
+        if not isinstance(quoted_hash, str):
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceExtraction snapshot evidence hash is invalid."
+            )
+
+        try:
+            digest = bytes.fromhex(quoted_hash)
+        except ValueError as exc:
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceExtraction snapshot evidence hash is invalid."
+            ) from exc
+
+        if len(digest) != 32:
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceExtraction snapshot evidence hash is not SHA-256."
+            )
+
+    if (
+        not isinstance(proposals, dict)
+        or set(proposals)
+        != {
+            "claims",
+            "knowledge_units",
+            "merge_candidates",
+            "relations",
+        }
+        or not all(
+            isinstance(proposals[name], list)
+            for name in (
+                "claims",
+                "knowledge_units",
+                "merge_candidates",
+                "relations",
+            )
+        )
+    ):
+        raise SourceProtectedSemanticIntegrityError(
+            "SourceExtraction snapshot proposals are invalid."
+        )
+
+
+def decode_source_extraction_snapshot_semantics(
+    plaintext: bytes,
+) -> ProtectedSourceExtractionSnapshotSemantics:
+    """Validate and decode one protected SourceExtraction snapshot-set payload."""
+    try:
+        payload = json.loads(plaintext.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceExtraction snapshot payload is not valid canonical JSON."
+        ) from exc
+
+    if (
+        not isinstance(payload, dict)
+        or set(payload)
+        != {
+            "entity_id",
+            "fields",
+            "payload_version",
+            "semantic_kind",
+        }
+    ):
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceExtraction snapshot payload has an invalid envelope."
+        )
+
+    if (
+        payload["semantic_kind"] != EXTRACTION_SNAPSHOT_SEMANTIC_KIND
+        or payload["payload_version"] != EXTRACTION_SNAPSHOT_PAYLOAD_VERSION
+    ):
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceExtraction snapshot payload version is unsupported."
+        )
+
+    try:
+        analysis_id = uuid.UUID(str(payload["entity_id"]))
+    except ValueError as exc:
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceExtraction snapshot payload has an invalid Analysis ID."
+        ) from exc
+
+    fields = payload["fields"]
+    if not isinstance(fields, dict) or set(fields) != {"snapshots"}:
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceExtraction snapshot payload fields are invalid."
+        )
+
+    raw_snapshots = fields["snapshots"]
+    if not isinstance(raw_snapshots, list):
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceExtraction snapshot entries are invalid."
+        )
+
+    snapshots: list[ProtectedSourceExtractionSnapshotEntry] = []
+    seen_run_ids: set[uuid.UUID] = set()
+
+    for raw in raw_snapshots:
+        if (
+            not isinstance(raw, dict)
+            or set(raw)
+            != {
+                "evidence_json",
+                "final_artifact_id",
+                "processing_run_id",
+                "proposals_json",
+            }
+        ):
+            raise SourceProtectedSemanticIntegrityError(
+                "Protected SourceExtraction snapshot entry is invalid."
+            )
+
+        try:
+            processing_run_id = uuid.UUID(str(raw["processing_run_id"]))
+            final_artifact_id = uuid.UUID(str(raw["final_artifact_id"]))
+        except ValueError as exc:
+            raise SourceProtectedSemanticIntegrityError(
+                "Protected SourceExtraction snapshot identity is invalid."
+            ) from exc
+
+        if processing_run_id in seen_run_ids:
+            raise SourceProtectedSemanticIntegrityError(
+                "Protected SourceExtraction snapshot payload contains duplicate runs."
+            )
+        seen_run_ids.add(processing_run_id)
+
+        evidence_json = raw["evidence_json"]
+        proposals_json = raw["proposals_json"]
+
+        if not isinstance(evidence_json, str) or not isinstance(proposals_json, str):
+            raise SourceProtectedSemanticIntegrityError(
+                "Protected SourceExtraction snapshot semantic JSON is invalid."
+            )
+
+        _validate_source_extraction_snapshot_semantic_json(
+            evidence_json,
+            proposals_json,
+        )
+
+        snapshots.append(
+            ProtectedSourceExtractionSnapshotEntry(
+                processing_run_id=processing_run_id,
+                final_artifact_id=final_artifact_id,
+                evidence_json=evidence_json,
+                proposals_json=proposals_json,
+            )
+        )
+
+    if tuple(item.processing_run_id.bytes for item in snapshots) != tuple(
+        sorted(item.processing_run_id.bytes for item in snapshots)
+    ):
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceExtraction snapshot ordering is invalid."
+        )
+
+    return ProtectedSourceExtractionSnapshotSemantics(
+        analysis_id=analysis_id,
+        snapshots=tuple(snapshots),
     )
 
 
@@ -2952,6 +3179,309 @@ class SourceProtectedSemanticRepository:
 
         return mapping
 
+
+    def protect_analysis_extraction_snapshot_semantics(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        source_id: uuid.UUID,
+        analysis_id: uuid.UUID,
+        protection_scope_id: uuid.UUID,
+        payload_writer: ProtectedSemanticPayloadWriter,
+        now_us: int | None = None,
+    ) -> SourceProtectedSemanticMapping:
+        """Protect every frozen SourceExtraction snapshot for one SourceAnalysis."""
+        if not connection.in_transaction:
+            raise RuntimeError(
+                "Protected Source semantic cutover requires an active transaction."
+            )
+
+        analysis = connection.execute(
+            """
+            SELECT analysis_id, source_id
+            FROM source_analyses
+            WHERE analysis_id = ?
+            """,
+            (uuid_to_blob(analysis_id),),
+        ).fetchone()
+
+        if analysis is None:
+            raise SourceProtectedSemanticNotFoundError(str(analysis_id))
+
+        actual_source_id = uuid_from_blob(bytes(analysis["source_id"]))
+        if actual_source_id != source_id:
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceAnalysis does not belong to the requested Source."
+            )
+
+        self._require_active_scope(
+            connection,
+            protection_scope_id,
+        )
+
+        created_at_us = utc_now_us() if now_us is None else now_us
+        rows = self._extraction_snapshot_rows(
+            connection,
+            analysis_id,
+        )
+
+        return self._protect_extraction_snapshot_rows(
+            connection,
+            rows=rows,
+            source_id=source_id,
+            analysis_id=analysis_id,
+            protection_scope_id=protection_scope_id,
+            payload_writer=payload_writer,
+            created_at_us=created_at_us,
+        )
+
+    def protect_source_extraction_snapshot_semantics(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        source_id: uuid.UUID,
+        protection_scope_id: uuid.UUID,
+        payload_writer: ProtectedSemanticPayloadWriter,
+        now_us: int | None = None,
+    ) -> tuple[SourceProtectedSemanticMapping, ...]:
+        """Protect all frozen SourceExtraction snapshot sets for one Source."""
+        if not connection.in_transaction:
+            raise RuntimeError(
+                "Protected Source semantic cutover requires an active transaction."
+            )
+
+        self._require_source(
+            connection,
+            source_id,
+        )
+        self._require_active_scope(
+            connection,
+            protection_scope_id,
+        )
+
+        analysis_rows = connection.execute(
+            """
+            SELECT analysis_id
+            FROM source_analyses
+            WHERE source_id = ?
+            ORDER BY analysis_id
+            """,
+            (uuid_to_blob(source_id),),
+        ).fetchall()
+
+        if not analysis_rows:
+            return ()
+
+        created_at_us = utc_now_us() if now_us is None else now_us
+        mappings: list[SourceProtectedSemanticMapping] = []
+
+        for analysis_row in analysis_rows:
+            analysis_id = uuid_from_blob(
+                bytes(analysis_row["analysis_id"])
+            )
+            mappings.append(
+                self.protect_analysis_extraction_snapshot_semantics(
+                    connection,
+                    source_id=source_id,
+                    analysis_id=analysis_id,
+                    protection_scope_id=protection_scope_id,
+                    payload_writer=payload_writer,
+                    now_us=created_at_us,
+                )
+            )
+
+        return tuple(mappings)
+
+    @staticmethod
+    def _extraction_snapshot_rows(
+        connection: sqlite3.Connection,
+        analysis_id: uuid.UUID,
+    ) -> list[sqlite3.Row]:
+        return connection.execute(
+            """
+            SELECT
+                s.processing_run_id,
+                s.analysis_id,
+                s.final_artifact_id,
+                s.evidence_json,
+                s.proposals_json,
+                a.source_id,
+                f.analysis_id AS final_analysis_id,
+                f.artifact_kind AS final_artifact_kind
+            FROM source_extraction_result_snapshots AS s
+            JOIN source_analyses AS a
+              ON a.analysis_id = s.analysis_id
+            JOIN source_analysis_artifacts AS f
+              ON f.artifact_id = s.final_artifact_id
+            WHERE s.analysis_id = ?
+            ORDER BY s.processing_run_id
+            """,
+            (uuid_to_blob(analysis_id),),
+        ).fetchall()
+
+    def _protect_extraction_snapshot_rows(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        rows: list[sqlite3.Row],
+        source_id: uuid.UUID,
+        analysis_id: uuid.UUID,
+        protection_scope_id: uuid.UUID,
+        payload_writer: ProtectedSemanticPayloadWriter,
+        created_at_us: int,
+    ) -> SourceProtectedSemanticMapping:
+        existing = self._mapping_for(
+            connection,
+            source_id=source_id,
+            semantic_kind=EXTRACTION_SNAPSHOT_SEMANTIC_KIND,
+            entity_id=analysis_id,
+        )
+
+        snapshots: list[
+            tuple[uuid.UUID, uuid.UUID, str, str]
+        ] = []
+
+        for row in rows:
+            processing_run_id = uuid_from_blob(
+                bytes(row["processing_run_id"])
+            )
+            actual_analysis_id = uuid_from_blob(
+                bytes(row["analysis_id"])
+            )
+            final_artifact_id = uuid_from_blob(
+                bytes(row["final_artifact_id"])
+            )
+            actual_source_id = uuid_from_blob(
+                bytes(row["source_id"])
+            )
+            final_analysis_id = uuid_from_blob(
+                bytes(row["final_analysis_id"])
+            )
+            final_artifact_kind = str(row["final_artifact_kind"])
+            evidence_json = str(row["evidence_json"])
+            proposals_json = str(row["proposals_json"])
+
+            if (
+                actual_analysis_id != analysis_id
+                or actual_source_id != source_id
+                or final_analysis_id != analysis_id
+                or final_artifact_kind != "final"
+            ):
+                raise SourceProtectedSemanticIntegrityError(
+                    "SourceExtraction snapshot crossed the requested SourceAnalysis."
+                )
+
+            if existing is not None:
+                if (
+                    evidence_json != EXTRACTION_SNAPSHOT_NEUTRAL_EVIDENCE_JSON
+                    or proposals_json != EXTRACTION_SNAPSHOT_NEUTRAL_PROPOSALS_JSON
+                ):
+                    raise SourceProtectedSemanticIntegrityError(
+                        "Protected SourceExtraction snapshots are not fully neutralized."
+                    )
+
+                snapshots.append(
+                    (
+                        processing_run_id,
+                        final_artifact_id,
+                        evidence_json,
+                        proposals_json,
+                    )
+                )
+                continue
+
+            if (
+                evidence_json == EXTRACTION_SNAPSHOT_NEUTRAL_EVIDENCE_JSON
+                or proposals_json == EXTRACTION_SNAPSHOT_NEUTRAL_PROPOSALS_JSON
+            ):
+                raise SourceProtectedSemanticIntegrityError(
+                    "SourceExtraction snapshot appears neutralized "
+                    "without a protected mapping."
+                )
+
+            _validate_source_extraction_snapshot_semantic_json(
+                evidence_json,
+                proposals_json,
+            )
+
+            snapshots.append(
+                (
+                    processing_run_id,
+                    final_artifact_id,
+                    evidence_json,
+                    proposals_json,
+                )
+            )
+
+        if existing is not None:
+            self._require_existing_mapping(
+                connection,
+                existing,
+                semantic_kind=EXTRACTION_SNAPSHOT_SEMANTIC_KIND,
+                payload_version=EXTRACTION_SNAPSHOT_PAYLOAD_VERSION,
+                protection_scope_id=protection_scope_id,
+            )
+            return existing
+
+        original_snapshots = tuple(snapshots)
+
+        plaintext = self._encode_extraction_snapshot_semantics(
+            analysis_id=analysis_id,
+            snapshots=original_snapshots,
+        )
+        protected_payload_id = payload_writer(
+            connection,
+            plaintext,
+        )
+        self._require_payload_scope(
+            connection,
+            protected_payload_id=protected_payload_id,
+            protection_scope_id=protection_scope_id,
+        )
+        mapping = self._insert_semantic_mapping(
+            connection,
+            source_id=source_id,
+            semantic_kind=EXTRACTION_SNAPSHOT_SEMANTIC_KIND,
+            entity_id=analysis_id,
+            protection_scope_id=protection_scope_id,
+            protected_payload_id=protected_payload_id,
+            payload_version=EXTRACTION_SNAPSHOT_PAYLOAD_VERSION,
+            created_at_us=created_at_us,
+        )
+
+        for (
+            processing_run_id,
+            _final_artifact_id,
+            evidence_json,
+            proposals_json,
+        ) in original_snapshots:
+            updated = connection.execute(
+                """
+                UPDATE source_extraction_result_snapshots
+                SET evidence_json = ?,
+                    proposals_json = ?
+                WHERE processing_run_id = ?
+                  AND analysis_id = ?
+                  AND evidence_json = ?
+                  AND proposals_json = ?
+                """,
+                (
+                    EXTRACTION_SNAPSHOT_NEUTRAL_EVIDENCE_JSON,
+                    EXTRACTION_SNAPSHOT_NEUTRAL_PROPOSALS_JSON,
+                    uuid_to_blob(processing_run_id),
+                    uuid_to_blob(analysis_id),
+                    evidence_json,
+                    proposals_json,
+                ),
+            )
+
+            if updated.rowcount != 1:
+                raise SourceProtectedSemanticIntegrityError(
+                    "SourceExtraction snapshot changed during semantic cutover."
+                )
+
+        return mapping
+
     def _protect_page_map_semantics(
         self,
         connection: sqlite3.Connection,
@@ -3497,6 +4027,54 @@ class SourceProtectedSemanticRepository:
             },
             "payload_version": EXTRACTION_ARTIFACT_PAYLOAD_VERSION,
             "semantic_kind": EXTRACTION_ARTIFACT_SEMANTIC_KIND,
+        }
+
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+
+
+    @staticmethod
+    def _encode_extraction_snapshot_semantics(
+        *,
+        analysis_id: uuid.UUID,
+        snapshots: tuple[
+            tuple[uuid.UUID, uuid.UUID, str, str],
+            ...,
+        ],
+    ) -> bytes:
+        payload_snapshots: list[dict[str, str]] = []
+
+        for (
+            processing_run_id,
+            final_artifact_id,
+            evidence_json,
+            proposals_json,
+        ) in snapshots:
+            _validate_source_extraction_snapshot_semantic_json(
+                evidence_json,
+                proposals_json,
+            )
+            payload_snapshots.append(
+                {
+                    "evidence_json": evidence_json,
+                    "final_artifact_id": str(final_artifact_id),
+                    "processing_run_id": str(processing_run_id),
+                    "proposals_json": proposals_json,
+                }
+            )
+
+        payload = {
+            "entity_id": str(analysis_id),
+            "fields": {
+                "snapshots": payload_snapshots,
+            },
+            "payload_version": EXTRACTION_SNAPSHOT_PAYLOAD_VERSION,
+            "semantic_kind": EXTRACTION_SNAPSHOT_SEMANTIC_KIND,
         }
 
         return json.dumps(
