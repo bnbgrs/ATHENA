@@ -12,6 +12,8 @@ jobs:
     name: Python 3.12 quality
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      QT_QPA_PLATFORM: offscreen
 
     steps:
       - name: Check out repository
@@ -32,4 +34,4 @@ jobs:
         run: uv lock --check
 
       - name: Run ATHENA quality gate
-        run: uv run --locked --extra dev python scripts/quality.py
+        run: uv run --locked --extra dev --extra desktop python scripts/quality.py
