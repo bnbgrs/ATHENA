@@ -17,7 +17,10 @@ from athena.common.ids import (
 )
 from athena.common.time import utc_now_us
 from athena.lifecycle.deletion import record_deletion
-from athena.storage.database import SQLiteDatabase
+from athena.storage.database import (
+    DatabaseSnapshotChangedError,
+    SQLiteDatabase,
+)
 
 
 class LifecycleDeletionError(RuntimeError):
@@ -167,10 +170,13 @@ class LifecycleDeletionService:
         self,
         entity_id: uuid.UUID,
     ) -> DeletionPreview:
-        return self._preview_connection(
-            self.database.connection,
-            entity_id,
+        preview, _snapshot = self.database.stable_read(
+            lambda connection: self._preview_connection(
+                connection,
+                entity_id,
+            )
         )
+        return preview
 
     def delete(
         self,
@@ -198,6 +204,32 @@ class LifecycleDeletionService:
             self.chat.ensure_local_user()
         )
 
+        preview, snapshot = self.database.stable_read(
+            lambda connection: self._preview_connection(
+                connection,
+                entity_id,
+            )
+        )
+
+        if (
+            preview.preview_digest
+            != normalized_digest
+        ):
+            raise LifecycleDeletionPreviewStaleError(
+                "Deletion dependencies changed after preview; "
+                "review the deletion again."
+            )
+
+        if (
+            preview.lifecycle_state
+            == "deleted"
+        ):
+            raise LifecycleDeletionAlreadyDeletedError(
+                str(
+                    entity_id
+                )
+            )
+
         deleted_at_us = (
             utc_now_us()
         )
@@ -207,29 +239,16 @@ class LifecycleDeletionService:
         )
 
         with self.database.write_transaction() as connection:
-            preview = self._preview_connection(
-                connection,
-                entity_id,
-            )
-
-            if (
-                preview.preview_digest
-                != normalized_digest
-            ):
+            try:
+                self.database.assert_snapshot_current(
+                    connection,
+                    snapshot,
+                )
+            except DatabaseSnapshotChangedError as exc:
                 raise LifecycleDeletionPreviewStaleError(
                     "Deletion dependencies changed after preview; "
                     "review the deletion again."
-                )
-
-            if (
-                preview.lifecycle_state
-                == "deleted"
-            ):
-                raise LifecycleDeletionAlreadyDeletedError(
-                    str(
-                        entity_id
-                    )
-                )
+                ) from exc
 
             commit_seq = (
                 self._insert_commit(

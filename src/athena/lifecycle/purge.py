@@ -20,7 +20,10 @@ from athena.source.blob_store import (
     BlobStore,
     BlobStoreError,
 )
-from athena.storage.database import SQLiteDatabase
+from athena.storage.database import (
+    DatabaseSnapshotChangedError,
+    SQLiteDatabase,
+)
 from athena.storage.paths import RuntimePaths
 
 
@@ -134,46 +137,62 @@ class LifecyclePurgeService:
                     "preflight integrity verification."
                 ) from exc
 
+            (
+                checked_preflight,
+                snapshot,
+            ) = self.database.stable_read(
+                lambda connection: self._preflight_connection(
+                    connection,
+                    source_id,
+                )
+            )
+            (
+                checked_blob_id,
+                checked_locator,
+                checked_sha256,
+                checked_length,
+                checked_source_ids,
+                checked_needs_audit,
+            ) = checked_preflight
+
+            if (
+                checked_blob_id
+                != blob_id
+                or checked_locator
+                != storage_locator
+                or checked_sha256
+                != integrity_sha256
+                or checked_length
+                != byte_length
+                or checked_source_ids
+                != source_ids
+            ):
+                raise PhysicalPurgeBlockedError(
+                    "Source purge dependencies changed "
+                    "during physical-delete preflight."
+                )
+
+            needs_audit = (
+                needs_audit
+                or checked_needs_audit
+            )
+
             audit_commit_id: (
                 uuid.UUID
                 | None
             ) = None
 
             with self.database.write_transaction() as connection:
-                # Re-check everything after BEGIN IMMEDIATE.
-                (
-                    checked_blob_id,
-                    checked_locator,
-                    checked_sha256,
-                    checked_length,
-                    checked_source_ids,
-                    checked_needs_audit,
-                ) = self._preflight_connection(
-                    connection,
-                    source_id,
-                )
-
-                if (
-                    checked_blob_id
-                    != blob_id
-                    or checked_locator
-                    != storage_locator
-                    or checked_sha256
-                    != integrity_sha256
-                    or checked_length
-                    != byte_length
-                    or checked_source_ids
-                    != source_ids
-                ):
+                try:
+                    self.database.assert_snapshot_current(
+                        connection,
+                        snapshot,
+                    )
+                except DatabaseSnapshotChangedError as exc:
                     raise PhysicalPurgeBlockedError(
                         "Source purge dependencies changed "
                         "during physical-delete preflight."
-                    )
-
-                needs_audit = (
-                    needs_audit
-                    or checked_needs_audit
-                )
+                    ) from exc
 
                 if needs_audit:
                     audit_commit_id = (
@@ -304,10 +323,13 @@ class LifecyclePurgeService:
         ],
         bool,
     ]:
-        return self._preflight_connection(
-            self.database.connection,
-            source_id,
+        preflight, _snapshot = self.database.stable_read(
+            lambda connection: self._preflight_connection(
+                connection,
+                source_id,
+            )
         )
+        return preflight
 
     def _preflight_connection(
         self,

@@ -35,6 +35,7 @@ from athena.source.blob_store import (
 )
 from athena.source.models import BlobStorageArea
 from athena.storage.database import (
+    DatabaseSnapshotChangedError,
     SQLiteDatabase,
 )
 from athena.storage.paths import (
@@ -194,9 +195,11 @@ class ProtectedScopePurgeService:
         self,
         protection_scope_id: uuid.UUID,
     ) -> ProtectedScopeDeletionPreview:
-        state = self._state(
-            self.database.connection,
-            protection_scope_id,
+        state, _snapshot = self.database.stable_read(
+            lambda connection: self._state(
+                connection,
+                protection_scope_id,
+            )
         )
 
         if (
@@ -275,9 +278,11 @@ class ProtectedScopePurgeService:
         with runtime_data_lock(
             self.paths.state_root
         ):
-            state = self._state(
-                self.database.connection,
-                protection_scope_id,
+            state, _initial_snapshot = self.database.stable_read(
+                lambda connection: self._state(
+                    connection,
+                    protection_scope_id,
+                )
             )
 
             if (
@@ -333,6 +338,39 @@ class ProtectedScopePurgeService:
                 protection_scope_id
             )
 
+            (
+                locked_state,
+                snapshot,
+            ) = self.database.stable_read(
+                lambda connection: self._state(
+                    connection,
+                    protection_scope_id,
+                )
+            )
+
+            if (
+                locked_state.lifecycle_state
+                == "pending_delete"
+            ):
+                raise (
+                    ProtectedScopeAlreadyDeletedError(
+                        str(
+                            protection_scope_id
+                        )
+                    )
+                )
+
+            if (
+                locked_state.preview_digest
+                != state.preview_digest
+            ):
+                raise (
+                    ProtectedScopeDeletionPreviewStaleError(
+                        "ProtectionScope dependencies "
+                        "changed during deletion."
+                    )
+                )
+
             commit_id = new_uuid7()
             deleted_at_us = utc_now_us()
 
@@ -341,35 +379,18 @@ class ProtectedScopePurgeService:
                 .write_transaction()
                 as connection
             ):
-                locked_state = (
-                    self._state(
+                try:
+                    self.database.assert_snapshot_current(
                         connection,
-                        protection_scope_id,
+                        snapshot,
                     )
-                )
-
-                if (
-                    locked_state.lifecycle_state
-                    == "pending_delete"
-                ):
-                    raise (
-                        ProtectedScopeAlreadyDeletedError(
-                            str(
-                                protection_scope_id
-                            )
-                        )
-                    )
-
-                if (
-                    locked_state.preview_digest
-                    != state.preview_digest
-                ):
+                except DatabaseSnapshotChangedError as exc:
                     raise (
                         ProtectedScopeDeletionPreviewStaleError(
                             "ProtectionScope dependencies "
                             "changed during deletion."
                         )
-                    )
+                    ) from exc
 
                 commit_seq = (
                     self._insert_commit(
