@@ -423,6 +423,39 @@ class LMStudioProvider:
                 raise ProviderContextLimitError(
                     "LM Studio rejected controlled structured generation for context capacity."
                 ) from exc
+
+            if pinned_instance_id is not None:
+                current = self._cached_controlled_instance_is_current(
+                    model_id=model_id,
+                    instance_id=pinned_instance_id,
+                    context_length=context_length,
+                )
+
+                if current is False:
+                    if (
+                        self._controlled_instance_ids.get(instance_key)
+                        == pinned_instance_id
+                    ):
+                        self._controlled_instance_ids.pop(
+                            instance_key,
+                            None,
+                        )
+
+                    return self.generate_controlled_structured(
+                        model_id=model_id,
+                        messages=messages,
+                        schema_id=schema_id,
+                        json_schema=json_schema,
+                        reasoning_mode=reasoning_mode,
+                        context_length=context_length,
+                        max_output_tokens=max_output_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                        min_p=min_p,
+                        repeat_penalty=repeat_penalty,
+                    )
+
             raise ModelProviderError(
                 f"LM Studio returned HTTP {exc.code} during controlled structured generation."
             ) from exc
@@ -500,6 +533,104 @@ class LMStudioProvider:
                 "LM Studio controlled structured content must be a JSON object."
             )
         return cast(Mapping[str, Any], structured)
+
+
+    def _cached_controlled_instance_is_current(
+        self,
+        *,
+        model_id: str,
+        instance_id: str,
+        context_length: int,
+    ) -> bool | None:
+        """Best-effort reconciliation of one cached LM Studio runtime instance."""
+        try:
+            payload = self._get_json(
+                self.models_url
+            )
+            models = payload.get("models")
+
+            if not isinstance(models, list):
+                return None
+
+            for raw_model in models:
+                if not isinstance(
+                    raw_model,
+                    Mapping,
+                ):
+                    return None
+
+                key = raw_model.get("key")
+
+                if not isinstance(key, str):
+                    return None
+
+                if key != model_id:
+                    continue
+
+                loaded_instances = raw_model.get(
+                    "loaded_instances"
+                )
+
+                if not isinstance(
+                    loaded_instances,
+                    list,
+                ):
+                    return None
+
+                for raw_instance in loaded_instances:
+                    if not isinstance(
+                        raw_instance,
+                        Mapping,
+                    ):
+                        return None
+
+                    candidate_id = raw_instance.get(
+                        "id"
+                    )
+
+                    if not isinstance(
+                        candidate_id,
+                        str,
+                    ):
+                        return None
+
+                    if candidate_id != instance_id:
+                        continue
+
+                    config = raw_instance.get(
+                        "config"
+                    )
+
+                    if not isinstance(
+                        config,
+                        Mapping,
+                    ):
+                        return None
+
+                    reported_context = (
+                        self._optional_positive_int(
+                            config.get(
+                                "context_length"
+                            )
+                        )
+                    )
+
+                    if reported_context is None:
+                        return None
+
+                    return (
+                        reported_context
+                        == context_length
+                    )
+
+                return False
+
+            return False
+
+        except ModelProviderError:
+            # Reconciliation is deliberately best-effort. A transient models
+            # endpoint failure must not replace the original generation error.
+            return None
 
     def _get_json(self, url: str) -> Mapping[str, Any]:
         request = Request(url, headers={"Accept": "application/json"})
