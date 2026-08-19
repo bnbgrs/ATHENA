@@ -15,6 +15,9 @@ from pathlib import Path
 from typing import Any
 
 from athena.backup.deletion_codec import DeletionLedgerCodecMixin
+from athena.backup.errors import (
+    BackupRestoreError as BackupRestoreError,
+)
 from athena.backup.json_codec import _canonical_json
 from athena.backup.retention import (
     BackupRetentionPlan,
@@ -58,8 +61,6 @@ from athena.storage.schema import (
 
 logger = logging.getLogger(__name__)
 
-class BackupRestoreError(RuntimeError):
-    """Raised when backup/restore cannot complete with verified integrity."""
 
 
 @dataclass(frozen=True, slots=True)
