@@ -537,6 +537,17 @@ class ArchiveSemanticSearchService:
             )
 
         assert total_document_count is not None
+
+        # Resolve authoritative visibility once for this planner call rather
+        # than issuing one canonical SQLite query for every scanned chunk.
+        # Fence the snapshot immediately afterwards; the existing final fence
+        # below still catches visibility/generation changes during the scan.
+        visible_pairs = self.lexical.visible_representation_pairs()
+        self._assert_snapshot_current(
+            target_chunk_generation,
+            target_visibility_commit_seq,
+        )
+
         storage_model_id = _storage_model_id(normalized_model_id)
         scan_limit = min(4096, max(64, batch_limit * 4))
         current_cursor = resume_after
@@ -556,9 +567,28 @@ class ArchiveSemanticSearchService:
                     reached_end = True
                     break
 
+                chunks = tuple(
+                    self._chunk_record_from_row(row)
+                    for row in rows
+                )
+                visible_chunk_ids = tuple(
+                    chunk.chunk_id
+                    for chunk in chunks
+                    if (
+                        chunk.source_id,
+                        chunk.representation_id,
+                    )
+                    in visible_pairs
+                )
+                persisted_by_chunk_id = self._embedding_rows_for_chunks(
+                    connection,
+                    visible_chunk_ids,
+                    storage_model_id=storage_model_id,
+                    target_chunk_generation=target_chunk_generation,
+                )
+
                 consumed_all_rows = True
-                for row in rows:
-                    chunk = self._chunk_record_from_row(row)
+                for chunk in chunks:
                     current_cursor = ArchiveEmbeddingCursorKey(
                         representation_id=chunk.representation_id,
                         chunking_profile_id=chunk.chunking_profile_id,
@@ -566,10 +596,10 @@ class ArchiveSemanticSearchService:
                         chunk_id=chunk.chunk_id,
                     )
 
-                    if not self.lexical.is_visible_representation(
+                    if (
                         chunk.source_id,
                         chunk.representation_id,
-                    ):
+                    ) not in visible_pairs:
                         continue
 
                     if (
@@ -587,20 +617,9 @@ class ArchiveSemanticSearchService:
                             "SourceChunk text hash changed during embedding planning."
                         )
 
-                    persisted = connection.execute(
-                        """
-                        SELECT dimensions, vector_blob, text_sha256
-                        FROM archive_embeddings
-                        WHERE chunk_id = ?
-                          AND model_id = ?
-                          AND indexed_chunk_generation = ?
-                        """,
-                        (
-                            chunk.chunk_id.bytes,
-                            storage_model_id,
-                            target_chunk_generation,
-                        ),
-                    ).fetchone()
+                    persisted = persisted_by_chunk_id.get(
+                        chunk.chunk_id
+                    )
 
                     if persisted is not None:
                         row_dimensions = int(persisted["dimensions"])
@@ -1272,6 +1291,66 @@ class ArchiveSemanticSearchService:
             chunk_text=str(row["chunk_text"]),
             created_at_us=int(row["created_at_us"]),
         )
+
+
+    @staticmethod
+    def _embedding_rows_for_chunks(
+        connection: sqlite3.Connection,
+        chunk_ids: Sequence[uuid.UUID],
+        *,
+        storage_model_id: str,
+        target_chunk_generation: int,
+    ) -> dict[uuid.UUID, sqlite3.Row]:
+        """Load persisted current-generation embeddings in bounded set queries."""
+        if not chunk_ids:
+            return {}
+
+        persisted_by_chunk_id: dict[uuid.UUID, sqlite3.Row] = {}
+
+        # Stay safely below SQLite's historical 999-variable default while
+        # reserving two parameters for model ID and generation.
+        max_chunk_ids_per_query = 400
+
+        for start in range(0, len(chunk_ids), max_chunk_ids_per_query):
+            batch = chunk_ids[
+                start : start + max_chunk_ids_per_query
+            ]
+            placeholders = ", ".join("?" for _ in batch)
+            parameters: list[object] = [
+                storage_model_id,
+                target_chunk_generation,
+            ]
+            parameters.extend(
+                chunk_id.bytes
+                for chunk_id in batch
+            )
+
+            rows = connection.execute(
+                f"""
+                SELECT
+                    chunk_id,
+                    dimensions,
+                    vector_blob,
+                    text_sha256
+                FROM archive_embeddings
+                WHERE model_id = ?
+                  AND indexed_chunk_generation = ?
+                  AND chunk_id IN ({placeholders})
+                """,
+                tuple(parameters),
+            ).fetchall()
+
+            for row in rows:
+                chunk_id = uuid.UUID(
+                    bytes=bytes(row["chunk_id"])
+                )
+                if chunk_id in persisted_by_chunk_id:
+                    raise ArchiveSearchError(
+                        "Duplicate persisted archive embedding row."
+                    )
+                persisted_by_chunk_id[chunk_id] = row
+
+        return persisted_by_chunk_id
 
     @staticmethod
     def _chunk_rows_after(
