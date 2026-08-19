@@ -15,6 +15,8 @@ from athena.storage.durable_fs import durable_mkdir, durable_replace
 from athena.storage.paths import RuntimePaths
 
 _COPY_BUFFER_SIZE = 1024 * 1024
+ORPHAN_BLOB_SAFETY_HORIZON_US = 24 * 60 * 60 * 1_000_000
+_HEX_DIGITS = frozenset("0123456789abcdef")
 
 
 class BlobStoreError(RuntimeError):
@@ -45,6 +47,16 @@ class PreparedBlob:
     storage_area: BlobStorageArea
     storage_locator: str
     source_modified_at_us: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class BlobOrphanReconciliationResult:
+    scanned_blob_count: int
+    referenced_blob_count: int
+    recent_unreferenced_count: int
+    deleted_orphan_count: int
+    unsafe_candidate_count: int
+    archive_root_unavailable: bool
 
 
 class BlobStore:
@@ -470,6 +482,167 @@ class BlobStore:
             verified
         )
 
+
+    def reconcile_orphaned_blobs(
+        self,
+        *,
+        referenced_locators: frozenset[str],
+        now_us: int,
+        safety_horizon_us: int = ORPHAN_BLOB_SAFETY_HORIZON_US,
+    ) -> BlobOrphanReconciliationResult:
+        """Remove old unreferenced content-addressed blobs conservatively."""
+        if safety_horizon_us < 0:
+            raise ValueError(
+                "Blob orphan safety horizon must not be negative."
+            )
+
+        spool_root = self.paths.spool_root
+        if (
+            spool_root.is_symlink()
+            or not spool_root.is_dir()
+        ):
+            raise BlobStoreError(
+                "Durable Spool is unavailable for blob reconciliation."
+            )
+
+        roots: list[Path] = [spool_root]
+        archive_root_unavailable = False
+
+        archive_root = self.paths.archive_root
+        if archive_root is not None:
+            if (
+                archive_root.is_symlink()
+                or not archive_root.is_dir()
+            ):
+                archive_root_unavailable = True
+            else:
+                roots.append(archive_root)
+
+        cutoff_ns = max(
+            0,
+            now_us - safety_horizon_us,
+        ) * 1_000
+
+        scanned = 0
+        referenced = 0
+        recent = 0
+        deleted = 0
+        unsafe = 0
+        seen_roots: set[Path] = set()
+
+        for root in roots:
+            resolved_root = root.resolve()
+            if resolved_root in seen_roots:
+                continue
+            seen_roots.add(resolved_root)
+
+            candidates, unsafe_directories = (
+                _content_addressed_blob_candidates(root)
+            )
+            unsafe += unsafe_directories
+
+            for candidate in candidates:
+                scanned += 1
+
+                if (
+                    candidate.is_symlink()
+                    or not candidate.is_file()
+                ):
+                    unsafe += 1
+                    continue
+
+                try:
+                    relative = (
+                        candidate
+                        .relative_to(root)
+                        .as_posix()
+                    )
+                except ValueError:
+                    unsafe += 1
+                    continue
+
+                digest_hex = candidate.name.removesuffix(
+                    ".blob"
+                )
+
+                if (
+                    len(digest_hex) != 64
+                    or any(
+                        character not in _HEX_DIGITS
+                        for character in digest_hex
+                    )
+                ):
+                    unsafe += 1
+                    continue
+
+                expected_digest = bytes.fromhex(
+                    digest_hex
+                )
+                expected_locator = _blob_locator(
+                    expected_digest
+                )
+
+                if relative != expected_locator:
+                    unsafe += 1
+                    continue
+
+                if relative in referenced_locators:
+                    referenced += 1
+                    continue
+
+                try:
+                    stat = candidate.stat()
+                except OSError:
+                    unsafe += 1
+                    continue
+
+                if stat.st_mtime_ns > cutoff_ns:
+                    recent += 1
+                    continue
+
+                try:
+                    actual_digest, _length = (
+                        _hash_file(candidate)
+                    )
+                except BlobStoreError:
+                    unsafe += 1
+                    continue
+
+                if actual_digest != expected_digest:
+                    unsafe += 1
+                    continue
+
+                if (
+                    candidate.is_symlink()
+                    or not candidate.is_file()
+                ):
+                    unsafe += 1
+                    continue
+
+                try:
+                    candidate.unlink()
+                except OSError:
+                    unsafe += 1
+                    continue
+
+                if (
+                    candidate.exists()
+                    or candidate.is_symlink()
+                ):
+                    unsafe += 1
+                    continue
+
+                deleted += 1
+
+        return BlobOrphanReconciliationResult(
+            scanned_blob_count=scanned,
+            referenced_blob_count=referenced,
+            recent_unreferenced_count=recent,
+            deleted_orphan_count=deleted,
+            unsafe_candidate_count=unsafe,
+            archive_root_unavailable=archive_root_unavailable,
+        )
+
     def purge_verified_replicas(
         self,
         *,
@@ -666,6 +839,84 @@ class BlobStore:
             temp_path.unlink(
                 missing_ok=True
             )
+
+
+
+
+def _content_addressed_blob_candidates(
+    root: Path,
+) -> tuple[tuple[Path, ...], int]:
+    """Return exact blob-layout candidates without following symlink dirs."""
+    sha_root = root / "blobs" / "sha256"
+
+    if not sha_root.exists():
+        return (), 0
+
+    if (
+        sha_root.is_symlink()
+        or not sha_root.is_dir()
+    ):
+        return (), 1
+
+    candidates: list[Path] = []
+    unsafe = 0
+
+    try:
+        first_level = tuple(sha_root.iterdir())
+    except OSError:
+        return (), 1
+
+    for first in first_level:
+        if (
+            len(first.name) != 2
+            or any(
+                character not in _HEX_DIGITS
+                for character in first.name
+            )
+        ):
+            continue
+
+        if (
+            first.is_symlink()
+            or not first.is_dir()
+        ):
+            unsafe += 1
+            continue
+
+        try:
+            second_level = tuple(first.iterdir())
+        except OSError:
+            unsafe += 1
+            continue
+
+        for second in second_level:
+            if (
+                len(second.name) != 2
+                or any(
+                    character not in _HEX_DIGITS
+                    for character in second.name
+                )
+            ):
+                continue
+
+            if (
+                second.is_symlink()
+                or not second.is_dir()
+            ):
+                unsafe += 1
+                continue
+
+            try:
+                leaves = tuple(second.iterdir())
+            except OSError:
+                unsafe += 1
+                continue
+
+            for leaf in leaves:
+                if leaf.name.endswith(".blob"):
+                    candidates.append(leaf)
+
+    return tuple(candidates), unsafe
 
 
 def _blob_locator(integrity_sha256: bytes) -> str:

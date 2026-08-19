@@ -469,6 +469,21 @@ class SourceRepository:
             byte_length=byte_length,
         )
 
+    def list_blob_storage_locators(
+        self,
+    ) -> frozenset[str]:
+        rows = self.database.connection.execute(
+            """
+            SELECT DISTINCT storage_locator
+            FROM blob_records
+            ORDER BY storage_locator
+            """
+        ).fetchall()
+        return frozenset(
+            str(row["storage_locator"])
+            for row in rows
+        )
+
     def is_protection_transitioning(
         self,
         source_id: uuid.UUID,

@@ -623,6 +623,36 @@ class AthenaApplication:
             self.services.start_all()
             self.news.start()
             if run_startup_maintenance:
+                orphan_reconciliation = (
+                    self.sources.reconcile_orphaned_blobs()
+                )
+                if orphan_reconciliation.deleted_orphan_count:
+                    logger.warning(
+                        "Recovered orphaned Raw Archive blob publications",
+                        extra={
+                            "event": "source.blob_orphans_recovered",
+                            "deleted_orphan_count": (
+                                orphan_reconciliation.deleted_orphan_count
+                            ),
+                        },
+                    )
+                if (
+                    orphan_reconciliation.unsafe_candidate_count
+                    or orphan_reconciliation.archive_root_unavailable
+                ):
+                    logger.warning(
+                        "Raw Archive blob orphan reconciliation incomplete",
+                        extra={
+                            "event": "source.blob_orphans_incomplete",
+                            "unsafe_candidate_count": (
+                                orphan_reconciliation.unsafe_candidate_count
+                            ),
+                            "archive_root_unavailable": (
+                                orphan_reconciliation.archive_root_unavailable
+                            ),
+                        },
+                    )
+
                 recovered_backups = self.backup.recover_incomplete()
                 self.backup.sync_all_deletion_ledgers()
                 if recovered_backups:

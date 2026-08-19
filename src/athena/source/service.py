@@ -6,13 +6,18 @@ import uuid
 from pathlib import Path
 
 from athena.chat.service import ChatService
+from athena.common.time import utc_now_us
 from athena.lifecycle.runtime_lock import runtime_data_lock
 from athena.security.service import (
     ProtectedContentIntegrityError,
     ProtectedContentService,
     ProtectionScopeLockedError,
 )
-from athena.source.blob_store import BlobStore
+from athena.source.blob_store import (
+    ORPHAN_BLOB_SAFETY_HORIZON_US,
+    BlobOrphanReconciliationResult,
+    BlobStore,
+)
 from athena.source.models import BlobRecord, SourceCaptureResult, SourceRecord, SourceType
 from athena.source.protected_blob import ProtectedBlobStore, ProtectedSourceMetadata
 from athena.source.protection_transition import SourceProtectionTransitionService
@@ -147,6 +152,27 @@ class SourceCaptureService:
                 prepared_blob=prepared_blob,
                 source_type=SourceType.WEB_SNAPSHOT,
                 transactional_finalize=transactional_finalize,
+            )
+
+    def reconcile_orphaned_blobs(
+        self,
+        *,
+        now_us: int | None = None,
+        safety_horizon_us: int = ORPHAN_BLOB_SAFETY_HORIZON_US,
+    ) -> BlobOrphanReconciliationResult:
+        """Recover durable blob publications that never reached SQLite."""
+        with runtime_data_lock(self.runtime_lock_root):
+            referenced_locators = (
+                self.repository.list_blob_storage_locators()
+            )
+            return self.blob_store.reconcile_orphaned_blobs(
+                referenced_locators=referenced_locators,
+                now_us=(
+                    utc_now_us()
+                    if now_us is None
+                    else now_us
+                ),
+                safety_horizon_us=safety_horizon_us,
             )
 
     def get(self, source_id: uuid.UUID) -> tuple[SourceRecord, BlobRecord]:
