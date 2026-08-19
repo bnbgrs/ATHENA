@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 
 from athena.news.schema import (
@@ -264,6 +263,24 @@ from athena.storage.schema_contract import (
 )
 from athena.storage.schema_contract import (
     _user_tables as _user_tables,
+)
+from athena.storage.schema_error_sanitization import (
+    _PERSISTED_ERROR_CHECKPOINT_JOB_TYPES as _PERSISTED_ERROR_CHECKPOINT_JOB_TYPES,
+)
+from athena.storage.schema_error_sanitization import (
+    _PERSISTED_ERROR_CODE_RE as _PERSISTED_ERROR_CODE_RE,
+)
+from athena.storage.schema_error_sanitization import (
+    _PERSISTED_ERROR_SCALAR_FIELDS as _PERSISTED_ERROR_SCALAR_FIELDS,
+)
+from athena.storage.schema_error_sanitization import (
+    _canonical_migration_json as _canonical_migration_json,
+)
+from athena.storage.schema_error_sanitization import (
+    _sanitize_checkpoint_error_payload as _sanitize_checkpoint_error_payload,
+)
+from athena.storage.schema_error_sanitization import (
+    _sanitize_persisted_error_value as _sanitize_persisted_error_value,
 )
 
 
@@ -4027,121 +4044,14 @@ def _migrate_schema_v35_to_v36(
         raise
 
 
-_PERSISTED_ERROR_CODE_RE = re.compile(
-    r"[A-Za-z_][A-Za-z0-9_.-]{0,127}"
-    r"(?::[A-Za-z_][A-Za-z0-9_.-]{0,127})*\Z",
-    re.ASCII,
-)
-
-_PERSISTED_ERROR_SCALAR_FIELDS = (
-    ("processing_runs", "error_detail"),
-    ("archive_replication_outbox", "last_error_detail"),
-    ("backup_snapshots", "failure_detail"),
-    ("news_discoveries", "failure_reason"),
-    ("news_source_run_failures", "detail"),
-    ("news_source_states", "last_error"),
-    ("jobs", "blocked_reason"),
-)
 
 
-def _sanitize_persisted_error_value(
-    value: str,
-) -> str | None:
-    normalized = value.strip()
-
-    if not normalized:
-        return None
-
-    if _PERSISTED_ERROR_CODE_RE.fullmatch(normalized) is not None:
-        return normalized
-
-    prefix, separator, _suffix = normalized.partition(":")
-
-    if separator:
-        normalized_prefix = prefix.strip()
-
-        if (
-            _PERSISTED_ERROR_CODE_RE.fullmatch(
-                normalized_prefix
-            )
-            is not None
-        ):
-            return normalized_prefix
-
-    return "OperationalError"
-
-_PERSISTED_ERROR_CHECKPOINT_JOB_TYPES = frozenset(
-    {
-        "research.exhaustive",
-        "source.analyze",
-        "source.extract",
-    }
-)
 
 
-def _sanitize_checkpoint_error_payload(
-    *,
-    job_type: str,
-    value: object,
-) -> tuple[object, bool]:
-    """Sanitize only historically known operational checkpoint fields."""
-    if (
-        job_type
-        not in _PERSISTED_ERROR_CHECKPOINT_JOB_TYPES
-        or not isinstance(value, dict)
-    ):
-        return value, False
-
-    sanitized = dict(value)
-
-    if job_type == "source.extract":
-        raw_error = value.get("error")
-
-        if not isinstance(raw_error, str):
-            return value, False
-
-        replacement = _sanitize_persisted_error_value(
-            raw_error
-        )
-
-        if replacement == raw_error:
-            return value, False
-
-        sanitized["error"] = replacement
-
-        return sanitized, True
-
-    raw_reason = value.get("reason")
-    raw_detail = value.get("detail")
-
-    if (
-        not isinstance(raw_reason, str)
-        or not isinstance(raw_detail, str)
-    ):
-        return value, False
-
-    replacement = _sanitize_persisted_error_value(
-        raw_detail
-    )
-
-    if replacement == raw_detail:
-        return value, False
-
-    sanitized["detail"] = replacement
-
-    return sanitized, True
 
 
-def _canonical_migration_json(
-    value: object,
-) -> str:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
+
+
 
 
 def _migrate_schema_v36_to_v37(
