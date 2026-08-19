@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from athena.backup.deletion_codec import DeletionLedgerCodecMixin
+from athena.backup.json_codec import _canonical_json
 from athena.backup.retention import (
     BackupRetentionPlan,
     BackupRetentionPolicy,
@@ -79,7 +81,7 @@ class BackupSnapshotRecord:
     deletion_ledger_watermark: int = 0
 
 
-class BackupService:
+class BackupService(DeletionLedgerCodecMixin):
     """Create complete-marker backups and restore them only into a new root."""
 
     FORMAT_VERSION = 1
@@ -493,75 +495,7 @@ class BackupService:
         return result
 
 
-    @classmethod
-    def _deletion_records_digest(
-        cls,
-        records: tuple[
-            DeletionLedgerRecord,
-            ...,
-        ],
-    ) -> str:
-        hasher = hashlib.sha256()
 
-        for record in records:
-            encoded = _canonical_json(
-                cls._deletion_record_payload(
-                    record
-                )
-            ).encode(
-                "utf-8"
-            )
-
-            hasher.update(
-                len(encoded).to_bytes(
-                    8,
-                    byteorder="big",
-                    signed=False,
-                )
-            )
-
-            hasher.update(
-                encoded
-            )
-
-        return hasher.hexdigest()
-
-    @classmethod
-    def _deletion_head_payload(
-        cls,
-        *,
-        target_id: uuid.UUID,
-        records: tuple[
-            DeletionLedgerRecord,
-            ...,
-        ],
-    ) -> dict[
-        str,
-        object,
-    ]:
-        watermark = (
-            records[-1].ledger_seq
-            if records
-            else 0
-        )
-
-        return {
-            "format_version": (
-                cls.DELETION_LEDGER_HEAD_FORMAT_VERSION
-            ),
-            "record_count": len(
-                records
-            ),
-            "records_sha256": (
-                cls._deletion_records_digest(
-                    records
-                )
-            ),
-            "target_id": str(
-                target_id
-            ),
-            "watermark": watermark,
-        }
 
     def _write_target_deletion_head(
         self,
@@ -968,64 +902,7 @@ class BackupService:
                 "post-publication verification."
             )
 
-    @classmethod
-    def _deletion_record_name(
-        cls,
-        record: DeletionLedgerRecord,
-    ) -> str:
-        """Return immutable identity bound to every canonical record field."""
-        canonical_payload = _canonical_json(
-            cls._deletion_record_payload(
-                record
-            )
-        ).encode(
-            "utf-8"
-        )
 
-        payload_sha256 = hashlib.sha256(
-            canonical_payload
-        ).hexdigest()
-
-        return (
-            f"{record.ledger_seq:020d}-"
-            f"{record.deletion_id}-"
-            f"{payload_sha256}.json"
-        )
-
-    @classmethod
-    def _deletion_record_payload(
-        cls,
-        record: DeletionLedgerRecord,
-    ) -> dict[
-        str,
-        object,
-    ]:
-        return {
-            "deleted_at_us": (
-                record.deleted_at_us
-            ),
-            "deleted_by_actor_id": str(
-                record.deleted_by_actor_id
-            ),
-            "deletion_commit_seq": (
-                record.deletion_commit_seq
-            ),
-            "deletion_id": str(
-                record.deletion_id
-            ),
-            "entity_id": str(
-                record.entity_id
-            ),
-            "entity_type": (
-                record.entity_type
-            ),
-            "format_version": (
-                cls.DELETION_LEDGER_RECORD_FORMAT_VERSION
-            ),
-            "ledger_seq": (
-                record.ledger_seq
-            ),
-        }
 
     @classmethod
     def _deletion_record_from_payload(
@@ -5348,14 +5225,6 @@ def _write_fsynced(path: Path, data: bytes) -> None:
         )
 
 
-def _canonical_json(value: Any) -> str:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
 
 
 def _read_manifest(path: Path) -> dict[str, Any]:
