@@ -275,3 +275,49 @@ def test_client_rejects_invalid_response_shape(
         CoreApiClient(runtime_root).list_models()
 
     assert exc_info.value.code == "invalid_response"
+
+
+def test_client_from_environment_uses_core_api_runtime_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local_root = (tmp_path / "athena-local").resolve()
+    monkeypatch.setenv("ATHENA_LOCAL_ROOT", str(local_root))
+    monkeypatch.delenv("ATHENA_ARCHIVE_ROOT", raising=False)
+    monkeypatch.delenv("ATHENA_BACKUP_ROOT", raising=False)
+    monkeypatch.delenv("ATHENA_PROJECTION_ROOT", raising=False)
+
+    client = CoreApiClient.from_environment(timeout_seconds=1.25)
+
+    assert client.runtime_root == local_root / "tmp" / "core-api"
+    assert client.timeout_seconds == 1.25
+
+
+def test_client_exposes_trusted_discovery_process_id(tmp_path: Path) -> None:
+    runtime_root = tmp_path / "api"
+    _bootstrap(runtime_root)
+
+    assert CoreApiClient(runtime_root).discovery_process_id() == 1234
+
+
+def test_client_shutdown_command_is_not_retried(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_root = tmp_path / "api"
+    _bootstrap(runtime_root)
+    calls = 0
+
+    def fake_urlopen(request: Any, timeout: float) -> _Response:
+        nonlocal calls
+        del timeout
+        calls += 1
+        assert request.get_method() == "POST"
+        assert request.full_url.endswith("/api/v1/system/shutdown")
+        return _Response({"accepted": True}, status=202)
+
+    monkeypatch.setattr(client_module, "urlopen", fake_urlopen)
+
+    CoreApiClient(runtime_root).request_shutdown()
+
+    assert calls == 1

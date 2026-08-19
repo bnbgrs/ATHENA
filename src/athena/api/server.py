@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import threading
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast
@@ -30,8 +31,14 @@ class _AthenaHttpServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = False
 
-    def __init__(self, server_address: tuple[str, int], app: CoreApiAsgiApp) -> None:
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        app: CoreApiAsgiApp,
+        shutdown_callback: Callable[[], None] | None,
+    ) -> None:
         self.app = app
+        self.shutdown_callback = shutdown_callback
         super().__init__(server_address, _AthenaRequestHandler)
 
 
@@ -166,6 +173,15 @@ class _AthenaRequestHandler(BaseHTTPRequestHandler):
 
             if self.command != "HEAD" and response_body:
                 self.wfile.write(response_body)
+
+            if (
+                self.command == "POST"
+                and parsed.path == "/api/v1/system/shutdown"
+                and response_status == 202
+                and server.shutdown_callback is not None
+            ):
+                self.wfile.flush()
+                server.shutdown_callback()
         except (BrokenPipeError, ConnectionResetError):
             return
         except Exception:
@@ -234,6 +250,7 @@ class CoreApiServer:
         runtime_root: Path,
         host: str = _LOOPBACK_HOST,
         port: int = 0,
+        shutdown_callback: Callable[[], None] | None = None,
     ) -> None:
         if host != _LOOPBACK_HOST:
             raise ValueError("ATHENA Core API may bind only to IPv4 loopback in v1.")
@@ -242,7 +259,12 @@ class CoreApiServer:
         self._host = host
         self._configured_port = port
         self.runtime = LocalApiRuntime(runtime_root)
-        self.app = CoreApiAsgiApp(facade=facade, runtime=self.runtime)
+        self._shutdown_callback = shutdown_callback
+        self.app = CoreApiAsgiApp(
+            facade=facade,
+            runtime=self.runtime,
+            allow_shutdown=shutdown_callback is not None,
+        )
         self._server: _AthenaHttpServer | None = None
         self._thread: threading.Thread | None = None
         self._discovery: ApiDiscovery | None = None
@@ -269,7 +291,11 @@ class CoreApiServer:
         if self._server is not None:
             return
 
-        server = _AthenaHttpServer((self._host, self._configured_port), self.app)
+        server = _AthenaHttpServer(
+            (self._host, self._configured_port),
+            self.app,
+            self._shutdown_callback,
+        )
         actual_port = int(server.server_address[1])
         thread = threading.Thread(
             target=server.serve_forever,

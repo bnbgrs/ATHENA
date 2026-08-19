@@ -16,6 +16,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+desktop = [
+    "PySide6-Essentials==6.11.1",
+]
 dev = [
     "mypy==2.3.0",
     "pytest==9.1.1",
@@ -25,6 +28,7 @@ dev = [
 [project.scripts]
 athena = "athena.__main__:main"
 athena-recover = "athena.recovery_cli:main"
+athena-desktop = "athena.desktop.app:main"
 
 [tool.uv]
 required-version = "==0.11.21"

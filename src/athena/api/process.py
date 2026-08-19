@@ -81,10 +81,12 @@ class CoreApiProcess:
         self.port = port
         self.app = AthenaApplication(settings=settings)
         self.runtime_root = self.app.paths.temp_root / _RUNTIME_DIRECTORY_NAME
+        self._shutdown_requested = threading.Event()
         self.server = CoreApiServer(
             facade=self.app.api,
             runtime_root=self.runtime_root,
             port=port,
+            shutdown_callback=self.request_shutdown,
         )
         self._ownership: _CoreApiProcessLock | None = None
 
@@ -104,6 +106,7 @@ class CoreApiProcess:
 
         ownership = _CoreApiProcessLock.acquire(self.settings.local_root)
         self._ownership = ownership
+        self._shutdown_requested.clear()
 
         try:
             self.app.start()
@@ -139,15 +142,25 @@ class CoreApiProcess:
                 "ATHENA desktop Core did not stop cleanly."
             ) from failures[0]
 
-    def run(self, *, stop_event: threading.Event | None = None) -> int:
-        waiter = stop_event or threading.Event()
-        self.start()
+    def request_shutdown(self) -> None:
+        """Request an orderly stop from the authenticated local control API."""
+        self._shutdown_requested.set()
+
+    def wait(self, *, stop_event: threading.Event | None = None) -> int:
+        """Wait for an internal or caller-provided stop request."""
         try:
-            while not waiter.wait(_POLL_INTERVAL_SECONDS):
-                pass
-            return 0
+            while True:
+                if self._shutdown_requested.wait(_POLL_INTERVAL_SECONDS):
+                    return 0
+                if stop_event is not None and stop_event.is_set():
+                    return 0
         except KeyboardInterrupt:
             return 130
+
+    def run(self, *, stop_event: threading.Event | None = None) -> int:
+        self.start()
+        try:
+            return self.wait(stop_event=stop_event)
         finally:
             self.stop()
 
@@ -241,11 +254,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise CoreApiProcessError("ATHENA Core API started without a published port.")
         print(f"ATHENA Core API ready on 127.0.0.1:{port}", flush=True)
         print(f"Discovery: {process.server.runtime.discovery_path}", flush=True)
-        waiter = threading.Event()
-        while True:
-            waiter.wait(_POLL_INTERVAL_SECONDS)
-    except KeyboardInterrupt:
-        return 130
+        return process.wait()
     finally:
         process.stop()
 

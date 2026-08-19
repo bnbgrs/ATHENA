@@ -346,3 +346,37 @@ def test_asgi_known_route_with_wrong_method_is_405(tmp_path) -> None:
 
     assert status == 405
     assert payload["code"] == "method_not_allowed"
+
+
+def test_asgi_shutdown_requires_dedicated_process_opt_in(tmp_path) -> None:
+    app, runtime, token = _app(tmp_path)
+
+    unavailable_status, _, unavailable = asyncio.run(
+        _request(
+            app,
+            runtime,
+            method="POST",
+            path="/api/v1/system/shutdown",
+            token=token,
+        )
+    )
+
+    enabled = CoreApiAsgiApp(
+        facade=_facade(),
+        runtime=runtime,
+        allow_shutdown=True,
+    )
+    accepted_status, _, accepted = asyncio.run(
+        _request(
+            enabled,
+            runtime,
+            method="POST",
+            path="/api/v1/system/shutdown",
+            token=token,
+        )
+    )
+
+    assert unavailable_status == 409
+    assert unavailable["code"] == "shutdown_unavailable"
+    assert accepted_status == 202
+    assert accepted == {"accepted": True}

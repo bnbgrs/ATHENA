@@ -21,6 +21,8 @@ from athena.api.contracts import (
     ModelResponse,
     ProviderHealthResponse,
 )
+from athena.config.settings import AthenaSettings
+from athena.storage.paths import RuntimePaths
 
 _DISCOVERY_FILE = "core-api.json"
 _TOKEN_FILE = "core-api.token"
@@ -52,6 +54,7 @@ class _Bootstrap:
     host: str
     port: int
     token: str
+    process_id: int
 
     @property
     def base_url(self) -> str:
@@ -76,6 +79,20 @@ class CoreApiClient:
         self.runtime_root = Path(runtime_root)
         self.discovery_path = self.runtime_root / _DISCOVERY_FILE
         self.timeout_seconds = timeout_seconds
+
+    @classmethod
+    def from_environment(
+        cls,
+        *,
+        timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+    ) -> CoreApiClient:
+        """Create the desktop client from ATHENA's normal local runtime root."""
+        settings = AthenaSettings.from_environment()
+        paths = RuntimePaths.from_settings(settings)
+        return cls(
+            paths.temp_root / "core-api",
+            timeout_seconds=timeout_seconds,
+        )
 
     def health(self) -> HealthResponse:
         return _health(self._get("/api/v1/health"))
@@ -103,6 +120,18 @@ class CoreApiClient:
     def list_models(self) -> tuple[ModelResponse, ...]:
         payload = self._get("/api/v1/models")
         return tuple(_model(item) for item in _items(payload))
+
+    def discovery_process_id(self) -> int:
+        """Return the PID that published the currently trusted discovery state."""
+        return self._load_bootstrap().process_id
+
+    def request_shutdown(self) -> None:
+        """Request graceful shutdown without retrying the mutating command."""
+        self._request(
+            "POST",
+            "/api/v1/system/shutdown",
+            expected_status=202,
+        )
 
     def _get(
         self,
@@ -284,7 +313,12 @@ class CoreApiClient:
                 "ATHENA Core session token is invalid.",
                 code="invalid_discovery",
             )
-        return _Bootstrap(host=host, port=port, token=token)
+        return _Bootstrap(
+            host=host,
+            port=port,
+            token=token,
+            process_id=process_id,
+        )
 
 
 def _problem_from_http_error(status: int, raw: bytes) -> CoreApiClientError:

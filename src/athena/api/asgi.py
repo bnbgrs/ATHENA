@@ -24,9 +24,16 @@ _JSON_HEADERS = ((b"content-type", b"application/json; charset=utf-8"),)
 class CoreApiAsgiApp:
     """Small authenticated ASGI surface around :class:`CoreApiFacade`."""
 
-    def __init__(self, *, facade: CoreApiFacade, runtime: LocalApiRuntime) -> None:
+    def __init__(
+        self,
+        *,
+        facade: CoreApiFacade,
+        runtime: LocalApiRuntime,
+        allow_shutdown: bool = False,
+    ) -> None:
         self._facade = facade
         self._runtime = runtime
+        self._allow_shutdown = allow_shutdown
 
     async def __call__(
         self,
@@ -134,6 +141,25 @@ class CoreApiAsgiApp:
                     request_id=request_id,
                 )
                 return
+
+            if method == "POST" and path == "/api/v1/system/shutdown":
+                await _consume_empty_body(receive)
+                if not self._allow_shutdown:
+                    await _send_problem(
+                        send,
+                        status=409,
+                        code="shutdown_unavailable",
+                        message="ATHENA Core shutdown is unavailable in this process.",
+                        request_id=request_id,
+                    )
+                    return
+                await _send_json(
+                    send,
+                    status=202,
+                    payload={"accepted": True},
+                    request_id=request_id,
+                )
+                return
         except (ValueError, TypeError) as exc:
             await _send_problem(
                 send,
@@ -192,6 +218,7 @@ def _known_path(path: str) -> bool:
         "/api/v1/chats",
         "/api/v1/models",
         "/api/v1/models/health",
+        "/api/v1/system/shutdown",
     }:
         return True
     if path.startswith("/api/v1/chats/"):
