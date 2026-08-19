@@ -74,6 +74,15 @@ _NEUTRAL_ANALYSIS_ARTIFACT_HASH_DOMAIN = (
     b"ANALYSIS_ARTIFACT_V1:"
 )
 
+EXTRACTION_ARTIFACT_SEMANTIC_KIND = "source_extraction_artifacts"
+EXTRACTION_ARTIFACT_PAYLOAD_VERSION = 1
+EXTRACTION_NEUTRAL_ARTIFACT_CONTENT_JSON = "{}"
+_NEUTRAL_EXTRACTION_ARTIFACT_HASH_DOMAIN = (
+    b"ATHENA_PROTECTED_SOURCE_"
+    b"EXTRACTION_ARTIFACT_V1:"
+)
+
+
 class SourceProtectedSemanticError(
     RuntimeError
 ):
@@ -800,6 +809,169 @@ def decode_source_analysis_artifact_semantics(
         content_json=content_json,
         content_hash=content_hash,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectedSourceExtractionArtifactEntry:
+    artifact_id: uuid.UUID
+    content_json: str
+    content_hash: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectedSourceExtractionArtifactSemantics:
+    extraction_id: uuid.UUID
+    artifacts: tuple[ProtectedSourceExtractionArtifactEntry, ...]
+
+
+def extraction_artifact_neutral_content_hash(
+    artifact_id: uuid.UUID,
+) -> bytes:
+    """Return a deterministic non-content SourceExtraction artifact hash."""
+    return hashlib.sha256(
+        _NEUTRAL_EXTRACTION_ARTIFACT_HASH_DOMAIN + artifact_id.bytes
+    ).digest()
+
+
+def decode_source_extraction_artifact_semantics(
+    plaintext: bytes,
+) -> ProtectedSourceExtractionArtifactSemantics:
+    """Validate and decode one protected SourceExtraction artifact-set payload."""
+    try:
+        payload = json.loads(plaintext.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceExtraction artifact payload is not valid canonical JSON."
+        ) from exc
+
+    if (
+        not isinstance(payload, dict)
+        or set(payload)
+        != {
+            "entity_id",
+            "fields",
+            "payload_version",
+            "semantic_kind",
+        }
+    ):
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceExtraction artifact payload has an invalid envelope."
+        )
+
+    if (
+        payload["semantic_kind"] != EXTRACTION_ARTIFACT_SEMANTIC_KIND
+        or payload["payload_version"] != EXTRACTION_ARTIFACT_PAYLOAD_VERSION
+    ):
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceExtraction artifact payload version is unsupported."
+        )
+
+    try:
+        extraction_id = uuid.UUID(str(payload["entity_id"]))
+    except ValueError as exc:
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceExtraction artifact payload has an invalid entity ID."
+        ) from exc
+
+    fields = payload["fields"]
+    if not isinstance(fields, dict) or set(fields) != {"artifacts"}:
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceExtraction artifact payload fields are invalid."
+        )
+
+    raw_artifacts = fields["artifacts"]
+    if not isinstance(raw_artifacts, list):
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceExtraction artifact entries are invalid."
+        )
+
+    artifacts: list[ProtectedSourceExtractionArtifactEntry] = []
+    seen_ids: set[uuid.UUID] = set()
+
+    for raw in raw_artifacts:
+        if (
+            not isinstance(raw, dict)
+            or set(raw)
+            != {
+                "artifact_id",
+                "content_hash_hex",
+                "content_json",
+            }
+        ):
+            raise SourceProtectedSemanticIntegrityError(
+                "Protected SourceExtraction artifact entry is invalid."
+            )
+
+        try:
+            artifact_id = uuid.UUID(str(raw["artifact_id"]))
+        except ValueError as exc:
+            raise SourceProtectedSemanticIntegrityError(
+                "Protected SourceExtraction artifact has an invalid artifact ID."
+            ) from exc
+
+        if artifact_id in seen_ids:
+            raise SourceProtectedSemanticIntegrityError(
+                "Protected SourceExtraction artifact payload contains duplicate artifacts."
+            )
+        seen_ids.add(artifact_id)
+
+        content_json = raw["content_json"]
+        content_hash_hex = raw["content_hash_hex"]
+
+        if not isinstance(content_json, str):
+            raise SourceProtectedSemanticIntegrityError(
+                "Protected SourceExtraction artifact content is invalid."
+            )
+
+        try:
+            json.loads(content_json)
+        except json.JSONDecodeError as exc:
+            raise SourceProtectedSemanticIntegrityError(
+                "Protected SourceExtraction artifact content is not valid JSON."
+            ) from exc
+
+        if not isinstance(content_hash_hex, str):
+            raise SourceProtectedSemanticIntegrityError(
+                "Protected SourceExtraction artifact hash is invalid."
+            )
+
+        try:
+            content_hash = bytes.fromhex(content_hash_hex)
+        except ValueError as exc:
+            raise SourceProtectedSemanticIntegrityError(
+                "Protected SourceExtraction artifact hash is invalid."
+            ) from exc
+
+        if len(content_hash) != 32:
+            raise SourceProtectedSemanticIntegrityError(
+                "Protected SourceExtraction artifact hash is not SHA-256."
+            )
+
+        if hashlib.sha256(content_json.encode("utf-8")).digest() != content_hash:
+            raise SourceProtectedSemanticIntegrityError(
+                "Protected SourceExtraction artifact hash disagrees with content."
+            )
+
+        artifacts.append(
+            ProtectedSourceExtractionArtifactEntry(
+                artifact_id=artifact_id,
+                content_json=content_json,
+                content_hash=content_hash,
+            )
+        )
+
+    if tuple(item.artifact_id.bytes for item in artifacts) != tuple(
+        sorted(item.artifact_id.bytes for item in artifacts)
+    ):
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceExtraction artifact ordering is invalid."
+        )
+
+    return ProtectedSourceExtractionArtifactSemantics(
+        extraction_id=extraction_id,
+        artifacts=tuple(artifacts),
+    )
+
 
 def page_neutral_content_hash(
     representation_id: uuid.UUID,
@@ -2478,6 +2650,308 @@ class SourceProtectedSemanticRepository:
 
         return mapping
 
+
+    def protect_extraction_artifact_semantics(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        source_id: uuid.UUID,
+        extraction_id: uuid.UUID,
+        protection_scope_id: uuid.UUID,
+        payload_writer: ProtectedSemanticPayloadWriter,
+        now_us: int | None = None,
+    ) -> SourceProtectedSemanticMapping:
+        """Protect the complete persisted artifact set for one SourceExtraction."""
+        if not connection.in_transaction:
+            raise RuntimeError(
+                "Protected Source semantic cutover requires an active transaction."
+            )
+
+        extraction = connection.execute(
+            """
+            SELECT x.extraction_id, a.source_id
+            FROM source_extractions AS x
+            JOIN source_analyses AS a
+              ON a.analysis_id = x.analysis_id
+            WHERE x.extraction_id = ?
+            """,
+            (uuid_to_blob(extraction_id),),
+        ).fetchone()
+
+        if extraction is None:
+            raise SourceProtectedSemanticNotFoundError(str(extraction_id))
+
+        actual_source_id = uuid_from_blob(bytes(extraction["source_id"]))
+        if actual_source_id != source_id:
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceExtraction does not belong to the requested Source."
+            )
+
+        self._require_active_scope(
+            connection,
+            protection_scope_id,
+        )
+
+        created_at_us = utc_now_us() if now_us is None else now_us
+        rows = self._extraction_artifact_rows(
+            connection,
+            extraction_id,
+        )
+
+        return self._protect_extraction_artifact_rows(
+            connection,
+            rows=rows,
+            source_id=source_id,
+            extraction_id=extraction_id,
+            protection_scope_id=protection_scope_id,
+            payload_writer=payload_writer,
+            created_at_us=created_at_us,
+        )
+
+    def protect_source_extraction_artifact_semantics(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        source_id: uuid.UUID,
+        protection_scope_id: uuid.UUID,
+        payload_writer: ProtectedSemanticPayloadWriter,
+        now_us: int | None = None,
+    ) -> tuple[SourceProtectedSemanticMapping, ...]:
+        """Protect every persisted SourceExtraction artifact set for one Source."""
+        if not connection.in_transaction:
+            raise RuntimeError(
+                "Protected Source semantic cutover requires an active transaction."
+            )
+
+        self._require_source(
+            connection,
+            source_id,
+        )
+        self._require_active_scope(
+            connection,
+            protection_scope_id,
+        )
+
+        extraction_rows = connection.execute(
+            """
+            SELECT x.extraction_id
+            FROM source_extractions AS x
+            JOIN source_analyses AS a
+              ON a.analysis_id = x.analysis_id
+            WHERE a.source_id = ?
+            ORDER BY x.extraction_id
+            """,
+            (uuid_to_blob(source_id),),
+        ).fetchall()
+
+        if not extraction_rows:
+            return ()
+
+        created_at_us = utc_now_us() if now_us is None else now_us
+        mappings: list[SourceProtectedSemanticMapping] = []
+
+        for extraction_row in extraction_rows:
+            extraction_id = uuid_from_blob(
+                bytes(extraction_row["extraction_id"])
+            )
+            mappings.append(
+                self.protect_extraction_artifact_semantics(
+                    connection,
+                    source_id=source_id,
+                    extraction_id=extraction_id,
+                    protection_scope_id=protection_scope_id,
+                    payload_writer=payload_writer,
+                    now_us=created_at_us,
+                )
+            )
+
+        return tuple(mappings)
+
+    @staticmethod
+    def _extraction_artifact_rows(
+        connection: sqlite3.Connection,
+        extraction_id: uuid.UUID,
+    ) -> list[sqlite3.Row]:
+        return connection.execute(
+            """
+            SELECT
+                art.artifact_id,
+                art.extraction_id,
+                art.content_json,
+                art.content_hash,
+                a.source_id
+            FROM source_extraction_artifacts AS art
+            JOIN source_extractions AS x
+              ON x.extraction_id = art.extraction_id
+            JOIN source_analyses AS a
+              ON a.analysis_id = x.analysis_id
+            WHERE art.extraction_id = ?
+            ORDER BY art.artifact_id
+            """,
+            (uuid_to_blob(extraction_id),),
+        ).fetchall()
+
+    def _protect_extraction_artifact_rows(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        rows: list[sqlite3.Row],
+        source_id: uuid.UUID,
+        extraction_id: uuid.UUID,
+        protection_scope_id: uuid.UUID,
+        payload_writer: ProtectedSemanticPayloadWriter,
+        created_at_us: int,
+    ) -> SourceProtectedSemanticMapping:
+        existing = self._mapping_for(
+            connection,
+            source_id=source_id,
+            semantic_kind=EXTRACTION_ARTIFACT_SEMANTIC_KIND,
+            entity_id=extraction_id,
+        )
+
+        frozen: list[tuple[uuid.UUID, str, bytes]] = []
+
+        for row in rows:
+            artifact_id = uuid_from_blob(bytes(row["artifact_id"]))
+            actual_extraction_id = uuid_from_blob(bytes(row["extraction_id"]))
+            actual_source_id = uuid_from_blob(bytes(row["source_id"]))
+            content_json = str(row["content_json"])
+            content_hash = bytes(row["content_hash"])
+
+            if (
+                actual_extraction_id != extraction_id
+                or actual_source_id != source_id
+            ):
+                raise SourceProtectedSemanticIntegrityError(
+                    "SourceExtraction artifact crossed the requested Source."
+                )
+
+            neutral_hash = extraction_artifact_neutral_content_hash(
+                artifact_id
+            )
+
+            if existing is not None:
+                if (
+                    content_json != EXTRACTION_NEUTRAL_ARTIFACT_CONTENT_JSON
+                    or content_hash != neutral_hash
+                ):
+                    raise SourceProtectedSemanticIntegrityError(
+                        "Protected SourceExtraction artifacts are not fully neutralized."
+                    )
+
+                frozen.append(
+                    (
+                        artifact_id,
+                        content_json,
+                        content_hash,
+                    )
+                )
+                continue
+
+            if len(content_hash) != 32:
+                raise SourceProtectedSemanticIntegrityError(
+                    "SourceExtraction artifact hash is invalid."
+                )
+
+            try:
+                json.loads(content_json)
+            except json.JSONDecodeError as exc:
+                raise SourceProtectedSemanticIntegrityError(
+                    "SourceExtraction artifact content is not valid JSON."
+                ) from exc
+
+            expected_hash = hashlib.sha256(
+                content_json.encode("utf-8")
+            ).digest()
+
+            if content_hash != expected_hash:
+                raise SourceProtectedSemanticIntegrityError(
+                    "SourceExtraction artifact hash disagrees with content."
+                )
+
+            if (
+                content_json == EXTRACTION_NEUTRAL_ARTIFACT_CONTENT_JSON
+                and content_hash == neutral_hash
+            ):
+                raise SourceProtectedSemanticIntegrityError(
+                    "SourceExtraction artifact appears neutralized "
+                    "without a protected mapping."
+                )
+
+            frozen.append(
+                (
+                    artifact_id,
+                    content_json,
+                    content_hash,
+                )
+            )
+
+        if existing is not None:
+            self._require_existing_mapping(
+                connection,
+                existing,
+                semantic_kind=EXTRACTION_ARTIFACT_SEMANTIC_KIND,
+                payload_version=EXTRACTION_ARTIFACT_PAYLOAD_VERSION,
+                protection_scope_id=protection_scope_id,
+            )
+            return existing
+
+        original_artifacts = tuple(frozen)
+
+        plaintext = self._encode_extraction_artifact_semantics(
+            extraction_id=extraction_id,
+            artifacts=original_artifacts,
+        )
+        protected_payload_id = payload_writer(
+            connection,
+            plaintext,
+        )
+        self._require_payload_scope(
+            connection,
+            protected_payload_id=protected_payload_id,
+            protection_scope_id=protection_scope_id,
+        )
+        mapping = self._insert_semantic_mapping(
+            connection,
+            source_id=source_id,
+            semantic_kind=EXTRACTION_ARTIFACT_SEMANTIC_KIND,
+            entity_id=extraction_id,
+            protection_scope_id=protection_scope_id,
+            protected_payload_id=protected_payload_id,
+            payload_version=EXTRACTION_ARTIFACT_PAYLOAD_VERSION,
+            created_at_us=created_at_us,
+        )
+
+        for artifact_id, content_json, content_hash in original_artifacts:
+            updated = connection.execute(
+                """
+                UPDATE source_extraction_artifacts
+                SET content_json = ?,
+                    content_hash = ?
+                WHERE artifact_id = ?
+                  AND extraction_id = ?
+                  AND content_json = ?
+                  AND content_hash = ?
+                """,
+                (
+                    EXTRACTION_NEUTRAL_ARTIFACT_CONTENT_JSON,
+                    extraction_artifact_neutral_content_hash(
+                        artifact_id
+                    ),
+                    uuid_to_blob(artifact_id),
+                    uuid_to_blob(extraction_id),
+                    content_json,
+                    content_hash,
+                ),
+            )
+
+            if updated.rowcount != 1:
+                raise SourceProtectedSemanticIntegrityError(
+                    "SourceExtraction artifact changed during semantic cutover."
+                )
+
+        return mapping
+
     def _protect_page_map_semantics(
         self,
         connection: sqlite3.Connection,
@@ -2968,6 +3442,61 @@ class SourceProtectedSemanticRepository:
             },
             "payload_version": ANALYSIS_ARTIFACT_PAYLOAD_VERSION,
             "semantic_kind": ANALYSIS_ARTIFACT_SEMANTIC_KIND,
+        }
+
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+
+
+    @staticmethod
+    def _encode_extraction_artifact_semantics(
+        *,
+        extraction_id: uuid.UUID,
+        artifacts: tuple[
+            tuple[uuid.UUID, str, bytes],
+            ...,
+        ],
+    ) -> bytes:
+        payload_artifacts: list[dict[str, str]] = []
+
+        for artifact_id, content_json, content_hash in artifacts:
+            if len(content_hash) != 32:
+                raise SourceProtectedSemanticIntegrityError(
+                    "SourceExtraction artifact hash is invalid."
+                )
+
+            try:
+                json.loads(content_json)
+            except json.JSONDecodeError as exc:
+                raise SourceProtectedSemanticIntegrityError(
+                    "SourceExtraction artifact content is not valid JSON."
+                ) from exc
+
+            if hashlib.sha256(content_json.encode("utf-8")).digest() != content_hash:
+                raise SourceProtectedSemanticIntegrityError(
+                    "SourceExtraction artifact hash disagrees with content."
+                )
+
+            payload_artifacts.append(
+                {
+                    "artifact_id": str(artifact_id),
+                    "content_hash_hex": content_hash.hex(),
+                    "content_json": content_json,
+                }
+            )
+
+        payload = {
+            "entity_id": str(extraction_id),
+            "fields": {
+                "artifacts": payload_artifacts,
+            },
+            "payload_version": EXTRACTION_ARTIFACT_PAYLOAD_VERSION,
+            "semantic_kind": EXTRACTION_ARTIFACT_SEMANTIC_KIND,
         }
 
         return json.dumps(

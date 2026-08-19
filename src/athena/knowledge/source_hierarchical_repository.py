@@ -23,6 +23,11 @@ from athena.knowledge.source_hierarchical_models import (
     SourceHierarchicalExtractionWorkInput,
     SourceHierarchicalExtractionWorkItem,
 )
+from athena.source.protected_semantic import (
+    EXTRACTION_ARTIFACT_SEMANTIC_KIND,
+    EXTRACTION_NEUTRAL_ARTIFACT_CONTENT_JSON,
+    extraction_artifact_neutral_content_hash,
+)
 from athena.storage.database import SQLiteDatabase
 
 
@@ -421,6 +426,26 @@ class SourceHierarchicalExtractionRepository:
                     f"Hierarchical extraction work item {work_item_id} not found."
                 )
             item = _work_item_from_row(row)
+
+            protected = connection.execute(
+                """
+                SELECT 1
+                FROM source_protected_semantic_payloads
+                WHERE semantic_kind = ?
+                  AND entity_id = ?
+                LIMIT 1
+                """,
+                (
+                    EXTRACTION_ARTIFACT_SEMANTIC_KIND,
+                    uuid_to_blob(item.extraction_id),
+                ),
+            ).fetchone()
+
+            if protected is not None:
+                raise SourceHierarchicalExtractionInvariantError(
+                    "Protected SourceExtraction cannot accept new semantic artifacts."
+                )
+
             existing = connection.execute(
                 "SELECT * FROM source_extraction_artifacts WHERE work_item_id = ?",
                 (uuid_to_blob(work_item_id),),
@@ -835,15 +860,30 @@ def _work_item_from_row(row: Any) -> SourceHierarchicalExtractionWorkItem:
 
 
 def _artifact_from_row(row: Any) -> SourceHierarchicalExtractionArtifact:
+    artifact_id = uuid_from_blob(row["artifact_id"])
+    content_json = str(row["content_json"])
+    content_hash = bytes(row["content_hash"])
+
+    if (
+        content_json == EXTRACTION_NEUTRAL_ARTIFACT_CONTENT_JSON
+        and content_hash == extraction_artifact_neutral_content_hash(
+            artifact_id
+        )
+    ):
+        raise SourceHierarchicalExtractionInvariantError(
+            "Protected SourceExtraction artifact semantics are unavailable "
+            "through the public reader."
+        )
+
     return SourceHierarchicalExtractionArtifact(
-        artifact_id=uuid_from_blob(row["artifact_id"]),
+        artifact_id=artifact_id,
         extraction_id=uuid_from_blob(row["extraction_id"]),
         work_item_id=uuid_from_blob(row["work_item_id"]),
         artifact_kind=SourceExtractionStage(str(row["artifact_kind"])),
         level=int(row["level"]),
         ordinal=int(row["ordinal"]),
-        content_json=str(row["content_json"]),
-        content_hash=bytes(row["content_hash"]),
+        content_json=content_json,
+        content_hash=content_hash,
         processing_run_id=uuid_from_blob(row["processing_run_id"]),
         created_at_us=int(row["created_at_us"]),
     )
