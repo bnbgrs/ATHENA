@@ -4,15 +4,20 @@ on:
   push:
     branches:
       - backup/full-repo-20260819
+    paths-ignore:
+      - BACKUP_RUN_ID.txt
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   export:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Check out export branch
+        uses: actions/checkout@v6
+
       - name: Create exact mirror and bundle
         shell: bash
         run: |
@@ -45,3 +50,14 @@ jobs:
           path: ATHENA-complete-backup-2026-08-19.zip
           if-no-files-found: error
           retention-days: 7
+
+      - name: Record workflow run id
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' "${GITHUB_RUN_ID}" > BACKUP_RUN_ID.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add BACKUP_RUN_ID.txt
+          git commit -m "Record complete backup workflow run [skip ci]"
+          git push
