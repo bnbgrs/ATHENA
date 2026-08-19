@@ -1,0 +1,47 @@
+name: Export Complete Repository Backup
+
+on:
+  push:
+    branches:
+      - backup/full-repo-20260819
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Create exact mirror and bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --mirror "https://github.com/${GITHUB_REPOSITORY}.git" ATHENA.git
+          git -C ATHENA.git remote update --prune
+          git -C ATHENA.git bundle create ../ATHENA-complete-backup-2026-08-19.bundle --all
+          git -C ATHENA.git bundle verify ../ATHENA-complete-backup-2026-08-19.bundle
+          cat > ATHENA-RESTORE.txt <<'EOF'
+          ATHENA complete Git backup — 2026-08-19
+
+          Restore from bundle:
+            git clone ATHENA-complete-backup-2026-08-19.bundle ATHENA-restored
+
+          Restore from mirror:
+            git clone ATHENA.git ATHENA-restored
+
+          Verify:
+            cd ATHENA-restored
+            git branch -a
+            git tag
+            git log --oneline --decorate --graph --all
+          EOF
+          zip -qr ATHENA-complete-backup-2026-08-19.zip ATHENA.git ATHENA-complete-backup-2026-08-19.bundle ATHENA-RESTORE.txt
+
+      - name: Upload complete backup
+        uses: actions/upload-artifact@v4
+        with:
+          name: ATHENA-complete-backup-2026-08-19
+          path: ATHENA-complete-backup-2026-08-19.zip
+          if-no-files-found: error
+          retention-days: 7
