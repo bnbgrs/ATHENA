@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import inspect
 import uuid
 
@@ -28,7 +29,7 @@ def _record() -> DeletionLedgerRecord:
 
 def test_backup_service_inherits_deletion_codec_boundary() -> None:
     assert issubclass(BackupService, DeletionLedgerCodecMixin)
-    assert BackupService.__mro__[1] is DeletionLedgerCodecMixin
+    assert DeletionLedgerCodecMixin in BackupService.__mro__[1:]
 
     for name in (
         "_deletion_records_digest",
@@ -80,8 +81,20 @@ def test_service_no_longer_defines_codec_implementation() -> None:
     import athena.backup.service as service_module
 
     source = inspect.getsource(service_module)
+    tree = ast.parse(source)
 
-    assert "class BackupService(DeletionLedgerCodecMixin):" in source
+    backup_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "BackupService"
+    )
+
+    service_methods = {
+        node.name
+        for node in backup_class.body
+        if isinstance(node, ast.FunctionDef)
+    }
 
     for name in (
         "_deletion_records_digest",
@@ -89,6 +102,6 @@ def test_service_no_longer_defines_codec_implementation() -> None:
         "_deletion_record_name",
         "_deletion_record_payload",
     ):
-        assert f"def {name}(" not in source
+        assert name not in service_methods
 
     assert "def _canonical_json(" not in source

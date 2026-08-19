@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import uuid
 
+from athena.backup.errors import BackupRestoreError
 from athena.backup.json_codec import _canonical_json
 from athena.lifecycle.deletion import DeletionLedgerRecord
 
@@ -143,3 +144,139 @@ class DeletionLedgerCodecMixin:
                 record.ledger_seq
             ),
         }
+
+    @classmethod
+    def _deletion_record_from_payload(
+        cls,
+        payload: dict[
+            str,
+            object,
+        ],
+    ) -> DeletionLedgerRecord:
+        required_keys = {
+            "deleted_at_us",
+            "deleted_by_actor_id",
+            "deletion_commit_seq",
+            "deletion_id",
+            "entity_id",
+            "entity_type",
+            "format_version",
+            "ledger_seq",
+        }
+
+        if set(
+            payload
+        ) != required_keys:
+            raise BackupRestoreError(
+                "Backup deletion-ledger record "
+                "contains unexpected fields."
+            )
+
+        format_version = payload[
+            "format_version"
+        ]
+
+        if (
+            not isinstance(
+                format_version,
+                int,
+            )
+            or isinstance(
+                format_version,
+                bool,
+            )
+            or format_version
+            != cls.DELETION_LEDGER_RECORD_FORMAT_VERSION
+        ):
+            raise BackupRestoreError(
+                "Backup deletion-ledger record "
+                "format version is unsupported."
+            )
+
+        def integer(
+            key: str,
+            *,
+            minimum: int,
+        ) -> int:
+            value = payload[
+                key
+            ]
+
+            if (
+                not isinstance(
+                    value,
+                    int,
+                )
+                or isinstance(
+                    value,
+                    bool,
+                )
+                or value < minimum
+            ):
+                raise BackupRestoreError(
+                    f"Backup deletion-ledger field "
+                    f"{key!r} is invalid."
+                )
+
+            return value
+
+        entity_type = payload[
+            "entity_type"
+        ]
+
+        if (
+            not isinstance(
+                entity_type,
+                str,
+            )
+            or not entity_type.strip()
+        ):
+            raise BackupRestoreError(
+                "Backup deletion-ledger entity_type is invalid."
+            )
+
+        try:
+            return DeletionLedgerRecord(
+                ledger_seq=integer(
+                    "ledger_seq",
+                    minimum=1,
+                ),
+                deletion_id=uuid.UUID(
+                    str(
+                        payload[
+                            "deletion_id"
+                        ]
+                    )
+                ),
+                entity_id=uuid.UUID(
+                    str(
+                        payload[
+                            "entity_id"
+                        ]
+                    )
+                ),
+                entity_type=entity_type,
+                deleted_at_us=integer(
+                    "deleted_at_us",
+                    minimum=0,
+                ),
+                deletion_commit_seq=integer(
+                    "deletion_commit_seq",
+                    minimum=1,
+                ),
+                deleted_by_actor_id=uuid.UUID(
+                    str(
+                        payload[
+                            "deleted_by_actor_id"
+                        ]
+                    )
+                ),
+            )
+
+        except (
+            ValueError,
+            AttributeError,
+        ) as exc:
+            raise BackupRestoreError(
+                "Backup deletion-ledger UUID is invalid."
+            ) from exc
