@@ -44,6 +44,13 @@ _NEUTRAL_STRUCTURE_HASH_DOMAIN = (
 )
 _NEUTRAL_STRUCTURE_METADATA_JSON = "{}"
 
+ANCHOR_SEMANTIC_KIND = "source_anchor"
+ANCHOR_PAYLOAD_VERSION = 1
+_NEUTRAL_ANCHOR_HASH_DOMAIN = (
+    b"ATHENA_PROTECTED_SOURCE_"
+    b"ANCHOR_SEMANTIC_V1:"
+)
+_NEUTRAL_ANCHOR_GEOMETRY_JSON = "{}"
 
 class SourceProtectedSemanticError(
     RuntimeError
@@ -305,6 +312,112 @@ class ProtectedRepresentationStructureMapSemantics:
     representation_id: uuid.UUID
     structures: tuple[ProtectedRepresentationStructureEntry, ...]
 
+
+@dataclass(frozen=True, slots=True)
+class ProtectedSourceAnchorSemantics:
+    anchor_id: uuid.UUID
+    geometry_json: str | None
+    quoted_hash: bytes | None
+
+
+def anchor_neutral_quoted_hash(anchor_id: uuid.UUID) -> bytes:
+    """Return a deterministic non-content SourceAnchor hash."""
+    return hashlib.sha256(
+        _NEUTRAL_ANCHOR_HASH_DOMAIN + anchor_id.bytes
+    ).digest()
+
+
+def decode_source_anchor_semantics(
+    plaintext: bytes,
+) -> ProtectedSourceAnchorSemantics:
+    """Validate and decode one protected SourceAnchor semantic payload."""
+    try:
+        payload = json.loads(plaintext.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceAnchor payload is not valid canonical JSON."
+        ) from exc
+
+    if (
+        not isinstance(payload, dict)
+        or set(payload)
+        != {
+            "entity_id",
+            "fields",
+            "payload_version",
+            "semantic_kind",
+        }
+    ):
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceAnchor payload has an invalid envelope."
+        )
+
+    if (
+        payload["semantic_kind"] != ANCHOR_SEMANTIC_KIND
+        or payload["payload_version"] != ANCHOR_PAYLOAD_VERSION
+    ):
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceAnchor payload version is unsupported."
+        )
+
+    try:
+        anchor_id = uuid.UUID(str(payload["entity_id"]))
+    except ValueError as exc:
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceAnchor payload has an invalid entity ID."
+        ) from exc
+
+    fields = payload["fields"]
+
+    if (
+        not isinstance(fields, dict)
+        or set(fields) != {"geometry_json", "quoted_hash_hex"}
+    ):
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceAnchor payload fields are invalid."
+        )
+
+    geometry_json = fields["geometry_json"]
+
+    if geometry_json is not None:
+        if not isinstance(geometry_json, str):
+            raise SourceProtectedSemanticIntegrityError(
+                "Protected SourceAnchor geometry is invalid."
+            )
+
+        try:
+            json.loads(geometry_json)
+        except json.JSONDecodeError as exc:
+            raise SourceProtectedSemanticIntegrityError(
+                "Protected SourceAnchor geometry is not valid JSON."
+            ) from exc
+
+    quoted_hash_hex = fields["quoted_hash_hex"]
+
+    if quoted_hash_hex is None:
+        quoted_hash = None
+    elif isinstance(quoted_hash_hex, str):
+        try:
+            quoted_hash = bytes.fromhex(quoted_hash_hex)
+        except ValueError as exc:
+            raise SourceProtectedSemanticIntegrityError(
+                "Protected SourceAnchor quoted hash is invalid."
+            ) from exc
+
+        if len(quoted_hash) != 32:
+            raise SourceProtectedSemanticIntegrityError(
+                "Protected SourceAnchor quoted hash is not SHA-256."
+            )
+    else:
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceAnchor quoted hash is invalid."
+        )
+
+    return ProtectedSourceAnchorSemantics(
+        anchor_id=anchor_id,
+        geometry_json=geometry_json,
+        quoted_hash=quoted_hash,
+    )
 
 def page_neutral_content_hash(
     representation_id: uuid.UUID,
@@ -1060,6 +1173,240 @@ class SourceProtectedSemanticRepository:
             if mapping is not None
         )
 
+    def protect_anchor_semantics(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        source_id: uuid.UUID,
+        anchor_id: uuid.UUID,
+        protection_scope_id: uuid.UUID,
+        payload_writer: ProtectedSemanticPayloadWriter,
+        now_us: int | None = None,
+    ) -> SourceProtectedSemanticMapping:
+        """Protect one SourceAnchor semantic payload in the caller transaction."""
+        if not connection.in_transaction:
+            raise RuntimeError(
+                "Protected Source semantic cutover requires an active transaction."
+            )
+
+        row = connection.execute(
+            """
+            SELECT anchor_id, source_id, geometry_json, quoted_hash
+            FROM source_anchors
+            WHERE anchor_id = ?
+            """,
+            (uuid_to_blob(anchor_id),),
+        ).fetchone()
+
+        if row is None:
+            raise SourceProtectedSemanticNotFoundError(str(anchor_id))
+
+        actual_source_id = uuid_from_blob(bytes(row["source_id"]))
+
+        if actual_source_id != source_id:
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceAnchor does not belong to the requested Source."
+            )
+
+        self._require_active_scope(
+            connection,
+            protection_scope_id,
+        )
+
+        created_at_us = utc_now_us() if now_us is None else now_us
+
+        return self._protect_anchor_semantic_row(
+            connection,
+            row=row,
+            source_id=source_id,
+            protection_scope_id=protection_scope_id,
+            payload_writer=payload_writer,
+            created_at_us=created_at_us,
+        )
+
+    def protect_source_anchor_semantics(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        source_id: uuid.UUID,
+        protection_scope_id: uuid.UUID,
+        payload_writer: ProtectedSemanticPayloadWriter,
+        now_us: int | None = None,
+    ) -> tuple[SourceProtectedSemanticMapping, ...]:
+        """Protect all persisted SourceAnchor semantics for one Source."""
+        if not connection.in_transaction:
+            raise RuntimeError(
+                "Protected Source semantic cutover requires an active transaction."
+            )
+
+        self._require_source(
+            connection,
+            source_id,
+        )
+
+        self._require_active_scope(
+            connection,
+            protection_scope_id,
+        )
+
+        rows = connection.execute(
+            """
+            SELECT anchor_id, source_id, geometry_json, quoted_hash
+            FROM source_anchors
+            WHERE source_id = ?
+            ORDER BY anchor_id
+            """,
+            (uuid_to_blob(source_id),),
+        ).fetchall()
+
+        if not rows:
+            return ()
+
+        created_at_us = utc_now_us() if now_us is None else now_us
+
+        return tuple(
+            self._protect_anchor_semantic_row(
+                connection,
+                row=row,
+                source_id=source_id,
+                protection_scope_id=protection_scope_id,
+                payload_writer=payload_writer,
+                created_at_us=created_at_us,
+            )
+            for row in rows
+        )
+
+    def _protect_anchor_semantic_row(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        row: sqlite3.Row,
+        source_id: uuid.UUID,
+        protection_scope_id: uuid.UUID,
+        payload_writer: ProtectedSemanticPayloadWriter,
+        created_at_us: int,
+    ) -> SourceProtectedSemanticMapping:
+        anchor_id = uuid_from_blob(bytes(row["anchor_id"]))
+        actual_source_id = uuid_from_blob(bytes(row["source_id"]))
+
+        if actual_source_id != source_id:
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceAnchor does not belong to the requested Source."
+            )
+
+        geometry_json = (
+            None
+            if row["geometry_json"] is None
+            else str(row["geometry_json"])
+        )
+
+        quoted_hash = (
+            None
+            if row["quoted_hash"] is None
+            else bytes(row["quoted_hash"])
+        )
+
+        existing = self._mapping_for(
+            connection,
+            source_id=source_id,
+            semantic_kind=ANCHOR_SEMANTIC_KIND,
+            entity_id=anchor_id,
+        )
+
+        neutral_hash = anchor_neutral_quoted_hash(anchor_id)
+
+        if existing is not None:
+            self._require_existing_mapping(
+                connection,
+                existing,
+                semantic_kind=ANCHOR_SEMANTIC_KIND,
+                payload_version=ANCHOR_PAYLOAD_VERSION,
+                protection_scope_id=protection_scope_id,
+            )
+
+            if (
+                geometry_json != _NEUTRAL_ANCHOR_GEOMETRY_JSON
+                or quoted_hash != neutral_hash
+            ):
+                raise SourceProtectedSemanticIntegrityError(
+                    "Protected SourceAnchor is not fully neutralized."
+                )
+
+            return existing
+
+        if quoted_hash is not None and len(quoted_hash) != 32:
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceAnchor quoted hash is invalid."
+            )
+
+        if geometry_json is not None:
+            try:
+                json.loads(geometry_json)
+            except json.JSONDecodeError as exc:
+                raise SourceProtectedSemanticIntegrityError(
+                    "SourceAnchor geometry is not valid JSON."
+                ) from exc
+
+        if quoted_hash == neutral_hash:
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceAnchor appears neutralized without a protected mapping."
+            )
+
+        plaintext = self._encode_anchor_semantics(
+            anchor_id=anchor_id,
+            geometry_json=geometry_json,
+            quoted_hash=quoted_hash,
+        )
+
+        protected_payload_id = payload_writer(
+            connection,
+            plaintext,
+        )
+
+        self._require_payload_scope(
+            connection,
+            protected_payload_id=protected_payload_id,
+            protection_scope_id=protection_scope_id,
+        )
+
+        mapping = self._insert_semantic_mapping(
+            connection,
+            source_id=source_id,
+            semantic_kind=ANCHOR_SEMANTIC_KIND,
+            entity_id=anchor_id,
+            protection_scope_id=protection_scope_id,
+            protected_payload_id=protected_payload_id,
+            payload_version=ANCHOR_PAYLOAD_VERSION,
+            created_at_us=created_at_us,
+        )
+
+        updated = connection.execute(
+            """
+            UPDATE source_anchors
+            SET geometry_json = ?,
+                quoted_hash = ?
+            WHERE anchor_id = ?
+              AND source_id = ?
+              AND geometry_json IS ?
+              AND quoted_hash IS ?
+            """,
+            (
+                _NEUTRAL_ANCHOR_GEOMETRY_JSON,
+                neutral_hash,
+                uuid_to_blob(anchor_id),
+                uuid_to_blob(source_id),
+                geometry_json,
+                quoted_hash,
+            ),
+        )
+
+        if updated.rowcount != 1:
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceAnchor changed during semantic cutover."
+            )
+
+        return mapping
+
     def _protect_page_map_semantics(
         self,
         connection: sqlite3.Connection,
@@ -1453,6 +1800,33 @@ class SourceProtectedSemanticRepository:
         return mapping
 
     @staticmethod
+    def _encode_anchor_semantics(
+        *,
+        anchor_id: uuid.UUID,
+        geometry_json: str | None,
+        quoted_hash: bytes | None,
+    ) -> bytes:
+        payload = {
+            "entity_id": str(anchor_id),
+            "fields": {
+                "geometry_json": geometry_json,
+                "quoted_hash_hex": (
+                    None if quoted_hash is None else quoted_hash.hex()
+                ),
+            },
+            "payload_version": ANCHOR_PAYLOAD_VERSION,
+            "semantic_kind": ANCHOR_SEMANTIC_KIND,
+        }
+
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+
+    @staticmethod
     def _encode_page_map_semantics(
         *,
         representation_id: uuid.UUID,
@@ -1530,6 +1904,21 @@ class SourceProtectedSemanticRepository:
             separators=(",", ":"),
             allow_nan=False,
         ).encode("utf-8")
+
+    @staticmethod
+    def _require_source(
+        connection: sqlite3.Connection,
+        source_id: uuid.UUID,
+    ) -> None:
+        row = connection.execute(
+            "SELECT source_id FROM sources WHERE source_id = ?",
+            (uuid_to_blob(source_id),),
+        ).fetchone()
+
+        if row is None:
+            raise SourceProtectedSemanticNotFoundError(
+                str(source_id)
+            )
 
     @staticmethod
     def _require_representation_source(
