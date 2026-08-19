@@ -23,10 +23,13 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
-      - name: Install project and development tools
+      - name: Install pinned resolver
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
+          python -m pip install --disable-pip-version-check "pip==26.1.2"
+          python -m pip install --disable-pip-version-check "uv==0.11.21"
+
+      - name: Validate dependency lock
+        run: uv lock --check
 
       - name: Run ATHENA quality gate
-        run: python scripts/quality.py
+        run: uv run --locked --extra dev python scripts/quality.py
