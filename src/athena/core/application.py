@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from enum import Enum
 
+from athena.api.service import CoreApiFacade
 from athena.backup.service import BackupService
 from athena.chat.adaptive import (
     AdaptiveChatService,
@@ -278,6 +279,11 @@ class AthenaApplication:
             base_url=self.settings.lm_studio_base_url,
             timeout_seconds=self.settings.model_request_timeout_seconds,
             generation_timeout_seconds=self.settings.model_generation_timeout_seconds,
+        )
+        self.api = CoreApiFacade(
+            health=self.health,
+            chat=self.chat,
+            model_provider=self.model_provider,
         )
         self.resources = ResourceManager(
             database=self.database,
