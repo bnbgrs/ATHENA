@@ -52,6 +52,13 @@ _NEUTRAL_ANCHOR_HASH_DOMAIN = (
 )
 _NEUTRAL_ANCHOR_GEOMETRY_JSON = "{}"
 
+EXTRACTION_EVIDENCE_SEMANTIC_KIND = "source_extraction_evidence"
+EXTRACTION_EVIDENCE_PAYLOAD_VERSION = 1
+_NEUTRAL_EXTRACTION_EVIDENCE_HASH_DOMAIN = (
+    b"ATHENA_PROTECTED_SOURCE_"
+    b"EXTRACTION_EVIDENCE_V1:"
+)
+
 class SourceProtectedSemanticError(
     RuntimeError
 ):
@@ -418,6 +425,164 @@ def decode_source_anchor_semantics(
         geometry_json=geometry_json,
         quoted_hash=quoted_hash,
     )
+
+@dataclass(frozen=True, slots=True)
+class ProtectedSourceExtractionEvidenceEntry:
+    sequence_no: int
+    source_anchor_id: uuid.UUID
+    quoted_hash: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectedSourceExtractionEvidenceSemantics:
+    extraction_id: uuid.UUID
+    evidence: tuple[ProtectedSourceExtractionEvidenceEntry, ...]
+
+
+def extraction_evidence_neutral_quoted_hash(
+    extraction_id: uuid.UUID,
+    sequence_no: int,
+    source_anchor_id: uuid.UUID,
+) -> bytes:
+    """Return a deterministic non-content extraction-evidence hash."""
+    if sequence_no < 1 or sequence_no > 0x7FFF_FFFF_FFFF_FFFF:
+        raise ValueError("Extraction evidence sequence must fit positive SQLite INTEGER.")
+
+    return hashlib.sha256(
+        _NEUTRAL_EXTRACTION_EVIDENCE_HASH_DOMAIN
+        + extraction_id.bytes
+        + sequence_no.to_bytes(8, "big", signed=False)
+        + source_anchor_id.bytes
+    ).digest()
+
+
+def decode_source_extraction_evidence_semantics(
+    plaintext: bytes,
+) -> ProtectedSourceExtractionEvidenceSemantics:
+    """Validate and decode one protected extraction-evidence payload."""
+    try:
+        payload = json.loads(plaintext.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceExtraction evidence payload is not valid canonical JSON."
+        ) from exc
+
+    if (
+        not isinstance(payload, dict)
+        or set(payload)
+        != {
+            "entity_id",
+            "fields",
+            "payload_version",
+            "semantic_kind",
+        }
+    ):
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceExtraction evidence payload has an invalid envelope."
+        )
+
+    if (
+        payload["semantic_kind"] != EXTRACTION_EVIDENCE_SEMANTIC_KIND
+        or payload["payload_version"] != EXTRACTION_EVIDENCE_PAYLOAD_VERSION
+    ):
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceExtraction evidence payload version is unsupported."
+        )
+
+    try:
+        extraction_id = uuid.UUID(str(payload["entity_id"]))
+    except ValueError as exc:
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceExtraction evidence payload has an invalid entity ID."
+        ) from exc
+
+    fields = payload["fields"]
+
+    if not isinstance(fields, dict) or set(fields) != {"evidence"}:
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceExtraction evidence payload fields are invalid."
+        )
+
+    raw_evidence = fields["evidence"]
+
+    if not isinstance(raw_evidence, list) or not raw_evidence:
+        raise SourceProtectedSemanticIntegrityError(
+            "Protected SourceExtraction evidence payload has no evidence rows."
+        )
+
+    evidence: list[ProtectedSourceExtractionEvidenceEntry] = []
+    seen_anchor_ids: set[uuid.UUID] = set()
+
+    for expected_sequence, raw_entry in enumerate(raw_evidence, 1):
+        if (
+            not isinstance(raw_entry, dict)
+            or set(raw_entry)
+            != {
+                "quoted_hash_hex",
+                "sequence_no",
+                "source_anchor_id",
+            }
+        ):
+            raise SourceProtectedSemanticIntegrityError(
+                "Protected SourceExtraction evidence entry is invalid."
+            )
+
+        sequence_no = raw_entry["sequence_no"]
+
+        if (
+            isinstance(sequence_no, bool)
+            or not isinstance(sequence_no, int)
+            or sequence_no != expected_sequence
+        ):
+            raise SourceProtectedSemanticIntegrityError(
+                "Protected SourceExtraction evidence slots are not contiguous."
+            )
+
+        try:
+            source_anchor_id = uuid.UUID(str(raw_entry["source_anchor_id"]))
+        except ValueError as exc:
+            raise SourceProtectedSemanticIntegrityError(
+                "Protected SourceExtraction evidence has an invalid SourceAnchor ID."
+            ) from exc
+
+        if source_anchor_id in seen_anchor_ids:
+            raise SourceProtectedSemanticIntegrityError(
+                "Protected SourceExtraction evidence contains duplicate SourceAnchors."
+            )
+        seen_anchor_ids.add(source_anchor_id)
+
+        quoted_hash_hex = raw_entry["quoted_hash_hex"]
+
+        if not isinstance(quoted_hash_hex, str):
+            raise SourceProtectedSemanticIntegrityError(
+                "Protected SourceExtraction evidence hash is invalid."
+            )
+
+        try:
+            quoted_hash = bytes.fromhex(quoted_hash_hex)
+        except ValueError as exc:
+            raise SourceProtectedSemanticIntegrityError(
+                "Protected SourceExtraction evidence hash is invalid."
+            ) from exc
+
+        if len(quoted_hash) != 32:
+            raise SourceProtectedSemanticIntegrityError(
+                "Protected SourceExtraction evidence hash is not SHA-256."
+            )
+
+        evidence.append(
+            ProtectedSourceExtractionEvidenceEntry(
+                sequence_no=sequence_no,
+                source_anchor_id=source_anchor_id,
+                quoted_hash=quoted_hash,
+            )
+        )
+
+    return ProtectedSourceExtractionEvidenceSemantics(
+        extraction_id=extraction_id,
+        evidence=tuple(evidence),
+    )
+
 
 def page_neutral_content_hash(
     representation_id: uuid.UUID,
@@ -1407,6 +1572,308 @@ class SourceProtectedSemanticRepository:
 
         return mapping
 
+    def protect_extraction_evidence_semantics(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        source_id: uuid.UUID,
+        extraction_id: uuid.UUID,
+        protection_scope_id: uuid.UUID,
+        payload_writer: ProtectedSemanticPayloadWriter,
+        now_us: int | None = None,
+    ) -> SourceProtectedSemanticMapping:
+        """Protect one SourceExtraction frozen evidence map."""
+        if not connection.in_transaction:
+            raise RuntimeError(
+                "Protected Source semantic cutover requires an active transaction."
+            )
+
+        extraction = connection.execute(
+            """
+            SELECT x.extraction_id, a.source_id
+            FROM source_extractions AS x
+            JOIN source_analyses AS a
+              ON a.analysis_id = x.analysis_id
+            WHERE x.extraction_id = ?
+            """,
+            (uuid_to_blob(extraction_id),),
+        ).fetchone()
+
+        if extraction is None:
+            raise SourceProtectedSemanticNotFoundError(str(extraction_id))
+
+        actual_source_id = uuid_from_blob(bytes(extraction["source_id"]))
+
+        if actual_source_id != source_id:
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceExtraction does not belong to the requested Source."
+            )
+
+        self._require_active_scope(
+            connection,
+            protection_scope_id,
+        )
+
+        created_at_us = utc_now_us() if now_us is None else now_us
+        rows = self._extraction_evidence_rows(
+            connection,
+            extraction_id,
+        )
+
+        return self._protect_extraction_evidence_rows(
+            connection,
+            rows=rows,
+            source_id=source_id,
+            extraction_id=extraction_id,
+            protection_scope_id=protection_scope_id,
+            payload_writer=payload_writer,
+            created_at_us=created_at_us,
+        )
+
+    def protect_source_extraction_evidence_semantics(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        source_id: uuid.UUID,
+        protection_scope_id: uuid.UUID,
+        payload_writer: ProtectedSemanticPayloadWriter,
+        now_us: int | None = None,
+    ) -> tuple[SourceProtectedSemanticMapping, ...]:
+        """Protect every persisted SourceExtraction evidence map for one Source."""
+        if not connection.in_transaction:
+            raise RuntimeError(
+                "Protected Source semantic cutover requires an active transaction."
+            )
+
+        self._require_source(
+            connection,
+            source_id,
+        )
+        self._require_active_scope(
+            connection,
+            protection_scope_id,
+        )
+
+        extraction_rows = connection.execute(
+            """
+            SELECT x.extraction_id
+            FROM source_extractions AS x
+            JOIN source_analyses AS a
+              ON a.analysis_id = x.analysis_id
+            WHERE a.source_id = ?
+            ORDER BY x.extraction_id
+            """,
+            (uuid_to_blob(source_id),),
+        ).fetchall()
+
+        if not extraction_rows:
+            return ()
+
+        created_at_us = utc_now_us() if now_us is None else now_us
+        mappings: list[SourceProtectedSemanticMapping] = []
+
+        for extraction_row in extraction_rows:
+            extraction_id = uuid_from_blob(
+                bytes(extraction_row["extraction_id"])
+            )
+            rows = self._extraction_evidence_rows(
+                connection,
+                extraction_id,
+            )
+            mappings.append(
+                self._protect_extraction_evidence_rows(
+                    connection,
+                    rows=rows,
+                    source_id=source_id,
+                    extraction_id=extraction_id,
+                    protection_scope_id=protection_scope_id,
+                    payload_writer=payload_writer,
+                    created_at_us=created_at_us,
+                )
+            )
+
+        return tuple(mappings)
+
+    @staticmethod
+    def _extraction_evidence_rows(
+        connection: sqlite3.Connection,
+        extraction_id: uuid.UUID,
+    ) -> list[sqlite3.Row]:
+        return connection.execute(
+            """
+            SELECT
+                e.sequence_no,
+                e.source_anchor_id,
+                e.quoted_hash,
+                a.source_id AS anchor_source_id
+            FROM source_extraction_evidence AS e
+            JOIN source_anchors AS a
+              ON a.anchor_id = e.source_anchor_id
+            WHERE e.extraction_id = ?
+            ORDER BY e.sequence_no
+            """,
+            (uuid_to_blob(extraction_id),),
+        ).fetchall()
+
+    def _protect_extraction_evidence_rows(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        rows: list[sqlite3.Row],
+        source_id: uuid.UUID,
+        extraction_id: uuid.UUID,
+        protection_scope_id: uuid.UUID,
+        payload_writer: ProtectedSemanticPayloadWriter,
+        created_at_us: int,
+    ) -> SourceProtectedSemanticMapping:
+        existing = self._mapping_for(
+            connection,
+            source_id=source_id,
+            semantic_kind=EXTRACTION_EVIDENCE_SEMANTIC_KIND,
+            entity_id=extraction_id,
+        )
+
+        if not rows:
+            if existing is not None:
+                raise SourceProtectedSemanticIntegrityError(
+                    "Protected SourceExtraction evidence mapping exists "
+                    "but the public evidence map is missing."
+                )
+            raise SourceProtectedSemanticIntegrityError(
+                "SourceExtraction has no frozen evidence rows."
+            )
+
+        evidence: list[tuple[int, uuid.UUID, bytes]] = []
+        seen_anchor_ids: set[uuid.UUID] = set()
+
+        for expected_sequence, row in enumerate(rows, 1):
+            sequence_no = int(row["sequence_no"])
+            source_anchor_id = uuid_from_blob(
+                bytes(row["source_anchor_id"])
+            )
+            quoted_hash = bytes(row["quoted_hash"])
+            anchor_source_id = uuid_from_blob(
+                bytes(row["anchor_source_id"])
+            )
+
+            if sequence_no != expected_sequence:
+                raise SourceProtectedSemanticIntegrityError(
+                    "SourceExtraction evidence slots are not contiguous."
+                )
+
+            if source_anchor_id in seen_anchor_ids:
+                raise SourceProtectedSemanticIntegrityError(
+                    "SourceExtraction evidence contains duplicate SourceAnchors."
+                )
+            seen_anchor_ids.add(source_anchor_id)
+
+            if anchor_source_id != source_id:
+                raise SourceProtectedSemanticIntegrityError(
+                    "SourceExtraction evidence crossed the requested Source."
+                )
+
+            if len(quoted_hash) != 32:
+                raise SourceProtectedSemanticIntegrityError(
+                    "SourceExtraction evidence hash is invalid."
+                )
+
+            evidence.append(
+                (
+                    sequence_no,
+                    source_anchor_id,
+                    quoted_hash,
+                )
+            )
+
+        frozen = tuple(evidence)
+
+        if existing is not None:
+            self._require_existing_mapping(
+                connection,
+                existing,
+                semantic_kind=EXTRACTION_EVIDENCE_SEMANTIC_KIND,
+                payload_version=EXTRACTION_EVIDENCE_PAYLOAD_VERSION,
+                protection_scope_id=protection_scope_id,
+            )
+
+            for sequence_no, source_anchor_id, quoted_hash in frozen:
+                if quoted_hash != extraction_evidence_neutral_quoted_hash(
+                    extraction_id,
+                    sequence_no,
+                    source_anchor_id,
+                ):
+                    raise SourceProtectedSemanticIntegrityError(
+                        "Protected SourceExtraction evidence is not fully neutralized."
+                    )
+
+            return existing
+
+        for sequence_no, source_anchor_id, quoted_hash in frozen:
+            if quoted_hash == extraction_evidence_neutral_quoted_hash(
+                extraction_id,
+                sequence_no,
+                source_anchor_id,
+            ):
+                raise SourceProtectedSemanticIntegrityError(
+                    "SourceExtraction evidence appears neutralized "
+                    "without a protected mapping."
+                )
+
+        plaintext = self._encode_extraction_evidence_semantics(
+            extraction_id=extraction_id,
+            evidence=frozen,
+        )
+        protected_payload_id = payload_writer(
+            connection,
+            plaintext,
+        )
+        self._require_payload_scope(
+            connection,
+            protected_payload_id=protected_payload_id,
+            protection_scope_id=protection_scope_id,
+        )
+        mapping = self._insert_semantic_mapping(
+            connection,
+            source_id=source_id,
+            semantic_kind=EXTRACTION_EVIDENCE_SEMANTIC_KIND,
+            entity_id=extraction_id,
+            protection_scope_id=protection_scope_id,
+            protected_payload_id=protected_payload_id,
+            payload_version=EXTRACTION_EVIDENCE_PAYLOAD_VERSION,
+            created_at_us=created_at_us,
+        )
+
+        for sequence_no, source_anchor_id, original_hash in frozen:
+            neutral_hash = extraction_evidence_neutral_quoted_hash(
+                extraction_id,
+                sequence_no,
+                source_anchor_id,
+            )
+            updated = connection.execute(
+                """
+                UPDATE source_extraction_evidence
+                SET quoted_hash = ?
+                WHERE extraction_id = ?
+                  AND sequence_no = ?
+                  AND source_anchor_id = ?
+                  AND quoted_hash = ?
+                """,
+                (
+                    neutral_hash,
+                    uuid_to_blob(extraction_id),
+                    sequence_no,
+                    uuid_to_blob(source_anchor_id),
+                    original_hash,
+                ),
+            )
+
+            if updated.rowcount != 1:
+                raise SourceProtectedSemanticIntegrityError(
+                    "SourceExtraction evidence changed during semantic cutover."
+                )
+
+        return mapping
+
     def _protect_page_map_semantics(
         self,
         connection: sqlite3.Connection,
@@ -1799,6 +2266,42 @@ class SourceProtectedSemanticRepository:
 
         return mapping
 
+    @staticmethod
+    def _encode_extraction_evidence_semantics(
+        *,
+        extraction_id: uuid.UUID,
+        evidence: tuple[
+            tuple[int, uuid.UUID, bytes],
+            ...,
+        ],
+    ) -> bytes:
+        payload = {
+            "entity_id": str(extraction_id),
+            "fields": {
+                "evidence": [
+                    {
+                        "quoted_hash_hex": quoted_hash.hex(),
+                        "sequence_no": sequence_no,
+                        "source_anchor_id": str(source_anchor_id),
+                    }
+                    for (
+                        sequence_no,
+                        source_anchor_id,
+                        quoted_hash,
+                    ) in evidence
+                ]
+            },
+            "payload_version": EXTRACTION_EVIDENCE_PAYLOAD_VERSION,
+            "semantic_kind": EXTRACTION_EVIDENCE_SEMANTIC_KIND,
+        }
+
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
     @staticmethod
     def _encode_anchor_semantics(
         *,
