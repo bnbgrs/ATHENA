@@ -12,7 +12,21 @@ from typing import Any
 
 from athena.common.ids import new_uuid7, uuid_from_blob, uuid_to_blob
 from athena.common.time import utc_now_us
-from athena.jobs.repository import JobLeaseError
+from athena.research.errors import (
+    ResearchFenceError as ResearchFenceError,
+)
+from athena.research.errors import (
+    ResearchNotFoundError as ResearchNotFoundError,
+)
+from athena.research.errors import (
+    ResearchScopeUnsupportedError as ResearchScopeUnsupportedError,
+)
+from athena.research.errors import (
+    ResearchSnapshotError as ResearchSnapshotError,
+)
+from athena.research.errors import (
+    ResearchStateError as ResearchStateError,
+)
 from athena.research.models import (
     ResearchCandidateEligibility,
     ResearchCandidateRecord,
@@ -49,24 +63,14 @@ from athena.storage.database import SQLiteDatabase
 PRECISE_SYNTHESIS_PROVENANCE_POLICY_ID = "terminal-source-output-v1"
 
 
-class ResearchNotFoundError(LookupError):
-    """Raised when durable Research state does not exist."""
 
 
-class ResearchStateError(RuntimeError):
-    """Raised when an invalid Research state transition is requested."""
 
 
-class ResearchScopeUnsupportedError(ValueError):
-    """Raised when foundation discovery cannot honestly honor a persisted scope."""
 
 
-class ResearchSnapshotError(RuntimeError):
-    """Raised when an explicit candidate cannot exist inside the pinned snapshot."""
 
 
-class ResearchFenceError(JobLeaseError):
-    """Raised when a stale Research parent tries to commit orchestration state."""
 
 
 class ResearchRepository:
