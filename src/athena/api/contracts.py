@@ -85,6 +85,102 @@ class ChatThreadResponse(ApiContract):
 
 
 @dataclass(frozen=True, slots=True)
+class GroundedEvidenceResponse(ApiContract):
+    """One typed CTX evidence item behind a grounded assistant answer."""
+
+    context_id: str
+    evidence_class: str
+    entity_type: str
+    entity_id: str
+    revision_id: str | None
+    title: str | None
+    text: str
+    cited: bool
+    epistemic_status: str | None
+    source_id: str | None
+    representation_id: str | None
+    source_name: str | None
+    source_uri: str | None
+    start_offset: int | None
+    end_offset: int | None
+    page_start: int | None
+    page_end: int | None
+    quoted_sha256: str | None
+    truncated: bool
+
+
+@dataclass(frozen=True, slots=True)
+class GroundedMemoryResponse(ApiContract):
+    """Personal Memory kept distinct from factual evidence."""
+
+    context_id: str
+    memory_id: str
+    revision_id: str
+    memory_kind: str
+    scope_kind: str
+    scope_entity_id: str | None
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
+class GroundingResponse(ApiContract):
+    """Deterministic grounding validation result for one answer."""
+
+    cited_context_ids: tuple[str, ...]
+    canonical_context_ids: tuple[str, ...]
+    user_statement_context_ids: tuple[str, ...]
+    conversation_context_ids: tuple[str, ...]
+    source_context_ids: tuple[str, ...]
+    research_context_ids: tuple[str, ...]
+    news_context_ids: tuple[str, ...]
+    invalid_context_ids: tuple[str, ...]
+    uses_inference: bool
+    uses_model_prior: bool
+    uses_unknown: bool
+    has_provenance_marker: bool
+
+
+@dataclass(frozen=True, slots=True)
+class GroundedChatResponse(ApiContract):
+    """Persisted thread plus structured evidence for one grounded turn."""
+
+    thread: ChatThreadResponse
+    assistant_text: str
+    evidence: tuple[GroundedEvidenceResponse, ...]
+    personal_memory: tuple[GroundedMemoryResponse, ...]
+    grounding: GroundingResponse
+    processing_run_id: str
+    model_id: str
+    embedding_model_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DeletionDependencyResponse(ApiContract):
+    relation: str
+    count: int
+    dependent_entity_id: str | None
+    dependent_entity_type: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DeletionPreviewResponse(ApiContract):
+    entity_id: str
+    entity_type: str
+    lifecycle_state: str
+    dependencies: tuple[DeletionDependencyResponse, ...]
+    preview_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class DeletionResultResponse(ApiContract):
+    entity_id: str
+    entity_type: str
+    commit_id: str
+    deleted_entity_ids: tuple[str, ...]
+    preview_digest: str
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderHealthResponse(ApiContract):
     provider: str
     status: str

@@ -49,10 +49,10 @@ class ChatModelProvider(ModelDiscoveryProvider, Protocol):
         messages: Sequence[ModelChatMessage],
         max_output_tokens: int | None = None,
         reasoning_mode: str | None = None,
+        temperature: float | None = None,
     ) -> Iterator[str]:
         """Yield assistant text deltas for a complete local chat history."""
         ...
-
     def generate_structured(
         self,
         *,

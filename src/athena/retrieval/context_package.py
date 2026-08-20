@@ -151,6 +151,33 @@ class ContextPackage:
             )
         return max_output_tokens, reasoning_mode
 
+    def generation_temperature(self) -> float | None:
+        """Return the optional pinned sampling temperature for this package."""
+        try:
+            payload = json.loads(self.model_signature.generation_parameters_json)
+        except json.JSONDecodeError as exc:
+            raise ContextPackageError(
+                "ContextPackage ModelSignature has invalid generation JSON."
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ContextPackageError(
+                "ContextPackage generation parameters must be a JSON object."
+            )
+
+        value = payload.get("temperature")
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ContextPackageError(
+                "ContextPackage temperature must be numeric when provided."
+            )
+        temperature = float(value)
+        if not 0.0 <= temperature <= 2.0:
+            raise ContextPackageError(
+                "ContextPackage temperature must be between 0.0 and 2.0."
+            )
+        return temperature
+
     def structured_schema(self) -> dict[str, Any] | None:
         if self.structured_schema_id is None and self.structured_schema_json is None:
             return None

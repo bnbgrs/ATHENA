@@ -12,6 +12,9 @@ from athena.api.client import CoreApiClientError
 from athena.api.contracts import (
     ChatSummaryResponse,
     ChatThreadResponse,
+    DeletionPreviewResponse,
+    DeletionResultResponse,
+    GroundedChatResponse,
     HealthResponse,
     ModelResponse,
     ProviderHealthResponse,
@@ -19,7 +22,7 @@ from athena.api.contracts import (
 
 
 class CoreApiGateway(Protocol):
-    """Minimal read surface consumed by the desktop status controller."""
+    """Minimal local Core API surface consumed by the desktop controller."""
 
     def health(self) -> HealthResponse: ...
 
@@ -39,8 +42,31 @@ class CoreApiGateway(Protocol):
         *,
         content: str,
         model_id: str | None = None,
+        effective_context_limit: int | None = None,
+        max_output_tokens: int | None = None,
+        temperature: float | None = None,
+        thinking_enabled: bool | None = None,
     ) -> ChatThreadResponse: ...
+    def send_unified_local_chat_message(
+        self,
+        chat_id: str,
+        *,
+        content: str,
+        model_id: str | None = None,
+        embedding_model_id: str | None = None,
+        effective_context_limit: int | None = None,
+        max_output_tokens: int | None = None,
+        temperature: float | None = None,
+        thinking_enabled: bool | None = None,
+    ) -> GroundedChatResponse: ...
+    def preview_chat_deletion(self, chat_id: str) -> DeletionPreviewResponse: ...
 
+    def delete_chat(
+        self,
+        chat_id: str,
+        *,
+        preview_digest: str,
+    ) -> DeletionResultResponse: ...
 
 @dataclass(frozen=True, slots=True)
 class DesktopApiSnapshot:
@@ -72,11 +98,28 @@ class _RefreshOutcome:
 class _ChatOperationOutcome:
     operation: str
     thread: ChatThreadResponse | None = None
+    grounded: GroundedChatResponse | None = None
+    deletion_preview: DeletionPreviewResponse | None = None
+    deleted_chat_id: str | None = None
     error: str | None = None
 
+    def __post_init__(self) -> None:
+        result_count = sum(
+            item is not None
+            for item in (
+                self.thread,
+                self.grounded,
+                self.deletion_preview,
+                self.deleted_chat_id,
+            )
+        )
+        if result_count > 1:
+            raise ValueError("Chat outcome cannot contain multiple result kinds.")
+        if self.error is None and result_count != 1:
+            raise ValueError("Successful chat outcome requires exactly one result.")
 
 class _ChatTask(QRunnable):
-    """Run one direct-chat read or mutation away from the UI thread."""
+    """Run one chat read/mutation away from the UI thread."""
 
     def __init__(
         self,
@@ -85,6 +128,12 @@ class _ChatTask(QRunnable):
         operation: str,
         chat_id: str | None,
         content: str | None,
+        model_id: str | None,
+        effective_context_limit: int | None,
+        max_output_tokens: int | None,
+        temperature: float | None,
+        thinking_enabled: bool | None,
+        preview_digest: str | None,
         outcomes: SimpleQueue[_ChatOperationOutcome],
         receiver: QObject,
     ) -> None:
@@ -93,10 +142,15 @@ class _ChatTask(QRunnable):
         self.operation = operation
         self.chat_id = chat_id
         self.content = content
+        self.model_id = model_id
+        self.effective_context_limit = effective_context_limit
+        self.max_output_tokens = max_output_tokens
+        self.temperature = temperature
+        self.thinking_enabled = thinking_enabled
+        self.preview_digest = preview_digest
         self.outcomes = outcomes
         self.receiver = receiver
         self.setAutoDelete(False)
-
     @Slot()
     def run(self) -> None:
         resolved_chat_id = self.chat_id
@@ -104,42 +158,158 @@ class _ChatTask(QRunnable):
             if self.operation == "load":
                 if resolved_chat_id is None:
                     raise ValueError("Chat load requires a chat ID.")
-                thread = self.gateway.load_chat(resolved_chat_id)
                 outcome = _ChatOperationOutcome(
                     operation=self.operation,
-                    thread=thread,
+                    thread=self.gateway.load_chat(resolved_chat_id),
                 )
             elif self.operation == "send":
                 if self.content is None or not self.content.strip():
                     raise ValueError("Chat send requires message content.")
                 if resolved_chat_id is None:
                     resolved_chat_id = self.gateway.create_chat().chat_id
-                thread = self.gateway.send_chat_message(
-                    resolved_chat_id,
-                    content=self.content,
-                )
+                if (
+                    self.effective_context_limit is None
+                    and self.max_output_tokens is None
+                    and self.temperature is None
+                    and self.thinking_enabled is None
+                ):
+                    thread = self.gateway.send_chat_message(
+                        resolved_chat_id,
+                        content=self.content,
+                        model_id=self.model_id,
+                    )
+                elif (
+                    self.max_output_tokens is None
+                    and self.temperature is None
+                    and self.thinking_enabled is None
+                ):
+                    thread = self.gateway.send_chat_message(
+                        resolved_chat_id,
+                        content=self.content,
+                        model_id=self.model_id,
+                        effective_context_limit=self.effective_context_limit,
+                    )
+                else:
+                    thread = self.gateway.send_chat_message(
+                        resolved_chat_id,
+                        content=self.content,
+                        model_id=self.model_id,
+                        effective_context_limit=self.effective_context_limit,
+                        max_output_tokens=self.max_output_tokens,
+                        temperature=self.temperature,
+                        thinking_enabled=self.thinking_enabled,
+                    )
                 outcome = _ChatOperationOutcome(
                     operation=self.operation,
                     thread=thread,
+                )
+            elif self.operation == "send_grounded":
+                if self.content is None or not self.content.strip():
+                    raise ValueError("Grounded chat send requires message content.")
+                if resolved_chat_id is None:
+                    resolved_chat_id = self.gateway.create_chat().chat_id
+                if (
+                    self.effective_context_limit is None
+                    and self.max_output_tokens is None
+                    and self.temperature is None
+                    and self.thinking_enabled is None
+                ):
+                    grounded = self.gateway.send_unified_local_chat_message(
+                        resolved_chat_id,
+                        content=self.content,
+                        model_id=self.model_id,
+                    )
+                elif (
+                    self.max_output_tokens is None
+                    and self.temperature is None
+                    and self.thinking_enabled is None
+                ):
+                    grounded = self.gateway.send_unified_local_chat_message(
+                        resolved_chat_id,
+                        content=self.content,
+                        model_id=self.model_id,
+                        effective_context_limit=self.effective_context_limit,
+                    )
+                else:
+                    grounded = self.gateway.send_unified_local_chat_message(
+                        resolved_chat_id,
+                        content=self.content,
+                        model_id=self.model_id,
+                        effective_context_limit=self.effective_context_limit,
+                        max_output_tokens=self.max_output_tokens,
+                        temperature=self.temperature,
+                        thinking_enabled=self.thinking_enabled,
+                    )
+                if grounded.thread.chat_id != resolved_chat_id:
+                    raise RuntimeError("Grounded response belongs to another chat.")
+                outcome = _ChatOperationOutcome(
+                    operation=self.operation,
+                    grounded=grounded,
+                )
+            elif self.operation == "preview_delete":
+                if resolved_chat_id is None:
+                    raise ValueError("Chat deletion preview requires a chat ID.")
+                outcome = _ChatOperationOutcome(
+                    operation=self.operation,
+                    deletion_preview=self.gateway.preview_chat_deletion(
+                        resolved_chat_id
+                    ),
+                )
+            elif self.operation == "delete":
+                if resolved_chat_id is None or self.preview_digest is None:
+                    raise ValueError("Chat deletion requires a preview digest.")
+                result = self.gateway.delete_chat(
+                    resolved_chat_id,
+                    preview_digest=self.preview_digest,
+                )
+                if result.entity_id != resolved_chat_id:
+                    raise RuntimeError("Deletion result belongs to another chat.")
+                outcome = _ChatOperationOutcome(
+                    operation=self.operation,
+                    deleted_chat_id=resolved_chat_id,
                 )
             else:
                 raise ValueError("Unknown desktop chat operation.")
         except CoreApiClientError as exc:
             reconciled: ChatThreadResponse | None = None
-            if self.operation == "send" and resolved_chat_id is not None:
+            deletion_reconciled = False
+            if (
+                self.operation in {"send", "send_grounded"}
+                and resolved_chat_id is not None
+            ):
                 try:
                     reconciled = self.gateway.load_chat(resolved_chat_id)
                 except Exception:
                     reconciled = None
-            outcome = _ChatOperationOutcome(
-                operation=self.operation,
-                thread=reconciled,
-                error=str(exc),
-            )
+            elif (
+                self.operation == "delete"
+                and resolved_chat_id is not None
+                and exc.status is None
+            ):
+                try:
+                    self.gateway.load_chat(resolved_chat_id)
+                except CoreApiClientError as reconcile_exc:
+                    deletion_reconciled = (
+                        reconcile_exc.status == 404
+                        and reconcile_exc.code == "chat_not_found"
+                    )
+                except Exception:
+                    deletion_reconciled = False
+            if deletion_reconciled:
+                outcome = _ChatOperationOutcome(
+                    operation=self.operation,
+                    deleted_chat_id=resolved_chat_id,
+                )
+            else:
+                outcome = _ChatOperationOutcome(
+                    operation=self.operation,
+                    thread=reconciled,
+                    error=str(exc),
+                )
         except Exception:
             outcome = _ChatOperationOutcome(
                 operation=self.operation,
-                error="ATHENA direct chat operation failed.",
+                error="ATHENA chat operation failed.",
             )
 
         self.outcomes.put(outcome)
@@ -149,11 +319,7 @@ class _ChatTask(QRunnable):
             Qt.ConnectionType.QueuedConnection,
         )
         if not queued:
-            raise RuntimeError(
-                "ATHENA desktop could not queue the direct-chat result."
-            )
-
-
+            raise RuntimeError("ATHENA desktop could not queue the chat result.")
 def _chat_snapshot(
     gateway: CoreApiGateway,
     *,
@@ -257,13 +423,16 @@ class _RefreshTask(QRunnable):
 
 
 class DesktopApiController(QObject):
-    """Run Core API reads off the Qt UI thread and publish immutable snapshots."""
+    """Run Core API work off the Qt UI thread and publish immutable results."""
 
     snapshot_ready = Signal(object)
     connection_failed = Signal(str)
     refresh_state_changed = Signal(bool)
     chat_loaded = Signal(object)
     chat_sent = Signal(object)
+    grounded_chat_sent = Signal(object)
+    chat_deletion_preview_ready = Signal(object)
+    chat_deleted = Signal(str)
     chat_operation_failed = Signal(str, str)
     chat_busy_changed = Signal(bool)
 
@@ -276,16 +445,11 @@ class DesktopApiController(QObject):
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
-
         if not 1 <= chat_limit <= 200:
-            raise ValueError(
-                "Desktop chat limit must be between 1 and 200."
-            )
-
+            raise ValueError("Desktop chat limit must be between 1 and 200.")
         self.gateway = gateway
         self.thread_pool = thread_pool or QThreadPool.globalInstance()
         self.chat_limit = chat_limit
-
         self._refreshing = False
         self._outcomes: SimpleQueue[_RefreshOutcome] = SimpleQueue()
         self._active_task: _RefreshTask | None = None
@@ -304,17 +468,18 @@ class DesktopApiController(QObject):
     def load_chat(self, chat_id: str) -> None:
         if not chat_id or self._chat_busy:
             return
-        self._start_chat_task(
-            operation="load",
-            chat_id=chat_id,
-            content=None,
-        )
+        self._start_chat_task(operation="load", chat_id=chat_id)
 
     def send_message(
         self,
         *,
         chat_id: str | None,
         content: str,
+        model_id: str | None = None,
+        effective_context_limit: int | None = None,
+        max_output_tokens: int | None = None,
+        temperature: float | None = None,
+        thinking_enabled: bool | None = None,
     ) -> None:
         if self._chat_busy or not content.strip():
             return
@@ -322,6 +487,47 @@ class DesktopApiController(QObject):
             operation="send",
             chat_id=chat_id,
             content=content,
+            model_id=model_id,
+            effective_context_limit=effective_context_limit,
+            max_output_tokens=max_output_tokens,
+            temperature=temperature,
+            thinking_enabled=thinking_enabled,
+        )
+    def send_grounded_message(
+        self,
+        *,
+        chat_id: str | None,
+        content: str,
+        model_id: str | None = None,
+        effective_context_limit: int | None = None,
+        max_output_tokens: int | None = None,
+        temperature: float | None = None,
+        thinking_enabled: bool | None = None,
+    ) -> None:
+        if self._chat_busy or not content.strip():
+            return
+        self._start_chat_task(
+            operation="send_grounded",
+            chat_id=chat_id,
+            content=content,
+            model_id=model_id,
+            effective_context_limit=effective_context_limit,
+            max_output_tokens=max_output_tokens,
+            temperature=temperature,
+            thinking_enabled=thinking_enabled,
+        )
+    def preview_chat_deletion(self, chat_id: str) -> None:
+        if not chat_id or self._chat_busy:
+            return
+        self._start_chat_task(operation="preview_delete", chat_id=chat_id)
+
+    def delete_chat(self, chat_id: str, *, preview_digest: str) -> None:
+        if not chat_id or not preview_digest or self._chat_busy:
+            return
+        self._start_chat_task(
+            operation="delete",
+            chat_id=chat_id,
+            preview_digest=preview_digest,
         )
 
     def _start_chat_task(
@@ -329,13 +535,25 @@ class DesktopApiController(QObject):
         *,
         operation: str,
         chat_id: str | None,
-        content: str | None,
+        content: str | None = None,
+        model_id: str | None = None,
+        effective_context_limit: int | None = None,
+        max_output_tokens: int | None = None,
+        temperature: float | None = None,
+        thinking_enabled: bool | None = None,
+        preview_digest: str | None = None,
     ) -> None:
         task = _ChatTask(
             gateway=self.gateway,
             operation=operation,
             chat_id=chat_id,
             content=content,
+            model_id=model_id,
+            effective_context_limit=effective_context_limit,
+            max_output_tokens=max_output_tokens,
+            temperature=temperature,
+            thinking_enabled=thinking_enabled,
+            preview_digest=preview_digest,
             outcomes=self._chat_outcomes,
             receiver=self,
         )
@@ -343,19 +561,16 @@ class DesktopApiController(QObject):
         self._chat_busy = True
         self.chat_busy_changed.emit(True)
         self.thread_pool.start(task)
-
     @Slot()
     def refresh(self) -> None:
         if self._refreshing:
             return
-
         task = _RefreshTask(
             gateway=self.gateway,
             chat_limit=self.chat_limit,
             outcomes=self._outcomes,
             receiver=self,
         )
-
         self._active_task = task
         self._refreshing = True
         self.refresh_state_changed.emit(True)
@@ -371,11 +586,9 @@ class DesktopApiController(QObject):
                     "ATHENA Core status refresh result was lost."
                 )
                 return
-
             if outcome.snapshot is not None:
                 self.snapshot_ready.emit(outcome.snapshot)
                 return
-
             assert outcome.error is not None
             self.connection_failed.emit(outcome.error)
         finally:
@@ -394,18 +607,29 @@ class DesktopApiController(QObject):
             except Empty:
                 self.chat_operation_failed.emit(
                     "unknown",
-                    "ATHENA direct chat result was lost.",
+                    "ATHENA chat result was lost.",
                 )
                 return
 
             if outcome.error is not None:
+                # Failed send mutations may have committed the user turn. The
+                # worker reconciles only with a safe GET; it never retries POST.
+                if outcome.thread is not None:
+                    self.chat_loaded.emit(outcome.thread)
                 self.chat_operation_failed.emit(
                     outcome.operation,
                     outcome.error,
                 )
+                return
 
-            if outcome.thread is not None:
-                if outcome.operation == "send" and outcome.error is None:
+            if outcome.grounded is not None:
+                self.grounded_chat_sent.emit(outcome.grounded)
+            elif outcome.deletion_preview is not None:
+                self.chat_deletion_preview_ready.emit(outcome.deletion_preview)
+            elif outcome.deleted_chat_id is not None:
+                self.chat_deleted.emit(outcome.deleted_chat_id)
+            elif outcome.thread is not None:
+                if outcome.operation == "send":
                     self.chat_sent.emit(outcome.thread)
                 else:
                     self.chat_loaded.emit(outcome.thread)

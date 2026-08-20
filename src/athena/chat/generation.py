@@ -447,6 +447,7 @@ class ChatGenerationService:
                 "ContextPackage must end with the exact persisted current user message."
             )
         max_output_tokens, reasoning_mode = context_package.generation_controls()
+        temperature = context_package.generation_temperature()
 
         if self.interactive_demand is not None:
             with self.interactive_demand.interactive_session(
@@ -461,6 +462,7 @@ class ChatGenerationService:
                     grounding_contract=grounding_contract,
                     max_output_tokens=max_output_tokens,
                     reasoning_mode=reasoning_mode,
+                    temperature=temperature,
                     on_before_provider_call=on_before_provider_call,
                     interactive_lease=lease,
                 )
@@ -474,10 +476,10 @@ class ChatGenerationService:
             grounding_contract=grounding_contract,
             max_output_tokens=max_output_tokens,
             reasoning_mode=reasoning_mode,
+            temperature=temperature,
             on_before_provider_call=on_before_provider_call,
             interactive_lease=None,
         )
-
     def _generate_and_persist(
         self,
         *,
@@ -489,6 +491,7 @@ class ChatGenerationService:
         grounding_contract: GroundingContract | None,
         max_output_tokens: int | None,
         reasoning_mode: str | None,
+        temperature: float | None,
         on_before_provider_call: Callable[[], None] | None,
         interactive_lease: InteractiveDemandLease | None,
     ) -> ChatGenerationResult:
@@ -497,6 +500,10 @@ class ChatGenerationService:
 
         if reasoning_mode not in {None, "off"}:
             raise ValueError("reasoning_mode must be None or 'off'.")
+        if temperature is not None and not 0.0 <= temperature <= 2.0:
+            raise ValueError(
+                "temperature must be between 0.0 and 2.0 when provided."
+            )
 
         attempt_limit = (
             _GROUNDING_GENERATION_ATTEMPTS
@@ -530,7 +537,15 @@ class ChatGenerationService:
 
             chunks: list[str] = []
 
-            if reasoning_mode is not None:
+            if temperature is not None:
+                stream = self.provider.stream_chat(
+                    model_id=model.backend_model_id,
+                    messages=attempt_history,
+                    max_output_tokens=max_output_tokens,
+                    reasoning_mode=reasoning_mode,
+                    temperature=temperature,
+                )
+            elif reasoning_mode is not None:
                 stream = self.provider.stream_chat(
                     model_id=model.backend_model_id,
                     messages=attempt_history,
@@ -636,7 +651,6 @@ class ChatGenerationService:
         raise RuntimeError(
             "Grounded generation exhausted attempts without a terminal result."
         )
-
     def select_model(self, requested_model_id: str | None = None) -> ModelInfo:
         models = self.provider.discover_models()
         llms = tuple(model for model in models if model.model_type == "llm")

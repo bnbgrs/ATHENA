@@ -1,4 +1,5 @@
 """Visual constants for the ATHENA desktop shell."""
+# ATHENA_V4914_UX_HARDENING
 
 from __future__ import annotations
 
@@ -150,6 +151,22 @@ QLineEdit#promptInput {{
 }}
 QLineEdit#promptInput:disabled {{ color: {TEXT_DIM}; }}
 QLabel#commandMeta {{ color: {TEXT_DIM}; font-size: 10px; padding: 0 8px; }}
+QPushButton#groundButton {{
+    background: transparent;
+    color: {TEXT_DIM};
+    border: 1px solid {BORDER};
+    padding: 5px 8px;
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    font-size: 10px;
+}}
+QPushButton#groundButton:checked {{
+    color: {ORANGE};
+    border-color: {ORANGE};
+}}
+QPushButton#groundButton:disabled {{
+    color: {TEXT_DIM};
+    border-color: {BORDER};
+}}
 QPushButton#sendButton {{
     background: transparent;
     color: {TEXT_DIM};
@@ -202,4 +219,187 @@ QLabel#chainState {{
     font-family: "Cascadia Mono", "Consolas", monospace;
     font-size: 11px;
 }}
+QFrame#sessionControls {{
+    background: transparent;
+    border: none;
+    min-height: 34px;
+}}
+QLabel#sessionLabel,
+QLabel#sessionValue {{
+    color: {TEXT_DIM};
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    font-size: 10px;
+}}
+QLabel#sessionValue {{
+    color: {TEXT_MUTED};
+    min-width: 58px;
+}}
+QComboBox#chatSelector,
+QComboBox#modelSelector {{
+    background: #090909;
+    color: {TEXT_MUTED};
+    border: 1px solid {BORDER};
+    border-radius: 0;
+    padding: 5px 24px 5px 7px;
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    font-size: 10px;
+}}
+QComboBox#chatSelector:hover,
+QComboBox#modelSelector:hover {{
+    border-color: #3A3A38;
+    color: {TEXT};
+}}
+QComboBox#chatSelector::drop-down,
+QComboBox#modelSelector::drop-down {{
+    border: none;
+    width: 18px;
+}}
+QComboBox QAbstractItemView {{
+    background: #090909;
+    color: {TEXT};
+    border: 1px solid {BORDER};
+    selection-background-color: {PANEL_RAISED};
+    selection-color: {TEXT};
+    outline: none;
+}}
+QSlider#contextSlider::groove:horizontal {{
+    background: {BORDER};
+    height: 2px;
+}}
+QSlider#contextSlider::sub-page:horizontal {{
+    background: #555551;
+    height: 2px;
+}}
+QSlider#contextSlider::handle:horizontal {{
+    background: {ORANGE};
+    border: none;
+    width: 6px;
+    margin: -5px 0;
+}}
+QPushButton#deleteChatButton {{
+    background: transparent;
+    color: {TEXT_DIM};
+    border: 1px solid {BORDER};
+    border-radius: 0;
+    padding: 5px 7px;
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    font-size: 9px;
+}}
+QPushButton#deleteChatButton:hover {{
+    color: {ORANGE};
+    border-color: #3A3A38;
+}}
+QPushButton#deleteChatButton:disabled,
+QComboBox#chatSelector:disabled,
+QComboBox#modelSelector:disabled {{
+    color: #4D4D49;
+}}
+
+QPushButton#newChatButton {{
+    background: transparent;
+    color: {TEXT};
+    border: 1px solid {BORDER};
+    border-radius: 0;
+    padding: 5px 9px;
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    font-size: 9px;
+}}
+QPushButton#newChatButton:hover {{
+    color: {ORANGE};
+    border-color: #3A3A38;
+}}
+QLabel#settingsLabel,
+QLabel#settingsValue,
+QLabel#settingsHelp {{
+    font-family: "Cascadia Mono", "Consolas", monospace;
+}}
+QLabel#settingsLabel {{
+    color: {TEXT_DIM};
+    font-size: 10px;
+    min-width: 160px;
+}}
+QLabel#settingsValue {{
+    color: {TEXT};
+    font-size: 10px;
+}}
+QLabel#settingsHelp {{
+    color: {TEXT_MUTED};
+    font-size: 10px;
+}}
+QSpinBox#maxOutputTokens,
+QDoubleSpinBox#temperatureSpin {{
+    background: #090909;
+    color: {TEXT};
+    border: 1px solid {BORDER};
+    border-radius: 0;
+    padding: 5px 7px;
+    min-width: 110px;
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    font-size: 10px;
+}}
+QCheckBox#thinkingToggle {{
+    color: {TEXT};
+    spacing: 8px;
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    font-size: 10px;
+}}
+QCheckBox#thinkingToggle::indicator {{
+    width: 12px;
+    height: 12px;
+    border: 1px solid {BORDER};
+    background: #090909;
+}}
+QCheckBox#thinkingToggle::indicator:checked {{
+    background: {ORANGE};
+}}
+
+
+QLabel {{
+    selection-background-color: {ORANGE};
+    selection-color: {BACKGROUND};
+}}
+QSpinBox#contextSpin,
+QSpinBox#maxOutputTokens {{
+    min-width: 138px;
+}}
+QSlider#maxOutputSlider::groove:horizontal {{
+    background: {BORDER};
+    height: 2px;
+}}
+QSlider#maxOutputSlider::sub-page:horizontal {{
+    background: #555551;
+    height: 2px;
+}}
+QSlider#maxOutputSlider::handle:horizontal {{
+    background: {ORANGE};
+    border: none;
+    width: 6px;
+    margin: -5px 0;
+}}
+QCheckBox#thinkingToggle {{
+    min-width: 250px;
+    color: {TEXT_MUTED};
+}}
+QCheckBox#thinkingToggle:checked {{
+    color: {ORANGE};
+    font-weight: 600;
+}}
+QPushButton#inspectorCopyButton {{
+    background: transparent;
+    color: {TEXT_DIM};
+    border: 1px solid {BORDER};
+    border-radius: 0;
+    padding: 3px 7px;
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    font-size: 9px;
+}}
+QPushButton#inspectorCopyButton:hover {{
+    color: {ORANGE};
+    border-color: #3A3A38;
+}}
+QFrame#evidenceChain {{
+    background: #080808;
+    border: 1px solid #171717;
+}}
+
 """

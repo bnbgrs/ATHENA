@@ -16,6 +16,13 @@ from athena.api.contracts import (
     ChatMessageResponse,
     ChatSummaryResponse,
     ChatThreadResponse,
+    DeletionDependencyResponse,
+    DeletionPreviewResponse,
+    DeletionResultResponse,
+    GroundedChatResponse,
+    GroundedEvidenceResponse,
+    GroundedMemoryResponse,
+    GroundingResponse,
     HealthResponse,
     JsonValue,
     ModelResponse,
@@ -135,6 +142,10 @@ class CoreApiClient:
         *,
         content: str,
         model_id: str | None = None,
+        effective_context_limit: int | None = None,
+        max_output_tokens: int | None = None,
+        temperature: float | None = None,
+        thinking_enabled: bool | None = None,
     ) -> ChatThreadResponse:
         if not chat_id or "/" in chat_id:
             raise ValueError("Chat ID must be a single non-empty path segment.")
@@ -144,9 +155,39 @@ class CoreApiClient:
             )
         if model_id is not None and not model_id.strip():
             raise ValueError("Chat model_id must be non-empty when provided.")
+        if effective_context_limit is not None and (
+            isinstance(effective_context_limit, bool)
+            or not isinstance(effective_context_limit, int)
+            or effective_context_limit < 1
+        ):
+            raise ValueError(
+                "Chat effective_context_limit must be positive when provided."
+            )
+        if max_output_tokens is not None and (
+            isinstance(max_output_tokens, bool)
+            or not isinstance(max_output_tokens, int)
+            or max_output_tokens < 1
+        ):
+            raise ValueError("Chat max_output_tokens must be positive when provided.")
+        if temperature is not None and (
+            isinstance(temperature, bool)
+            or not isinstance(temperature, (int, float))
+            or not 0.0 <= float(temperature) <= 2.0
+        ):
+            raise ValueError("Chat temperature must be between 0.0 and 2.0.")
+        if thinking_enabled is not None and not isinstance(thinking_enabled, bool):
+            raise ValueError("Chat thinking_enabled must be boolean when provided.")
         payload: dict[str, JsonValue] = {"content": content}
         if model_id is not None:
             payload["model_id"] = model_id
+        if effective_context_limit is not None:
+            payload["effective_context_limit"] = effective_context_limit
+        if max_output_tokens is not None:
+            payload["max_output_tokens"] = max_output_tokens
+        if temperature is not None:
+            payload["temperature"] = float(temperature)
+        if thinking_enabled is not None:
+            payload["thinking_enabled"] = thinking_enabled
         return _chat_thread(
             self._request(
                 "POST",
@@ -154,6 +195,113 @@ class CoreApiClient:
                 expected_status=200,
                 json_body=payload,
                 timeout_seconds=self.generation_timeout_seconds,
+            )
+        )
+    def send_unified_local_chat_message(
+        self,
+        chat_id: str,
+        *,
+        content: str,
+        model_id: str | None = None,
+        embedding_model_id: str | None = None,
+        effective_context_limit: int | None = None,
+        max_output_tokens: int | None = None,
+        temperature: float | None = None,
+        thinking_enabled: bool | None = None,
+    ) -> GroundedChatResponse:
+        if not chat_id or "/" in chat_id:
+            raise ValueError(
+                "Chat ID must be a single non-empty path segment."
+            )
+        if not content.strip():
+            raise ValueError(
+                "Chat message content must contain non-whitespace text."
+            )
+        if model_id is not None and not model_id.strip():
+            raise ValueError(
+                "Chat model_id must be non-empty when provided."
+            )
+        if (
+            embedding_model_id is not None
+            and not embedding_model_id.strip()
+        ):
+            raise ValueError(
+                "Chat embedding_model_id must be non-empty when provided."
+            )
+        if effective_context_limit is not None and (
+            isinstance(effective_context_limit, bool)
+            or not isinstance(effective_context_limit, int)
+            or effective_context_limit < 1
+        ):
+            raise ValueError(
+                "Chat effective_context_limit must be positive when provided."
+            )
+        if max_output_tokens is not None and (
+            isinstance(max_output_tokens, bool)
+            or not isinstance(max_output_tokens, int)
+            or max_output_tokens < 1
+        ):
+            raise ValueError("Chat max_output_tokens must be positive when provided.")
+        if temperature is not None and (
+            isinstance(temperature, bool)
+            or not isinstance(temperature, (int, float))
+            or not 0.0 <= float(temperature) <= 2.0
+        ):
+            raise ValueError("Chat temperature must be between 0.0 and 2.0.")
+        if thinking_enabled is not None and not isinstance(thinking_enabled, bool):
+            raise ValueError("Chat thinking_enabled must be boolean when provided.")
+
+        payload: dict[str, JsonValue] = {"content": content}
+        if model_id is not None:
+            payload["model_id"] = model_id
+        if embedding_model_id is not None:
+            payload["embedding_model_id"] = embedding_model_id
+        if effective_context_limit is not None:
+            payload["effective_context_limit"] = effective_context_limit
+        if max_output_tokens is not None:
+            payload["max_output_tokens"] = max_output_tokens
+        if temperature is not None:
+            payload["temperature"] = float(temperature)
+        if thinking_enabled is not None:
+            payload["thinking_enabled"] = thinking_enabled
+
+        return _grounded_chat(
+            self._request(
+                "POST",
+                f"/api/v1/chats/{chat_id}/messages/unified-local",
+                expected_status=200,
+                json_body=payload,
+                timeout_seconds=self.generation_timeout_seconds,
+            )
+        )
+
+    def preview_chat_deletion(self, chat_id: str) -> DeletionPreviewResponse:
+        if not chat_id or "/" in chat_id:
+            raise ValueError("Chat ID must be a single non-empty path segment.")
+        return _deletion_preview(
+            self._get(f"/api/v1/chats/{chat_id}/deletion-preview")
+        )
+
+    def delete_chat(
+        self,
+        chat_id: str,
+        *,
+        preview_digest: str,
+    ) -> DeletionResultResponse:
+        if not chat_id or "/" in chat_id:
+            raise ValueError("Chat ID must be a single non-empty path segment.")
+        try:
+            digest = bytes.fromhex(preview_digest)
+        except ValueError as exc:
+            raise ValueError("preview_digest must be valid SHA-256 hexadecimal.") from exc
+        if len(digest) != 32 or len(preview_digest) != 64:
+            raise ValueError("preview_digest must be a SHA-256 hexadecimal digest.")
+        return _deletion_result(
+            self._request(
+                "DELETE",
+                f"/api/v1/chats/{chat_id}",
+                expected_status=200,
+                json_body={"preview_digest": preview_digest},
             )
         )
 
@@ -509,6 +657,76 @@ def _chat_summary(payload: dict[str, JsonValue]) -> ChatSummaryResponse:
     )
 
 
+
+def _deletion_dependency(
+    payload: dict[str, JsonValue],
+) -> DeletionDependencyResponse:
+    return DeletionDependencyResponse(
+        relation=_required_str(payload, "relation"),
+        count=_required_int(payload, "count"),
+        dependent_entity_id=_optional_str(payload, "dependent_entity_id"),
+        dependent_entity_type=_optional_str(payload, "dependent_entity_type"),
+    )
+
+
+def _deletion_preview(payload: dict[str, JsonValue]) -> DeletionPreviewResponse:
+    raw_dependencies = payload.get("dependencies")
+    if not isinstance(raw_dependencies, list):
+        raise CoreApiClientError(
+            "ATHENA Core deletion dependencies are invalid.",
+            code="invalid_response",
+        )
+    dependencies_list: list[DeletionDependencyResponse] = []
+    for raw_dependency in raw_dependencies:
+        if not isinstance(raw_dependency, dict):
+            raise CoreApiClientError(
+                "ATHENA Core deletion dependency is invalid.",
+                code="invalid_response",
+            )
+        dependencies_list.append(
+            _deletion_dependency(raw_dependency)
+        )
+    dependencies = tuple(dependencies_list)
+    preview = DeletionPreviewResponse(
+        entity_id=_required_str(payload, "entity_id"),
+        entity_type=_required_str(payload, "entity_type"),
+        lifecycle_state=_required_str(payload, "lifecycle_state"),
+        dependencies=dependencies,
+        preview_digest=_required_str(payload, "preview_digest"),
+    )
+    if preview.entity_type != "chat" or len(preview.preview_digest) != 64:
+        raise CoreApiClientError(
+            "ATHENA Core returned an invalid chat deletion preview.",
+            code="invalid_response",
+        )
+    return preview
+
+
+def _deletion_result(payload: dict[str, JsonValue]) -> DeletionResultResponse:
+    raw_deleted = payload.get("deleted_entity_ids")
+    if not isinstance(raw_deleted, list) or not all(
+        isinstance(item, str) and item for item in raw_deleted
+    ):
+        raise CoreApiClientError(
+            "ATHENA Core deletion result is invalid.",
+            code="invalid_response",
+        )
+    deleted_ids = tuple(cast(str, item) for item in raw_deleted)
+    result = DeletionResultResponse(
+        entity_id=_required_str(payload, "entity_id"),
+        entity_type=_required_str(payload, "entity_type"),
+        commit_id=_required_str(payload, "commit_id"),
+        deleted_entity_ids=deleted_ids,
+        preview_digest=_required_str(payload, "preview_digest"),
+    )
+    if result.entity_type != "chat" or result.entity_id not in result.deleted_entity_ids:
+        raise CoreApiClientError(
+            "ATHENA Core returned an inconsistent chat deletion result.",
+            code="invalid_response",
+        )
+    return result
+
+
 def _chat_message(payload: dict[str, JsonValue]) -> ChatMessageResponse:
     return ChatMessageResponse(
         message_id=_required_str(payload, "message_id"),
@@ -539,6 +757,318 @@ def _chat_thread(payload: dict[str, JsonValue]) -> ChatThreadResponse:
         archive_mode=_required_str(payload, "archive_mode"),
         lifecycle_state=_required_str(payload, "lifecycle_state"),
         messages=tuple(messages),
+    )
+
+
+def _required_object(
+    payload: dict[str, JsonValue],
+    key: str,
+) -> dict[str, JsonValue]:
+    value = payload.get(key)
+    if not isinstance(value, dict):
+        raise CoreApiClientError(
+            f"ATHENA Core response field {key!r} is invalid.",
+            code="invalid_response",
+        )
+    return value
+
+
+def _required_str_tuple(
+    payload: dict[str, JsonValue],
+    key: str,
+) -> tuple[str, ...]:
+    value = payload.get(key)
+    if (
+        not isinstance(value, list)
+        or not all(isinstance(item, str) for item in value)
+    ):
+        raise CoreApiClientError(
+            f"ATHENA Core response field {key!r} is invalid.",
+            code="invalid_response",
+        )
+    return tuple(cast(list[str], value))
+
+
+def _grounded_evidence(
+    payload: dict[str, JsonValue],
+) -> GroundedEvidenceResponse:
+    if "epistemic_status" not in payload:
+        raise CoreApiClientError(
+            "ATHENA Core response field 'epistemic_status' is missing.",
+            code="invalid_response",
+        )
+    item = GroundedEvidenceResponse(
+        context_id=_required_str(payload, "context_id"),
+        evidence_class=_required_str(payload, "evidence_class"),
+        entity_type=_required_str(payload, "entity_type"),
+        entity_id=_required_str(payload, "entity_id"),
+        revision_id=_optional_str(payload, "revision_id"),
+        title=_optional_str(payload, "title"),
+        text=_required_str(payload, "text"),
+        cited=_required_bool(payload, "cited"),
+        epistemic_status=_optional_str(
+            payload,
+            "epistemic_status",
+        ),
+        source_id=_optional_str(payload, "source_id"),
+        representation_id=_optional_str(
+            payload,
+            "representation_id",
+        ),
+        source_name=_optional_str(payload, "source_name"),
+        source_uri=_optional_str(payload, "source_uri"),
+        start_offset=_optional_int(payload, "start_offset"),
+        end_offset=_optional_int(payload, "end_offset"),
+        page_start=_optional_int(payload, "page_start"),
+        page_end=_optional_int(payload, "page_end"),
+        quoted_sha256=_optional_str(payload, "quoted_sha256"),
+        truncated=_required_bool(payload, "truncated"),
+    )
+
+    source_metadata = (
+        item.source_id,
+        item.representation_id,
+        item.start_offset,
+        item.end_offset,
+        item.quoted_sha256,
+    )
+    allowed_epistemic_statuses = {
+        "asserted",
+        "supported",
+        "disputed",
+        "contradicted",
+        "retracted",
+        "superseded",
+        "uncertain",
+        "unknown",
+    }
+    if item.evidence_class == "canonical":
+        if (
+            item.epistemic_status
+            not in allowed_epistemic_statuses
+        ):
+            raise CoreApiClientError(
+                "ATHENA Core returned canonical evidence without a valid epistemic status.",
+                code="invalid_response",
+            )
+    elif item.epistemic_status is not None:
+        raise CoreApiClientError(
+            "ATHENA Core mixed canonical epistemic status into non-canonical evidence.",
+            code="invalid_response",
+        )
+
+    if item.evidence_class == "source":
+        if (
+            item.entity_type != "source_anchor"
+            or item.revision_id is not None
+            or any(value is None for value in source_metadata)
+        ):
+            raise CoreApiClientError(
+                "ATHENA Core returned incomplete source evidence.",
+                code="invalid_response",
+            )
+        assert item.start_offset is not None
+        assert item.end_offset is not None
+        assert item.quoted_sha256 is not None
+        if not 0 <= item.start_offset < item.end_offset:
+            raise CoreApiClientError(
+                "ATHENA Core returned an invalid source range.",
+                code="invalid_response",
+            )
+        try:
+            digest = bytes.fromhex(item.quoted_sha256)
+        except ValueError as exc:
+            raise CoreApiClientError(
+                "ATHENA Core returned an invalid source hash.",
+                code="invalid_response",
+            ) from exc
+        if len(digest) != 32:
+            raise CoreApiClientError(
+                "ATHENA Core returned an invalid source hash.",
+                code="invalid_response",
+            )
+    else:
+        if item.revision_id is None:
+            raise CoreApiClientError(
+                "ATHENA Core returned evidence without a revision.",
+                code="invalid_response",
+            )
+        if any(value is not None for value in source_metadata):
+            raise CoreApiClientError(
+                "ATHENA Core mixed source metadata into non-source evidence.",
+                code="invalid_response",
+            )
+
+    return item
+
+
+def _grounded_memory(
+    payload: dict[str, JsonValue],
+) -> GroundedMemoryResponse:
+    return GroundedMemoryResponse(
+        context_id=_required_str(payload, "context_id"),
+        memory_id=_required_str(payload, "memory_id"),
+        revision_id=_required_str(payload, "revision_id"),
+        memory_kind=_required_str(payload, "memory_kind"),
+        scope_kind=_required_str(payload, "scope_kind"),
+        scope_entity_id=_optional_str(
+            payload,
+            "scope_entity_id",
+        ),
+        content=_required_str(payload, "content"),
+    )
+
+
+def _grounding(
+    payload: dict[str, JsonValue],
+) -> GroundingResponse:
+    return GroundingResponse(
+        cited_context_ids=_required_str_tuple(
+            payload,
+            "cited_context_ids",
+        ),
+        canonical_context_ids=_required_str_tuple(
+            payload,
+            "canonical_context_ids",
+        ),
+        user_statement_context_ids=_required_str_tuple(
+            payload,
+            "user_statement_context_ids",
+        ),
+        conversation_context_ids=_required_str_tuple(
+            payload,
+            "conversation_context_ids",
+        ),
+        source_context_ids=_required_str_tuple(
+            payload,
+            "source_context_ids",
+        ),
+        research_context_ids=_required_str_tuple(
+            payload,
+            "research_context_ids",
+        ),
+        news_context_ids=_required_str_tuple(
+            payload,
+            "news_context_ids",
+        ),
+        invalid_context_ids=_required_str_tuple(
+            payload,
+            "invalid_context_ids",
+        ),
+        uses_inference=_required_bool(
+            payload,
+            "uses_inference",
+        ),
+        uses_model_prior=_required_bool(
+            payload,
+            "uses_model_prior",
+        ),
+        uses_unknown=_required_bool(
+            payload,
+            "uses_unknown",
+        ),
+        has_provenance_marker=_required_bool(
+            payload,
+            "has_provenance_marker",
+        ),
+    )
+
+
+def _grounded_chat(
+    payload: dict[str, JsonValue],
+) -> GroundedChatResponse:
+    raw_evidence = payload.get("evidence")
+    if not isinstance(raw_evidence, list):
+        raise CoreApiClientError(
+            "ATHENA Core grounded evidence is invalid.",
+            code="invalid_response",
+        )
+    evidence = tuple(
+        _grounded_evidence(
+            item
+        )
+        for item in raw_evidence
+        if isinstance(item, dict)
+    )
+    if len(evidence) != len(raw_evidence):
+        raise CoreApiClientError(
+            "ATHENA Core grounded evidence item is invalid.",
+            code="invalid_response",
+        )
+
+    raw_memory = payload.get("personal_memory")
+    if not isinstance(raw_memory, list):
+        raise CoreApiClientError(
+            "ATHENA Core grounded Personal Memory is invalid.",
+            code="invalid_response",
+        )
+    personal_memory = tuple(
+        _grounded_memory(
+            item
+        )
+        for item in raw_memory
+        if isinstance(item, dict)
+    )
+    if len(personal_memory) != len(raw_memory):
+        raise CoreApiClientError(
+            "ATHENA Core grounded Personal Memory item is invalid.",
+            code="invalid_response",
+        )
+
+    grounding = _grounding(
+        _required_object(payload, "grounding")
+    )
+    evidence_ids = tuple(item.context_id for item in evidence)
+    if len(set(evidence_ids)) != len(evidence_ids):
+        raise CoreApiClientError(
+            "ATHENA Core returned duplicate evidence context IDs.",
+            code="invalid_response",
+        )
+    cited = set(grounding.cited_context_ids)
+    if not cited.issubset(evidence_ids):
+        raise CoreApiClientError(
+            "ATHENA Core grounding cites missing evidence.",
+            code="invalid_response",
+        )
+    for item in evidence:
+        if item.cited != (item.context_id in cited):
+            raise CoreApiClientError(
+                "ATHENA Core evidence citation state is inconsistent.",
+                code="invalid_response",
+            )
+    if grounding.invalid_context_ids:
+        raise CoreApiClientError(
+            "ATHENA Core returned invalid grounding references.",
+            code="invalid_response",
+        )
+
+    assistant_text = _required_str(
+        payload,
+        "assistant_text",
+    ).strip()
+    if not assistant_text:
+        raise CoreApiClientError(
+            "ATHENA Core grounded assistant text is blank.",
+            code="invalid_response",
+        )
+
+    return GroundedChatResponse(
+        thread=_chat_thread(
+            _required_object(payload, "thread")
+        ),
+        assistant_text=assistant_text,
+        evidence=evidence,
+        personal_memory=personal_memory,
+        grounding=grounding,
+        processing_run_id=_required_str(
+            payload,
+            "processing_run_id",
+        ),
+        model_id=_required_str(payload, "model_id"),
+        embedding_model_id=_optional_str(
+            payload,
+            "embedding_model_id",
+        ),
     )
 
 

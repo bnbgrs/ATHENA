@@ -120,9 +120,19 @@ class _Gateway:
         *,
         content: str,
         model_id: str | None = None,
+        effective_context_limit: int | None = None,
+        max_output_tokens: int | None = None,
+        temperature: float | None = None,
+        thinking_enabled: bool | None = None,
     ) -> ChatThreadResponse:
         self._record()
-        del model_id
+        del (
+            model_id,
+            effective_context_limit,
+            max_output_tokens,
+            temperature,
+            thinking_enabled,
+        )
         self.sent.append((chat_id, content))
         if self.fail_send:
             raise CoreApiClientError(
@@ -131,7 +141,6 @@ class _Gateway:
                 retryable=True,
             )
         return _thread(with_messages=True)
-
 
 def _app() -> QApplication:
     return create_application(["athena-desktop-direct-chat-test"])

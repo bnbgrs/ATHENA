@@ -311,6 +311,7 @@ class AthenaApplication:
             chat=self.chat,
             model_provider=self.model_provider,
             direct_chat=self.direct_chat,
+            lifecycle_deletion=self.lifecycle_deletion,
         )
         self.prior_research_search = PriorResearchSearchService(
             self.database
@@ -571,6 +572,9 @@ class AthenaApplication:
             source_context_builder=self.source_context_builder,
             context_packages=self.context_packages,
             model_runs=self.model_runs,
+        )
+        self.api.attach_unified_local_chat(
+            self.unified_local_chat
         )
         self.adaptive_retrieval_planner = AdaptiveRetrievalPlanner(
             local_search=self.search,

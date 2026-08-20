@@ -71,6 +71,7 @@ def test_shell_exposes_expected_primary_navigation() -> None:
         "JOBS",
         "FILES",
         "SYSTEM",
+        "SETTINGS",
     )
 
 
@@ -79,13 +80,13 @@ def test_shell_builds_three_zone_layout_and_switches_pages() -> None:
     window = AthenaMainWindow()
     try:
         assert window.windowTitle() == "ATHENA"
-        assert window.navigation.count() == 6
+        assert window.navigation.count() == 7
         nav_rows_height = sum(
             window.navigation.sizeHintForRow(index)
             for index in range(window.navigation.count())
         )
         assert nav_rows_height <= window.navigation.height()
-        assert window.pages.count() == 6
+        assert window.pages.count() == 7
         assert window.pages.currentIndex() == 0
         assert window.prompt_input.isEnabled() is False
         assert window.send_button.isEnabled() is False

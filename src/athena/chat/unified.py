@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 import unicodedata
 import uuid
 from collections.abc import Callable
@@ -23,6 +25,7 @@ from athena.chat.grounding import (
     GroundingEvidenceRef,
     render_grounding_instructions,
 )
+from athena.chat.provenance import strip_turn_local_grounding_markers
 from athena.memory.models import MemoryScopeKind
 from athena.memory.service import PersonalMemoryService
 from athena.model.adapters.lm_studio_embeddings import LMStudioEmbeddingProvider
@@ -71,6 +74,150 @@ _DEFAULT_OUTPUT_RESERVE = 2048
 _DEFAULT_SAFETY_MARGIN = 256
 _MESSAGE_WRAPPER_ESTIMATE = 6
 _GROUNDING_REF_TOKEN_RESERVE = 12
+_EPISTEMIC_GROUNDING_VERSION = 1
+_EPISTEMIC_ITEM_TOKEN_RESERVE = 64
+_CONTEXTUAL_RETRIEVAL_POLICY_VERSION = 1
+_CONTEXTUAL_RETRIEVAL_MAX_TOKENS = 10
+_CONTEXTUAL_RETRIEVAL_MAX_PREVIOUS_CHARS = 2000
+
+_CONTEXTUAL_REFERENCE_TOKENS = frozenset(
+    {
+        "about",
+        "beide",
+        "beiden",
+        "both",
+        "davon",
+        "das",
+        "dem",
+        "den",
+        "der",
+        "die",
+        "dies",
+        "diese",
+        "dieser",
+        "dieses",
+        "that",
+        "them",
+        "these",
+        "this",
+        "those",
+        "welche",
+        "welcher",
+        "welches",
+        "which",
+        "warum",
+        "why",
+        "richtig",
+        "stimmt",
+        "true",
+        "correct",
+        "right",
+    }
+)
+
+_CONTEXTUAL_NON_TOPIC_TOKENS = frozenset(
+    {
+        "about",
+        "also",
+        "am",
+        "an",
+        "and",
+        "are",
+        "beide",
+        "beiden",
+        "both",
+        "correct",
+        "da",
+        "das",
+        "davon",
+        "dem",
+        "den",
+        "der",
+        "die",
+        "dies",
+        "diese",
+        "dieser",
+        "dieses",
+        "do",
+        "does",
+        "es",
+        "etwas",
+        "genau",
+        "gilt",
+        "ihr",
+        "ihre",
+        "in",
+        "is",
+        "ist",
+        "it",
+        "mit",
+        "noch",
+        "nun",
+        "oder",
+        "one",
+        "right",
+        "richtig",
+        "sind",
+        "so",
+        "stimmt",
+        "that",
+        "the",
+        "them",
+        "then",
+        "these",
+        "this",
+        "those",
+        "true",
+        "und",
+        "von",
+        "warum",
+        "was",
+        "welche",
+        "welcher",
+        "welches",
+        "what",
+        "which",
+        "why",
+        "wie",
+        "wieso",
+        "woher",
+        "zu",
+    }
+)
+
+_EPISTEMIC_INTERPRETATION = (
+    "ATHENA EPISTEMIC INTERPRETATION\n"
+    "Canonical means stored/accepted in ATHENA; it does not mean independently "
+    "verified truth.\n"
+    "The epistemic status `asserted` means an assertion is stored. It is not the "
+    "same as `supported`, verified, confirmed, or secured fact.\n"
+    "A positive contradiction_count is an explicit conflict signal, not a truth "
+    "score and not evidence that either side is superior.\n"
+    "Preserve the exact epistemic status of retrieved canonical evidence in your "
+    "reasoning.\n"
+    "Do not describe asserted-only evidence as verified, confirmed, secured, "
+    "established, or otherwise independently validated unless another valid cited "
+    "source supports that.\n"
+    "When local canonical evidence conflicts and the retrieved evidence cannot "
+    "resolve which side is factually correct, state that ATHENA's local evidence "
+    "is unresolved.\n"
+    "If the grounding contract allows model prior and the user asks for a factual "
+    "resolution, you may add a clearly separate resolution based on model prior, "
+    "marked [MODEL-PRIOR].\n"
+    "Never attribute a model-prior resolution to ATHENA's local canonical evidence.\n"
+)
+
+_RESPONSE_LANGUAGE_POLICY_VERSION = 1
+_RESPONSE_LANGUAGE_INSTRUCTION = (
+    "ATHENA RESPONSE LANGUAGE\n"
+    "Respond in the same natural language as the current user message unless "
+    "the user explicitly requests another language.\n"
+    "For a short or language-ambiguous follow-up, continue the natural language "
+    "of the preceding user turn unless the user explicitly requests a switch.\n"
+    "Do not switch languages merely because system instructions, retrieved "
+    "evidence, source material, citations, or model-prior knowledge use another "
+    "language.\n"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +244,113 @@ class UnifiedLocalChatResult:
     embedding_model: ModelInfo | None
     evidence_selection: MemoryEvidenceSelection
     budget: UnifiedLocalBudgetReport
+
+
+def _query_tokens(value: str) -> tuple[str, ...]:
+    return tuple(
+        token.casefold()
+        for token in re.findall(
+            r"\w+",
+            unicodedata.normalize("NFKC", value),
+            flags=re.UNICODE,
+        )
+    )
+
+
+def _resolve_contextual_retrieval_query(
+    *,
+    content: str,
+    recent_messages: tuple[object, ...],
+) -> tuple[str, str]:
+    normalized = content.strip()
+    tokens = _query_tokens(normalized)
+    if (
+        not tokens
+        or len(tokens) > _CONTEXTUAL_RETRIEVAL_MAX_TOKENS
+        or not any(
+            token in _CONTEXTUAL_REFERENCE_TOKENS
+            for token in tokens
+        )
+        or any(
+            token not in _CONTEXTUAL_NON_TOPIC_TOKENS
+            for token in tokens
+        )
+    ):
+        return normalized, "current_message"
+
+    previous_user_content: str | None = None
+    for message in reversed(recent_messages):
+        message_type = getattr(message, "message_type", None)
+        message_content = getattr(message, "content", None)
+        if (
+            getattr(message_type, "value", None) == "user"
+            and isinstance(message_content, str)
+            and message_content.strip()
+        ):
+            previous_user_content = strip_turn_local_grounding_markers(
+                message_content
+            ).strip()
+            break
+
+    if (
+        previous_user_content is None
+        or len(previous_user_content)
+        > _CONTEXTUAL_RETRIEVAL_MAX_PREVIOUS_CHARS
+    ):
+        return normalized, "current_message"
+
+    return (
+        previous_user_content + "\n" + normalized,
+        "previous_user_plus_current",
+    )
+
+
+def _render_epistemic_context(
+    *,
+    memory_context: ContextBundle,
+    evidence_selection: MemoryEvidenceSelection,
+) -> str:
+    items: list[dict[str, object]] = []
+
+    for context_item in memory_context.items:
+        classification = evidence_selection.classification_for(
+            entity_type=context_item.entity_type,
+            entity_id=context_item.entity_id,
+            revision_id=context_item.revision_id,
+        )
+        if classification.evidence_class is not EvidenceClass.CANONICAL:
+            raise RuntimeError(
+                "Unified epistemic overlay received non-canonical evidence."
+            )
+
+        status = (
+            "unknown"
+            if classification.epistemic_status is None
+            else classification.epistemic_status.value
+        )
+        items.append(
+            {
+                "context_id": context_item.context_id,
+                "entity_type": context_item.entity_type.value,
+                "epistemic_status": status,
+                "contradiction_count": context_item.contradiction_count,
+                "duplicate_count": context_item.duplicate_count,
+            }
+        )
+
+    payload = {
+        "athena_epistemic_context_version": _EPISTEMIC_GROUNDING_VERSION,
+        "canonical_means_stored_not_verified": True,
+        "asserted_means_asserted_not_verified": True,
+        "contradiction_count_is_conflict_signal_not_truth_score": True,
+        "items": items,
+    }
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=False,
+    )
 
 
 def _canonical_text_key(value: str) -> str:
@@ -251,6 +505,8 @@ class UnifiedLocalChatService:
         effective_context_limit: int | None = None,
         output_reserve: int = _DEFAULT_OUTPUT_RESERVE,
         safety_margin: int = _DEFAULT_SAFETY_MARGIN,
+        temperature: float | None = None,
+        reasoning_mode: str | None = "off",
         allow_model_prior: bool = True,
         on_delta: Callable[[str], None] | None = None,
     ) -> UnifiedLocalChatResult:
@@ -264,14 +520,24 @@ class UnifiedLocalChatService:
             output_reserve=output_reserve,
             safety_margin=safety_margin,
         )
+        if temperature is not None and not 0.0 <= temperature <= 2.0:
+            raise ContextBuilderError(
+                "Temperature must be between 0.0 and 2.0."
+            )
+        if reasoning_mode not in {None, "off"}:
+            raise ContextBuilderError(
+                "Reasoning mode must be None or 'off'."
+            )
 
         search_query = content
+        retrieval_query_mode = "current_message"
         if retrieval_query is not None:
             search_query = retrieval_query.strip()
             if not search_query:
                 raise ContextBuilderError(
                     "Retrieval query override must not be empty."
                 )
+            retrieval_query_mode = "explicit_override"
 
         model = self.chat_generation.select_model(requested_model_id)
         context_limit = _resolve_context_limit(
@@ -296,20 +562,36 @@ class UnifiedLocalChatService:
             max_turns=max_recent_conversation_turns,
             include_assistant=False,
         )
+        if retrieval_query is None:
+            search_query, retrieval_query_mode = (
+                _resolve_contextual_retrieval_query(
+                    content=content,
+                    recent_messages=preflight_recent,
+                )
+            )
         preflight_conversation_tokens = _estimate_persisted_messages(
             preflight_recent
         )
         current_user_tokens = estimate_tokens(content) + _MESSAGE_WRAPPER_ESTIMATE
-        grounding_reserve = estimate_tokens(
-            render_grounding_instructions(
-                GroundingContract(
-                    evidence_refs=(),
-                    allow_model_prior=allow_model_prior,
+        grounding_reserve = (
+            estimate_tokens(
+                render_grounding_instructions(
+                    GroundingContract(
+                        evidence_refs=(),
+                        allow_model_prior=allow_model_prior,
+                    )
                 )
             )
-        ) + (
-            max_memory_context_items + max_source_context_items
-        ) * _GROUNDING_REF_TOKEN_RESERVE
+            + estimate_tokens(_EPISTEMIC_INTERPRETATION)
+            + estimate_tokens(_RESPONSE_LANGUAGE_INSTRUCTION)
+            + max_memory_context_items
+            * _EPISTEMIC_ITEM_TOKEN_RESERVE
+            + (
+                max_memory_context_items
+                + max_source_context_items
+            )
+            * _GROUNDING_REF_TOKEN_RESERVE
+        )
 
         available_payload_tokens = (
             context_limit
@@ -487,6 +769,10 @@ class UnifiedLocalChatService:
             max_items=max_memory_context_items,
             max_memory_items=max_memory_items,
         )
+        epistemic_context = _render_epistemic_context(
+            memory_context=memory_context,
+            evidence_selection=evidence_selection,
+        )
 
         # Memory/Knowledge owns CTX-001..N. Rebase only the ephemeral labels of
         # Raw Archive items. Durable SourceAnchor identity is unchanged.
@@ -503,7 +789,11 @@ class UnifiedLocalChatService:
         )
         system_text = (
             render_grounding_instructions(grounding_contract)
-            + "ATHENA LOCAL MEMORY / KNOWLEDGE CONTEXT\n"
+            + _EPISTEMIC_INTERPRETATION
+            + _RESPONSE_LANGUAGE_INSTRUCTION
+            + "\nATHENA CANONICAL EPISTEMIC METADATA\n"
+            + epistemic_context
+            + "\n\nATHENA LOCAL MEMORY / KNOWLEDGE CONTEXT\n"
             + memory_context.rendered_text
             + "\n\nATHENA RAW ARCHIVE CONTEXT\n"
             + source_context.rendered_text
@@ -548,14 +838,27 @@ class UnifiedLocalChatService:
             "source_retrieval_mode": source_retrieval_mode,
             "retrieval_warnings": retrieval_warnings,
             "evidence_policy_id": evidence_selection.policy_id,
+            "epistemic_grounding_version": (
+                _EPISTEMIC_GROUNDING_VERSION
+            ),
+            "response_language_policy_version": (
+                _RESPONSE_LANGUAGE_POLICY_VERSION
+            ),
+            "retrieval_query_policy_version": (
+                _CONTEXTUAL_RETRIEVAL_POLICY_VERSION
+            ),
+            "retrieval_query_mode": retrieval_query_mode,
             "allow_model_prior": allow_model_prior,
         }
+        generation_parameters: dict[str, object] = {
+            "max_output_tokens": output_reserve,
+            "reasoning_mode": reasoning_mode,
+        }
+        if temperature is not None:
+            generation_parameters["temperature"] = temperature
         signature = self.model_runs.get_or_create_signature(
             model=model,
-            generation_parameters={
-                "max_output_tokens": output_reserve,
-                "reasoning_mode": "off",
-            },
+            generation_parameters=generation_parameters,
             context_configuration=context_configuration,
         )
 
@@ -724,7 +1027,6 @@ class UnifiedLocalChatService:
                 estimated_total_tokens=estimated_total_tokens,
             ),
         )
-
     @staticmethod
     def _system_package_refs(
         *,

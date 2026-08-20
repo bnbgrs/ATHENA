@@ -10,6 +10,7 @@ from athena.chat.generation import ChatGenerationResult
 from athena.chat.grounding import GroundingContract
 from athena.chat.models import ChatMessage, ChatThread, MessageType
 from athena.chat.unified import UnifiedLocalChatService
+from athena.knowledge.models import EpistemicStatus
 from athena.model.adapters.lm_studio import ModelProviderError
 from athena.model.domain import ModelInfo
 from athena.model.provenance import ModelSignature, ProcessingRun
@@ -194,6 +195,7 @@ class FakeEvidencePolicy:
                     entity_type=item.entity_type,
                     evidence_class=EvidenceClass.CANONICAL,
                     message_type=None,
+                    epistemic_status=EpistemicStatus.ASSERTED,
                 )
                 for item in results
             ),
@@ -970,3 +972,141 @@ def test_unified_chat_degrades_both_domains_when_embedding_model_is_unavailable(
         == ["embedding_model_unavailable"]
     )
     assert configuration["embedding_model_id"] is None
+
+
+def _conflict_grounding_fixture():
+    source = archive_result()
+    generation = FakeChatGeneration()
+    embedding = FakeEmbeddingProvider()
+    memory_hybrid = FakeMemoryHybrid()
+    archive = FakeArchiveRetrieval(source)
+    anchors = FakeAnchors(source)
+    packages = FakeContextPackages()
+    runs = FakeModelRuns()
+
+    service = UnifiedLocalChatService(
+        chat_generation=generation,  # type: ignore[arg-type]
+        embedding_provider=embedding,  # type: ignore[arg-type]
+        hybrid_retrieval=memory_hybrid,  # type: ignore[arg-type]
+        memory_context_builder=ContextBuilderService(),
+        evidence_policy=FakeEvidencePolicy(),  # type: ignore[arg-type]
+        personal_memory=FakePersonalMemory(),  # type: ignore[arg-type]
+        archive_retrieval=archive,  # type: ignore[arg-type]
+        source_context_builder=SourceContextBuilderService(
+            anchors
+        ),  # type: ignore[arg-type]
+        context_packages=packages,  # type: ignore[arg-type]
+        model_runs=runs,  # type: ignore[arg-type]
+    )
+    return service, generation, memory_hybrid, archive
+
+
+def test_unified_local_chat_exposes_epistemic_conflict_metadata_to_model() -> None:
+    service, generation, _memory_hybrid, _archive = (
+        _conflict_grounding_fixture()
+    )
+
+    service.send_message(
+        chat_id=uuid.uuid4(),
+        content="Was weiß ATHENA über die Hauptstadt Deutschlands?",
+        requested_model_id="primary",
+        requested_embedding_model_id="embed",
+    )
+
+    package = generation.calls[-1]["context_package"]
+    system_text = package.sections[0].content
+
+    assert "ATHENA EPISTEMIC INTERPRETATION" in system_text
+    assert "ATHENA RESPONSE LANGUAGE" in system_text
+    assert (
+        "Respond in the same natural language as the current user message"
+        in system_text
+    )
+    assert "Canonical means stored/accepted in ATHENA" in system_text
+    assert "`asserted` means an assertion is stored" in system_text
+    assert "ATHENA CANONICAL EPISTEMIC METADATA" in system_text
+    assert '"epistemic_status": "asserted"' in system_text
+    assert '"contradiction_count": 1' in system_text
+    assert (
+        '"contradiction_count_is_conflict_signal_not_truth_score": true'
+        in system_text
+    )
+
+    configuration = json.loads(
+        package.model_signature.context_configuration_json or "{}"
+    )
+    assert configuration["epistemic_grounding_version"] == 1
+    assert configuration["response_language_policy_version"] == 1
+    assert configuration["retrieval_query_policy_version"] == 1
+    assert configuration["retrieval_query_mode"] == "current_message"
+
+
+def test_unified_local_chat_contextualizes_short_followup_retrieval() -> None:
+    service, generation, memory_hybrid, archive = (
+        _conflict_grounding_fixture()
+    )
+    chat_id = uuid.uuid4()
+    previous = "Was weiß ATHENA über die Hauptstadt Deutschlands?"
+    current = "was davon ist richtig?"
+    generation.chat.add_user_message(
+        chat_id=chat_id,
+        content=previous,
+    )
+
+    service.send_message(
+        chat_id=chat_id,
+        content=current,
+        requested_model_id="primary",
+        requested_embedding_model_id="embed",
+    )
+
+    expected_query = previous + "\n" + current
+
+    assert memory_hybrid.calls
+    assert {call[0] for call in memory_hybrid.calls} == {expected_query}
+    assert {call[3] for call in memory_hybrid.calls} == {
+        SearchEntityType.KNOWLEDGE,
+        SearchEntityType.CLAIM,
+    }
+    assert archive.calls
+    assert {call[0] for call in archive.calls} == {expected_query}
+
+    package = generation.calls[-1]["context_package"]
+    configuration = json.loads(
+        package.model_signature.context_configuration_json or "{}"
+    )
+    assert configuration["retrieval_query_mode"] == (
+        "previous_user_plus_current"
+    )
+    assert package.sections[-1].content == current
+
+
+def test_unified_local_chat_explicit_retrieval_override_wins_over_followup() -> None:
+    service, generation, memory_hybrid, archive = (
+        _conflict_grounding_fixture()
+    )
+    chat_id = uuid.uuid4()
+    generation.chat.add_user_message(
+        chat_id=chat_id,
+        content="Was weiß ATHENA über die Hauptstadt Deutschlands?",
+    )
+
+    explicit_query = "Deutschland Hauptstadt Konflikt"
+    service.send_message(
+        chat_id=chat_id,
+        content="was davon ist richtig?",
+        retrieval_query=explicit_query,
+        requested_model_id="primary",
+        requested_embedding_model_id="embed",
+    )
+
+    assert memory_hybrid.calls
+    assert {call[0] for call in memory_hybrid.calls} == {explicit_query}
+    assert archive.calls
+    assert {call[0] for call in archive.calls} == {explicit_query}
+
+    package = generation.calls[-1]["context_package"]
+    configuration = json.loads(
+        package.model_signature.context_configuration_json or "{}"
+    )
+    assert configuration["retrieval_query_mode"] == "explicit_override"

@@ -12,6 +12,13 @@ from athena.api.contracts import ApiContract, JsonValue
 from athena.api.ports import CoreApiSurface
 from athena.api.runtime import LocalApiRuntime
 from athena.chat.repository import ChatNotFoundError
+from athena.lifecycle.service import (
+    LifecycleDeletionAlreadyDeletedError,
+    LifecycleDeletionNotFoundError,
+    LifecycleDeletionPreviewStaleError,
+    LifecycleDeletionUnsupportedError,
+)
+from athena.model.adapters.lm_studio import ProviderOutputLimitError
 
 AsgiMessage = dict[str, Any]
 AsgiScope = dict[str, Any]
@@ -116,6 +123,121 @@ class CoreApiAsgiApp:
             if (
                 method == "POST"
                 and path.startswith("/api/v1/chats/")
+                and path.endswith("/messages/unified-local")
+            ):
+                chat_id = path.removeprefix(
+                    "/api/v1/chats/"
+                ).removesuffix(
+                    "/messages/unified-local"
+                )
+                if not chat_id or "/" in chat_id:
+                    raise ValueError(
+                        "Invalid Unified Local chat message resource path."
+                    )
+
+                payload = await _read_json_object(receive)
+                unknown = set(payload) - {
+                    "content",
+                    "model_id",
+                    "embedding_model_id",
+                    "effective_context_limit",
+                    "max_output_tokens",
+                    "temperature",
+                    "thinking_enabled",
+                }
+                if unknown:
+                    raise ValueError(
+                        "Unified Local chat request contains unsupported fields."
+                    )
+
+                content = payload.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    raise ValueError(
+                        "Chat message content must contain non-whitespace text."
+                    )
+
+                model_id = payload.get("model_id")
+                if model_id is not None and (
+                    not isinstance(model_id, str)
+                    or not model_id.strip()
+                ):
+                    raise ValueError(
+                        "Chat model_id must be a non-empty string or null."
+                    )
+
+                embedding_model_id = payload.get(
+                    "embedding_model_id"
+                )
+                if embedding_model_id is not None and (
+                    not isinstance(embedding_model_id, str)
+                    or not embedding_model_id.strip()
+                ):
+                    raise ValueError(
+                        "Chat embedding_model_id must be a "
+                        "non-empty string or null."
+                    )
+
+                effective_context_limit = payload.get(
+                    "effective_context_limit"
+                )
+                if effective_context_limit is not None and (
+                    isinstance(effective_context_limit, bool)
+                    or not isinstance(effective_context_limit, int)
+                    or effective_context_limit < 1
+                ):
+                    raise ValueError(
+                        "Chat effective_context_limit must be a positive integer or null."
+                    )
+
+                max_output_tokens = payload.get("max_output_tokens")
+                if max_output_tokens is not None and (
+                    isinstance(max_output_tokens, bool)
+                    or not isinstance(max_output_tokens, int)
+                    or max_output_tokens < 1
+                ):
+                    raise ValueError(
+                        "Chat max_output_tokens must be a positive integer or null."
+                    )
+                temperature_value = payload.get("temperature")
+                if temperature_value is not None and (
+                    isinstance(temperature_value, bool)
+                    or not isinstance(temperature_value, (int, float))
+                    or not 0.0 <= float(temperature_value) <= 2.0
+                ):
+                    raise ValueError(
+                        "Chat temperature must be between 0.0 and 2.0 or null."
+                    )
+                temperature = (
+                    None if temperature_value is None else float(temperature_value)
+                )
+                thinking_enabled = payload.get("thinking_enabled")
+                if thinking_enabled is not None and not isinstance(
+                    thinking_enabled, bool
+                ):
+                    raise ValueError(
+                        "Chat thinking_enabled must be boolean or null."
+                    )
+                await _send_contract(
+                    send,
+                    self._facade.send_unified_local_chat_message(
+                        chat_id,
+                        content=content,
+                        requested_model_id=model_id,
+                        requested_embedding_model_id=(
+                            embedding_model_id
+                        ),
+                        effective_context_limit=effective_context_limit,
+                        max_output_tokens=max_output_tokens,
+                        temperature=temperature,
+                        thinking_enabled=thinking_enabled,
+                    ),
+                    request_id=request_id,
+                )
+                return
+
+            if (
+                method == "POST"
+                and path.startswith("/api/v1/chats/")
                 and path.endswith("/messages")
             ):
                 chat_id = path.removeprefix("/api/v1/chats/").removesuffix(
@@ -124,7 +246,14 @@ class CoreApiAsgiApp:
                 if not chat_id or "/" in chat_id:
                     raise ValueError("Invalid chat message resource path.")
                 payload = await _read_json_object(receive)
-                unknown = set(payload) - {"content", "model_id"}
+                unknown = set(payload) - {
+                    "content",
+                    "model_id",
+                    "effective_context_limit",
+                    "max_output_tokens",
+                    "temperature",
+                    "thinking_enabled",
+                }
                 if unknown:
                     raise ValueError(
                         "Chat message request contains unsupported fields."
@@ -141,12 +270,113 @@ class CoreApiAsgiApp:
                     raise ValueError(
                         "Chat model_id must be a non-empty string or null."
                     )
+                effective_context_limit = payload.get(
+                    "effective_context_limit"
+                )
+                if effective_context_limit is not None and (
+                    isinstance(effective_context_limit, bool)
+                    or not isinstance(effective_context_limit, int)
+                    or effective_context_limit < 1
+                ):
+                    raise ValueError(
+                        "Chat effective_context_limit must be a positive integer or null."
+                    )
+                max_output_tokens = payload.get("max_output_tokens")
+                if max_output_tokens is not None and (
+                    isinstance(max_output_tokens, bool)
+                    or not isinstance(max_output_tokens, int)
+                    or max_output_tokens < 1
+                ):
+                    raise ValueError(
+                        "Chat max_output_tokens must be a positive integer or null."
+                    )
+                temperature_value = payload.get("temperature")
+                if temperature_value is not None and (
+                    isinstance(temperature_value, bool)
+                    or not isinstance(temperature_value, (int, float))
+                    or not 0.0 <= float(temperature_value) <= 2.0
+                ):
+                    raise ValueError(
+                        "Chat temperature must be between 0.0 and 2.0 or null."
+                    )
+                temperature = (
+                    None if temperature_value is None else float(temperature_value)
+                )
+                thinking_enabled = payload.get("thinking_enabled")
+                if thinking_enabled is not None and not isinstance(
+                    thinking_enabled, bool
+                ):
+                    raise ValueError(
+                        "Chat thinking_enabled must be boolean or null."
+                    )
                 await _send_contract(
                     send,
                     self._facade.send_chat_message(
                         chat_id,
                         content=content,
                         requested_model_id=model_id,
+                        effective_context_limit=effective_context_limit,
+                        max_output_tokens=max_output_tokens,
+                        temperature=temperature,
+                        thinking_enabled=thinking_enabled,
+                    ),
+                    request_id=request_id,
+                )
+                return
+
+            if (
+                method == "GET"
+                and path.startswith("/api/v1/chats/")
+                and path.endswith("/deletion-preview")
+            ):
+                chat_id = path.removeprefix(
+                    "/api/v1/chats/"
+                ).removesuffix("/deletion-preview")
+                if not chat_id or "/" in chat_id:
+                    raise ValueError("Invalid chat deletion-preview resource path.")
+                await _send_contract(
+                    send,
+                    self._facade.preview_chat_deletion(chat_id),
+                    request_id=request_id,
+                )
+                return
+
+            if (
+                method == "DELETE"
+                and path.startswith("/api/v1/chats/")
+            ):
+                chat_id = path.removeprefix("/api/v1/chats/")
+                if not chat_id or "/" in chat_id:
+                    raise ValueError("Invalid chat deletion resource path.")
+                payload = await _read_json_object(receive)
+                unknown = set(payload) - {"preview_digest"}
+                if unknown:
+                    raise ValueError(
+                        "Chat deletion request contains unsupported fields."
+                    )
+                preview_digest = payload.get("preview_digest")
+                if (
+                    not isinstance(preview_digest, str)
+                    or len(preview_digest) != 64
+                ):
+                    raise ValueError(
+                        "Chat deletion preview_digest must be a 64-character SHA-256 hex digest."
+                    )
+                try:
+                    digest_bytes = bytes.fromhex(preview_digest)
+                except ValueError as exc:
+                    raise ValueError(
+                        "Chat deletion preview_digest must be valid hexadecimal."
+                    ) from exc
+                if len(digest_bytes) != 32:
+                    raise ValueError(
+                        "Chat deletion preview_digest must be a SHA-256 digest."
+                    )
+                await _send_contract(
+                    send,
+                    self._facade.delete_chat(
+                        chat_id,
+                        preview_digest=preview_digest,
                     ),
                     request_id=request_id,
                 )
@@ -209,12 +439,55 @@ class CoreApiAsgiApp:
                 request_id=request_id,
             )
             return
+        except ProviderOutputLimitError:
+            await _send_problem(
+                send,
+                status=409,
+                code="output_limit_reached",
+                message=(
+                    "The model reached the configured maximum output tokens. "
+                    "The incomplete assistant response was not persisted."
+                ),
+                request_id=request_id,
+                retryable=False,
+            )
+            return
         except ChatNotFoundError:
             await _send_problem(
                 send,
                 status=404,
                 code="chat_not_found",
                 message="The requested chat does not exist.",
+                request_id=request_id,
+            )
+            return
+        except (
+            LifecycleDeletionNotFoundError,
+            LifecycleDeletionAlreadyDeletedError,
+        ):
+            await _send_problem(
+                send,
+                status=404,
+                code="chat_not_found",
+                message="The requested chat does not exist.",
+                request_id=request_id,
+            )
+            return
+        except LifecycleDeletionPreviewStaleError:
+            await _send_problem(
+                send,
+                status=409,
+                code="deletion_preview_stale",
+                message="Chat dependencies changed; review deletion again.",
+                request_id=request_id,
+            )
+            return
+        except LifecycleDeletionUnsupportedError:
+            await _send_problem(
+                send,
+                status=409,
+                code="deletion_unsupported",
+                message="This chat cannot be deleted through the current lifecycle path.",
                 request_id=request_id,
             )
             return
@@ -261,6 +534,24 @@ def _known_path(path: str) -> bool:
         "/api/v1/system/shutdown",
     }:
         return True
+    if (
+        path.startswith("/api/v1/chats/")
+        and path.endswith("/deletion-preview")
+    ):
+        chat_id = path.removeprefix(
+            "/api/v1/chats/"
+        ).removesuffix("/deletion-preview")
+        return bool(chat_id) and "/" not in chat_id
+    if (
+        path.startswith("/api/v1/chats/")
+        and path.endswith("/messages/unified-local")
+    ):
+        chat_id = path.removeprefix(
+            "/api/v1/chats/"
+        ).removesuffix(
+            "/messages/unified-local"
+        )
+        return bool(chat_id) and "/" not in chat_id
     if path.startswith("/api/v1/chats/") and path.endswith("/messages"):
         chat_id = path.removeprefix("/api/v1/chats/").removesuffix(
             "/messages"

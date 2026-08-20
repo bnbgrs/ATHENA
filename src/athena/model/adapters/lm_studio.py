@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from threading import Lock
+from time import monotonic
 from typing import Any, cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -52,6 +54,12 @@ class LMStudioProvider:
     _controlled_instance_ids: dict[tuple[str, int], str] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
+    _model_discovery_cache: list[tuple[float, tuple[ModelInfo, ...]]] = field(
+        default_factory=list, init=False, repr=False, compare=False
+    )
+    _model_discovery_lock: Any = field(
+        default_factory=Lock, init=False, repr=False, compare=False
+    )
 
     @property
     def provider_id(self) -> str:
@@ -83,18 +91,33 @@ class LMStudioProvider:
         return ProviderHealth(ProviderHealthStatus.READY)
 
     def discover_models(self) -> tuple[ModelInfo, ...]:
-        payload = self._get_json(self.models_url)
-        models_value = payload.get("models")
-        if not isinstance(models_value, list):
-            raise ProviderProtocolError("LM Studio response is missing a 'models' array.")
+        now = monotonic()
+        with self._model_discovery_lock:
+            if self._model_discovery_cache:
+                cached_at, cached_models = self._model_discovery_cache[0]
+                if now - cached_at <= 1.0:
+                    return cached_models
 
-        models: list[ModelInfo] = []
-        for raw_model in models_value:
-            if not isinstance(raw_model, Mapping):
-                raise ProviderProtocolError("LM Studio returned a non-object model entry.")
-            models.append(self._parse_model(cast(Mapping[str, Any], raw_model)))
-        return tuple(models)
+            payload = self._get_json(self.models_url)
+            models_value = payload.get("models")
+            if not isinstance(models_value, list):
+                raise ProviderProtocolError(
+                    "LM Studio response is missing a 'models' array."
+                )
 
+            models: list[ModelInfo] = []
+            for raw_model in models_value:
+                if not isinstance(raw_model, Mapping):
+                    raise ProviderProtocolError(
+                        "LM Studio returned a non-object model entry."
+                    )
+                models.append(
+                    self._parse_model(cast(Mapping[str, Any], raw_model))
+                )
+
+            normalized = tuple(models)
+            self._model_discovery_cache[:] = [(monotonic(), normalized)]
+            return normalized
     def stream_chat(
         self,
         *,
@@ -102,6 +125,7 @@ class LMStudioProvider:
         messages: Sequence[ModelChatMessage],
         max_output_tokens: int | None = None,
         reasoning_mode: str | None = None,
+        temperature: float | None = None,
     ) -> Iterator[str]:
         """Stream assistant text from LM Studio using SSE chat completions."""
         if not model_id:
@@ -112,6 +136,8 @@ class LMStudioProvider:
             raise ValueError("max_output_tokens must be positive when provided.")
         if reasoning_mode not in {None, "off"}:
             raise ValueError("reasoning_mode must be None or 'off'.")
+        if temperature is not None and not 0.0 <= temperature <= 2.0:
+            raise ValueError("temperature must be between 0.0 and 2.0 when provided.")
 
         request_payload: dict[str, Any] = {
             "model": model_id,
@@ -124,9 +150,10 @@ class LMStudioProvider:
         if max_output_tokens is not None:
             request_payload["max_tokens"] = max_output_tokens
         if reasoning_mode == "off":
-            # LM Studio's OpenAI-compatible chat-completions endpoint maps
-            # ATHENA's provider-independent reasoning mode to reasoning_effort.
             request_payload["reasoning_effort"] = "none"
+        if temperature is not None:
+            request_payload["temperature"] = temperature
+
         raw_body = json.dumps(request_payload, ensure_ascii=False).encode("utf-8")
         request = Request(
             self.chat_completions_url,
@@ -182,7 +209,6 @@ class LMStudioProvider:
             raise ProviderUnavailableError(
                 f"LM Studio chat generation failed at {self.base_url}."
             ) from exc
-
     def generate_structured(
         self,
         *,
@@ -672,6 +698,15 @@ class LMStudioProvider:
         choice = choices[0]
         if not isinstance(choice, Mapping):
             raise ProviderProtocolError("LM Studio returned an invalid chat choice.")
+        finish_reason = choice.get("finish_reason")
+        if finish_reason is not None and not isinstance(finish_reason, str):
+            raise ProviderProtocolError(
+                "LM Studio returned an invalid chat finish_reason."
+            )
+        if finish_reason == "length":
+            raise ProviderOutputLimitError(
+                "LM Studio chat generation reached the configured output-token limit."
+            )
         delta = choice.get("delta")
         if not isinstance(delta, Mapping):
             raise ProviderProtocolError("LM Studio chat choice is missing a delta object.")

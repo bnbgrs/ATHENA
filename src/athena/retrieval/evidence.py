@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from athena.common.ids import uuid_to_blob
+from athena.knowledge.models import EpistemicStatus
 from athena.retrieval.hybrid import HybridSearchResult
 from athena.retrieval.search import SearchEntityType
 from athena.storage.database import SQLiteDatabase
@@ -39,6 +40,7 @@ class MemoryEvidenceClassification:
     entity_type: SearchEntityType
     evidence_class: EvidenceClass
     message_type: str | None
+    epistemic_status: EpistemicStatus | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +100,69 @@ class MemoryEvidencePolicy:
             classifications=classifications,
         )
 
+    def _canonical_epistemic_status(
+        self,
+        result: HybridSearchResult,
+    ) -> EpistemicStatus:
+        if result.entity_type is SearchEntityType.KNOWLEDGE:
+            row = self.database.connection.execute(
+                """
+                SELECT kr.epistemic_status
+                FROM knowledge_units AS k
+                JOIN entity_registry AS e
+                  ON e.entity_id = k.knowledge_id
+                JOIN entity_heads AS h
+                  ON h.entity_id = k.knowledge_id
+                JOIN knowledge_unit_revisions AS kr
+                  ON kr.revision_id = h.current_revision_id
+                WHERE k.knowledge_id = ?
+                  AND h.current_revision_id = ?
+                  AND e.lifecycle_state = 'active'
+                """,
+                (
+                    uuid_to_blob(result.entity_id),
+                    uuid_to_blob(result.revision_id),
+                ),
+            ).fetchone()
+        elif result.entity_type is SearchEntityType.CLAIM:
+            row = self.database.connection.execute(
+                """
+                SELECT cr.epistemic_status
+                FROM claims AS c
+                JOIN entity_registry AS e
+                  ON e.entity_id = c.claim_id
+                JOIN entity_heads AS h
+                  ON h.entity_id = c.claim_id
+                JOIN claim_revisions AS cr
+                  ON cr.revision_id = h.current_revision_id
+                WHERE c.claim_id = ?
+                  AND h.current_revision_id = ?
+                  AND e.lifecycle_state = 'active'
+                """,
+                (
+                    uuid_to_blob(result.entity_id),
+                    uuid_to_blob(result.revision_id),
+                ),
+            ).fetchone()
+        else:
+            raise MemoryEvidencePolicyError(
+                "Canonical epistemic status requires Knowledge or Claim."
+            )
+
+        if row is None:
+            raise MemoryEvidencePolicyError(
+                "Retrieved canonical evidence is not the active current revision: "
+                f"{result.entity_type.value}:{result.entity_id}:"
+                f"{result.revision_id}"
+            )
+
+        try:
+            return EpistemicStatus(str(row["epistemic_status"]))
+        except ValueError as exc:
+            raise MemoryEvidencePolicyError(
+                "Retrieved canonical evidence has an unsupported epistemic status."
+            ) from exc
+
     def _classify_one(
         self,
         result: HybridSearchResult,
@@ -112,6 +177,9 @@ class MemoryEvidencePolicy:
                 entity_type=result.entity_type,
                 evidence_class=EvidenceClass.CANONICAL,
                 message_type=None,
+                epistemic_status=self._canonical_epistemic_status(
+                    result
+                ),
             )
 
         if result.entity_type is not SearchEntityType.CHAT_MESSAGE:
@@ -150,4 +218,5 @@ class MemoryEvidencePolicy:
             entity_type=result.entity_type,
             evidence_class=evidence_class,
             message_type=message_type,
+            epistemic_status=None,
         )

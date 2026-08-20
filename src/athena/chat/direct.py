@@ -64,6 +64,8 @@ class DirectChatService:
         effective_context_limit: int | None = None,
         output_reserve: int = _DEFAULT_OUTPUT_RESERVE,
         safety_margin: int = _DEFAULT_SAFETY_MARGIN,
+        temperature: float | None = None,
+        reasoning_mode: str | None = "off",
         on_delta: Callable[[str], None] | None = None,
     ) -> DirectChatGenerationResult:
         if not 1 <= max_recent_conversation_turns <= _MAX_RECENT_CONVERSATION_TURNS:
@@ -74,6 +76,14 @@ class DirectChatService:
             raise ContextBuilderError("Output reserve must be positive.")
         if safety_margin < 0:
             raise ContextBuilderError("Safety margin must not be negative.")
+        if temperature is not None and not 0.0 <= temperature <= 2.0:
+            raise ContextBuilderError(
+                "Temperature must be between 0.0 and 2.0."
+            )
+        if reasoning_mode not in {None, "off"}:
+            raise ContextBuilderError(
+                "Reasoning mode must be None or 'off'."
+            )
 
         model = self.chat_generation.select_model(requested_model_id)
         context_limit = _resolve_context_limit(
@@ -111,12 +121,15 @@ class DirectChatService:
             "max_recent_conversation_turns": max_recent_conversation_turns,
             "safety_margin": safety_margin,
         }
+        generation_parameters: dict[str, object] = {
+            "max_output_tokens": output_reserve,
+            "reasoning_mode": reasoning_mode,
+        }
+        if temperature is not None:
+            generation_parameters["temperature"] = temperature
         signature = self.model_runs.get_or_create_signature(
             model=model,
-            generation_parameters={
-                "max_output_tokens": output_reserve,
-                "reasoning_mode": "off",
-            },
+            generation_parameters=generation_parameters,
             context_configuration=context_configuration,
         )
 
@@ -226,7 +239,6 @@ class DirectChatService:
             context_package=package,
             processing_run=processing_run,
         )
-
 
 def _select_recent_conversation_window(
     messages: tuple[ChatMessage, ...],

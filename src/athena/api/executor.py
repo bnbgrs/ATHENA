@@ -11,6 +11,9 @@ from athena.api.contracts import (
     CapabilitiesResponse,
     ChatSummaryResponse,
     ChatThreadResponse,
+    DeletionPreviewResponse,
+    DeletionResultResponse,
+    GroundedChatResponse,
     HealthResponse,
     ModelResponse,
     ProviderHealthResponse,
@@ -213,6 +216,25 @@ class SerializedCoreApiSurface:
     def provider_health(self) -> ProviderHealthResponse:
         return self._executor.call(self._surface.provider_health)
 
+
+    def preview_chat_deletion(self, chat_id: str) -> DeletionPreviewResponse:
+        return self._executor.call(
+            lambda: self._surface.preview_chat_deletion(chat_id)
+        )
+
+    def delete_chat(
+        self,
+        chat_id: str,
+        *,
+        preview_digest: str,
+    ) -> DeletionResultResponse:
+        return self._executor.call(
+            lambda: self._surface.delete_chat(
+                chat_id,
+                preview_digest=preview_digest,
+            )
+        )
+
     def list_models(self) -> tuple[ModelResponse, ...]:
         return self._executor.call(self._surface.list_models)
 
@@ -222,11 +244,97 @@ class SerializedCoreApiSurface:
         *,
         content: str,
         requested_model_id: str | None = None,
+        effective_context_limit: int | None = None,
+        max_output_tokens: int | None = None,
+        temperature: float | None = None,
+        thinking_enabled: bool | None = None,
     ) -> ChatThreadResponse:
+        if (
+            effective_context_limit is None
+            and max_output_tokens is None
+            and temperature is None
+            and thinking_enabled is None
+        ):
+            return self._executor.call(
+                lambda: self._surface.send_chat_message(
+                    chat_id,
+                    content=content,
+                    requested_model_id=requested_model_id,
+                )
+            )
+        if (
+            max_output_tokens is None
+            and temperature is None
+            and thinking_enabled is None
+        ):
+            return self._executor.call(
+                lambda: self._surface.send_chat_message(
+                    chat_id,
+                    content=content,
+                    requested_model_id=requested_model_id,
+                    effective_context_limit=effective_context_limit,
+                )
+            )
         return self._executor.call(
             lambda: self._surface.send_chat_message(
                 chat_id,
                 content=content,
                 requested_model_id=requested_model_id,
+                effective_context_limit=effective_context_limit,
+                max_output_tokens=max_output_tokens,
+                temperature=temperature,
+                thinking_enabled=thinking_enabled,
+            )
+        )
+    def send_unified_local_chat_message(
+        self,
+        chat_id: str,
+        *,
+        content: str,
+        requested_model_id: str | None = None,
+        requested_embedding_model_id: str | None = None,
+        effective_context_limit: int | None = None,
+        max_output_tokens: int | None = None,
+        temperature: float | None = None,
+        thinking_enabled: bool | None = None,
+    ) -> GroundedChatResponse:
+        if (
+            effective_context_limit is None
+            and max_output_tokens is None
+            and temperature is None
+            and thinking_enabled is None
+        ):
+            return self._executor.call(
+                lambda: self._surface.send_unified_local_chat_message(
+                    chat_id,
+                    content=content,
+                    requested_model_id=requested_model_id,
+                    requested_embedding_model_id=requested_embedding_model_id,
+                )
+            )
+        if (
+            max_output_tokens is None
+            and temperature is None
+            and thinking_enabled is None
+        ):
+            return self._executor.call(
+                lambda: self._surface.send_unified_local_chat_message(
+                    chat_id,
+                    content=content,
+                    requested_model_id=requested_model_id,
+                    requested_embedding_model_id=requested_embedding_model_id,
+                    effective_context_limit=effective_context_limit,
+                )
+            )
+        return self._executor.call(
+            lambda: self._surface.send_unified_local_chat_message(
+                chat_id,
+                content=content,
+                requested_model_id=requested_model_id,
+                requested_embedding_model_id=requested_embedding_model_id,
+                effective_context_limit=effective_context_limit,
+                max_output_tokens=max_output_tokens,
+                temperature=temperature,
+                thinking_enabled=thinking_enabled,
             )
         )
