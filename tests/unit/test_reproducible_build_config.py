@@ -33,6 +33,11 @@ def test_quality_ci_uses_only_the_frozen_dependency_resolution() -> None:
 
     assert '"pip==26.1.2"' in workflow
     assert '"uv==0.11.21"' in workflow
+    assert "sudo apt-get update" in workflow
+    assert (
+        "sudo apt-get install --no-install-recommends -y libegl1"
+        in workflow
+    )
     assert "uv lock --check" in workflow
     assert (
         "uv run --locked --extra dev --extra desktop "

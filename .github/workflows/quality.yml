@@ -30,6 +30,11 @@ jobs:
           python -m pip install --disable-pip-version-check "pip==26.1.2"
           python -m pip install --disable-pip-version-check "uv==0.11.21"
 
+      - name: Install desktop runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libegl1
+
       - name: Validate dependency lock
         run: uv lock --check
 
