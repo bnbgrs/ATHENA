@@ -11,6 +11,7 @@ from PySide6.QtCore import QMetaObject, QObject, QRunnable, Qt, QThreadPool, Sig
 from athena.api.client import CoreApiClientError
 from athena.api.contracts import (
     ChatSummaryResponse,
+    ChatThreadResponse,
     HealthResponse,
     ModelResponse,
     ProviderHealthResponse,
@@ -27,6 +28,18 @@ class CoreApiGateway(Protocol):
     def list_models(self) -> tuple[ModelResponse, ...]: ...
 
     def list_chats(self, *, limit: int = 50) -> tuple[ChatSummaryResponse, ...]: ...
+
+    def create_chat(self) -> ChatThreadResponse: ...
+
+    def load_chat(self, chat_id: str) -> ChatThreadResponse: ...
+
+    def send_chat_message(
+        self,
+        chat_id: str,
+        *,
+        content: str,
+        model_id: str | None = None,
+    ) -> ChatThreadResponse: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +66,92 @@ class _RefreshOutcome:
     def __post_init__(self) -> None:
         if (self.snapshot is None) == (self.error is None):
             raise ValueError("Refresh outcome requires exactly one result kind.")
+
+
+@dataclass(frozen=True, slots=True)
+class _ChatOperationOutcome:
+    operation: str
+    thread: ChatThreadResponse | None = None
+    error: str | None = None
+
+
+class _ChatTask(QRunnable):
+    """Run one direct-chat read or mutation away from the UI thread."""
+
+    def __init__(
+        self,
+        *,
+        gateway: CoreApiGateway,
+        operation: str,
+        chat_id: str | None,
+        content: str | None,
+        outcomes: SimpleQueue[_ChatOperationOutcome],
+        receiver: QObject,
+    ) -> None:
+        super().__init__()
+        self.gateway = gateway
+        self.operation = operation
+        self.chat_id = chat_id
+        self.content = content
+        self.outcomes = outcomes
+        self.receiver = receiver
+        self.setAutoDelete(False)
+
+    @Slot()
+    def run(self) -> None:
+        resolved_chat_id = self.chat_id
+        try:
+            if self.operation == "load":
+                if resolved_chat_id is None:
+                    raise ValueError("Chat load requires a chat ID.")
+                thread = self.gateway.load_chat(resolved_chat_id)
+                outcome = _ChatOperationOutcome(
+                    operation=self.operation,
+                    thread=thread,
+                )
+            elif self.operation == "send":
+                if self.content is None or not self.content.strip():
+                    raise ValueError("Chat send requires message content.")
+                if resolved_chat_id is None:
+                    resolved_chat_id = self.gateway.create_chat().chat_id
+                thread = self.gateway.send_chat_message(
+                    resolved_chat_id,
+                    content=self.content,
+                )
+                outcome = _ChatOperationOutcome(
+                    operation=self.operation,
+                    thread=thread,
+                )
+            else:
+                raise ValueError("Unknown desktop chat operation.")
+        except CoreApiClientError as exc:
+            reconciled: ChatThreadResponse | None = None
+            if self.operation == "send" and resolved_chat_id is not None:
+                try:
+                    reconciled = self.gateway.load_chat(resolved_chat_id)
+                except Exception:
+                    reconciled = None
+            outcome = _ChatOperationOutcome(
+                operation=self.operation,
+                thread=reconciled,
+                error=str(exc),
+            )
+        except Exception:
+            outcome = _ChatOperationOutcome(
+                operation=self.operation,
+                error="ATHENA direct chat operation failed.",
+            )
+
+        self.outcomes.put(outcome)
+        queued = QMetaObject.invokeMethod(
+            self.receiver,
+            "_drain_chat_outcome",
+            Qt.ConnectionType.QueuedConnection,
+        )
+        if not queued:
+            raise RuntimeError(
+                "ATHENA desktop could not queue the direct-chat result."
+            )
 
 
 def _chat_snapshot(
@@ -163,6 +262,10 @@ class DesktopApiController(QObject):
     snapshot_ready = Signal(object)
     connection_failed = Signal(str)
     refresh_state_changed = Signal(bool)
+    chat_loaded = Signal(object)
+    chat_sent = Signal(object)
+    chat_operation_failed = Signal(str, str)
+    chat_busy_changed = Signal(bool)
 
     def __init__(
         self,
@@ -186,10 +289,60 @@ class DesktopApiController(QObject):
         self._refreshing = False
         self._outcomes: SimpleQueue[_RefreshOutcome] = SimpleQueue()
         self._active_task: _RefreshTask | None = None
+        self._chat_busy = False
+        self._chat_outcomes: SimpleQueue[_ChatOperationOutcome] = SimpleQueue()
+        self._active_chat_task: _ChatTask | None = None
 
     @property
     def refreshing(self) -> bool:
         return self._refreshing
+
+    @property
+    def chat_busy(self) -> bool:
+        return self._chat_busy
+
+    def load_chat(self, chat_id: str) -> None:
+        if not chat_id or self._chat_busy:
+            return
+        self._start_chat_task(
+            operation="load",
+            chat_id=chat_id,
+            content=None,
+        )
+
+    def send_message(
+        self,
+        *,
+        chat_id: str | None,
+        content: str,
+    ) -> None:
+        if self._chat_busy or not content.strip():
+            return
+        self._start_chat_task(
+            operation="send",
+            chat_id=chat_id,
+            content=content,
+        )
+
+    def _start_chat_task(
+        self,
+        *,
+        operation: str,
+        chat_id: str | None,
+        content: str | None,
+    ) -> None:
+        task = _ChatTask(
+            gateway=self.gateway,
+            operation=operation,
+            chat_id=chat_id,
+            content=content,
+            outcomes=self._chat_outcomes,
+            receiver=self,
+        )
+        self._active_chat_task = task
+        self._chat_busy = True
+        self.chat_busy_changed.emit(True)
+        self.thread_pool.start(task)
 
     @Slot()
     def refresh(self) -> None:
@@ -232,3 +385,31 @@ class DesktopApiController(QObject):
         self._active_task = None
         self._refreshing = False
         self.refresh_state_changed.emit(False)
+
+    @Slot()
+    def _drain_chat_outcome(self) -> None:
+        try:
+            try:
+                outcome = self._chat_outcomes.get_nowait()
+            except Empty:
+                self.chat_operation_failed.emit(
+                    "unknown",
+                    "ATHENA direct chat result was lost.",
+                )
+                return
+
+            if outcome.error is not None:
+                self.chat_operation_failed.emit(
+                    outcome.operation,
+                    outcome.error,
+                )
+
+            if outcome.thread is not None:
+                if outcome.operation == "send" and outcome.error is None:
+                    self.chat_sent.emit(outcome.thread)
+                else:
+                    self.chat_loaded.emit(outcome.thread)
+        finally:
+            self._active_chat_task = None
+            self._chat_busy = False
+            self.chat_busy_changed.emit(False)

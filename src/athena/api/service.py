@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from typing import Protocol
 
 from athena.api.contracts import (
     API_VERSION,
@@ -19,6 +20,18 @@ from athena.chat.service import ChatService
 from athena.model.domain import ModelInfo
 from athena.model.ports import ModelDiscoveryProvider
 from athena.observability.health import HealthService
+
+
+class DirectChatSender(Protocol):
+    """Minimal direct-chat orchestration boundary used by the API."""
+
+    def send_message(
+        self,
+        *,
+        chat_id: uuid.UUID,
+        content: str,
+        requested_model_id: str | None = None,
+    ) -> object: ...
 
 
 class CoreApiFacade:
@@ -43,10 +56,12 @@ class CoreApiFacade:
         health: HealthService,
         chat: ChatService,
         model_provider: ModelDiscoveryProvider,
+        direct_chat: DirectChatSender | None = None,
     ) -> None:
         self._health = health
         self._chat = chat
         self._model_provider = model_provider
+        self._direct_chat = direct_chat
 
     def health(self) -> HealthResponse:
         snapshot = self._health.snapshot()
@@ -57,9 +72,12 @@ class CoreApiFacade:
         )
 
     def capabilities(self) -> CapabilitiesResponse:
+        features: tuple[str, ...] = self._FEATURES
+        if self._direct_chat is not None:
+            features = (*features, "chat.send.direct")
         return CapabilitiesResponse(
             api_version=API_VERSION,
-            features=self._FEATURES,
+            features=features,
         )
 
     def list_chats(self, *, limit: int = 50) -> tuple[ChatSummaryResponse, ...]:
@@ -71,6 +89,23 @@ class CoreApiFacade:
 
     def load_chat(self, chat_id: str) -> ChatThreadResponse:
         parsed_chat_id = uuid.UUID(chat_id)
+        return _chat_thread(self._chat.load_chat(parsed_chat_id))
+
+    def send_chat_message(
+        self,
+        chat_id: str,
+        *,
+        content: str,
+        requested_model_id: str | None = None,
+    ) -> ChatThreadResponse:
+        if self._direct_chat is None:
+            raise RuntimeError("Direct chat is unavailable in this Core process.")
+        parsed_chat_id = uuid.UUID(chat_id)
+        self._direct_chat.send_message(
+            chat_id=parsed_chat_id,
+            content=content,
+            requested_model_id=requested_model_id,
+        )
         return _chat_thread(self._chat.load_chat(parsed_chat_id))
 
     def provider_health(self) -> ProviderHealthResponse:

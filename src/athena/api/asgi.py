@@ -9,8 +9,8 @@ from typing import Any, cast
 from urllib.parse import parse_qs
 
 from athena.api.contracts import ApiContract, JsonValue
+from athena.api.ports import CoreApiSurface
 from athena.api.runtime import LocalApiRuntime
-from athena.api.service import CoreApiFacade
 from athena.chat.repository import ChatNotFoundError
 
 AsgiMessage = dict[str, Any]
@@ -19,6 +19,7 @@ AsgiReceive = Callable[[], Awaitable[AsgiMessage]]
 AsgiSend = Callable[[AsgiMessage], Awaitable[None]]
 
 _JSON_HEADERS = ((b"content-type", b"application/json; charset=utf-8"),)
+_MAX_JSON_BODY_BYTES = 64 * 1024
 
 
 class CoreApiAsgiApp:
@@ -27,7 +28,7 @@ class CoreApiAsgiApp:
     def __init__(
         self,
         *,
-        facade: CoreApiFacade,
+        facade: CoreApiSurface,
         runtime: LocalApiRuntime,
         allow_shutdown: bool = False,
     ) -> None:
@@ -108,6 +109,45 @@ class CoreApiAsgiApp:
                     send,
                     self._facade.create_chat(),
                     status=201,
+                    request_id=request_id,
+                )
+                return
+
+            if (
+                method == "POST"
+                and path.startswith("/api/v1/chats/")
+                and path.endswith("/messages")
+            ):
+                chat_id = path.removeprefix("/api/v1/chats/").removesuffix(
+                    "/messages"
+                )
+                if not chat_id or "/" in chat_id:
+                    raise ValueError("Invalid chat message resource path.")
+                payload = await _read_json_object(receive)
+                unknown = set(payload) - {"content", "model_id"}
+                if unknown:
+                    raise ValueError(
+                        "Chat message request contains unsupported fields."
+                    )
+                content = payload.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    raise ValueError(
+                        "Chat message content must contain non-whitespace text."
+                    )
+                model_id = payload.get("model_id")
+                if model_id is not None and (
+                    not isinstance(model_id, str) or not model_id.strip()
+                ):
+                    raise ValueError(
+                        "Chat model_id must be a non-empty string or null."
+                    )
+                await _send_contract(
+                    send,
+                    self._facade.send_chat_message(
+                        chat_id,
+                        content=content,
+                        requested_model_id=model_id,
+                    ),
                     request_id=request_id,
                 )
                 return
@@ -221,6 +261,11 @@ def _known_path(path: str) -> bool:
         "/api/v1/system/shutdown",
     }:
         return True
+    if path.startswith("/api/v1/chats/") and path.endswith("/messages"):
+        chat_id = path.removeprefix("/api/v1/chats/").removesuffix(
+            "/messages"
+        )
+        return bool(chat_id) and "/" not in chat_id
     if path.startswith("/api/v1/chats/"):
         chat_id = path.removeprefix("/api/v1/chats/")
         return bool(chat_id) and "/" not in chat_id
@@ -264,6 +309,33 @@ def _positive_limit(scope: AsgiScope, *, default: int, maximum: int) -> int:
     if not 1 <= limit <= maximum:
         raise ValueError(f"Query parameter 'limit' must be between 1 and {maximum}.")
     return limit
+
+
+async def _read_json_object(
+    receive: AsgiReceive,
+) -> dict[str, JsonValue]:
+    raw = bytearray()
+    while True:
+        message = await receive()
+        if message.get("type") != "http.request":
+            raise ValueError("Invalid HTTP request body event.")
+        chunk = cast(bytes, message.get("body", b""))
+        if len(raw) + len(chunk) > _MAX_JSON_BODY_BYTES:
+            raise ValueError("JSON request body is too large.")
+        raw.extend(chunk)
+        if not bool(message.get("more_body", False)):
+            break
+    if not raw:
+        raise ValueError("This endpoint requires a JSON request body.")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Request body must contain valid UTF-8 JSON.") from exc
+    if not isinstance(payload, dict) or not all(
+        isinstance(key, str) for key in payload
+    ):
+        raise ValueError("JSON request body must be an object.")
+    return cast(dict[str, JsonValue], payload)
 
 
 async def _consume_empty_body(receive: AsgiReceive) -> None:

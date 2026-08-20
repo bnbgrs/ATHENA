@@ -280,11 +280,6 @@ class AthenaApplication:
             timeout_seconds=self.settings.model_request_timeout_seconds,
             generation_timeout_seconds=self.settings.model_generation_timeout_seconds,
         )
-        self.api = CoreApiFacade(
-            health=self.health,
-            chat=self.chat,
-            model_provider=self.model_provider,
-        )
         self.resources = ResourceManager(
             database=self.database,
             paths=self.paths,
@@ -310,6 +305,12 @@ class AthenaApplication:
             chat_generation=self.chat_generation,
             context_packages=self.context_packages,
             model_runs=self.model_runs,
+        )
+        self.api = CoreApiFacade(
+            health=self.health,
+            chat=self.chat,
+            model_provider=self.model_provider,
+            direct_chat=self.direct_chat,
         )
         self.prior_research_search = PriorResearchSearchService(
             self.database

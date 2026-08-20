@@ -35,7 +35,7 @@ def test_quality_ci_uses_only_the_frozen_dependency_resolution() -> None:
     assert '"uv==0.11.21"' in workflow
     assert "uv lock --check" in workflow
     assert (
-        "uv run --locked --extra dev "
+        "uv run --locked --extra dev --extra desktop "
         "python scripts/quality.py"
         in workflow
     )

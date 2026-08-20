@@ -73,12 +73,23 @@ class CoreApiClient:
         runtime_root: Path,
         *,
         timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+        generation_timeout_seconds: float | None = None,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("ATHENA API client timeout must be positive.")
+        resolved_generation_timeout = (
+            timeout_seconds
+            if generation_timeout_seconds is None
+            else generation_timeout_seconds
+        )
+        if resolved_generation_timeout <= 0:
+            raise ValueError(
+                "ATHENA API generation timeout must be positive."
+            )
         self.runtime_root = Path(runtime_root)
         self.discovery_path = self.runtime_root / _DISCOVERY_FILE
         self.timeout_seconds = timeout_seconds
+        self.generation_timeout_seconds = resolved_generation_timeout
 
     @classmethod
     def from_environment(
@@ -92,6 +103,10 @@ class CoreApiClient:
         return cls(
             paths.temp_root / "core-api",
             timeout_seconds=timeout_seconds,
+            generation_timeout_seconds=max(
+                timeout_seconds,
+                float(settings.model_generation_timeout_seconds) + 30.0,
+            ),
         )
 
     def health(self) -> HealthResponse:
@@ -113,6 +128,34 @@ class CoreApiClient:
         if not chat_id or "/" in chat_id:
             raise ValueError("Chat ID must be a single non-empty path segment.")
         return _chat_thread(self._get(f"/api/v1/chats/{chat_id}"))
+
+    def send_chat_message(
+        self,
+        chat_id: str,
+        *,
+        content: str,
+        model_id: str | None = None,
+    ) -> ChatThreadResponse:
+        if not chat_id or "/" in chat_id:
+            raise ValueError("Chat ID must be a single non-empty path segment.")
+        if not content.strip():
+            raise ValueError(
+                "Chat message content must contain non-whitespace text."
+            )
+        if model_id is not None and not model_id.strip():
+            raise ValueError("Chat model_id must be non-empty when provided.")
+        payload: dict[str, JsonValue] = {"content": content}
+        if model_id is not None:
+            payload["model_id"] = model_id
+        return _chat_thread(
+            self._request(
+                "POST",
+                f"/api/v1/chats/{chat_id}/messages",
+                expected_status=200,
+                json_body=payload,
+                timeout_seconds=self.generation_timeout_seconds,
+            )
+        )
 
     def provider_health(self) -> ProviderHealthResponse:
         return _provider_health(self._get("/api/v1/models/health"))
@@ -148,6 +191,8 @@ class CoreApiClient:
         *,
         query: dict[str, str] | None = None,
         expected_status: int,
+        json_body: dict[str, JsonValue] | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, JsonValue]:
         attempts = 2 if method == "GET" else 1
         last_transport_error: CoreApiClientError | None = None
@@ -161,6 +206,8 @@ class CoreApiClient:
                     path=path,
                     query=query,
                     expected_status=expected_status,
+                    json_body=json_body,
+                    timeout_seconds=timeout_seconds,
                 )
             except CoreApiClientError as exc:
                 if exc.status == 401 and attempt == 0:
@@ -186,24 +233,37 @@ class CoreApiClient:
         path: str,
         query: dict[str, str] | None,
         expected_status: int,
+        json_body: dict[str, JsonValue] | None,
+        timeout_seconds: float | None,
     ) -> dict[str, JsonValue]:
         suffix = ""
         if query:
             suffix = "?" + urlencode(query)
         url = bootstrap.base_url + path + suffix
         data = b"" if method == "POST" else None
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {bootstrap.token}",
+        }
+        if json_body is not None:
+            data = json.dumps(
+                json_body,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            headers["Content-Type"] = "application/json"
         request = Request(
             url,
             data=data,
             method=method,
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {bootstrap.token}",
-            },
+            headers=headers,
+        )
+        resolved_timeout = (
+            self.timeout_seconds if timeout_seconds is None else timeout_seconds
         )
 
         try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
+            with urlopen(request, timeout=resolved_timeout) as response:
                 status = int(response.status)
                 raw = response.read()
         except HTTPError as exc:

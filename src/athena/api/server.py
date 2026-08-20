@@ -13,8 +13,8 @@ from typing import cast
 from urllib.parse import urlsplit
 
 from athena.api.asgi import AsgiMessage, AsgiScope, CoreApiAsgiApp
+from athena.api.ports import CoreApiSurface
 from athena.api.runtime import ApiDiscovery, LocalApiRuntime
-from athena.api.service import CoreApiFacade
 
 logger = logging.getLogger(__name__)
 
@@ -246,7 +246,7 @@ class CoreApiServer:
     def __init__(
         self,
         *,
-        facade: CoreApiFacade,
+        facade: CoreApiSurface,
         runtime_root: Path,
         host: str = _LOOPBACK_HOST,
         port: int = 0,

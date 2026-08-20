@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QFrame, QWidget
 
 from athena.api.contracts import (
     ChatSummaryResponse,
@@ -51,8 +51,8 @@ def _snapshot() -> DesktopApiSnapshot:
 
 
 def test_theme_keeps_the_restrained_athena_palette() -> None:
-    assert "#050505" in APP_STYLESHEET
-    assert ORANGE == "#FF6A00"
+    assert "#060606" in APP_STYLESHEET
+    assert ORANGE == "#F26A21"
     assert "gradient" not in APP_STYLESHEET.casefold()
     assert "#0000ff" not in APP_STYLESHEET.casefold()
 
@@ -68,9 +68,9 @@ def test_shell_exposes_expected_primary_navigation() -> None:
         "CHAT",
         "KNOWLEDGE",
         "RESEARCH",
-        "AGENTS",
+        "JOBS",
         "FILES",
-        "TASKS",
+        "SYSTEM",
     )
 
 
@@ -80,10 +80,22 @@ def test_shell_builds_three_zone_layout_and_switches_pages() -> None:
     try:
         assert window.windowTitle() == "ATHENA"
         assert window.navigation.count() == 6
+        nav_rows_height = sum(
+            window.navigation.sizeHintForRow(index)
+            for index in range(window.navigation.count())
+        )
+        assert nav_rows_height <= window.navigation.height()
         assert window.pages.count() == 6
         assert window.pages.currentIndex() == 0
         assert window.prompt_input.isEnabled() is False
         assert window.send_button.isEnabled() is False
+        assert window.findChild(QFrame, "inspector") is not None
+        assert window.findChild(QWidget, "evidenceRail") is not None
+        assert window.findChild(QFrame, "evidenceChain") is not None
+        pallas = window.findChild(QWidget, "pallasVisualPlaceholder")
+        assert pallas is not None
+        assert pallas.width() * 16 == pallas.height() * 9
+        assert pallas.width() >= 200
 
         window.navigation.setCurrentRow(2)
         app.processEvents()
@@ -106,7 +118,7 @@ def test_shell_renders_connected_and_disconnected_api_state() -> None:
         assert window.model_metric.value_label.text() == "Qwen Test"
         assert window.context_metric.value_label.text() == "48 000"
         assert window.chat_metric.value_label.text() == "1"
-        assert "CORE READY" in window.status_text.text()
+        assert window.status_text.text() == "LOCAL / READY"
 
         window.apply_api_failure("ATHENA Core is unavailable.")
 

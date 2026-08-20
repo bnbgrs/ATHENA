@@ -13,6 +13,11 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import BinaryIO, cast
 
+from athena.api.executor import (
+    CoreDomainExecutor,
+    CoreDomainExecutorError,
+    SerializedCoreApiSurface,
+)
 from athena.api.server import CoreApiServer, CoreApiServerError
 from athena.config.settings import AthenaSettings, ConfigurationError
 from athena.core.application import ApplicationState, AthenaApplication
@@ -80,10 +85,15 @@ class CoreApiProcess:
         self.settings = settings
         self.port = port
         self.app = AthenaApplication(settings=settings)
+        self.executor = CoreDomainExecutor(self.app)
+        self.api_surface = SerializedCoreApiSurface(
+            self.app.api,
+            self.executor,
+        )
         self.runtime_root = self.app.paths.temp_root / _RUNTIME_DIRECTORY_NAME
         self._shutdown_requested = threading.Event()
         self.server = CoreApiServer(
-            facade=self.app.api,
+            facade=self.api_surface,
             runtime_root=self.runtime_root,
             port=port,
             shutdown_callback=self.request_shutdown,
@@ -92,7 +102,7 @@ class CoreApiProcess:
 
     @property
     def running(self) -> bool:
-        return self.app.state is ApplicationState.RUNNING and self.server.running
+        return self.executor.running and self.server.running
 
     def start(self) -> None:
         if self.running:
@@ -109,7 +119,7 @@ class CoreApiProcess:
         self._shutdown_requested.clear()
 
         try:
-            self.app.start()
+            self.executor.start()
             self.server.start()
         except Exception:
             self._rollback_startup()
@@ -123,11 +133,10 @@ class CoreApiProcess:
         except Exception as exc:
             failures.append(exc)
 
-        if self.app.state is not ApplicationState.STOPPED:
-            try:
-                self.app.stop()
-            except Exception as exc:
-                failures.append(exc)
+        try:
+            self.executor.stop()
+        except Exception as exc:
+            failures.append(exc)
 
         ownership = self._ownership
         self._ownership = None
@@ -170,11 +179,10 @@ class CoreApiProcess:
         except Exception:
             pass
 
-        if self.app.state is not ApplicationState.STOPPED:
-            try:
-                self.app.stop()
-            except Exception:
-                pass
+        try:
+            self.executor.stop()
+        except Exception:
+            pass
 
         ownership = self._ownership
         self._ownership = None
@@ -244,7 +252,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         settings = AthenaSettings.from_environment()
         process = CoreApiProcess(settings=settings, port=args.port)
         process.start()
-    except (ConfigurationError, CoreApiProcessError, CoreApiServerError, OSError) as exc:
+    except (
+        ConfigurationError,
+        CoreApiProcessError,
+        CoreApiServerError,
+        CoreDomainExecutorError,
+        OSError,
+    ) as exc:
         print(f"ATHENA Core API error: {exc}", file=sys.stderr)
         return 2
 
