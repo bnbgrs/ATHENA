@@ -325,6 +325,9 @@ class AthenaMainWindow(QMainWindow):
         self.model_metric = MetricRow("MODEL", "—")
         self.chat_metric = MetricRow("CHATS", "—")
         self.current_chat_id: str | None = None
+        self.loaded_chat_id: str | None = None
+        self.selected_chat_id: str | None = None
+        self.pending_chat_id: str | None = None
         self._core_ready = False
         self._chat_busy = False
         self._chat_follow_tail = True
@@ -607,20 +610,45 @@ class AthenaMainWindow(QMainWindow):
         finally:
             self.model_selector.blockSignals(False)
 
+        committed_chat_id = self._committed_chat_id()
+        selector_target = (
+            self.pending_chat_id
+            if self.pending_chat_id is not None
+            else committed_chat_id
+        )
+
         self.chat_selector.blockSignals(True)
         try:
             self.chat_selector.clear()
             self.chat_selector.addItem("NEW CHAT", None)
-            selected_index = 0
-            for index, chat in enumerate(snapshot.chats, start=1):
+
+            for chat in snapshot.chats:
                 suffix = "MSG" if chat.message_count == 1 else "MSGS"
                 self.chat_selector.addItem(
                     f"{chat.chat_id[:8].upper()} · {chat.message_count} {suffix}",
                     chat.chat_id,
                 )
-                if chat.chat_id == self.current_chat_id:
-                    selected_index = index
-            self.chat_selector.setCurrentIndex(selected_index)
+
+            target_index = self.chat_selector.findData(
+                selector_target
+            )
+
+            if selector_target is not None and target_index < 0:
+                fallback_state = (
+                    "LOADING"
+                    if selector_target == self.pending_chat_id
+                    else "CURRENT"
+                )
+                self.chat_selector.addItem(
+                    f"{selector_target[:8].upper()} · {fallback_state}",
+                    selector_target,
+                )
+                target_index = self.chat_selector.count() - 1
+
+            self.chat_selector.setCurrentIndex(
+                max(0, target_index)
+            )
+            self.selected_chat_id = selector_target
         finally:
             self.chat_selector.blockSignals(False)
 
@@ -989,6 +1017,65 @@ class AthenaMainWindow(QMainWindow):
                 message=message,
             )
 
+    def _committed_chat_id(self) -> str | None:
+        return (
+            self.loaded_chat_id
+            if self.loaded_chat_id is not None
+            else self.current_chat_id
+        )
+
+    def _set_chat_selector_identity(
+        self,
+        chat_id: str | None,
+        *,
+        fallback_state: str,
+    ) -> None:
+        self.chat_selector.blockSignals(True)
+        try:
+            index = self.chat_selector.findData(chat_id)
+
+            if index < 0:
+                if chat_id is None:
+                    self.chat_selector.insertItem(
+                        0,
+                        "NEW CHAT",
+                        None,
+                    )
+                    index = 0
+                else:
+                    self.chat_selector.addItem(
+                        f"{chat_id[:8].upper()} · {fallback_state}",
+                        chat_id,
+                    )
+                    index = self.chat_selector.count() - 1
+
+            self.chat_selector.setCurrentIndex(index)
+        finally:
+            self.chat_selector.blockSignals(False)
+
+        self.selected_chat_id = chat_id
+
+    def _commit_loaded_chat_identity(
+        self,
+        chat_id: str,
+    ) -> None:
+        self.current_chat_id = chat_id
+        self.loaded_chat_id = chat_id
+        self.pending_chat_id = None
+        self._set_chat_selector_identity(
+            chat_id,
+            fallback_state="CURRENT",
+        )
+        self._sync_composer_enabled()
+
+    def _rollback_pending_chat_selection(self) -> None:
+        self.pending_chat_id = None
+        self._set_chat_selector_identity(
+            self._committed_chat_id(),
+            fallback_state="CURRENT",
+        )
+        self._sync_composer_enabled()
+
     def _enter_new_chat_state(
         self,
         *,
@@ -996,38 +1083,62 @@ class AthenaMainWindow(QMainWindow):
         message: str = "New persistent conversation. Type below to send the first message.",
     ) -> None:
         self.current_chat_id = None
+        self.loaded_chat_id = None
+        self.selected_chat_id = None
+        self.pending_chat_id = None
         self._last_rendered_sequence = 0
         self._clear_knowledge_review()
         if clear_transient:
             self._transient_failures.pop("__NEW_CHAT__", None)
-        self.chat_selector.blockSignals(True)
-        try:
-            index = self.chat_selector.findData(None)
-            self.chat_selector.setCurrentIndex(max(0, index))
-        finally:
-            self.chat_selector.blockSignals(False)
+        self._set_chat_selector_identity(
+            None,
+            fallback_state="NEW",
+        )
         self._render_empty_chat(message)
         self._append_new_chat_transient_failures()
         self._update_inspector_for_empty_chat()
         self._sync_composer_enabled()
 
     def _start_new_chat(self) -> None:
-        if self._chat_busy:
+        if self._chat_busy or self.pending_chat_id is not None:
             return
         self._enter_new_chat_state(clear_transient=True)
 
     def _on_chat_selected(self, index: int) -> None:
-        if index < 0 or self._chat_busy:
+        if index < 0:
             return
+
+        if self._chat_busy:
+            self._rollback_pending_chat_selection()
+            return
+
         value = self.chat_selector.itemData(index)
+
         if value is None:
             self._enter_new_chat_state(clear_transient=True)
             return
-        if not isinstance(value, str) or value == self.current_chat_id:
+
+        if not isinstance(value, str) or not value:
+            self._rollback_pending_chat_selection()
             return
+
+        committed_chat_id = self._committed_chat_id()
+
+        if value == committed_chat_id:
+            self.pending_chat_id = None
+            self.selected_chat_id = value
+            self._sync_composer_enabled()
+            return
+
         controller = self.api_controller
-        if controller is not None:
-            controller.load_chat(value)
+        if controller is None:
+            self._rollback_pending_chat_selection()
+            return
+
+        self.selected_chat_id = value
+        self.pending_chat_id = value
+        self._sync_composer_enabled()
+        controller.load_chat(value)
 
     def _request_chat_deletion(self) -> None:
         controller = self.api_controller
@@ -1035,6 +1146,7 @@ class AthenaMainWindow(QMainWindow):
             controller is None
             or self.current_chat_id is None
             or self._chat_busy
+            or self.pending_chat_id is not None
         ):
             return
         controller.preview_chat_deletion(self.current_chat_id)
@@ -1453,7 +1565,10 @@ class AthenaMainWindow(QMainWindow):
                 f"Core connected · {len(snapshot.chats)} chats available."
             )
 
-        if self.current_chat_id is None:
+        if (
+            self._committed_chat_id() is None
+            and self.pending_chat_id is None
+        ):
             self._enter_new_chat_state(
                 clear_transient=False,
                 message=(
@@ -1480,19 +1595,25 @@ class AthenaMainWindow(QMainWindow):
     def apply_chat_loaded(self, thread: object) -> None:
         if not isinstance(thread, ChatThreadResponse):
             return
-        self.current_chat_id = thread.chat_id
-        chat_index = self.chat_selector.findData(thread.chat_id)
-        if chat_index >= 0:
-            self.chat_selector.blockSignals(True)
-            self.chat_selector.setCurrentIndex(chat_index)
-            self.chat_selector.blockSignals(False)
+
+        if (
+            self.pending_chat_id is not None
+            and thread.chat_id != self.pending_chat_id
+        ):
+            return
+
+        self._commit_loaded_chat_identity(
+            thread.chat_id
+        )
         self._render_chat_thread(thread)
 
     @Slot(object)
     def apply_chat_sent(self, thread: object) -> None:
         if not isinstance(thread, ChatThreadResponse):
             return
-        self.current_chat_id = thread.chat_id
+        self._commit_loaded_chat_identity(
+            thread.chat_id
+        )
         self.prompt_input.clear()
         self._render_chat_thread(thread)
         QTimer.singleShot(0, self.refresh_core_status)
@@ -1502,7 +1623,9 @@ class AthenaMainWindow(QMainWindow):
         if not isinstance(response, GroundedChatResponse):
             return
 
-        self.current_chat_id = response.thread.chat_id
+        self._commit_loaded_chat_identity(
+            response.thread.chat_id
+        )
         self.prompt_input.clear()
         self._render_chat_thread(
             response.thread,
@@ -1653,6 +1776,9 @@ class AthenaMainWindow(QMainWindow):
         operation: str,
         message: str,
     ) -> None:
+        if operation == "load":
+            self._rollback_pending_chat_selection()
+
         knowledge_operations = {
             "extract_knowledge",
             "prepare_knowledge_review",
@@ -1674,6 +1800,8 @@ class AthenaMainWindow(QMainWindow):
             if operation in {"preview_delete", "delete"}
             else "Remember"
             if operation == "remember"
+            else "Chat loading"
+            if operation == "load"
             else "Knowledge extraction"
             if operation == "extract_knowledge"
             else "Knowledge review"
@@ -1734,6 +1862,7 @@ class AthenaMainWindow(QMainWindow):
             controller is None
             or not self._core_ready
             or self._chat_busy
+            or self.pending_chat_id is not None
         ):
             return
 
@@ -1895,11 +2024,16 @@ class AthenaMainWindow(QMainWindow):
             self.api_controller is not None
             and self._core_ready
             and not self._chat_busy
+            and self.pending_chat_id is None
         )
         self.prompt_input.setEnabled(enabled)
         self.ground_button.setEnabled(enabled)
         self.send_button.setEnabled(enabled)
-        controls_available = self.api_controller is not None and not self._chat_busy
+        controls_available = (
+            self.api_controller is not None
+            and not self._chat_busy
+            and self.pending_chat_id is None
+        )
         self.chat_selector.setEnabled(controls_available)
         self.delete_chat_button.setEnabled(
             controls_available and self.current_chat_id is not None
@@ -1927,6 +2061,7 @@ class AthenaMainWindow(QMainWindow):
             self.api_controller is not None
             and self.current_chat_id is not None
             and not self._chat_busy
+            and self.pending_chat_id is None
         )
         for button in self.chat_messages_widget.findChildren(
             QPushButton,
@@ -2159,7 +2294,12 @@ class AthenaMainWindow(QMainWindow):
     def _remember_message(self, message_id: str, revision_id: str) -> None:
         controller = self.api_controller
         chat_id = self.current_chat_id
-        if controller is None or chat_id is None or self._chat_busy:
+        if (
+            controller is None
+            or chat_id is None
+            or self._chat_busy
+            or self.pending_chat_id is not None
+        ):
             return
         controller.remember_message(
             chat_id=chat_id,
@@ -2170,7 +2310,13 @@ class AthenaMainWindow(QMainWindow):
     def _extract_message_knowledge(self, message_id: str, revision_id: str) -> None:
         controller = self.api_controller
         chat_id = self.current_chat_id
-        if controller is None or chat_id is None or self._chat_busy or not self._core_ready:
+        if (
+            controller is None
+            or chat_id is None
+            or self._chat_busy
+            or self.pending_chat_id is not None
+            or not self._core_ready
+        ):
             return
         self._knowledge_review_request = (
             chat_id,

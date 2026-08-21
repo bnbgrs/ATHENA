@@ -216,9 +216,16 @@ class _ChatTask(QRunnable):
             if self.operation == "load":
                 if resolved_chat_id is None:
                     raise ValueError("Chat load requires a chat ID.")
+                thread = self.gateway.load_chat(
+                    resolved_chat_id
+                )
+                if thread.chat_id != resolved_chat_id:
+                    raise RuntimeError(
+                        "Loaded chat belongs to another chat."
+                    )
                 outcome = _ChatOperationOutcome(
                     operation=self.operation,
-                    thread=self.gateway.load_chat(resolved_chat_id),
+                    thread=thread,
                 )
             elif self.operation == "send":
                 if self.content is None or not self.content.strip():
