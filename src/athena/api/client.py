@@ -132,11 +132,29 @@ class CoreApiClient:
     def capabilities(self) -> CapabilitiesResponse:
         return _capabilities(self._get("/api/v1/capabilities"))
 
-    def list_chats(self, *, limit: int = 50) -> tuple[ChatSummaryResponse, ...]:
+    def list_chats(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[ChatSummaryResponse, ...]:
         if not 1 <= limit <= 200:
             raise ValueError("Chat list limit must be between 1 and 200.")
-        payload = self._get("/api/v1/chats", query={"limit": str(limit)})
-        return tuple(_chat_summary(item) for item in _items(payload))
+        if offset < 0:
+            raise ValueError("Chat list offset must be zero or greater.")
+
+        query = {"limit": str(limit)}
+        if offset:
+            query["offset"] = str(offset)
+
+        payload = self._get(
+            "/api/v1/chats",
+            query=query,
+        )
+        return tuple(
+            _chat_summary(item)
+            for item in _items(payload)
+        )
 
     def create_chat(self) -> ChatThreadResponse:
         return _chat_thread(self._request("POST", "/api/v1/chats", expected_status=201))

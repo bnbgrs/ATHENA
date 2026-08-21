@@ -20,8 +20,14 @@ class _Chat:
         self.revision_id = uuid.UUID("33333333-3333-3333-3333-333333333333")
         self.actor_id = uuid.UUID("44444444-4444-4444-4444-444444444444")
 
-    def list_chats(self, *, limit: int = 50) -> tuple[ChatSummary, ...]:
+    def list_chats(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[ChatSummary, ...]:
         assert limit > 0
+        assert offset >= 0
         return (
             ChatSummary(
                 chat_id=self.chat_id,
@@ -225,7 +231,7 @@ def test_asgi_chat_routes_and_limit_validation(tmp_path) -> None:
             runtime,
             method="GET",
             path="/api/v1/chats",
-            query=b"limit=20",
+            query=b"limit=20&offset=1",
             token=token,
         )
     )
@@ -257,6 +263,16 @@ def test_asgi_chat_routes_and_limit_validation(tmp_path) -> None:
             token=token,
         )
     )
+    invalid_offset_status, _, invalid_offset = asyncio.run(
+        _request(
+            app,
+            runtime,
+            method="GET",
+            path="/api/v1/chats",
+            query=b"limit=20&offset=-1",
+            token=token,
+        )
+    )
 
     assert list_status == 200
     assert listed["items"][0]["message_count"] == 1
@@ -266,6 +282,9 @@ def test_asgi_chat_routes_and_limit_validation(tmp_path) -> None:
     assert loaded["messages"][0]["content"] == "hello"
     assert invalid_status == 400
     assert invalid["code"] == "invalid_request"
+    assert invalid_offset_status == 400
+    assert invalid_offset["code"] == "invalid_request"
+    assert "offset" in invalid_offset["message"]
 
 
 def test_asgi_model_routes(tmp_path) -> None:

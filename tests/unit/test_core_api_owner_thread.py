@@ -33,15 +33,35 @@ def test_core_api_sqlite_work_runs_on_domain_owner_thread(
             timeout_seconds=2.0,
         )
 
-        created = client.create_chat()
-        loaded = client.load_chat(created.chat_id)
-        chats = client.list_chats(limit=10)
+        first = client.create_chat()
+        second = client.create_chat()
 
-        assert loaded.chat_id == created.chat_id
-        assert any(
-            chat.chat_id == created.chat_id
+        loaded = client.load_chat(
+            first.chat_id
+        )
+
+        chats = client.list_chats(
+            limit=10
+        )
+        offset_chats = client.list_chats(
+            limit=10,
+            offset=1,
+        )
+
+        assert loaded.chat_id == first.chat_id
+
+        listed_ids = tuple(
+            chat.chat_id
             for chat in chats
         )
+        offset_ids = tuple(
+            chat.chat_id
+            for chat in offset_chats
+        )
+
+        assert first.chat_id in listed_ids
+        assert second.chat_id in listed_ids
+        assert offset_ids == listed_ids[1:]
         assert process.executor.thread_id == owner_thread
     finally:
         process.stop()

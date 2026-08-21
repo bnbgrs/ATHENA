@@ -210,7 +210,9 @@ def test_client_parses_chat_and_model_lists(
 
     def fake_urlopen(request: Any, timeout: float) -> _Response:
         del timeout
-        if request.full_url.endswith("/api/v1/chats?limit=7"):
+        if request.full_url.endswith(
+            "/api/v1/chats?limit=7&offset=3"
+        ):
             return _Response(
                 {
                     "items": [
@@ -249,7 +251,10 @@ def test_client_parses_chat_and_model_lists(
     monkeypatch.setattr(client_module, "urlopen", fake_urlopen)
     client = CoreApiClient(runtime_root)
 
-    chats = client.list_chats(limit=7)
+    chats = client.list_chats(
+        limit=7,
+        offset=3,
+    )
     models = client.list_models()
 
     assert chats[0].chat_id == "chat-1"
@@ -321,3 +326,21 @@ def test_client_shutdown_command_is_not_retried(
     CoreApiClient(runtime_root).request_shutdown()
 
     assert calls == 1
+
+
+
+def test_client_rejects_negative_chat_offset(
+    tmp_path: Path,
+) -> None:
+    runtime_root = tmp_path / "api"
+    _bootstrap(runtime_root)
+
+    with pytest.raises(
+        ValueError,
+        match="offset",
+    ):
+        CoreApiClient(
+            runtime_root
+        ).list_chats(
+            offset=-1
+        )

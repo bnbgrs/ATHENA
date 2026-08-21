@@ -268,9 +268,16 @@ class ChatRepository:
             content_format=content_format,
         )
 
-    def list_chats(self, *, limit: int = 50) -> tuple[ChatSummary, ...]:
+    def list_chats(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[ChatSummary, ...]:
         if limit < 1 or limit > 500:
             raise ValueError("Chat list limit must be between 1 and 500.")
+        if offset < 0:
+            raise ValueError("Chat list offset must be zero or greater.")
 
         rows = self.database.connection.execute(
             """
@@ -292,9 +299,9 @@ class ChatRepository:
                 c.archive_mode,
                 c.lifecycle_state
             ORDER BY c.started_at_us DESC, c.chat_id DESC
-            LIMIT ?
+            LIMIT ? OFFSET ?
             """,
-            (limit,),
+            (limit, offset),
         ).fetchall()
 
         return tuple(

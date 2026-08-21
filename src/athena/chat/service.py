@@ -91,5 +91,13 @@ class ChatService:
     def load_chat(self, chat_id: uuid.UUID) -> ChatThread:
         return self.repository.load_chat(chat_id)
 
-    def list_chats(self, *, limit: int = 50) -> tuple[ChatSummary, ...]:
-        return self.repository.list_chats(limit=limit)
+    def list_chats(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[ChatSummary, ...]:
+        return self.repository.list_chats(
+            limit=limit,
+            offset=offset,
+        )

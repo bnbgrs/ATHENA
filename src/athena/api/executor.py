@@ -204,9 +204,13 @@ class SerializedCoreApiSurface:
         self,
         *,
         limit: int = 50,
+        offset: int = 0,
     ) -> tuple[ChatSummaryResponse, ...]:
         return self._executor.call(
-            lambda: self._surface.list_chats(limit=limit)
+            lambda: self._surface.list_chats(
+                limit=limit,
+                offset=offset,
+            )
         )
 
     def create_chat(self) -> ChatThreadResponse:

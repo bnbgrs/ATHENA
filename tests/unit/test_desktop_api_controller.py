@@ -148,3 +148,160 @@ def test_controller_keeps_core_connected_when_optional_status_fails() -> None:
     assert snapshot.chat_error == "Chat status is unavailable."
     assert snapshot.model_error == "LM Studio is unavailable."
     assert pool.waitForDone(2_000)
+
+
+
+def _chat_summary(index: int) -> ChatSummaryResponse:
+    return ChatSummaryResponse(
+        chat_id=f"chat-{index:03d}",
+        started_at_us=10_000 - index,
+        ended_at_us=None,
+        archive_mode="standard",
+        lifecycle_state="active",
+        message_count=index,
+    )
+
+
+class _PagedGateway(_Gateway):
+    def __init__(self) -> None:
+        super().__init__()
+        self.chats = tuple(
+            _chat_summary(index)
+            for index in range(125)
+        )
+        self.chat_page_calls: list[
+            tuple[int, int]
+        ] = []
+
+    def list_chats(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[ChatSummaryResponse, ...]:
+        self._record()
+
+        self.chat_page_calls.append(
+            (limit, offset)
+        )
+
+        return self.chats[
+            offset : offset + limit
+        ]
+
+
+class _DuplicatePageGateway(_Gateway):
+    def __init__(self) -> None:
+        super().__init__()
+        self.chat_page_calls: list[
+            tuple[int, int]
+        ] = []
+
+    def list_chats(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[ChatSummaryResponse, ...]:
+        self._record()
+
+        self.chat_page_calls.append(
+            (limit, offset)
+        )
+
+        return tuple(
+            _chat_summary(index)
+            for index in range(limit)
+        )
+
+
+def test_controller_paginates_all_chat_summaries() -> None:
+    app = _app()
+    gateway = _PagedGateway()
+    pool = _pool()
+
+    controller = DesktopApiController(
+        gateway,
+        thread_pool=pool,
+        chat_limit=50,
+    )
+
+    spy = QSignalSpy(
+        controller.snapshot_ready
+    )
+
+    controller.refresh()
+
+    assert pool.waitForDone(2_000)
+    app.processEvents()
+
+    assert spy.count() == 1
+
+    snapshot = spy.at(0)[0]
+
+    assert isinstance(
+        snapshot,
+        DesktopApiSnapshot,
+    )
+
+    assert snapshot.chat_error is None
+    assert len(snapshot.chats) == 125
+
+    assert len(
+        {
+            chat.chat_id
+            for chat in snapshot.chats
+        }
+    ) == 125
+
+    assert gateway.chat_page_calls == [
+        (50, 0),
+        (50, 50),
+        (50, 100),
+    ]
+
+    assert pool.waitForDone(2_000)
+
+
+def test_controller_rejects_duplicate_chat_page() -> None:
+    app = _app()
+    gateway = _DuplicatePageGateway()
+    pool = _pool()
+
+    controller = DesktopApiController(
+        gateway,
+        thread_pool=pool,
+        chat_limit=50,
+    )
+
+    spy = QSignalSpy(
+        controller.snapshot_ready
+    )
+
+    controller.refresh()
+
+    assert pool.waitForDone(2_000)
+    app.processEvents()
+
+    assert spy.count() == 1
+
+    snapshot = spy.at(0)[0]
+
+    assert isinstance(
+        snapshot,
+        DesktopApiSnapshot,
+    )
+
+    assert snapshot.chats == ()
+
+    assert snapshot.chat_error == (
+        "ATHENA chat pagination returned "
+        "a duplicate chat identity."
+    )
+
+    assert gateway.chat_page_calls == [
+        (50, 0),
+        (50, 50),
+    ]
+
+    assert pool.waitForDone(2_000)

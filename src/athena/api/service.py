@@ -292,8 +292,19 @@ class CoreApiFacade:
             features=features,
         )
 
-    def list_chats(self, *, limit: int = 50) -> tuple[ChatSummaryResponse, ...]:
-        return tuple(_chat_summary(summary) for summary in self._chat.list_chats(limit=limit))
+    def list_chats(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[ChatSummaryResponse, ...]:
+        return tuple(
+            _chat_summary(summary)
+            for summary in self._chat.list_chats(
+                limit=limit,
+                offset=offset,
+            )
+        )
 
     def create_chat(self) -> ChatThreadResponse:
         chat_id = self._chat.create_chat()

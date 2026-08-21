@@ -105,12 +105,26 @@ class CoreApiAsgiApp:
                 return
 
             if method == "GET" and path == "/api/v1/chats":
-                limit = _positive_limit(scope, default=50, maximum=200)
+                limit = _positive_limit(
+                    scope,
+                    default=50,
+                    maximum=200,
+                )
+                offset = _nonnegative_offset(
+                    scope,
+                    default=0,
+                )
                 await _send_json(
                     send,
                     status=200,
                     payload={
-                        "items": [item.to_dict() for item in self._facade.list_chats(limit=limit)]
+                        "items": [
+                            item.to_dict()
+                            for item in self._facade.list_chats(
+                                limit=limit,
+                                offset=offset,
+                            )
+                        ]
                     },
                     request_id=request_id,
                 )
@@ -845,6 +859,47 @@ def _positive_limit(scope: AsgiScope, *, default: int, maximum: int) -> int:
     if not 1 <= limit <= maximum:
         raise ValueError(f"Query parameter 'limit' must be between 1 and {maximum}.")
     return limit
+
+
+def _nonnegative_offset(
+    scope: AsgiScope,
+    *,
+    default: int,
+) -> int:
+    raw_query = cast(
+        bytes,
+        scope.get("query_string", b""),
+    )
+    if not raw_query:
+        return default
+
+    values = parse_qs(
+        raw_query.decode("ascii"),
+        keep_blank_values=True,
+    )
+    raw_offset = values.get("offset")
+
+    if raw_offset is None:
+        return default
+
+    if len(raw_offset) != 1:
+        raise ValueError(
+            "Query parameter 'offset' must occur once."
+        )
+
+    try:
+        offset = int(raw_offset[0])
+    except ValueError as exc:
+        raise ValueError(
+            "Query parameter 'offset' must be an integer."
+        ) from exc
+
+    if offset < 0:
+        raise ValueError(
+            "Query parameter 'offset' must be zero or greater."
+        )
+
+    return offset
 
 
 async def _read_json_object(

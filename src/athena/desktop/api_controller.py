@@ -34,7 +34,12 @@ class CoreApiGateway(Protocol):
 
     def list_models(self) -> tuple[ModelResponse, ...]: ...
 
-    def list_chats(self, *, limit: int = 50) -> tuple[ChatSummaryResponse, ...]: ...
+    def list_chats(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[ChatSummaryResponse, ...]: ...
 
     def create_chat(self) -> ChatThreadResponse: ...
 
@@ -485,12 +490,50 @@ def _chat_snapshot(
     *,
     chat_limit: int,
 ) -> tuple[tuple[ChatSummaryResponse, ...], str | None]:
-    try:
-        return gateway.list_chats(limit=chat_limit), None
-    except CoreApiClientError as exc:
-        return (), str(exc)
-    except Exception:
-        return (), "ATHENA chat status refresh failed."
+    chats: list[ChatSummaryResponse] = []
+    seen_chat_ids: set[str] = set()
+    offset = 0
+
+    while True:
+        try:
+            page = (
+                gateway.list_chats(
+                    limit=chat_limit,
+                )
+                if offset == 0
+                else gateway.list_chats(
+                    limit=chat_limit,
+                    offset=offset,
+                )
+            )
+        except CoreApiClientError as exc:
+            return (), str(exc)
+        except Exception:
+            return (), "ATHENA chat status refresh failed."
+
+        if len(page) > chat_limit:
+            return (
+                (),
+                "ATHENA chat pagination exceeded the requested page size.",
+            )
+
+        for chat in page:
+            if chat.chat_id in seen_chat_ids:
+                return (
+                    (),
+                    "ATHENA chat pagination returned a duplicate chat identity.",
+                )
+
+            seen_chat_ids.add(
+                chat.chat_id
+            )
+
+        chats.extend(page)
+
+        if len(page) < chat_limit:
+            return tuple(chats), None
+
+        offset += len(page)
 
 
 def _model_snapshot(

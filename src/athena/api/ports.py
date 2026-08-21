@@ -32,6 +32,7 @@ class CoreApiSurface(Protocol):
         self,
         *,
         limit: int = 50,
+        offset: int = 0,
     ) -> tuple[ChatSummaryResponse, ...]: ...
 
     def create_chat(self) -> ChatThreadResponse: ...
