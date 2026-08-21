@@ -39,9 +39,16 @@ class ChatService:
             display_name=self._LOCAL_USER_NAME,
         )
 
-    def create_chat(self) -> uuid.UUID:
+    def create_chat(
+        self,
+        *,
+        chat_id: uuid.UUID | None = None,
+    ) -> uuid.UUID:
         user_id = self.ensure_local_user()
-        return self.repository.create_chat(actor_id=user_id)
+        return self.repository.create_chat(
+            actor_id=user_id,
+            chat_id=chat_id,
+        )
 
     def add_user_message(
         self,

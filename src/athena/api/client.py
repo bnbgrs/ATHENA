@@ -157,8 +157,45 @@ class CoreApiClient:
             for item in _items(payload)
         )
 
-    def create_chat(self) -> ChatThreadResponse:
-        return _chat_thread(self._request("POST", "/api/v1/chats", expected_status=201))
+    def create_chat(
+        self,
+        chat_id: str | None = None,
+    ) -> ChatThreadResponse:
+        if chat_id is None:
+            return _chat_thread(
+                self._request(
+                    "POST",
+                    "/api/v1/chats",
+                    expected_status=201,
+                )
+            )
+
+        if not chat_id or "/" in chat_id:
+            raise ValueError(
+                "Chat ID must be a single non-empty path segment."
+            )
+
+        try:
+            canonical_chat_id = str(
+                uuid.UUID(
+                    chat_id
+                )
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "Chat ID must be a valid UUID."
+            ) from exc
+
+        return _chat_thread(
+            self._request(
+                "PUT",
+                (
+                    "/api/v1/chats/"
+                    + canonical_chat_id
+                ),
+                expected_status=201,
+            )
+        )
 
     def load_chat(self, chat_id: str) -> ChatThreadResponse:
         if not chat_id or "/" in chat_id:

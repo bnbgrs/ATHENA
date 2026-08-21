@@ -144,6 +144,33 @@ class CoreApiAsgiApp:
                 )
                 return
 
+            if (
+                method == "PUT"
+                and path.startswith("/api/v1/chats/")
+            ):
+                chat_id = path.removeprefix(
+                    "/api/v1/chats/"
+                )
+
+                if not chat_id or "/" in chat_id:
+                    raise ValueError(
+                        "Invalid chat creation resource path."
+                    )
+
+                await _consume_empty_body(
+                    receive
+                )
+
+                await _send_contract(
+                    send,
+                    self._facade.create_chat(
+                        chat_id
+                    ),
+                    status=201,
+                    request_id=request_id,
+                )
+                return
+
             remember_resource = _message_action_resource(path, action="remember")
             if method == "POST" and remember_resource is not None:
                 chat_id, message_id = remember_resource

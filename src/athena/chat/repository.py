@@ -80,20 +80,56 @@ class ChatRepository:
 
         return actor_id
 
-    def create_chat(self, *, actor_id: uuid.UUID, archive_mode: str = "standard") -> uuid.UUID:
+    def create_chat(
+        self,
+        *,
+        actor_id: uuid.UUID,
+        archive_mode: str = "standard",
+        chat_id: uuid.UUID | None = None,
+    ) -> uuid.UUID:
         if archive_mode != "standard":
             raise UnsupportedArchiveModeError(
                 "Vertical Slice 1 persists only standard chats. Temporary and "
                 "do_not_store modes require their dedicated lifecycle paths."
             )
 
-        chat_id = new_uuid7()
-        commit_id = new_uuid7()
-        provenance_id = new_uuid7()
-        created_at_us = utc_now_us()
+        resolved_chat_id = (
+            chat_id
+            if chat_id is not None
+            else new_uuid7()
+        )
 
         with self.database.write_transaction() as connection:
-            self._require_active_actor(connection, actor_id)
+            self._require_active_actor(
+                connection,
+                actor_id,
+            )
+
+            if chat_id is not None:
+                existing = connection.execute(
+                    """
+                    SELECT 1
+                    FROM chats
+                    WHERE chat_id = ?
+                    """,
+                    (
+                        uuid_to_blob(
+                            resolved_chat_id
+                        ),
+                    ),
+                ).fetchone()
+
+                if existing is not None:
+                    self._require_standard_chat(
+                        connection,
+                        resolved_chat_id,
+                    )
+                    return resolved_chat_id
+
+            commit_id = new_uuid7()
+            provenance_id = new_uuid7()
+            created_at_us = utc_now_us()
+
             commit_seq = self._insert_commit(
                 connection,
                 commit_id=commit_id,
@@ -101,14 +137,16 @@ class ChatRepository:
                 operation_type="chat.create",
                 committed_at_us=created_at_us,
             )
+
             self._insert_entity(
                 connection,
-                entity_id=chat_id,
+                entity_id=resolved_chat_id,
                 entity_type="chat",
                 actor_id=actor_id,
                 created_at_us=created_at_us,
                 commit_seq=commit_seq,
             )
+
             connection.execute(
                 """
                 INSERT INTO chats (
@@ -120,27 +158,43 @@ class ChatRepository:
                     protection_scope_id
                 ) VALUES (?, ?, NULL, ?, 'active', NULL)
                 """,
-                (uuid_to_blob(chat_id), created_at_us, archive_mode),
+                (
+                    uuid_to_blob(
+                        resolved_chat_id
+                    ),
+                    created_at_us,
+                    archive_mode,
+                ),
             )
+
             self._insert_provenance(
                 connection,
                 provenance_id=provenance_id,
-                entity_id=chat_id,
+                entity_id=resolved_chat_id,
                 revision_id=None,
                 operation="chat.create",
                 actor_id=actor_id,
                 created_at_us=created_at_us,
             )
+
             connection.execute(
                 """
                 INSERT INTO commit_changes (
-                    commit_seq, entity_id, revision_id, change_type
+                    commit_seq,
+                    entity_id,
+                    revision_id,
+                    change_type
                 ) VALUES (?, ?, NULL, 'create')
                 """,
-                (commit_seq, uuid_to_blob(chat_id)),
+                (
+                    commit_seq,
+                    uuid_to_blob(
+                        resolved_chat_id
+                    ),
+                ),
             )
 
-        return chat_id
+        return resolved_chat_id
 
     def append_message(
         self,

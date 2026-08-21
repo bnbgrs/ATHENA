@@ -311,9 +311,22 @@ class CoreApiFacade:
             )
         )
 
-    def create_chat(self) -> ChatThreadResponse:
-        chat_id = self._chat.create_chat()
-        return _chat_thread(self._chat.load_chat(chat_id))
+    def create_chat(
+        self,
+        chat_id: str | None = None,
+    ) -> ChatThreadResponse:
+        if chat_id is None:
+            created_chat_id = self._chat.create_chat()
+        else:
+            created_chat_id = self._chat.create_chat(
+                chat_id=uuid.UUID(chat_id)
+            )
+
+        return _chat_thread(
+            self._chat.load_chat(
+                created_chat_id
+            )
+        )
 
     def load_chat(self, chat_id: str) -> ChatThreadResponse:
         parsed_chat_id = uuid.UUID(chat_id)

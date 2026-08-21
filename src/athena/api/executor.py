@@ -213,8 +213,20 @@ class SerializedCoreApiSurface:
             )
         )
 
-    def create_chat(self) -> ChatThreadResponse:
-        return self._executor.call(self._surface.create_chat)
+    def create_chat(
+        self,
+        chat_id: str | None = None,
+    ) -> ChatThreadResponse:
+        if chat_id is None:
+            return self._executor.call(
+                self._surface.create_chat
+            )
+
+        return self._executor.call(
+            lambda: self._surface.create_chat(
+                chat_id
+            )
+        )
 
     def load_chat(self, chat_id: str) -> ChatThreadResponse:
         return self._executor.call(
