@@ -6,6 +6,11 @@ import uuid
 
 from athena.chat.models import ChatMessage, ChatSummary, ChatThread, MessageType
 from athena.chat.repository import ChatRepository
+from athena.chat.send_identity import (
+    SendOperationStatus,
+    assistant_message_id_for_operation,
+    user_message_id_for_operation,
+)
 
 
 class EmptyMessageError(ValueError):
@@ -38,16 +43,34 @@ class ChatService:
         user_id = self.ensure_local_user()
         return self.repository.create_chat(actor_id=user_id)
 
-    def add_user_message(self, *, chat_id: uuid.UUID, content: str) -> ChatMessage:
+    def add_user_message(
+        self,
+        *,
+        chat_id: uuid.UUID,
+        content: str,
+        operation_id: uuid.UUID | None = None,
+    ) -> ChatMessage:
         if not content.strip():
-            raise EmptyMessageError("A chat message must contain non-whitespace text.")
+            raise EmptyMessageError(
+                "A chat message must contain non-whitespace text."
+            )
 
         user_id = self.ensure_local_user()
+
+        message_id = (
+            user_message_id_for_operation(
+                operation_id
+            )
+            if operation_id is not None
+            else None
+        )
+
         return self.repository.append_message(
             chat_id=chat_id,
             actor_id=user_id,
             message_type=MessageType.USER,
             content=content,
+            message_id=message_id,
         )
 
 
@@ -73,6 +96,7 @@ class ChatService:
         content: str,
         provider_id: str,
         model_id: str,
+        operation_id: uuid.UUID | None = None,
     ) -> ChatMessage:
         if not content.strip():
             raise EmptyMessageError("An assistant message must contain non-whitespace text.")
@@ -81,11 +105,38 @@ class ChatService:
             provider_id=provider_id,
             model_id=model_id,
         )
+        message_id = (
+            assistant_message_id_for_operation(
+                operation_id
+            )
+            if operation_id is not None
+            else None
+        )
+
         return self.repository.append_message(
             chat_id=chat_id,
             actor_id=actor_id,
             message_type=MessageType.ASSISTANT,
             content=content,
+            message_id=message_id,
+        )
+
+    def inspect_send_operation(
+        self,
+        *,
+        chat_id: uuid.UUID,
+        operation_id: uuid.UUID,
+        content: str,
+    ) -> SendOperationStatus:
+        if not content.strip():
+            raise EmptyMessageError(
+                "A chat message must contain non-whitespace text."
+            )
+
+        return self.repository.inspect_send_operation(
+            chat_id=chat_id,
+            operation_id=operation_id,
+            expected_content=content,
         )
 
     def load_chat(self, chat_id: uuid.UUID) -> ChatThread:

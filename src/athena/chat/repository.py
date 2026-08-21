@@ -8,6 +8,12 @@ import sqlite3
 import uuid
 
 from athena.chat.models import ChatMessage, ChatSummary, ChatThread, MessageType
+from athena.chat.send_identity import (
+    SendOperationState,
+    SendOperationStatus,
+    assistant_message_id_for_operation,
+    user_message_id_for_operation,
+)
 from athena.common.ids import new_uuid7, uuid_from_blob, uuid_to_blob
 from athena.common.time import utc_now_us
 from athena.storage.database import SQLiteDatabase
@@ -144,8 +150,13 @@ class ChatRepository:
         message_type: MessageType,
         content: str,
         content_format: str = "text/plain",
+        message_id: uuid.UUID | None = None,
     ) -> ChatMessage:
-        message_id = new_uuid7()
+        resolved_message_id = (
+            message_id
+            if message_id is not None
+            else new_uuid7()
+        )
         revision_id = new_uuid7()
         provenance_id = new_uuid7()
         commit_id = new_uuid7()
@@ -176,7 +187,7 @@ class ChatRepository:
             )
             self._insert_entity(
                 connection,
-                entity_id=message_id,
+                entity_id=resolved_message_id,
                 entity_type="chat_message",
                 actor_id=actor_id,
                 created_at_us=created_at_us,
@@ -185,7 +196,7 @@ class ChatRepository:
             self._insert_provenance(
                 connection,
                 provenance_id=provenance_id,
-                entity_id=message_id,
+                entity_id=resolved_message_id,
                 revision_id=revision_id,
                 operation="chat_message.create",
                 actor_id=actor_id,
@@ -209,7 +220,7 @@ class ChatRepository:
                 """,
                 (
                     uuid_to_blob(revision_id),
-                    uuid_to_blob(message_id),
+                    uuid_to_blob(resolved_message_id),
                     created_at_us,
                     uuid_to_blob(actor_id),
                     uuid_to_blob(provenance_id),
@@ -223,7 +234,7 @@ class ChatRepository:
                     entity_id, current_revision_id, current_revision_no
                 ) VALUES (?, ?, 1)
                 """,
-                (uuid_to_blob(message_id), uuid_to_blob(revision_id)),
+                (uuid_to_blob(resolved_message_id), uuid_to_blob(revision_id)),
             )
             connection.execute(
                 """
@@ -232,7 +243,7 @@ class ChatRepository:
                 ) VALUES (?, ?, ?, ?, ?)
                 """,
                 (
-                    uuid_to_blob(message_id),
+                    uuid_to_blob(resolved_message_id),
                     uuid_to_blob(chat_id),
                     next_sequence,
                     message_type.value,
@@ -253,11 +264,11 @@ class ChatRepository:
                     commit_seq, entity_id, revision_id, change_type
                 ) VALUES (?, ?, ?, 'create')
                 """,
-                (commit_seq, uuid_to_blob(message_id), uuid_to_blob(revision_id)),
+                (commit_seq, uuid_to_blob(resolved_message_id), uuid_to_blob(revision_id)),
             )
 
         return ChatMessage(
-            message_id=message_id,
+            message_id=resolved_message_id,
             chat_id=chat_id,
             sequence_no=next_sequence,
             message_type=message_type,
@@ -266,6 +277,115 @@ class ChatRepository:
             revision_id=revision_id,
             content=content,
             content_format=content_format,
+        )
+
+    def inspect_send_operation(
+        self,
+        *,
+        chat_id: uuid.UUID,
+        operation_id: uuid.UUID,
+        expected_content: str,
+    ) -> SendOperationStatus:
+        """Inspect durable send state without performing a mutation."""
+        connection = self.database.connection
+        self._require_standard_chat(
+            connection,
+            chat_id,
+        )
+
+        user_message_id = (
+            user_message_id_for_operation(
+                operation_id
+            )
+        )
+        assistant_message_id = (
+            assistant_message_id_for_operation(
+                operation_id
+            )
+        )
+
+        rows = connection.execute(
+            """
+            SELECT
+                m.message_id,
+                m.chat_id,
+                m.sequence_no,
+                m.message_type,
+                m.actor_id,
+                r.created_at_us,
+                r.revision_id,
+                mr.content,
+                mr.content_format
+            FROM chat_messages AS m
+            JOIN entity_heads AS h
+              ON h.entity_id = m.message_id
+            JOIN revisions AS r
+              ON r.revision_id = h.current_revision_id
+            JOIN chat_message_revisions AS mr
+              ON mr.revision_id = r.revision_id
+            WHERE m.message_id IN (?, ?)
+            """,
+            (
+                uuid_to_blob(
+                    user_message_id
+                ),
+                uuid_to_blob(
+                    assistant_message_id
+                ),
+            ),
+        ).fetchall()
+
+        messages = {
+            message.message_id: message
+            for message in (
+                self._message_from_row(row)
+                for row in rows
+            )
+        }
+
+        user_message = messages.get(
+            user_message_id
+        )
+        assistant_message = messages.get(
+            assistant_message_id
+        )
+
+        if (
+            user_message is None
+            and assistant_message is None
+        ):
+            state = SendOperationState.ABSENT
+        elif user_message is None:
+            state = SendOperationState.CONFLICT
+        elif (
+            user_message.chat_id != chat_id
+            or user_message.message_type
+            is not MessageType.USER
+            or user_message.content
+            != expected_content
+        ):
+            state = SendOperationState.CONFLICT
+        elif assistant_message is None:
+            state = SendOperationState.INCOMPLETE
+        elif (
+            assistant_message.chat_id != chat_id
+            or assistant_message.message_type
+            is not MessageType.ASSISTANT
+            or assistant_message.sequence_no
+            != user_message.sequence_no + 1
+        ):
+            state = SendOperationState.CONFLICT
+        else:
+            state = SendOperationState.COMPLETE
+
+        return SendOperationStatus(
+            chat_id=chat_id,
+            operation_id=operation_id,
+            user_message_id=user_message_id,
+            assistant_message_id=(
+                assistant_message_id
+            ),
+            state=state,
         )
 
     def list_chats(
