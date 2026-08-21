@@ -12,21 +12,31 @@ from urllib.request import Request, urlopen
 
 from athena.api.contracts import (
     API_VERSION,
+    CanonicalMergeReviewResponse,
     CapabilitiesResponse,
     ChatMessageResponse,
     ChatSummaryResponse,
     ChatThreadResponse,
+    ClaimProposalResponse,
+    DedupDecisionResponse,
     DeletionDependencyResponse,
     DeletionPreviewResponse,
     DeletionResultResponse,
+    ExtractorMergeCandidateResponse,
     GroundedChatResponse,
     GroundedEvidenceResponse,
     GroundedMemoryResponse,
     GroundingResponse,
     HealthResponse,
     JsonValue,
+    KnowledgeMergeReviewResponse,
+    KnowledgeReviewResponse,
+    KnowledgeUnitProposalResponse,
+    MessageKnowledgeExtractionResponse,
     ModelResponse,
     ProviderHealthResponse,
+    RelationProposalResponse,
+    RememberedChatMessageResponse,
 )
 from athena.config.settings import AthenaSettings
 from athena.storage.paths import RuntimePaths
@@ -274,6 +284,149 @@ class CoreApiClient:
                 timeout_seconds=self.generation_timeout_seconds,
             )
         )
+
+    def remember_chat_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        *,
+        revision_id: str,
+    ) -> RememberedChatMessageResponse:
+        if not chat_id or "/" in chat_id:
+            raise ValueError("Chat ID must be a single non-empty path segment.")
+        if not message_id or "/" in message_id:
+            raise ValueError("Message ID must be a single non-empty path segment.")
+        if not revision_id.strip():
+            raise ValueError("Message revision_id must be non-empty.")
+        result = _remembered_chat_message(
+            self._request(
+                "POST",
+                f"/api/v1/chats/{chat_id}/messages/{message_id}/remember",
+                expected_status=201,
+                json_body={"revision_id": revision_id},
+            )
+        )
+        if (
+            result.chat_id != chat_id
+            or result.message_id != message_id
+            or result.message_revision_id != revision_id
+        ):
+            raise CoreApiClientError(
+                "ATHENA Core returned Remember data for another message revision.",
+                code="invalid_response",
+            )
+        return result
+
+    def extract_chat_message_knowledge(
+        self,
+        chat_id: str,
+        message_id: str,
+        *,
+        revision_id: str,
+        model_id: str | None = None,
+        effective_context_limit: int | None = None,
+        max_output_tokens: int | None = None,
+    ) -> MessageKnowledgeExtractionResponse:
+        if not chat_id or "/" in chat_id:
+            raise ValueError("Chat ID must be a single non-empty path segment.")
+        if not message_id or "/" in message_id:
+            raise ValueError("Message ID must be a single non-empty path segment.")
+        if not revision_id.strip():
+            raise ValueError("Message revision_id must be non-empty.")
+        if model_id is not None and not model_id.strip():
+            raise ValueError(
+                "Knowledge extraction model_id must be non-empty when provided."
+            )
+        if effective_context_limit is not None and (
+            isinstance(effective_context_limit, bool)
+            or not isinstance(effective_context_limit, int)
+            or effective_context_limit < 1
+        ):
+            raise ValueError(
+                "Knowledge extraction effective_context_limit must be positive when provided."
+            )
+        if max_output_tokens is not None and (
+            isinstance(max_output_tokens, bool)
+            or not isinstance(max_output_tokens, int)
+            or max_output_tokens < 1
+        ):
+            raise ValueError(
+                "Knowledge extraction max_output_tokens must be positive when provided."
+            )
+        payload: dict[str, JsonValue] = {"revision_id": revision_id}
+        if model_id is not None:
+            payload["model_id"] = model_id
+        if effective_context_limit is not None:
+            payload["effective_context_limit"] = effective_context_limit
+        if max_output_tokens is not None:
+            payload["max_output_tokens"] = max_output_tokens
+        result = _message_knowledge_extraction(
+            self._request(
+                "POST",
+                f"/api/v1/chats/{chat_id}/messages/{message_id}/knowledge-extraction",
+                expected_status=201,
+                json_body=payload,
+                timeout_seconds=self.generation_timeout_seconds,
+            )
+        )
+        if (
+            result.chat_id != chat_id
+            or result.message_id != message_id
+            or result.message_revision_id != revision_id
+        ):
+            raise CoreApiClientError(
+                "ATHENA Core returned extraction data for another message revision.",
+                code="invalid_response",
+            )
+        return result
+
+    def prepare_knowledge_review(
+        self,
+        processing_run_id: str,
+    ) -> KnowledgeReviewResponse:
+        _require_path_segment(processing_run_id, label="ProcessingRun ID")
+        return _knowledge_review(
+            self._request(
+                "POST",
+                f"/api/v1/knowledge-extractions/{processing_run_id}/review",
+                expected_status=200,
+            )
+        )
+
+    def load_knowledge_merge_review(
+        self,
+        review_id: str,
+    ) -> KnowledgeMergeReviewResponse:
+        _require_path_segment(review_id, label="Knowledge review ID")
+        return _knowledge_merge_review(
+            self._get(f"/api/v1/knowledge-merge-reviews/{review_id}")
+        )
+
+    def resolve_knowledge_merge_review(
+        self,
+        review_id: str,
+        *,
+        decision: str,
+    ) -> KnowledgeMergeReviewResponse:
+        _require_path_segment(review_id, label="Knowledge review ID")
+        if decision not in {"merge", "keep_separate"}:
+            raise ValueError(
+                "Knowledge merge decision must be 'merge' or 'keep_separate'."
+            )
+        result = _knowledge_merge_review(
+            self._request(
+                "POST",
+                f"/api/v1/knowledge-merge-reviews/{review_id}/decision",
+                expected_status=200,
+                json_body={"decision": decision},
+            )
+        )
+        if result.review_id != review_id or result.decision != decision:
+            raise CoreApiClientError(
+                "ATHENA Core returned another Knowledge merge-review decision.",
+                code="invalid_response",
+            )
+        return result
 
     def preview_chat_deletion(self, chat_id: str) -> DeletionPreviewResponse:
         if not chat_id or "/" in chat_id:
@@ -529,6 +682,11 @@ class CoreApiClient:
         )
 
 
+def _require_path_segment(value: str, *, label: str) -> None:
+    if not value or "/" in value:
+        raise ValueError(f"{label} must be a single non-empty path segment.")
+
+
 def _problem_from_http_error(status: int, raw: bytes) -> CoreApiClientError:
     try:
         payload = _json_object(raw)
@@ -594,6 +752,16 @@ def _required_int(payload: dict[str, JsonValue], key: str) -> int:
     return value
 
 
+def _required_float(payload: dict[str, JsonValue], key: str) -> float:
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise CoreApiClientError(
+            f"ATHENA Core response field {key!r} is invalid.",
+            code="invalid_response",
+        )
+    return float(value)
+
+
 def _optional_int(payload: dict[str, JsonValue], key: str) -> int | None:
     value = payload.get(key)
     if value is None:
@@ -656,6 +824,438 @@ def _chat_summary(payload: dict[str, JsonValue]) -> ChatSummaryResponse:
         message_count=_required_int(payload, "message_count"),
     )
 
+
+
+def _remembered_chat_message(
+    payload: dict[str, JsonValue],
+) -> RememberedChatMessageResponse:
+    return RememberedChatMessageResponse(
+        chat_id=_required_str(payload, "chat_id"),
+        message_id=_required_str(payload, "message_id"),
+        message_revision_id=_required_str(payload, "message_revision_id"),
+        memory_id=_required_str(payload, "memory_id"),
+        memory_revision_id=_required_str(payload, "memory_revision_id"),
+        content=_required_str(payload, "content"),
+    )
+
+
+def _object_items(
+    payload: dict[str, JsonValue],
+    key: str,
+) -> tuple[dict[str, JsonValue], ...]:
+    raw_items = payload.get(key)
+    if not isinstance(raw_items, list):
+        raise CoreApiClientError(
+            f"ATHENA Core response field {key!r} is invalid.",
+            code="invalid_response",
+        )
+    items: list[dict[str, JsonValue]] = []
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            raise CoreApiClientError(
+                f"ATHENA Core response field {key!r} contains an invalid item.",
+                code="invalid_response",
+            )
+        items.append(raw_item)
+    return tuple(items)
+
+
+def _knowledge_unit_proposal(
+    payload: dict[str, JsonValue],
+) -> KnowledgeUnitProposalResponse:
+    return KnowledgeUnitProposalResponse(
+        proposal_index=_required_int(payload, "proposal_index"),
+        source_sequence_no=_required_int(payload, "source_sequence_no"),
+        source_quote=_required_str(payload, "source_quote"),
+        knowledge_kind=_required_str(payload, "knowledge_kind"),
+        title=_optional_str(payload, "title"),
+        body=_required_str(payload, "body"),
+        epistemic_status=_required_str(payload, "epistemic_status"),
+        confidence=_required_float(payload, "confidence"),
+    )
+
+
+def _claim_proposal(payload: dict[str, JsonValue]) -> ClaimProposalResponse:
+    return ClaimProposalResponse(
+        proposal_index=_required_int(payload, "proposal_index"),
+        source_sequence_no=_required_int(payload, "source_sequence_no"),
+        source_quote=_required_str(payload, "source_quote"),
+        claim_kind=_required_str(payload, "claim_kind"),
+        statement=_required_str(payload, "statement"),
+        epistemic_status=_required_str(payload, "epistemic_status"),
+        confidence=_required_float(payload, "confidence"),
+    )
+
+
+def _relation_proposal(payload: dict[str, JsonValue]) -> RelationProposalResponse:
+    return RelationProposalResponse(
+        relation_index=_required_int(payload, "relation_index"),
+        left_type=_required_str(payload, "left_type"),
+        left_index=_required_int(payload, "left_index"),
+        relation_type=_required_str(payload, "relation_type"),
+        right_type=_required_str(payload, "right_type"),
+        right_index=_required_int(payload, "right_index"),
+        confidence=_required_float(payload, "confidence"),
+    )
+
+
+def _extractor_merge_candidate(
+    payload: dict[str, JsonValue],
+) -> ExtractorMergeCandidateResponse:
+    return ExtractorMergeCandidateResponse(
+        candidate_index=_required_int(payload, "candidate_index"),
+        proposal_type=_required_str(payload, "proposal_type"),
+        proposal_index=_required_int(payload, "proposal_index"),
+        reason=_required_str(payload, "reason"),
+        confidence=_required_float(payload, "confidence"),
+    )
+
+
+def _message_knowledge_extraction(
+    payload: dict[str, JsonValue],
+) -> MessageKnowledgeExtractionResponse:
+    result = MessageKnowledgeExtractionResponse(
+        chat_id=_required_str(payload, "chat_id"),
+        message_id=_required_str(payload, "message_id"),
+        message_revision_id=_required_str(payload, "message_revision_id"),
+        processing_run_id=_required_str(payload, "processing_run_id"),
+        model_id=_required_str(payload, "model_id"),
+        model_signature_id=_required_str(payload, "model_signature_id"),
+        knowledge_units=tuple(
+            _knowledge_unit_proposal(item)
+            for item in _object_items(payload, "knowledge_units")
+        ),
+        claims=tuple(
+            _claim_proposal(item) for item in _object_items(payload, "claims")
+        ),
+        relations=tuple(
+            _relation_proposal(item) for item in _object_items(payload, "relations")
+        ),
+        extractor_merge_candidates=tuple(
+            _extractor_merge_candidate(item)
+            for item in _object_items(payload, "extractor_merge_candidates")
+        ),
+    )
+    if tuple(item.proposal_index for item in result.knowledge_units) != tuple(
+        range(len(result.knowledge_units))
+    ):
+        raise CoreApiClientError(
+            "ATHENA Core returned non-contiguous Knowledge proposal indexes.",
+            code="invalid_response",
+        )
+    if tuple(item.proposal_index for item in result.claims) != tuple(
+        range(len(result.claims))
+    ):
+        raise CoreApiClientError(
+            "ATHENA Core returned non-contiguous Claim proposal indexes.",
+            code="invalid_response",
+        )
+    if tuple(item.relation_index for item in result.relations) != tuple(
+        range(len(result.relations))
+    ):
+        raise CoreApiClientError(
+            "ATHENA Core returned non-contiguous relation indexes.",
+            code="invalid_response",
+        )
+    if tuple(
+        item.candidate_index for item in result.extractor_merge_candidates
+    ) != tuple(range(len(result.extractor_merge_candidates))):
+        raise CoreApiClientError(
+            "ATHENA Core returned non-contiguous merge-candidate indexes.",
+            code="invalid_response",
+        )
+    proposal_counts = {
+        "knowledge": len(result.knowledge_units),
+        "claim": len(result.claims),
+    }
+    for relation in result.relations:
+        left_count = proposal_counts.get(relation.left_type)
+        right_count = proposal_counts.get(relation.right_type)
+        if (
+            left_count is None
+            or right_count is None
+            or not 0 <= relation.left_index < left_count
+            or not 0 <= relation.right_index < right_count
+        ):
+            raise CoreApiClientError(
+                "ATHENA Core returned an invalid proposal relation reference.",
+                code="invalid_response",
+            )
+    for candidate in result.extractor_merge_candidates:
+        proposal_count = proposal_counts.get(candidate.proposal_type)
+        if proposal_count is None or not 0 <= candidate.proposal_index < proposal_count:
+            raise CoreApiClientError(
+                "ATHENA Core returned an invalid extractor merge-candidate reference.",
+                code="invalid_response",
+            )
+    return result
+
+
+def _dedup_decision(
+    payload: dict[str, JsonValue],
+) -> DedupDecisionResponse:
+    proposal_type = _required_str(payload, "proposal_type")
+    proposal_index = _required_int(payload, "proposal_index")
+    action = _required_str(payload, "action")
+    existing_entity_id = _optional_str(payload, "existing_entity_id")
+    existing_revision_id = _optional_str(payload, "existing_revision_id")
+    duplicate_of = _optional_int(payload, "duplicate_of_proposal_index")
+    if proposal_type not in {"knowledge", "claim"} or proposal_index < 0:
+        raise CoreApiClientError(
+            "ATHENA Core returned an invalid deduplication proposal reference.",
+            code="invalid_response",
+        )
+    if action == "create":
+        valid = (
+            existing_entity_id is None
+            and existing_revision_id is None
+            and duplicate_of is None
+        )
+    elif action == "reuse_canonical":
+        valid = (
+            existing_entity_id is not None
+            and existing_revision_id is not None
+            and duplicate_of is None
+        )
+    elif action == "reuse_proposal":
+        valid = (
+            existing_entity_id is None
+            and existing_revision_id is None
+            and duplicate_of is not None
+            and 0 <= duplicate_of < proposal_index
+        )
+    else:
+        valid = False
+    if not valid:
+        raise CoreApiClientError(
+            "ATHENA Core returned an invalid deduplication decision.",
+            code="invalid_response",
+        )
+    return DedupDecisionResponse(
+        proposal_type=proposal_type,
+        proposal_index=proposal_index,
+        action=action,
+        existing_entity_id=existing_entity_id,
+        existing_revision_id=existing_revision_id,
+        duplicate_of_proposal_index=duplicate_of,
+    )
+
+
+def _canonical_merge_review(
+    payload: dict[str, JsonValue],
+) -> CanonicalMergeReviewResponse:
+    candidate_index = _required_int(payload, "candidate_index")
+    proposal_type = _required_str(payload, "proposal_type")
+    proposal_index = _required_int(payload, "proposal_index")
+    similarity = _required_float(payload, "similarity")
+    if (
+        candidate_index < 0
+        or proposal_type not in {"knowledge", "claim"}
+        or proposal_index < 0
+        or not 0.0 <= similarity <= 1.0
+    ):
+        raise CoreApiClientError(
+            "ATHENA Core returned an invalid canonical merge candidate.",
+            code="invalid_response",
+        )
+    return CanonicalMergeReviewResponse(
+        candidate_index=candidate_index,
+        review_id=_required_str(payload, "review_id"),
+        proposal_type=proposal_type,
+        proposal_index=proposal_index,
+        existing_entity_id=_required_str(payload, "existing_entity_id"),
+        existing_revision_id=_required_str(payload, "existing_revision_id"),
+        similarity=similarity,
+        reason=_required_str(payload, "reason"),
+    )
+
+
+def _knowledge_review(
+    payload: dict[str, JsonValue],
+) -> KnowledgeReviewResponse:
+    raw_ready = payload.get("ready_to_accept")
+    if not isinstance(raw_ready, bool):
+        raise CoreApiClientError(
+            "ATHENA Core response field 'ready_to_accept' is invalid.",
+            code="invalid_response",
+        )
+    result = KnowledgeReviewResponse(
+        processing_run_id=_required_str(payload, "processing_run_id"),
+        model_signature_id=_required_str(payload, "model_signature_id"),
+        ready_to_accept=raw_ready,
+        blocked_reason=_optional_str(payload, "blocked_reason"),
+        preflight_digest=_optional_str(payload, "preflight_digest"),
+        knowledge_decisions=tuple(
+            _dedup_decision(item)
+            for item in _object_items(payload, "knowledge_decisions")
+        ),
+        claim_decisions=tuple(
+            _dedup_decision(item)
+            for item in _object_items(payload, "claim_decisions")
+        ),
+        canonical_merge_candidates=tuple(
+            _canonical_merge_review(item)
+            for item in _object_items(payload, "canonical_merge_candidates")
+        ),
+    )
+    allowed_blockers = {
+        "extractor_merge_candidates",
+        "canonical_merge_candidates",
+    }
+    if result.ready_to_accept:
+        if (
+            result.blocked_reason is not None
+            or result.canonical_merge_candidates
+        ):
+            raise CoreApiClientError(
+                "ATHENA Core returned an inconsistent Knowledge review state.",
+                code="invalid_response",
+            )
+        digest = result.preflight_digest
+        if digest is None or len(digest) != 64:
+            raise CoreApiClientError(
+                "ATHENA Core returned an invalid Knowledge preflight digest.",
+                code="invalid_response",
+            )
+        try:
+            digest_bytes = bytes.fromhex(digest)
+        except ValueError as exc:
+            raise CoreApiClientError(
+                "ATHENA Core returned an invalid Knowledge preflight digest.",
+                code="invalid_response",
+            ) from exc
+        if len(digest_bytes) != 32:
+            raise CoreApiClientError(
+                "ATHENA Core returned an invalid Knowledge preflight digest.",
+                code="invalid_response",
+            )
+    else:
+        if (
+            result.blocked_reason not in allowed_blockers
+            or result.preflight_digest is not None
+        ):
+            raise CoreApiClientError(
+                "ATHENA Core returned an inconsistent blocked Knowledge review.",
+                code="invalid_response",
+            )
+        if result.blocked_reason == "extractor_merge_candidates" and (
+            result.knowledge_decisions
+            or result.claim_decisions
+            or result.canonical_merge_candidates
+        ):
+            raise CoreApiClientError(
+                "Extractor-blocked Knowledge review exposed canonical decisions.",
+                code="invalid_response",
+            )
+        if (
+            result.blocked_reason == "canonical_merge_candidates"
+            and not result.canonical_merge_candidates
+        ):
+            raise CoreApiClientError(
+                "Canonical-merge blocker is missing merge-review candidates.",
+                code="invalid_response",
+            )
+
+    if tuple(item.proposal_index for item in result.knowledge_decisions) != tuple(
+        range(len(result.knowledge_decisions))
+    ) or any(
+        item.proposal_type != "knowledge" for item in result.knowledge_decisions
+    ):
+        raise CoreApiClientError(
+            "ATHENA Core returned invalid Knowledge deduplication indexes.",
+            code="invalid_response",
+        )
+    if tuple(item.proposal_index for item in result.claim_decisions) != tuple(
+        range(len(result.claim_decisions))
+    ) or any(
+        item.proposal_type != "claim" for item in result.claim_decisions
+    ):
+        raise CoreApiClientError(
+            "ATHENA Core returned invalid Claim deduplication indexes.",
+            code="invalid_response",
+        )
+    if tuple(
+        item.candidate_index for item in result.canonical_merge_candidates
+    ) != tuple(range(len(result.canonical_merge_candidates))):
+        raise CoreApiClientError(
+            "ATHENA Core returned non-contiguous canonical merge indexes.",
+            code="invalid_response",
+        )
+    if len(
+        {item.review_id for item in result.canonical_merge_candidates}
+    ) != len(result.canonical_merge_candidates):
+        raise CoreApiClientError(
+            "ATHENA Core returned duplicate canonical merge-review IDs.",
+            code="invalid_response",
+        )
+    proposal_counts = {
+        "knowledge": len(result.knowledge_decisions),
+        "claim": len(result.claim_decisions),
+    }
+    for candidate in result.canonical_merge_candidates:
+        proposal_count = proposal_counts[candidate.proposal_type]
+        if not 0 <= candidate.proposal_index < proposal_count:
+            raise CoreApiClientError(
+                "ATHENA Core returned an invalid canonical merge proposal reference.",
+                code="invalid_response",
+            )
+    return result
+
+
+def _knowledge_merge_review(
+    payload: dict[str, JsonValue],
+) -> KnowledgeMergeReviewResponse:
+    similarity = _required_float(payload, "similarity")
+    proposal_type = _required_str(payload, "proposal_type")
+    proposal_index = _required_int(payload, "proposal_index")
+    status = _required_str(payload, "status")
+    decision = _optional_str(payload, "decision")
+    if (
+        not 0.0 <= similarity <= 1.0
+        or proposal_type not in {"knowledge", "claim"}
+        or proposal_index < 0
+        or status not in {"pending", "accepted", "rejected", "superseded"}
+    ):
+        raise CoreApiClientError(
+            "ATHENA Core returned an invalid Knowledge merge review.",
+            code="invalid_response",
+        )
+    if status == "pending" and decision is not None:
+        raise CoreApiClientError(
+            "Pending Knowledge merge review cannot have a decision.",
+            code="invalid_response",
+        )
+    if status == "accepted" and decision not in {
+        "merge",
+        "keep_separate",
+    }:
+        raise CoreApiClientError(
+            "Resolved Knowledge merge review has an invalid decision.",
+            code="invalid_response",
+        )
+    if status in {"rejected", "superseded"} and decision is not None:
+        raise CoreApiClientError(
+            "Non-accepted Knowledge merge review cannot have a merge decision.",
+            code="invalid_response",
+        )
+    return KnowledgeMergeReviewResponse(
+        review_id=_required_str(payload, "review_id"),
+        status=status,
+        proposal_type=proposal_type,
+        proposal_index=proposal_index,
+        source_entity_id=_required_str(payload, "source_entity_id"),
+        source_revision_id=_required_str(payload, "source_revision_id"),
+        proposal_text=_required_str(payload, "proposal_text"),
+        proposal_kind=_required_str(payload, "proposal_kind"),
+        proposal_epistemic_status=_required_str(
+            payload,
+            "proposal_epistemic_status",
+        ),
+        similarity=similarity,
+        decision=decision,
+        existing_entity_id=_required_str(payload, "existing_entity_id"),
+        existing_revision_id=_required_str(payload, "existing_revision_id"),
+    )
 
 
 def _deletion_dependency(

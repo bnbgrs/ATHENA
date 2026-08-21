@@ -15,8 +15,12 @@ from athena.api.contracts import (
     DeletionResultResponse,
     GroundedChatResponse,
     HealthResponse,
+    KnowledgeMergeReviewResponse,
+    KnowledgeReviewResponse,
+    MessageKnowledgeExtractionResponse,
     ModelResponse,
     ProviderHealthResponse,
+    RememberedChatMessageResponse,
 )
 from athena.api.ports import CoreApiSurface
 from athena.core.application import ApplicationState, AthenaApplication
@@ -216,6 +220,70 @@ class SerializedCoreApiSurface:
     def provider_health(self) -> ProviderHealthResponse:
         return self._executor.call(self._surface.provider_health)
 
+    def remember_chat_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        *,
+        revision_id: str,
+    ) -> RememberedChatMessageResponse:
+        return self._executor.call(
+            lambda: self._surface.remember_chat_message(
+                chat_id,
+                message_id,
+                revision_id=revision_id,
+            )
+        )
+
+    def extract_chat_message_knowledge(
+        self,
+        chat_id: str,
+        message_id: str,
+        *,
+        revision_id: str,
+        requested_model_id: str | None = None,
+        effective_context_limit: int | None = None,
+        max_output_tokens: int | None = None,
+    ) -> MessageKnowledgeExtractionResponse:
+        return self._executor.call(
+            lambda: self._surface.extract_chat_message_knowledge(
+                chat_id,
+                message_id,
+                revision_id=revision_id,
+                requested_model_id=requested_model_id,
+                effective_context_limit=effective_context_limit,
+                max_output_tokens=max_output_tokens,
+            )
+        )
+
+    def prepare_knowledge_review(
+        self,
+        processing_run_id: str,
+    ) -> KnowledgeReviewResponse:
+        return self._executor.call(
+            lambda: self._surface.prepare_knowledge_review(processing_run_id)
+        )
+
+    def load_knowledge_merge_review(
+        self,
+        review_id: str,
+    ) -> KnowledgeMergeReviewResponse:
+        return self._executor.call(
+            lambda: self._surface.load_knowledge_merge_review(review_id)
+        )
+
+    def resolve_knowledge_merge_review(
+        self,
+        review_id: str,
+        *,
+        decision: str,
+    ) -> KnowledgeMergeReviewResponse:
+        return self._executor.call(
+            lambda: self._surface.resolve_knowledge_merge_review(
+                review_id,
+                decision=decision,
+            )
+        )
 
     def preview_chat_deletion(self, chat_id: str) -> DeletionPreviewResponse:
         return self._executor.call(

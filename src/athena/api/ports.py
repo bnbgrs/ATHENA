@@ -12,8 +12,12 @@ from athena.api.contracts import (
     DeletionResultResponse,
     GroundedChatResponse,
     HealthResponse,
+    KnowledgeMergeReviewResponse,
+    KnowledgeReviewResponse,
+    MessageKnowledgeExtractionResponse,
     ModelResponse,
     ProviderHealthResponse,
+    RememberedChatMessageResponse,
 )
 
 
@@ -33,6 +37,42 @@ class CoreApiSurface(Protocol):
     def create_chat(self) -> ChatThreadResponse: ...
 
     def load_chat(self, chat_id: str) -> ChatThreadResponse: ...
+
+    def remember_chat_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        *,
+        revision_id: str,
+    ) -> RememberedChatMessageResponse: ...
+
+    def extract_chat_message_knowledge(
+        self,
+        chat_id: str,
+        message_id: str,
+        *,
+        revision_id: str,
+        requested_model_id: str | None = None,
+        effective_context_limit: int | None = None,
+        max_output_tokens: int | None = None,
+    ) -> MessageKnowledgeExtractionResponse: ...
+
+    def prepare_knowledge_review(
+        self,
+        processing_run_id: str,
+    ) -> KnowledgeReviewResponse: ...
+
+    def load_knowledge_merge_review(
+        self,
+        review_id: str,
+    ) -> KnowledgeMergeReviewResponse: ...
+
+    def resolve_knowledge_merge_review(
+        self,
+        review_id: str,
+        *,
+        decision: str,
+    ) -> KnowledgeMergeReviewResponse: ...
 
     def provider_health(self) -> ProviderHealthResponse: ...
 

@@ -50,6 +50,14 @@ class UnsupportedExtractionSourceError(ValueError):
     """Raised when the current slice cannot expose a source to extraction."""
 
 
+class ExtractionMessageNotFoundError(ValueError):
+    """Raised when a requested persisted message is not in the requested chat."""
+
+
+class ExtractionMessageRevisionMismatchError(ValueError):
+    """Raised when a requested message revision is no longer the persisted revision."""
+
+
 @dataclass(frozen=True, slots=True)
 class ExtractionPrompt:
     schema_id: str
@@ -108,11 +116,83 @@ class ChatKnowledgeExtractionService:
         snapshot_commit_seq = self.context_packages.current_commit_seq()
         thread = self.chat.load_chat(chat_id)
         if not thread.messages:
-            raise EmptyExtractionScopeError("Cannot extract Knowledge from an empty chat.")
+            raise EmptyExtractionScopeError(
+                "Cannot extract Knowledge from an empty chat."
+            )
+        return self._extract_messages(
+            chat_id=chat_id,
+            source_messages=thread.messages,
+            trigger_actor_id=trigger_actor_id,
+            snapshot_commit_seq=snapshot_commit_seq,
+            requested_model_id=requested_model_id,
+            context_limit=context_limit,
+            output_reserve=output_reserve,
+            safety_margin=safety_margin,
+        )
+
+    def extract_message(
+        self,
+        *,
+        chat_id: uuid.UUID,
+        message_id: uuid.UUID,
+        revision_id: uuid.UUID,
+        requested_model_id: str | None = None,
+        context_limit: int | None = None,
+        output_reserve: int | None = None,
+        safety_margin: int | None = None,
+    ) -> ChatExtractionResult:
+        """Extract proposals from exactly one persisted chat-message revision."""
+        trigger_actor_id = self.chat.ensure_local_user()
+        snapshot_commit_seq = self.context_packages.current_commit_seq()
+        thread = self.chat.load_chat(chat_id)
+        message = next(
+            (
+                item
+                for item in thread.messages
+                if item.message_id == message_id
+            ),
+            None,
+        )
+        if message is None:
+            raise ExtractionMessageNotFoundError(
+                f"Chat {chat_id} has no message {message_id}."
+            )
+        if message.revision_id != revision_id:
+            raise ExtractionMessageRevisionMismatchError(
+                "Requested chat-message revision is stale or does not match "
+                "the persisted message."
+            )
+        return self._extract_messages(
+            chat_id=chat_id,
+            source_messages=(message,),
+            trigger_actor_id=trigger_actor_id,
+            snapshot_commit_seq=snapshot_commit_seq,
+            requested_model_id=requested_model_id,
+            context_limit=context_limit,
+            output_reserve=output_reserve,
+            safety_margin=safety_margin,
+        )
+
+    def _extract_messages(
+        self,
+        *,
+        chat_id: uuid.UUID,
+        source_messages: Sequence[ChatMessage],
+        trigger_actor_id: uuid.UUID,
+        snapshot_commit_seq: int,
+        requested_model_id: str | None,
+        context_limit: int | None,
+        output_reserve: int | None,
+        safety_margin: int | None,
+    ) -> ChatExtractionResult:
+        if not source_messages:
+            raise EmptyExtractionScopeError(
+                "Cannot extract Knowledge from an empty message scope."
+            )
 
         model = self.chat_generation.select_model(requested_model_id)
-        prompt = self._build_prompt(thread.messages)
-        source_messages = self._source_messages(thread.messages)
+        prompt = self._build_prompt(source_messages)
+        source_text_by_sequence = self._source_messages(source_messages)
         messages = (
             ModelChatMessage(role="system", content=prompt.system_message),
             ModelChatMessage(role="user", content=prompt.user_message),
@@ -140,7 +220,7 @@ class ChatKnowledgeExtractionService:
                 entity_id=message.message_id,
                 revision_id=message.revision_id,
             )
-            for message in thread.messages
+            for message in source_messages
         )
         package = self._package_for_call(
             signature=signature,
@@ -150,7 +230,7 @@ class ChatKnowledgeExtractionService:
             snapshot_commit_seq=snapshot_commit_seq,
             schema_id=prompt.schema_id,
             schema=schema,
-            conversation_candidate_count=len(thread.messages),
+            conversation_candidate_count=len(source_messages),
         )
         self.context_packages.assert_snapshot_current(
             package.snapshot_commit_seq,
@@ -169,7 +249,7 @@ class ChatKnowledgeExtractionService:
                         "revision_id": str(message.revision_id),
                         "message_type": message.message_type.value,
                     }
-                    for message in thread.messages
+                    for message in source_messages
                 ],
                 "context_package": package.run_snapshot(),
             },
@@ -206,11 +286,14 @@ class ChatKnowledgeExtractionService:
                 package.snapshot_commit_seq,
                 phase="immediately-after-chat-knowledge-extraction-model-call",
             )
-            proposals = parse_extraction_proposals(raw, source_messages=source_messages)
+            proposals = parse_extraction_proposals(
+                raw,
+                source_messages=source_text_by_sequence,
+            )
             proposals = self._audit_claim_pairs(
                 model=model,
                 proposals=proposals,
-                source_messages=thread.messages,
+                source_messages=source_messages,
                 parent_run=run,
                 trigger_actor_id=trigger_actor_id,
                 budget=budget,
@@ -230,7 +313,10 @@ class ChatKnowledgeExtractionService:
             package.snapshot_commit_seq,
             phase="chat-knowledge-extraction-before-success",
         )
-        finished_run = self.runs.finish_run(run.processing_run_id, status="succeeded")
+        finished_run = self.runs.finish_run(
+            run.processing_run_id,
+            status="succeeded",
+        )
         result = ChatExtractionResult(
             chat_id=chat_id,
             model=model,

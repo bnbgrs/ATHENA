@@ -164,11 +164,15 @@ def test_chat_and_inspector_text_support_mouse_and_keyboard_selection() -> None:
         assert flags & Qt.TextInteractionFlag.TextSelectableByMouse
         assert flags & Qt.TextInteractionFlag.TextSelectableByKeyboard
 
+        message_id = "11111111-1111-1111-1111-111111111111"
+        revision_id = "22222222-2222-2222-2222-222222222222"
         widget = window._message_widget(
             role="assistant",
             content="select and copy this",
             created_at_us=1,
             sequence_no=1,
+            message_id=message_id,
+            revision_id=revision_id,
         )
         labels = widget.findChildren(QLabel)
         assert labels
@@ -176,7 +180,12 @@ def test_chat_and_inspector_text_support_mouse_and_keyboard_selection() -> None:
         body_flags = body.textInteractionFlags()
         assert body_flags & Qt.TextInteractionFlag.TextSelectableByMouse
         assert body_flags & Qt.TextInteractionFlag.TextSelectableByKeyboard
-        assert widget.findChild(QPushButton, "copyMessageButton") is not None
+        copy_button = widget.findChild(QPushButton, "copyMessageButton")
+        assert copy_button is not None
+        assert widget.property("messageId") == message_id
+        assert widget.property("messageRevisionId") == revision_id
+        assert copy_button.property("messageId") == message_id
+        assert copy_button.property("messageRevisionId") == revision_id
     finally:
         window.close()
         app.processEvents()

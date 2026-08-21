@@ -210,6 +210,23 @@ QWidget#chatMessages {{
 QWidget#chatMessage {{
     background: transparent;
 }}
+QPushButton#rememberMessageButton,
+QPushButton#addKnowledgeButton {{
+    background: transparent;
+    color: {TEXT_DIM};
+    border: none;
+    padding: 3px 5px;
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    font-size: 9px;
+}}
+QPushButton#rememberMessageButton:hover,
+QPushButton#addKnowledgeButton:hover {{
+    color: {ORANGE};
+}}
+QPushButton#rememberMessageButton:disabled,
+QPushButton#addKnowledgeButton:disabled {{
+    color: #4D4D49;
+}}
 QLabel#emptyChatState {{
     color: {TEXT_DIM};
     font-size: 16px;
@@ -400,6 +417,64 @@ QPushButton#inspectorCopyButton:hover {{
 QFrame#evidenceChain {{
     background: #080808;
     border: 1px solid #171717;
+}}
+QFrame#knowledgeReviewPanel {{
+    background: #080808;
+    border: 1px solid #1B1B1B;
+}}
+QLabel#knowledgeReviewTitle,
+QLabel#knowledgeReviewState,
+QLabel#knowledgeReviewItemTitle,
+QLabel#knowledgeReviewItemBody {{
+    font-family: "Cascadia Mono", "Consolas", monospace;
+}}
+QLabel#knowledgeReviewTitle {{
+    color: {TEXT};
+    font-size: 11px;
+    font-weight: 600;
+}}
+QLabel#knowledgeReviewState {{
+    color: {ORANGE};
+    font-size: 10px;
+}}
+QFrame#knowledgeReviewItem {{
+    background: #090909;
+    border: 1px solid #171717;
+}}
+QLabel#knowledgeReviewItemTitle {{
+    color: {TEXT_MUTED};
+    font-size: 10px;
+    font-weight: 600;
+}}
+QLabel#knowledgeReviewItemBody {{
+    color: {TEXT};
+    font-size: 11px;
+}}
+QScrollArea#knowledgeReviewScroll {{
+    background: transparent;
+    border: none;
+}}
+QScrollArea#knowledgeReviewScroll > QWidget > QWidget {{
+    background: transparent;
+}}
+QPushButton#knowledgeReviewCloseButton,
+QPushButton#knowledgeMergeButton {{
+    background: transparent;
+    color: {TEXT_DIM};
+    border: 1px solid {BORDER};
+    border-radius: 0;
+    padding: 3px 7px;
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    font-size: 9px;
+}}
+QPushButton#knowledgeReviewCloseButton:hover,
+QPushButton#knowledgeMergeButton:hover {{
+    color: {ORANGE};
+    border-color: #3A3A38;
+}}
+QPushButton#knowledgeReviewCloseButton:disabled,
+QPushButton#knowledgeMergeButton:disabled {{
+    color: #4D4D49;
 }}
 
 """

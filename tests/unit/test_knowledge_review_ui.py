@@ -1,0 +1,303 @@
+from __future__ import annotations
+
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton
+
+from athena.api.contracts import (
+    CanonicalMergeReviewResponse,
+    DedupDecisionResponse,
+    KnowledgeMergeReviewResponse,
+    KnowledgeReviewResponse,
+    KnowledgeUnitProposalResponse,
+    MessageKnowledgeExtractionResponse,
+    RememberedChatMessageResponse,
+)
+from athena.desktop.window import AthenaMainWindow
+
+CHAT_ID = "11111111-1111-1111-1111-111111111111"
+MESSAGE_ID = "22222222-2222-2222-2222-222222222222"
+REVISION_ID = "33333333-3333-3333-3333-333333333333"
+RUN_ID = "44444444-4444-4444-4444-444444444444"
+SIGNATURE_ID = "55555555-5555-5555-5555-555555555555"
+REVIEW_ID = "66666666-6666-6666-6666-666666666666"
+EXISTING_ID = "77777777-7777-7777-7777-777777777777"
+EXISTING_REVISION_ID = "88888888-8888-8888-8888-888888888888"
+
+
+class _Controller:
+    def __init__(self) -> None:
+        self.remember_calls: list[dict[str, object]] = []
+        self.extract_calls: list[dict[str, object]] = []
+        self.review_runs: list[str] = []
+        self.merge_calls: list[tuple[str, str]] = []
+
+    def remember_message(self, **kwargs: object) -> None:
+        self.remember_calls.append(kwargs)
+
+    def extract_message_knowledge(self, **kwargs: object) -> None:
+        self.extract_calls.append(kwargs)
+
+    def prepare_knowledge_review(self, processing_run_id: str) -> None:
+        self.review_runs.append(processing_run_id)
+
+    def resolve_knowledge_merge_review(
+        self,
+        review_id: str,
+        *,
+        decision: str,
+    ) -> None:
+        self.merge_calls.append((review_id, decision))
+
+
+def _app() -> QApplication:
+    return QApplication.instance() or QApplication([])
+
+
+def _extraction() -> MessageKnowledgeExtractionResponse:
+    return MessageKnowledgeExtractionResponse(
+        chat_id=CHAT_ID,
+        message_id=MESSAGE_ID,
+        message_revision_id=REVISION_ID,
+        processing_run_id=RUN_ID,
+        model_id="local-model",
+        model_signature_id=SIGNATURE_ID,
+        knowledge_units=(
+            KnowledgeUnitProposalResponse(
+                proposal_index=0,
+                source_sequence_no=1,
+                source_quote="Berlin is Germany's capital.",
+                knowledge_kind="fact",
+                title="German capital",
+                body="Berlin is the capital of Germany.",
+                epistemic_status="asserted",
+                confidence=0.98,
+            ),
+        ),
+        claims=(),
+        relations=(),
+        extractor_merge_candidates=(),
+    )
+
+
+def _review(*, merge_candidate: bool) -> KnowledgeReviewResponse:
+    candidates = (
+        (
+            CanonicalMergeReviewResponse(
+                candidate_index=0,
+                review_id=REVIEW_ID,
+                proposal_type="knowledge",
+                proposal_index=0,
+                existing_entity_id=EXISTING_ID,
+                existing_revision_id=EXISTING_REVISION_ID,
+                similarity=0.97,
+                reason="possible textual near-duplicate of canonical Knowledge",
+            ),
+        )
+        if merge_candidate
+        else ()
+    )
+    return KnowledgeReviewResponse(
+        processing_run_id=RUN_ID,
+        model_signature_id=SIGNATURE_ID,
+        ready_to_accept=not merge_candidate,
+        blocked_reason="canonical_merge_candidates" if merge_candidate else None,
+        preflight_digest=None if merge_candidate else "a" * 64,
+        knowledge_decisions=(
+            DedupDecisionResponse(
+                proposal_type="knowledge",
+                proposal_index=0,
+                action="create",
+                existing_entity_id=None,
+                existing_revision_id=None,
+                duplicate_of_proposal_index=None,
+            ),
+        ),
+        claim_decisions=(),
+        canonical_merge_candidates=candidates,
+    )
+
+
+def test_message_actions_are_stable_and_dispatch_exact_revision() -> None:
+    app = _app()
+    window = AthenaMainWindow(api_controller=None)
+    controller = _Controller()
+    try:
+        window.api_controller = controller  # type: ignore[assignment]
+        window.current_chat_id = CHAT_ID
+        window._core_ready = True
+        widget = window._message_widget(
+            role="user",
+            content="Berlin is Germany's capital.",
+            created_at_us=1,
+            sequence_no=1,
+            message_id=MESSAGE_ID,
+            revision_id=REVISION_ID,
+        )
+        window.chat_messages_layout.insertWidget(0, widget)
+        window._sync_composer_enabled()
+
+        remember = widget.findChild(QPushButton, "rememberMessageButton")
+        knowledge = widget.findChild(QPushButton, "addKnowledgeButton")
+        assert remember is not None
+        assert knowledge is not None
+        assert remember.property("messageId") == MESSAGE_ID
+        assert remember.property("messageRevisionId") == REVISION_ID
+        assert knowledge.property("messageId") == MESSAGE_ID
+        assert knowledge.property("messageRevisionId") == REVISION_ID
+
+        remember.click()
+        knowledge.click()
+
+        assert controller.remember_calls == [
+            {
+                "chat_id": CHAT_ID,
+                "message_id": MESSAGE_ID,
+                "revision_id": REVISION_ID,
+            }
+        ]
+        assert controller.extract_calls == [
+            {
+                "chat_id": CHAT_ID,
+                "message_id": MESSAGE_ID,
+                "revision_id": REVISION_ID,
+                "model_id": None,
+                "effective_context_limit": None,
+                "max_output_tokens": None,
+            }
+        ]
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_remember_result_marks_exact_message_revision() -> None:
+    app = _app()
+    window = AthenaMainWindow(api_controller=None)
+    controller = _Controller()
+    try:
+        window.api_controller = controller  # type: ignore[assignment]
+        window.current_chat_id = CHAT_ID
+        widget = window._message_widget(
+            role="assistant",
+            content="Persisted answer",
+            created_at_us=1,
+            sequence_no=1,
+            message_id=MESSAGE_ID,
+            revision_id=REVISION_ID,
+        )
+        window.chat_messages_layout.insertWidget(0, widget)
+
+        window.apply_message_remembered(
+            RememberedChatMessageResponse(
+                chat_id=CHAT_ID,
+                message_id=MESSAGE_ID,
+                message_revision_id=REVISION_ID,
+                memory_id="99999999-9999-9999-9999-999999999999",
+                memory_revision_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                content="Persisted answer",
+            )
+        )
+
+        remember = widget.findChild(QPushButton, "rememberMessageButton")
+        assert remember is not None
+        assert remember.text() == "REMEMBERED"
+        assert remember.isEnabled() is False
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_extraction_opens_review_panel_and_queues_preflight() -> None:
+    app = _app()
+    window = AthenaMainWindow(api_controller=None)
+    controller = _Controller()
+    try:
+        window.api_controller = controller  # type: ignore[assignment]
+        window.current_chat_id = CHAT_ID
+        window.apply_knowledge_extraction_ready(_extraction())
+
+        assert window.knowledge_review_panel.isHidden() is False
+        app.processEvents()
+        labels = window.knowledge_review_panel.findChildren(QLabel)
+        assert any("Berlin is the capital of Germany." in label.text() for label in labels)
+        assert controller.review_runs == [RUN_ID]
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_canonical_merge_buttons_dispatch_explicit_decision() -> None:
+    app = _app()
+    window = AthenaMainWindow(api_controller=None)
+    controller = _Controller()
+    try:
+        window.api_controller = controller  # type: ignore[assignment]
+        window.current_chat_id = CHAT_ID
+        window._knowledge_extraction = _extraction()
+        window.apply_knowledge_review_ready(_review(merge_candidate=True))
+
+        buttons = window.knowledge_review_panel.findChildren(
+            QPushButton,
+            "knowledgeMergeButton",
+        )
+        assert len(buttons) == 2
+        merge = next(button for button in buttons if button.property("decision") == "merge")
+        separate = next(
+            button
+            for button in buttons
+            if button.property("decision") == "keep_separate"
+        )
+        assert merge.property("reviewId") == REVIEW_ID
+        assert separate.property("reviewId") == REVIEW_ID
+
+        merge.click()
+        assert controller.merge_calls == [(REVIEW_ID, "merge")]
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_merge_result_refreshes_same_frozen_preflight() -> None:
+    app = _app()
+    window = AthenaMainWindow(api_controller=None)
+    controller = _Controller()
+    try:
+        window.api_controller = controller  # type: ignore[assignment]
+        window.current_chat_id = CHAT_ID
+        window._knowledge_extraction = _extraction()
+        window.apply_knowledge_merge_review_ready(
+            KnowledgeMergeReviewResponse(
+                review_id=REVIEW_ID,
+                status="accepted",
+                proposal_type="knowledge",
+                proposal_index=0,
+                source_entity_id=MESSAGE_ID,
+                source_revision_id=REVISION_ID,
+                proposal_text="Berlin is the capital of Germany.",
+                proposal_kind="fact",
+                proposal_epistemic_status="asserted",
+                similarity=0.97,
+                decision="merge",
+                existing_entity_id=EXISTING_ID,
+                existing_revision_id=EXISTING_REVISION_ID,
+            )
+        )
+        app.processEvents()
+        assert controller.review_runs == [RUN_ID]
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_review_ready_does_not_expose_canonical_accept_write() -> None:
+    app = _app()
+    window = AthenaMainWindow(api_controller=None)
+    try:
+        window.current_chat_id = CHAT_ID
+        window._knowledge_extraction = _extraction()
+        window.apply_knowledge_review_ready(_review(merge_candidate=False))
+        assert window.knowledge_review_state.text() == "REVIEW COMPLETE / READY"
+        buttons = window.knowledge_review_panel.findChildren(QPushButton)
+        assert all(button.text() != "ACCEPT" for button in buttons)
+    finally:
+        window.close()
+        app.processEvents()

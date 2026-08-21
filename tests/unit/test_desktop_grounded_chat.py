@@ -630,6 +630,8 @@ def test_chat_message_body_expands_to_full_wrapped_height() -> None:
             content=long_answer,
             created_at_us=1_700_000_000_000_000,
             sequence_no=999,
+            message_id="33333333-3333-3333-3333-333333333333",
+            revision_id="44444444-4444-4444-4444-444444444444",
         )
         insert_index = max(
             0,

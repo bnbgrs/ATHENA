@@ -538,6 +538,10 @@ class AthenaApplication:
             runs=self.model_runs,
             snapshots=self.extraction_snapshots,
         )
+        self.api.attach_knowledge_interaction(
+            personal_memory=self.personal_memory,
+            extraction=self.extraction,
+        )
         self.search = LocalSearchService(self.database)
         self.retrieval = RetrievalRankingService(self.search)
         self.semantic_search = LocalSemanticSearchService(
@@ -597,6 +601,11 @@ class AthenaApplication:
             chat=self.chat,
             knowledge=self.knowledge_repository,
             claims=self.claim_repository,
+            reviews=self.reviews,
+        )
+        self.api.attach_knowledge_review(
+            extraction_snapshots=self.extraction_snapshots,
+            proposal_review_planner=self.proposal_acceptance,
             reviews=self.reviews,
         )
 

@@ -11,6 +11,12 @@ from urllib.parse import parse_qs
 from athena.api.contracts import ApiContract, JsonValue
 from athena.api.ports import CoreApiSurface
 from athena.api.runtime import LocalApiRuntime
+from athena.api.service import (
+    ChatMessageNotFoundError,
+    ChatMessageRevisionMismatchError,
+    KnowledgeReviewConflictError,
+    KnowledgeReviewNotFoundError,
+)
 from athena.chat.repository import ChatNotFoundError
 from athena.lifecycle.service import (
     LifecycleDeletionAlreadyDeletedError,
@@ -115,6 +121,94 @@ class CoreApiAsgiApp:
                 await _send_contract(
                     send,
                     self._facade.create_chat(),
+                    status=201,
+                    request_id=request_id,
+                )
+                return
+
+            remember_resource = _message_action_resource(path, action="remember")
+            if method == "POST" and remember_resource is not None:
+                chat_id, message_id = remember_resource
+                payload = await _read_json_object(receive)
+                unknown = set(payload) - {"revision_id"}
+                if unknown:
+                    raise ValueError(
+                        "Remember request contains unsupported fields."
+                    )
+                revision_id = payload.get("revision_id")
+                if not isinstance(revision_id, str) or not revision_id.strip():
+                    raise ValueError(
+                        "Remember revision_id must be a non-empty string."
+                    )
+                await _send_contract(
+                    send,
+                    self._facade.remember_chat_message(
+                        chat_id,
+                        message_id,
+                        revision_id=revision_id,
+                    ),
+                    status=201,
+                    request_id=request_id,
+                )
+                return
+
+            extraction_resource = _message_action_resource(
+                path,
+                action="knowledge-extraction",
+            )
+            if method == "POST" and extraction_resource is not None:
+                chat_id, message_id = extraction_resource
+                payload = await _read_json_object(receive)
+                unknown = set(payload) - {
+                    "revision_id",
+                    "model_id",
+                    "effective_context_limit",
+                    "max_output_tokens",
+                }
+                if unknown:
+                    raise ValueError(
+                        "Knowledge extraction request contains unsupported fields."
+                    )
+                revision_id = payload.get("revision_id")
+                if not isinstance(revision_id, str) or not revision_id.strip():
+                    raise ValueError(
+                        "Knowledge extraction revision_id must be a non-empty string."
+                    )
+                model_id = payload.get("model_id")
+                if model_id is not None and (
+                    not isinstance(model_id, str) or not model_id.strip()
+                ):
+                    raise ValueError(
+                        "Knowledge extraction model_id must be a non-empty string or null."
+                    )
+                effective_context_limit = payload.get("effective_context_limit")
+                if effective_context_limit is not None and (
+                    isinstance(effective_context_limit, bool)
+                    or not isinstance(effective_context_limit, int)
+                    or effective_context_limit < 1
+                ):
+                    raise ValueError(
+                        "Knowledge extraction effective_context_limit must be positive or null."
+                    )
+                max_output_tokens = payload.get("max_output_tokens")
+                if max_output_tokens is not None and (
+                    isinstance(max_output_tokens, bool)
+                    or not isinstance(max_output_tokens, int)
+                    or max_output_tokens < 1
+                ):
+                    raise ValueError(
+                        "Knowledge extraction max_output_tokens must be positive or null."
+                    )
+                await _send_contract(
+                    send,
+                    self._facade.extract_chat_message_knowledge(
+                        chat_id,
+                        message_id,
+                        revision_id=revision_id,
+                        requested_model_id=model_id,
+                        effective_context_limit=effective_context_limit,
+                        max_output_tokens=max_output_tokens,
+                    ),
                     status=201,
                     request_id=request_id,
                 )
@@ -412,6 +506,59 @@ class CoreApiAsgiApp:
                 )
                 return
 
+            review_run_id = _single_resource_id(
+                path,
+                prefix="/api/v1/knowledge-extractions/",
+                suffix="/review",
+            )
+            if method == "POST" and review_run_id is not None:
+                await _consume_empty_body(receive)
+                await _send_contract(
+                    send,
+                    self._facade.prepare_knowledge_review(review_run_id),
+                    request_id=request_id,
+                )
+                return
+
+            merge_decision_id = _single_resource_id(
+                path,
+                prefix="/api/v1/knowledge-merge-reviews/",
+                suffix="/decision",
+            )
+            if method == "POST" and merge_decision_id is not None:
+                payload = await _read_json_object(receive)
+                unknown = set(payload) - {"decision"}
+                if unknown:
+                    raise ValueError(
+                        "Knowledge merge decision contains unsupported fields."
+                    )
+                decision = payload.get("decision")
+                if not isinstance(decision, str):
+                    raise ValueError(
+                        "Knowledge merge decision must be a string."
+                    )
+                await _send_contract(
+                    send,
+                    self._facade.resolve_knowledge_merge_review(
+                        merge_decision_id,
+                        decision=decision,
+                    ),
+                    request_id=request_id,
+                )
+                return
+
+            merge_review_id = _single_resource_id(
+                path,
+                prefix="/api/v1/knowledge-merge-reviews/",
+            )
+            if method == "GET" and merge_review_id is not None:
+                await _send_contract(
+                    send,
+                    self._facade.load_knowledge_merge_review(merge_review_id),
+                    request_id=request_id,
+                )
+                return
+
             if method == "POST" and path == "/api/v1/system/shutdown":
                 await _consume_empty_body(receive)
                 if not self._allow_shutdown:
@@ -430,6 +577,44 @@ class CoreApiAsgiApp:
                     request_id=request_id,
                 )
                 return
+        except ChatMessageNotFoundError:
+            await _send_problem(
+                send,
+                status=404,
+                code="chat_message_not_found",
+                message="The requested chat message does not exist in this chat.",
+                request_id=request_id,
+            )
+            return
+        except ChatMessageRevisionMismatchError:
+            await _send_problem(
+                send,
+                status=409,
+                code="chat_message_revision_stale",
+                message="The requested chat message revision is stale.",
+                request_id=request_id,
+                retryable=False,
+            )
+            return
+        except KnowledgeReviewNotFoundError:
+            await _send_problem(
+                send,
+                status=404,
+                code="knowledge_review_not_found",
+                message="The requested Knowledge review resource does not exist.",
+                request_id=request_id,
+            )
+            return
+        except KnowledgeReviewConflictError:
+            await _send_problem(
+                send,
+                status=409,
+                code="knowledge_review_conflict",
+                message="Knowledge review state changed or requires another decision.",
+                request_id=request_id,
+                retryable=False,
+            )
+            return
         except (ValueError, TypeError) as exc:
             await _send_problem(
                 send,
@@ -552,16 +737,76 @@ def _known_path(path: str) -> bool:
             "/messages/unified-local"
         )
         return bool(chat_id) and "/" not in chat_id
+    if _message_action_resource(path, action="remember") is not None:
+        return True
+    if _message_action_resource(path, action="knowledge-extraction") is not None:
+        return True
     if path.startswith("/api/v1/chats/") and path.endswith("/messages"):
         chat_id = path.removeprefix("/api/v1/chats/").removesuffix(
             "/messages"
         )
         return bool(chat_id) and "/" not in chat_id
+    if _single_resource_id(
+        path,
+        prefix="/api/v1/knowledge-extractions/",
+        suffix="/review",
+    ) is not None:
+        return True
+    if _single_resource_id(
+        path,
+        prefix="/api/v1/knowledge-merge-reviews/",
+        suffix="/decision",
+    ) is not None:
+        return True
+    if _single_resource_id(
+        path,
+        prefix="/api/v1/knowledge-merge-reviews/",
+    ) is not None:
+        return True
     if path.startswith("/api/v1/chats/"):
         chat_id = path.removeprefix("/api/v1/chats/")
         return bool(chat_id) and "/" not in chat_id
     return False
 
+
+
+def _message_action_resource(
+    path: str,
+    *,
+    action: str,
+) -> tuple[str, str] | None:
+    prefix = "/api/v1/chats/"
+    suffix = f"/{action}"
+    if not path.startswith(prefix) or not path.endswith(suffix):
+        return None
+    middle = path[len(prefix) : -len(suffix)]
+    chat_id, separator, message_id = middle.partition("/messages/")
+    if (
+        separator != "/messages/"
+        or not chat_id
+        or not message_id
+        or "/" in chat_id
+        or "/" in message_id
+    ):
+        return None
+    return chat_id, message_id
+
+
+def _single_resource_id(
+    path: str,
+    *,
+    prefix: str,
+    suffix: str = "",
+) -> str | None:
+    if not path.startswith(prefix):
+        return None
+    if suffix and not path.endswith(suffix):
+        return None
+    end = -len(suffix) if suffix else None
+    resource_id = path[len(prefix) : end]
+    if not resource_id or "/" in resource_id:
+        return None
+    return resource_id
 
 
 def _headers(scope: AsgiScope) -> dict[str, str]:

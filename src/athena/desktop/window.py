@@ -40,10 +40,15 @@ from PySide6.QtWidgets import (
 )
 
 from athena.api.contracts import (
+    CanonicalMergeReviewResponse,
     ChatThreadResponse,
     DeletionPreviewResponse,
     GroundedChatResponse,
+    KnowledgeMergeReviewResponse,
+    KnowledgeReviewResponse,
+    MessageKnowledgeExtractionResponse,
     ModelResponse,
+    RememberedChatMessageResponse,
 )
 from athena.desktop.api_controller import DesktopApiController, DesktopApiSnapshot
 from athena.desktop.ascii_panel import AsciiPanel
@@ -303,6 +308,9 @@ class AthenaMainWindow(QMainWindow):
         self._max_output_by_model: dict[str, int] = {}
         self._temperature_by_model: dict[str, float] = {}
         self._thinking_by_model: dict[str, bool] = {}
+        self._remembered_message_revisions: set[tuple[str, str]] = set()
+        self._knowledge_extraction: MessageKnowledgeExtractionResponse | None = None
+        self._knowledge_review: KnowledgeReviewResponse | None = None
         self._transient_failures: dict[str, list[tuple[int, str, str]]] = {}
         self._last_rendered_sequence = 0
         self._core_transport_ready = False
@@ -326,6 +334,12 @@ class AthenaMainWindow(QMainWindow):
         self.chat_messages_layout = QVBoxLayout(self.chat_messages_widget)
         self.evidence_rail = EvidenceRail()
         self.evidence_chain = QFrame()
+        self.knowledge_review_panel = QFrame()
+        self.knowledge_review_state = QLabel("IDLE")
+        self.knowledge_review_close_button = QPushButton("CLOSE")
+        self.knowledge_review_scroll = QScrollArea()
+        self.knowledge_review_content = QWidget()
+        self.knowledge_review_items = QVBoxLayout(self.knowledge_review_content)
         self.evidence_chain_state = QLabel(
             "DIRECT / PROVENANCE NOT ATTACHED"
         )
@@ -513,6 +527,9 @@ class AthenaMainWindow(QMainWindow):
         conversation_row.addWidget(self.chat_scroll, 1)
         conversation_row.addWidget(self.evidence_rail)
         layout.addLayout(conversation_row, 1)
+
+        layout.addSpacing(12)
+        layout.addWidget(self._build_knowledge_review_panel())
 
         layout.addSpacing(14)
         layout.addWidget(_rule())
@@ -978,6 +995,7 @@ class AthenaMainWindow(QMainWindow):
     ) -> None:
         self.current_chat_id = None
         self._last_rendered_sequence = 0
+        self._clear_knowledge_review()
         if clear_transient:
             self._transient_failures.pop("__NEW_CHAT__", None)
         self.chat_selector.blockSignals(True)
@@ -1077,6 +1095,49 @@ class AthenaMainWindow(QMainWindow):
             "Chat deletion committed through ATHENA lifecycle deletion."
         )
         QTimer.singleShot(0, self.refresh_core_status)
+    def _build_knowledge_review_panel(self) -> QFrame:
+        panel = self.knowledge_review_panel
+        panel.setObjectName("knowledgeReviewPanel")
+        panel.setVisible(False)
+        panel.setMinimumHeight(170)
+        panel.setMaximumHeight(320)
+
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(8)
+        title = QLabel("KNOWLEDGE REVIEW")
+        title.setObjectName("knowledgeReviewTitle")
+        self.knowledge_review_state.setObjectName("knowledgeReviewState")
+        self.knowledge_review_close_button.setObjectName("knowledgeReviewCloseButton")
+        self.knowledge_review_close_button.setToolTip("Close Knowledge review")
+        self.knowledge_review_close_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.knowledge_review_close_button.clicked.connect(
+            self._close_knowledge_review
+        )
+        header.addWidget(title)
+        header.addWidget(self.knowledge_review_state)
+        header.addStretch(1)
+        header.addWidget(self.knowledge_review_close_button)
+        layout.addLayout(header)
+
+        self.knowledge_review_items.setContentsMargins(0, 0, 6, 0)
+        self.knowledge_review_items.setSpacing(8)
+        self.knowledge_review_items.addStretch(1)
+
+        self.knowledge_review_scroll.setObjectName("knowledgeReviewScroll")
+        self.knowledge_review_scroll.setWidgetResizable(True)
+        self.knowledge_review_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.knowledge_review_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.knowledge_review_scroll.setWidget(self.knowledge_review_content)
+        layout.addWidget(self.knowledge_review_scroll, 1)
+        return panel
+
     def _build_evidence_chain(self) -> QFrame:
         chain = QFrame()
         chain.setObjectName("evidenceChain")
@@ -1312,6 +1373,14 @@ class AthenaMainWindow(QMainWindow):
             self.apply_chat_deletion_preview
         )
         controller.chat_deleted.connect(self.apply_chat_deleted)
+        controller.message_remembered.connect(self.apply_message_remembered)
+        controller.knowledge_extraction_ready.connect(
+            self.apply_knowledge_extraction_ready
+        )
+        controller.knowledge_review_ready.connect(self.apply_knowledge_review_ready)
+        controller.knowledge_merge_review_ready.connect(
+            self.apply_knowledge_merge_review_ready
+        )
         controller.chat_operation_failed.connect(self.apply_chat_operation_failure)
         controller.chat_busy_changed.connect(self.apply_chat_busy)
 
@@ -1469,6 +1538,109 @@ class AthenaMainWindow(QMainWindow):
         )
         QTimer.singleShot(0, self.refresh_core_status)
 
+    @Slot(object)
+    def apply_message_remembered(self, response: object) -> None:
+        if not isinstance(response, RememberedChatMessageResponse):
+            return
+        if response.chat_id != self.current_chat_id:
+            self.apply_chat_operation_failure(
+                "remember",
+                "Remember result belongs to another chat",
+            )
+            return
+        self._remembered_message_revisions.add(
+            (response.message_id, response.message_revision_id)
+        )
+        self._sync_message_action_buttons()
+        self.connection_detail.setText(
+            "Message remembered · memory " + response.memory_id[:8].upper() + "."
+        )
+
+    @Slot(object)
+    def apply_knowledge_extraction_ready(self, response: object) -> None:
+        if not isinstance(response, MessageKnowledgeExtractionResponse):
+            return
+        if response.chat_id != self.current_chat_id:
+            self.apply_chat_operation_failure(
+                "extract_knowledge",
+                "Knowledge extraction belongs to another chat",
+            )
+            return
+
+        self._knowledge_extraction = response
+        self._knowledge_review = None
+        self._render_knowledge_review_panel()
+        self.knowledge_review_panel.setVisible(True)
+        self.inspector_object_id.setText(
+            f"RUN / {response.processing_run_id[:8].upper()}"
+        )
+        self.inspector_heading.setText("Knowledge extraction review")
+        self.inspector_mode.set_value("KNOWLEDGE REVIEW")
+        self.inspector_provenance.setText(
+            "Frozen extraction from persisted chat message "
+            f"{response.message_id[:8].upper()} revision "
+            f"{response.message_revision_id[:8].upper()}. "
+            "Canonical Knowledge is unchanged until an explicit acceptance step."
+        )
+        self.connection_detail.setText(
+            "Knowledge extraction complete · canonical deduplication preflight pending."
+        )
+
+        controller = self.api_controller
+        if controller is not None:
+            run_id = response.processing_run_id
+            QTimer.singleShot(
+                0,
+                lambda: controller.prepare_knowledge_review(run_id),
+            )
+
+    @Slot(object)
+    def apply_knowledge_review_ready(self, response: object) -> None:
+        if not isinstance(response, KnowledgeReviewResponse):
+            return
+        extraction = self._knowledge_extraction
+        if extraction is None or response.processing_run_id != extraction.processing_run_id:
+            self.apply_chat_operation_failure(
+                "prepare_knowledge_review",
+                "Knowledge review belongs to another extraction run",
+            )
+            return
+        self._knowledge_review = response
+        self._render_knowledge_review_panel()
+        self.knowledge_review_panel.setVisible(True)
+        if response.ready_to_accept:
+            detail = "Knowledge review complete · proposal set is ready for explicit acceptance."
+        elif response.blocked_reason == "canonical_merge_candidates":
+            detail = "Knowledge review requires explicit canonical merge decisions."
+        elif response.blocked_reason == "extractor_merge_candidates":
+            detail = "Knowledge review is blocked by extractor merge candidates."
+        else:
+            detail = "Knowledge review is blocked pending explicit resolution."
+        self.connection_detail.setText(detail)
+
+    @Slot(object)
+    def apply_knowledge_merge_review_ready(self, response: object) -> None:
+        if not isinstance(response, KnowledgeMergeReviewResponse):
+            return
+        extraction = self._knowledge_extraction
+        if extraction is None:
+            return
+        self.knowledge_review_state.setText(
+            "MERGE DECISION SAVED / REFRESHING PREFLIGHT"
+        )
+        self.connection_detail.setText(
+            "Merge decision saved · "
+            + (response.decision or response.status).replace("_", " ").upper()
+            + "."
+        )
+        controller = self.api_controller
+        if controller is not None:
+            run_id = extraction.processing_run_id
+            QTimer.singleShot(
+                0,
+                lambda: controller.prepare_knowledge_review(run_id),
+            )
+
     @Slot(str, str)
     def apply_chat_operation_failure(
         self,
@@ -1480,13 +1652,30 @@ class AthenaMainWindow(QMainWindow):
             if operation == "send_grounded"
             else "Chat deletion"
             if operation in {"preview_delete", "delete"}
+            else "Remember"
+            if operation == "remember"
+            else "Knowledge extraction"
+            if operation == "extract_knowledge"
+            else "Knowledge review"
+            if operation in {
+                "prepare_knowledge_review",
+                "load_merge_review",
+                "resolve_merge_review",
+            }
             else "Direct chat"
         )
         retry_note = (
             " ATHENA did not retry the mutation DELETE automatically."
             if operation == "delete"
             else " ATHENA did not retry the mutation POST automatically."
-            if operation in {"send", "send_grounded"}
+            if operation in {
+                "send",
+                "send_grounded",
+                "remember",
+                "extract_knowledge",
+                "prepare_knowledge_review",
+                "resolve_merge_review",
+            }
             else ""
         )
         detail = f"{operation_label} failed: {message}.{retry_note}"
@@ -1497,6 +1686,14 @@ class AthenaMainWindow(QMainWindow):
             f"{operation_label} failed"
         )
         self.inspector_provenance.setText(detail)
+        if operation in {
+            "extract_knowledge",
+            "prepare_knowledge_review",
+            "load_merge_review",
+            "resolve_merge_review",
+        }:
+            self.knowledge_review_panel.setVisible(True)
+            self.knowledge_review_state.setText("ERROR / " + operation.upper())
         if operation in {"send", "send_grounded"}:
             self._remember_transient_failure(operation, message)
             self._append_chat_operation_failure(
@@ -1703,6 +1900,37 @@ class AthenaMainWindow(QMainWindow):
         self.max_output_spin.setEnabled(model_available)
         self.temperature_spin.setEnabled(model_available)
         self.thinking_checkbox.setEnabled(model_available)
+        self._sync_message_action_buttons()
+
+    def _sync_message_action_buttons(self) -> None:
+        controls_available = (
+            self.api_controller is not None
+            and self.current_chat_id is not None
+            and not self._chat_busy
+        )
+        for button in self.chat_messages_widget.findChildren(
+            QPushButton,
+            "rememberMessageButton",
+        ):
+            message_id = button.property("messageId")
+            revision_id = button.property("messageRevisionId")
+            remembered = (
+                isinstance(message_id, str)
+                and isinstance(revision_id, str)
+                and (message_id, revision_id) in self._remembered_message_revisions
+            )
+            button.setText("REMEMBERED" if remembered else "REMEMBER")
+            button.setEnabled(controls_available and not remembered)
+        for button in self.chat_messages_widget.findChildren(
+            QPushButton,
+            "addKnowledgeButton",
+        ):
+            button.setEnabled(controls_available and self._core_ready)
+        for button in self.knowledge_review_panel.findChildren(
+            QPushButton,
+            "knowledgeMergeButton",
+        ):
+            button.setEnabled(controls_available)
     def _render_empty_chat(self, message: str) -> None:
         self._clear_chat_messages()
         label = QLabel(message)
@@ -1719,6 +1947,7 @@ class AthenaMainWindow(QMainWindow):
         assistant_display_override: str | None = None,
     ) -> None:
         self._clear_chat_messages()
+        self._clear_knowledge_review()
         self._last_rendered_sequence = 0
         transient_key = thread.chat_id
 
@@ -1756,6 +1985,8 @@ class AthenaMainWindow(QMainWindow):
                         content=display_content,
                         created_at_us=message.created_at_us,
                         sequence_no=message.sequence_no,
+                        message_id=message.message_id,
+                        revision_id=message.revision_id,
                     )
                 )
                 self._last_rendered_sequence = max(
@@ -1792,9 +2023,15 @@ class AthenaMainWindow(QMainWindow):
         content: str | None,
         created_at_us: int,
         sequence_no: int,
+        message_id: str,
+        revision_id: str,
     ) -> QWidget:
         container = QWidget()
         container.setObjectName("chatMessage")
+        container.setProperty("messageId", message_id)
+        container.setProperty("messageRevisionId", revision_id)
+        container.setProperty("messageSequence", sequence_no)
+        container.setProperty("messageRole", role)
 
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 18)
@@ -1825,6 +2062,8 @@ class AthenaMainWindow(QMainWindow):
         copy_button.setObjectName("copyMessageButton")
         copy_button.setProperty("messageSequence", sequence_no)
         copy_button.setProperty("messageRole", role)
+        copy_button.setProperty("messageId", message_id)
+        copy_button.setProperty("messageRevisionId", revision_id)
         copy_button.setAccessibleName(
             f"Copy {display_role.lower()} message"
         )
@@ -1847,8 +2086,40 @@ class AthenaMainWindow(QMainWindow):
             )
         )
 
+        remember_button = QPushButton("REMEMBER")
+        remember_button.setObjectName("rememberMessageButton")
+        remember_button.setProperty("messageId", message_id)
+        remember_button.setProperty("messageRevisionId", revision_id)
+        remember_button.setProperty("messageSequence", sequence_no)
+        remember_button.setProperty("messageRole", role)
+        remember_button.setToolTip("Store this exact persisted message in Personal Memory")
+        remember_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        remember_button.clicked.connect(
+            lambda _checked=False, mid=message_id, rid=revision_id: (
+                self._remember_message(mid, rid)
+            )
+        )
+
+        knowledge_button = QPushButton("ADD TO KNOWLEDGE")
+        knowledge_button.setObjectName("addKnowledgeButton")
+        knowledge_button.setProperty("messageId", message_id)
+        knowledge_button.setProperty("messageRevisionId", revision_id)
+        knowledge_button.setProperty("messageSequence", sequence_no)
+        knowledge_button.setProperty("messageRole", role)
+        knowledge_button.setToolTip(
+            "Extract Knowledge proposals from this exact persisted message"
+        )
+        knowledge_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        knowledge_button.clicked.connect(
+            lambda _checked=False, mid=message_id, rid=revision_id: (
+                self._extract_message_knowledge(mid, rid)
+            )
+        )
+
         header.addWidget(meta)
         header.addStretch(1)
+        header.addWidget(remember_button)
+        header.addWidget(knowledge_button)
         header.addWidget(copy_button)
 
         body = _AutoHeightMessageLabel(copy_text)
@@ -1863,6 +2134,269 @@ class AthenaMainWindow(QMainWindow):
         layout.addWidget(body)
         layout.addWidget(_rule())
         return container
+
+    def _remember_message(self, message_id: str, revision_id: str) -> None:
+        controller = self.api_controller
+        chat_id = self.current_chat_id
+        if controller is None or chat_id is None or self._chat_busy:
+            return
+        controller.remember_message(
+            chat_id=chat_id,
+            message_id=message_id,
+            revision_id=revision_id,
+        )
+
+    def _extract_message_knowledge(self, message_id: str, revision_id: str) -> None:
+        controller = self.api_controller
+        chat_id = self.current_chat_id
+        if controller is None or chat_id is None or self._chat_busy or not self._core_ready:
+            return
+        self._knowledge_extraction = None
+        self._knowledge_review = None
+        self.knowledge_review_panel.setVisible(True)
+        self.knowledge_review_state.setText("EXTRACTING / SELECTED MESSAGE")
+        controller.extract_message_knowledge(
+            chat_id=chat_id,
+            message_id=message_id,
+            revision_id=revision_id,
+            model_id=self._selected_model_id(),
+            effective_context_limit=self._effective_context_limit(),
+            max_output_tokens=self._max_output_tokens(),
+        )
+
+    def _close_knowledge_review(self) -> None:
+        self._clear_knowledge_review()
+        if self.current_chat_id is not None:
+            self.inspector_object_id.setText(
+                f"CHAT / {self.current_chat_id[:8].upper()}"
+            )
+            self.inspector_heading.setText("Persistent conversation · local history")
+            self.inspector_mode.set_value("DIRECT")
+            self.inspector_provenance.setText(
+                "No Knowledge proposal is selected. Direct chat does not invent "
+                "source relationships."
+            )
+
+    def _clear_knowledge_review(self) -> None:
+        self._knowledge_extraction = None
+        self._knowledge_review = None
+        self.knowledge_review_panel.setVisible(False)
+        self.knowledge_review_state.setText("IDLE")
+        self._clear_knowledge_review_items()
+
+    def _clear_knowledge_review_items(self) -> None:
+        while self.knowledge_review_items.count():
+            item = self.knowledge_review_items.takeAt(0)
+            if item is None:
+                break
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        self.knowledge_review_items.addStretch(1)
+
+    def _add_knowledge_review_item(
+        self,
+        *,
+        title: str,
+        body: str,
+    ) -> None:
+        card = QFrame()
+        card.setObjectName("knowledgeReviewItem")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(4)
+        heading = QLabel(title)
+        heading.setObjectName("knowledgeReviewItemTitle")
+        text = QLabel(body)
+        text.setObjectName("knowledgeReviewItemBody")
+        text.setTextFormat(Qt.TextFormat.PlainText)
+        text.setWordWrap(True)
+        _make_label_selectable(text)
+        layout.addWidget(heading)
+        layout.addWidget(text)
+        insert_index = max(0, self.knowledge_review_items.count() - 1)
+        self.knowledge_review_items.insertWidget(insert_index, card)
+
+    def _add_canonical_merge_candidate(
+        self,
+        candidate: CanonicalMergeReviewResponse,
+    ) -> None:
+        card = QFrame()
+        card.setObjectName("knowledgeReviewItem")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(6)
+
+        prefix = "K" if candidate.proposal_type == "knowledge" else "C"
+        heading = QLabel(
+            f"{prefix}{candidate.proposal_index:02d} / POSSIBLE CANONICAL DUPLICATE "
+            f"/ {candidate.similarity:.0%}"
+        )
+        heading.setObjectName("knowledgeReviewItemTitle")
+        detail = QLabel(
+            f"Existing {candidate.existing_entity_id[:8].upper()} · {candidate.reason}"
+        )
+        detail.setObjectName("knowledgeReviewItemBody")
+        detail.setWordWrap(True)
+        _make_label_selectable(detail)
+
+        actions = QHBoxLayout()
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.setSpacing(6)
+        merge_button = QPushButton("MERGE")
+        merge_button.setObjectName("knowledgeMergeButton")
+        merge_button.setProperty("reviewId", candidate.review_id)
+        merge_button.setProperty("decision", "merge")
+        merge_button.clicked.connect(
+            lambda _checked=False, rid=candidate.review_id: (
+                self._resolve_knowledge_merge(rid, "merge")
+            )
+        )
+        separate_button = QPushButton("KEEP SEPARATE")
+        separate_button.setObjectName("knowledgeMergeButton")
+        separate_button.setProperty("reviewId", candidate.review_id)
+        separate_button.setProperty("decision", "keep_separate")
+        separate_button.clicked.connect(
+            lambda _checked=False, rid=candidate.review_id: (
+                self._resolve_knowledge_merge(rid, "keep_separate")
+            )
+        )
+        actions.addWidget(merge_button)
+        actions.addWidget(separate_button)
+        actions.addStretch(1)
+
+        layout.addWidget(heading)
+        layout.addWidget(detail)
+        layout.addLayout(actions)
+        insert_index = max(0, self.knowledge_review_items.count() - 1)
+        self.knowledge_review_items.insertWidget(insert_index, card)
+
+    def _resolve_knowledge_merge(self, review_id: str, decision: str) -> None:
+        controller = self.api_controller
+        if controller is None or self._chat_busy:
+            return
+        if decision not in {"merge", "keep_separate"}:
+            return
+        self.knowledge_review_state.setText("SAVING MERGE DECISION")
+        controller.resolve_knowledge_merge_review(
+            review_id,
+            decision=decision,
+        )
+
+    def _render_knowledge_review_panel(self) -> None:
+        extraction = self._knowledge_extraction
+        if extraction is None:
+            return
+        self._clear_knowledge_review_items()
+
+        self._add_knowledge_review_item(
+            title=(
+                f"RUN {extraction.processing_run_id[:8].upper()} / "
+                f"MODEL {extraction.model_id}"
+            ),
+            body=(
+                f"Message {extraction.message_id[:8].upper()} · "
+                f"{len(extraction.knowledge_units)} Knowledge · "
+                f"{len(extraction.claims)} Claims · "
+                f"{len(extraction.relations)} Relations"
+            ),
+        )
+
+        for knowledge_proposal in extraction.knowledge_units:
+            heading = (
+                f"K{knowledge_proposal.proposal_index:02d} / "
+                f"{knowledge_proposal.knowledge_kind.upper()} / "
+                f"{knowledge_proposal.confidence:.0%}"
+            )
+            title = (
+                knowledge_proposal.title.strip()
+                if knowledge_proposal.title
+                else ""
+            )
+            body = (
+                knowledge_proposal.body
+                if not title
+                else f"{title}\n{knowledge_proposal.body}"
+            )
+            self._add_knowledge_review_item(title=heading, body=body)
+
+        for claim_proposal in extraction.claims:
+            self._add_knowledge_review_item(
+                title=(
+                    f"C{claim_proposal.proposal_index:02d} / "
+                    f"{claim_proposal.claim_kind.upper()} / "
+                    f"{claim_proposal.confidence:.0%}"
+                ),
+                body=claim_proposal.statement,
+            )
+
+        if extraction.relations:
+            relation_lines = tuple(
+                f"{relation.left_type[0].upper()}{relation.left_index:02d} "
+                f"{relation.relation_type.upper()} "
+                f"{relation.right_type[0].upper()}{relation.right_index:02d} "
+                f"/ {relation.confidence:.0%}"
+                for relation in extraction.relations
+            )
+            self._add_knowledge_review_item(
+                title="RELATIONS",
+                body="\n".join(relation_lines),
+            )
+
+        if extraction.extractor_merge_candidates:
+            lines = tuple(
+                f"{merge_candidate.proposal_type.upper()} "
+                f"{merge_candidate.proposal_index:02d} / "
+                f"{merge_candidate.reason} / {merge_candidate.confidence:.0%}"
+                for merge_candidate in extraction.extractor_merge_candidates
+            )
+            self._add_knowledge_review_item(
+                title="EXTRACTOR MERGE CANDIDATES / BLOCKING",
+                body="\n".join(lines),
+            )
+
+        review = self._knowledge_review
+        if review is None:
+            self.knowledge_review_state.setText("PREFLIGHT / PENDING")
+            return
+
+        decision_lines = tuple(
+            f"K{knowledge_decision.proposal_index:02d}  "
+            f"{knowledge_decision.action.replace('_', ' ').upper()}"
+            + (
+                f"  → {knowledge_decision.existing_entity_id[:8].upper()}"
+                if knowledge_decision.existing_entity_id is not None
+                else ""
+            )
+            for knowledge_decision in review.knowledge_decisions
+        ) + tuple(
+            f"C{claim_decision.proposal_index:02d}  "
+            f"{claim_decision.action.replace('_', ' ').upper()}"
+            + (
+                f"  → {claim_decision.existing_entity_id[:8].upper()}"
+                if claim_decision.existing_entity_id is not None
+                else ""
+            )
+            for claim_decision in review.claim_decisions
+        )
+        if decision_lines:
+            self._add_knowledge_review_item(
+                title="CANONICAL PREFLIGHT",
+                body="\n".join(decision_lines),
+            )
+
+        for candidate in review.canonical_merge_candidates:
+            self._add_canonical_merge_candidate(candidate)
+
+        if review.ready_to_accept:
+            self.knowledge_review_state.setText("REVIEW COMPLETE / READY")
+        elif review.blocked_reason == "canonical_merge_candidates":
+            self.knowledge_review_state.setText("DECISION REQUIRED / CANONICAL MERGE")
+        elif review.blocked_reason == "extractor_merge_candidates":
+            self.knowledge_review_state.setText("BLOCKED / EXTRACTOR MERGE")
+        else:
+            self.knowledge_review_state.setText("BLOCKED / REVIEW REQUIRED")
 
     def _clear_chat_messages(self) -> None:
         while self.chat_messages_layout.count():

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
@@ -16,7 +17,11 @@ from athena.knowledge.extraction_models import (
     extraction_json_schema,
     parse_extraction_proposals,
 )
-from athena.knowledge.extraction_service import ChatKnowledgeExtractionService
+from athena.knowledge.extraction_service import (
+    ChatKnowledgeExtractionService,
+    ExtractionMessageNotFoundError,
+    ExtractionMessageRevisionMismatchError,
+)
 from athena.model.domain import ModelChatMessage, ModelInfo, ProviderHealth, ProviderHealthStatus
 from athena.model.provenance import ModelRunRepository
 from athena.storage.database import SQLiteDatabase
@@ -348,6 +353,141 @@ def test_incomplete_claim_pair_audit_marks_run_failed(tmp_path) -> None:
     assert run is not None
     assert run["status"] == "failed"
     database.stop()
+
+
+def test_message_scoped_extraction_uses_only_selected_stable_revision(tmp_path) -> None:
+    database = SQLiteDatabase(tmp_path / "athena.db")
+    database.start()
+    payload = {
+        "knowledge_units": [
+            {
+                "source_sequence_no": 2,
+                "source_quote": "The selected message uses SQLite.",
+                "knowledge_kind": "fact",
+                "title": "Selected database fact",
+                "body": "The selected message uses SQLite.",
+                "epistemic_status": "asserted",
+                "confidence": 0.95,
+            }
+        ],
+        "claims": [],
+        "relations": [],
+        "merge_candidates": [],
+    }
+    provider = FakeStructuredProvider(payload)
+    chat, extraction = _service(database, provider)
+
+    try:
+        chat_id = chat.create_chat()
+        first = chat.add_user_message(
+            chat_id=chat_id,
+            content="This message must not enter the scoped extraction.",
+        )
+        selected = chat.add_user_message(
+            chat_id=chat_id,
+            content="The selected message uses SQLite.",
+        )
+
+        result = extraction.extract_message(
+            chat_id=chat_id,
+            message_id=selected.message_id,
+            revision_id=selected.revision_id,
+        )
+
+        assert result.processing_run.status == "succeeded"
+        assert result.proposals.knowledge_units[0].source_sequence_no == 2
+        assert len(provider.calls) == 1
+        prompt = provider.calls[0][1][1].content
+        assert "[2] user:" in prompt
+        assert selected.content in prompt
+        assert first.content not in prompt
+
+        row = database.connection.execute(
+            "SELECT input_snapshot_json FROM processing_runs "
+            "WHERE run_type = 'knowledge_extraction'"
+        ).fetchone()
+        assert row is not None
+        snapshot = json.loads(str(row["input_snapshot_json"]))
+        assert snapshot["messages"] == [
+            {
+                "sequence_no": selected.sequence_no,
+                "message_id": str(selected.message_id),
+                "revision_id": str(selected.revision_id),
+                "message_type": "user",
+            }
+        ]
+    finally:
+        database.stop()
+
+
+def test_message_scoped_extraction_rejects_message_from_outside_chat(tmp_path) -> None:
+    database = SQLiteDatabase(tmp_path / "athena.db")
+    database.start()
+    provider = FakeStructuredProvider(_valid_payload())
+    chat, extraction = _service(database, provider)
+
+    try:
+        chat_id = chat.create_chat()
+        message = chat.add_user_message(
+            chat_id=chat_id,
+            content="Only this persisted message exists.",
+        )
+
+        with pytest.raises(
+            ExtractionMessageNotFoundError,
+            match="has no message",
+        ):
+            extraction.extract_message(
+                chat_id=chat_id,
+                message_id=uuid.uuid4(),
+                revision_id=message.revision_id,
+            )
+
+        assert provider.calls == []
+        assert (
+            database.connection.execute(
+                "SELECT COUNT(*) FROM processing_runs"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        database.stop()
+
+
+def test_message_scoped_extraction_rejects_stale_revision_before_model_call(
+    tmp_path,
+) -> None:
+    database = SQLiteDatabase(tmp_path / "athena.db")
+    database.start()
+    provider = FakeStructuredProvider(_valid_payload())
+    chat, extraction = _service(database, provider)
+
+    try:
+        chat_id = chat.create_chat()
+        message = chat.add_user_message(
+            chat_id=chat_id,
+            content="Only this persisted message exists.",
+        )
+
+        with pytest.raises(
+            ExtractionMessageRevisionMismatchError,
+            match="revision is stale",
+        ):
+            extraction.extract_message(
+                chat_id=chat_id,
+                message_id=message.message_id,
+                revision_id=uuid.uuid4(),
+            )
+
+        assert provider.calls == []
+        assert (
+            database.connection.execute(
+                "SELECT COUNT(*) FROM processing_runs"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        database.stop()
 
 
 def test_extraction_schema_excludes_attributed_opinion() -> None:

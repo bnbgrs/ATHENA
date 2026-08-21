@@ -16,8 +16,12 @@ from athena.api.contracts import (
     DeletionResultResponse,
     GroundedChatResponse,
     HealthResponse,
+    KnowledgeMergeReviewResponse,
+    KnowledgeReviewResponse,
+    MessageKnowledgeExtractionResponse,
     ModelResponse,
     ProviderHealthResponse,
+    RememberedChatMessageResponse,
 )
 
 
@@ -59,6 +63,42 @@ class CoreApiGateway(Protocol):
         temperature: float | None = None,
         thinking_enabled: bool | None = None,
     ) -> GroundedChatResponse: ...
+    def remember_chat_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        *,
+        revision_id: str,
+    ) -> RememberedChatMessageResponse: ...
+
+    def extract_chat_message_knowledge(
+        self,
+        chat_id: str,
+        message_id: str,
+        *,
+        revision_id: str,
+        model_id: str | None = None,
+        effective_context_limit: int | None = None,
+        max_output_tokens: int | None = None,
+    ) -> MessageKnowledgeExtractionResponse: ...
+
+    def prepare_knowledge_review(
+        self,
+        processing_run_id: str,
+    ) -> KnowledgeReviewResponse: ...
+
+    def load_knowledge_merge_review(
+        self,
+        review_id: str,
+    ) -> KnowledgeMergeReviewResponse: ...
+
+    def resolve_knowledge_merge_review(
+        self,
+        review_id: str,
+        *,
+        decision: str,
+    ) -> KnowledgeMergeReviewResponse: ...
+
     def preview_chat_deletion(self, chat_id: str) -> DeletionPreviewResponse: ...
 
     def delete_chat(
@@ -101,6 +141,10 @@ class _ChatOperationOutcome:
     grounded: GroundedChatResponse | None = None
     deletion_preview: DeletionPreviewResponse | None = None
     deleted_chat_id: str | None = None
+    remembered: RememberedChatMessageResponse | None = None
+    knowledge_extraction: MessageKnowledgeExtractionResponse | None = None
+    knowledge_review: KnowledgeReviewResponse | None = None
+    merge_review: KnowledgeMergeReviewResponse | None = None
     error: str | None = None
 
     def __post_init__(self) -> None:
@@ -111,6 +155,10 @@ class _ChatOperationOutcome:
                 self.grounded,
                 self.deletion_preview,
                 self.deleted_chat_id,
+                self.remembered,
+                self.knowledge_extraction,
+                self.knowledge_review,
+                self.merge_review,
             )
         )
         if result_count > 1:
@@ -134,6 +182,11 @@ class _ChatTask(QRunnable):
         temperature: float | None,
         thinking_enabled: bool | None,
         preview_digest: str | None,
+        message_id: str | None,
+        revision_id: str | None,
+        processing_run_id: str | None = None,
+        review_id: str | None = None,
+        review_decision: str | None = None,
         outcomes: SimpleQueue[_ChatOperationOutcome],
         receiver: QObject,
     ) -> None:
@@ -148,6 +201,11 @@ class _ChatTask(QRunnable):
         self.temperature = temperature
         self.thinking_enabled = thinking_enabled
         self.preview_digest = preview_digest
+        self.message_id = message_id
+        self.revision_id = revision_id
+        self.processing_run_id = processing_run_id
+        self.review_id = review_id
+        self.review_decision = review_decision
         self.outcomes = outcomes
         self.receiver = receiver
         self.setAutoDelete(False)
@@ -245,6 +303,101 @@ class _ChatTask(QRunnable):
                 outcome = _ChatOperationOutcome(
                     operation=self.operation,
                     grounded=grounded,
+                )
+            elif self.operation == "remember":
+                message_id = self.message_id
+                revision_id = self.revision_id
+                if (
+                    resolved_chat_id is None
+                    or message_id is None
+                    or revision_id is None
+                ):
+                    raise ValueError(
+                        "Remember requires stable chat-message identity."
+                    )
+                remembered = self.gateway.remember_chat_message(
+                    resolved_chat_id,
+                    message_id,
+                    revision_id=revision_id,
+                )
+                if (
+                    remembered.chat_id != resolved_chat_id
+                    or remembered.message_id != message_id
+                    or remembered.message_revision_id != revision_id
+                ):
+                    raise RuntimeError(
+                        "Remember result belongs to another message revision."
+                    )
+                outcome = _ChatOperationOutcome(
+                    operation=self.operation,
+                    remembered=remembered,
+                )
+            elif self.operation == "extract_knowledge":
+                message_id = self.message_id
+                revision_id = self.revision_id
+                if (
+                    resolved_chat_id is None
+                    or message_id is None
+                    or revision_id is None
+                ):
+                    raise ValueError(
+                        "Knowledge extraction requires stable chat-message identity."
+                    )
+                extraction = self.gateway.extract_chat_message_knowledge(
+                    resolved_chat_id,
+                    message_id,
+                    revision_id=revision_id,
+                    model_id=self.model_id,
+                    effective_context_limit=self.effective_context_limit,
+                    max_output_tokens=self.max_output_tokens,
+                )
+                if (
+                    extraction.chat_id != resolved_chat_id
+                    or extraction.message_id != message_id
+                    or extraction.message_revision_id != revision_id
+                ):
+                    raise RuntimeError(
+                        "Knowledge extraction result belongs to another message revision."
+                    )
+                outcome = _ChatOperationOutcome(
+                    operation=self.operation,
+                    knowledge_extraction=extraction,
+                )
+            elif self.operation == "prepare_knowledge_review":
+                processing_run_id = self.processing_run_id
+                if processing_run_id is None:
+                    raise ValueError(
+                        "Knowledge review requires a ProcessingRun ID."
+                    )
+                outcome = _ChatOperationOutcome(
+                    operation=self.operation,
+                    knowledge_review=self.gateway.prepare_knowledge_review(
+                        processing_run_id
+                    ),
+                )
+            elif self.operation == "load_merge_review":
+                review_id = self.review_id
+                if review_id is None:
+                    raise ValueError("Merge review load requires a review ID.")
+                outcome = _ChatOperationOutcome(
+                    operation=self.operation,
+                    merge_review=self.gateway.load_knowledge_merge_review(
+                        review_id
+                    ),
+                )
+            elif self.operation == "resolve_merge_review":
+                review_id = self.review_id
+                review_decision = self.review_decision
+                if review_id is None or review_decision is None:
+                    raise ValueError(
+                        "Merge review resolution requires review identity and decision."
+                    )
+                outcome = _ChatOperationOutcome(
+                    operation=self.operation,
+                    merge_review=self.gateway.resolve_knowledge_merge_review(
+                        review_id,
+                        decision=review_decision,
+                    ),
                 )
             elif self.operation == "preview_delete":
                 if resolved_chat_id is None:
@@ -433,6 +586,10 @@ class DesktopApiController(QObject):
     grounded_chat_sent = Signal(object)
     chat_deletion_preview_ready = Signal(object)
     chat_deleted = Signal(str)
+    message_remembered = Signal(object)
+    knowledge_extraction_ready = Signal(object)
+    knowledge_review_ready = Signal(object)
+    knowledge_merge_review_ready = Signal(object)
     chat_operation_failed = Signal(str, str)
     chat_busy_changed = Signal(bool)
 
@@ -516,6 +673,84 @@ class DesktopApiController(QObject):
             temperature=temperature,
             thinking_enabled=thinking_enabled,
         )
+    def remember_message(
+        self,
+        *,
+        chat_id: str,
+        message_id: str,
+        revision_id: str,
+    ) -> None:
+        if self._chat_busy or not chat_id or not message_id or not revision_id:
+            return
+        self._start_chat_task(
+            operation="remember",
+            chat_id=chat_id,
+            message_id=message_id,
+            revision_id=revision_id,
+        )
+
+    def extract_message_knowledge(
+        self,
+        *,
+        chat_id: str,
+        message_id: str,
+        revision_id: str,
+        model_id: str | None = None,
+        effective_context_limit: int | None = None,
+        max_output_tokens: int | None = None,
+    ) -> None:
+        if self._chat_busy or not chat_id or not message_id or not revision_id:
+            return
+        self._start_chat_task(
+            operation="extract_knowledge",
+            chat_id=chat_id,
+            message_id=message_id,
+            revision_id=revision_id,
+            model_id=model_id,
+            effective_context_limit=effective_context_limit,
+            max_output_tokens=max_output_tokens,
+        )
+
+    def prepare_knowledge_review(
+        self,
+        processing_run_id: str,
+    ) -> None:
+        if self._chat_busy or not processing_run_id:
+            return
+        self._start_chat_task(
+            operation="prepare_knowledge_review",
+            chat_id=None,
+            processing_run_id=processing_run_id,
+        )
+
+    def load_knowledge_merge_review(self, review_id: str) -> None:
+        if self._chat_busy or not review_id:
+            return
+        self._start_chat_task(
+            operation="load_merge_review",
+            chat_id=None,
+            review_id=review_id,
+        )
+
+    def resolve_knowledge_merge_review(
+        self,
+        review_id: str,
+        *,
+        decision: str,
+    ) -> None:
+        if (
+            self._chat_busy
+            or not review_id
+            or decision not in {"merge", "keep_separate"}
+        ):
+            return
+        self._start_chat_task(
+            operation="resolve_merge_review",
+            chat_id=None,
+            review_id=review_id,
+            review_decision=decision,
+        )
+
     def preview_chat_deletion(self, chat_id: str) -> None:
         if not chat_id or self._chat_busy:
             return
@@ -542,6 +777,11 @@ class DesktopApiController(QObject):
         temperature: float | None = None,
         thinking_enabled: bool | None = None,
         preview_digest: str | None = None,
+        message_id: str | None = None,
+        revision_id: str | None = None,
+        processing_run_id: str | None = None,
+        review_id: str | None = None,
+        review_decision: str | None = None,
     ) -> None:
         task = _ChatTask(
             gateway=self.gateway,
@@ -554,6 +794,11 @@ class DesktopApiController(QObject):
             temperature=temperature,
             thinking_enabled=thinking_enabled,
             preview_digest=preview_digest,
+            message_id=message_id,
+            revision_id=revision_id,
+            processing_run_id=processing_run_id,
+            review_id=review_id,
+            review_decision=review_decision,
             outcomes=self._chat_outcomes,
             receiver=self,
         )
@@ -628,6 +873,14 @@ class DesktopApiController(QObject):
                 self.chat_deletion_preview_ready.emit(outcome.deletion_preview)
             elif outcome.deleted_chat_id is not None:
                 self.chat_deleted.emit(outcome.deleted_chat_id)
+            elif outcome.remembered is not None:
+                self.message_remembered.emit(outcome.remembered)
+            elif outcome.knowledge_extraction is not None:
+                self.knowledge_extraction_ready.emit(outcome.knowledge_extraction)
+            elif outcome.knowledge_review is not None:
+                self.knowledge_review_ready.emit(outcome.knowledge_review)
+            elif outcome.merge_review is not None:
+                self.knowledge_merge_review_ready.emit(outcome.merge_review)
             elif outcome.thread is not None:
                 if outcome.operation == "send":
                     self.chat_sent.emit(outcome.thread)

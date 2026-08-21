@@ -155,6 +155,124 @@ class GroundedChatResponse(ApiContract):
 
 
 @dataclass(frozen=True, slots=True)
+class RememberedChatMessageResponse(ApiContract):
+    chat_id: str
+    message_id: str
+    message_revision_id: str
+    memory_id: str
+    memory_revision_id: str
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
+class KnowledgeUnitProposalResponse(ApiContract):
+    proposal_index: int
+    source_sequence_no: int
+    source_quote: str
+    knowledge_kind: str
+    title: str | None
+    body: str
+    epistemic_status: str
+    confidence: float
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimProposalResponse(ApiContract):
+    proposal_index: int
+    source_sequence_no: int
+    source_quote: str
+    claim_kind: str
+    statement: str
+    epistemic_status: str
+    confidence: float
+
+
+@dataclass(frozen=True, slots=True)
+class RelationProposalResponse(ApiContract):
+    relation_index: int
+    left_type: str
+    left_index: int
+    relation_type: str
+    right_type: str
+    right_index: int
+    confidence: float
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractorMergeCandidateResponse(ApiContract):
+    candidate_index: int
+    proposal_type: str
+    proposal_index: int
+    reason: str
+    confidence: float
+
+
+@dataclass(frozen=True, slots=True)
+class MessageKnowledgeExtractionResponse(ApiContract):
+    chat_id: str
+    message_id: str
+    message_revision_id: str
+    processing_run_id: str
+    model_id: str
+    model_signature_id: str
+    knowledge_units: tuple[KnowledgeUnitProposalResponse, ...]
+    claims: tuple[ClaimProposalResponse, ...]
+    relations: tuple[RelationProposalResponse, ...]
+    extractor_merge_candidates: tuple[ExtractorMergeCandidateResponse, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DedupDecisionResponse(ApiContract):
+    proposal_type: str
+    proposal_index: int
+    action: str
+    existing_entity_id: str | None
+    existing_revision_id: str | None
+    duplicate_of_proposal_index: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalMergeReviewResponse(ApiContract):
+    candidate_index: int
+    review_id: str
+    proposal_type: str
+    proposal_index: int
+    existing_entity_id: str
+    existing_revision_id: str
+    similarity: float
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class KnowledgeReviewResponse(ApiContract):
+    processing_run_id: str
+    model_signature_id: str
+    ready_to_accept: bool
+    blocked_reason: str | None
+    preflight_digest: str | None
+    knowledge_decisions: tuple[DedupDecisionResponse, ...]
+    claim_decisions: tuple[DedupDecisionResponse, ...]
+    canonical_merge_candidates: tuple[CanonicalMergeReviewResponse, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class KnowledgeMergeReviewResponse(ApiContract):
+    review_id: str
+    status: str
+    proposal_type: str
+    proposal_index: int
+    source_entity_id: str
+    source_revision_id: str
+    proposal_text: str
+    proposal_kind: str
+    proposal_epistemic_status: str
+    similarity: float
+    decision: str | None
+    existing_entity_id: str
+    existing_revision_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class DeletionDependencyResponse(ApiContract):
     relation: str
     count: int
