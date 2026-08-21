@@ -12,6 +12,7 @@ from athena.chat.provenance import (
     strip_model_facing_assistant_trace,
     strip_turn_local_grounding_markers,
 )
+from athena.chat.send_identity import SendOperationState, SendOperationStateError
 from athena.model.domain import ModelInfo
 from athena.model.provenance import ModelRunRepository, ProcessingRun
 from athena.retrieval.context import ContextBuilderError, estimate_tokens
@@ -60,6 +61,7 @@ class DirectChatService:
         chat_id: uuid.UUID,
         content: str,
         requested_model_id: str | None = None,
+        operation_id: uuid.UUID | None = None,
         max_recent_conversation_turns: int = _DEFAULT_RECENT_CONVERSATION_TURNS,
         effective_context_limit: int | None = None,
         output_reserve: int = _DEFAULT_OUTPUT_RESERVE,
@@ -84,6 +86,18 @@ class DirectChatService:
             raise ContextBuilderError(
                 "Reasoning mode must be None or 'off'."
             )
+
+        if operation_id is not None:
+            operation_status = self.chat_generation.chat.inspect_send_operation(
+                chat_id=chat_id,
+                operation_id=operation_id,
+                content=content,
+            )
+
+            if operation_status.state is not SendOperationState.ABSENT:
+                raise SendOperationStateError(
+                    operation_status
+                )
 
         model = self.chat_generation.select_model(requested_model_id)
         context_limit = _resolve_context_limit(
@@ -136,6 +150,7 @@ class DirectChatService:
         user_message = self.chat_generation.chat.add_user_message(
             chat_id=chat_id,
             content=content,
+            operation_id=operation_id,
         )
         package_snapshot_commit_seq = self.context_packages.assert_user_commit_follows(
             retrieval_snapshot_commit_seq,
@@ -210,6 +225,7 @@ class DirectChatService:
                 chat_id=chat_id,
                 user_message=user_message,
                 context_package=package,
+                operation_id=operation_id,
                 on_delta=on_delta,
                 on_before_provider_call=lambda: self.context_packages.assert_snapshot_current(
                     package.snapshot_commit_seq,

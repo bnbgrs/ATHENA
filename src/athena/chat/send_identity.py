@@ -34,6 +34,22 @@ class SendOperationStatus:
     state: SendOperationState
 
 
+class SendOperationStateError(RuntimeError):
+    """Raised when a non-absent durable send is executed again."""
+
+    def __init__(
+        self,
+        status: SendOperationStatus,
+    ) -> None:
+        self.status = status
+
+        super().__init__(
+            "Send operation "
+            f"{status.operation_id} is {status.state.value}; "
+            "only absent operations may execute."
+        )
+
+
 def user_message_id_for_operation(
     operation_id: uuid.UUID,
 ) -> uuid.UUID:

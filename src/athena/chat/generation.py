@@ -396,6 +396,7 @@ class ChatGenerationService:
         chat_id: uuid.UUID,
         user_message: ChatMessage,
         context_package: ContextPackage,
+        operation_id: uuid.UUID | None = None,
         on_delta: Callable[[str], None] | None = None,
         grounding_contract: GroundingContract | None = None,
         on_before_provider_call: Callable[[], None] | None = None,
@@ -407,6 +408,14 @@ class ChatGenerationService:
             raise ValueError("ContextPackage generation requires a user message.")
         if user_message.content is None:
             raise ValueError("ContextPackage current user content is unavailable.")
+        if (
+            operation_id is not None
+            and user_message.message_id != operation_id
+        ):
+            raise ValueError(
+                "ContextPackage user message does not match "
+                "the send operation identity."
+            )
 
         current_ref = context_package.current_user_ref()
         if (
@@ -456,6 +465,7 @@ class ChatGenerationService:
                 return self._generate_and_persist(
                     chat_id=chat_id,
                     user_message=user_message,
+                    operation_id=operation_id,
                     model=model,
                     history=history,
                     on_delta=on_delta,
@@ -470,6 +480,7 @@ class ChatGenerationService:
         return self._generate_and_persist(
             chat_id=chat_id,
             user_message=user_message,
+            operation_id=operation_id,
             model=model,
             history=history,
             on_delta=on_delta,
@@ -485,6 +496,7 @@ class ChatGenerationService:
         *,
         chat_id: uuid.UUID,
         user_message: ChatMessage,
+        operation_id: uuid.UUID | None,
         model: ModelInfo,
         history: tuple[ModelChatMessage, ...],
         on_delta: Callable[[str], None] | None,
@@ -639,6 +651,7 @@ class ChatGenerationService:
                 content=assistant_text,
                 provider_id=model.provider,
                 model_id=model.backend_model_id,
+                operation_id=operation_id,
             )
 
             return ChatGenerationResult(
