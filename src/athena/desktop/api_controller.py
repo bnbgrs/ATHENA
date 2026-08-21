@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from queue import Empty, SimpleQueue
 from typing import Literal, Protocol
@@ -23,6 +24,10 @@ from athena.api.contracts import (
     ProviderHealthResponse,
     RememberedChatMessageResponse,
 )
+from athena.chat.send_identity import (
+    assistant_message_id_for_operation,
+    chat_id_for_operation,
+)
 
 
 class CoreApiGateway(Protocol):
@@ -41,7 +46,10 @@ class CoreApiGateway(Protocol):
         offset: int = 0,
     ) -> tuple[ChatSummaryResponse, ...]: ...
 
-    def create_chat(self) -> ChatThreadResponse: ...
+    def create_chat(
+        self,
+        chat_id: str | None = None,
+    ) -> ChatThreadResponse: ...
 
     def load_chat(self, chat_id: str) -> ChatThreadResponse: ...
 
@@ -51,6 +59,7 @@ class CoreApiGateway(Protocol):
         *,
         content: str,
         model_id: str | None = None,
+        operation_id: str | None = None,
         effective_context_limit: int | None = None,
         max_output_tokens: int | None = None,
         temperature: float | None = None,
@@ -188,6 +197,90 @@ class _ChatOperationOutcome:
         if self.error is None and result_count != 1:
             raise ValueError("Successful chat outcome requires exactly one result.")
 
+_DirectSendReconciliationState = Literal[
+    "absent",
+    "incomplete",
+    "complete",
+    "conflict",
+]
+
+
+def _classify_direct_send(
+    thread: ChatThreadResponse,
+    *,
+    chat_id: str,
+    operation_id: str,
+    content: str,
+) -> _DirectSendReconciliationState:
+    if thread.chat_id != chat_id:
+        return "conflict"
+
+    try:
+        parsed_operation_id = uuid.UUID(
+            operation_id
+        )
+    except ValueError:
+        return "conflict"
+
+    expected_user_id = str(
+        parsed_operation_id
+    )
+
+    expected_assistant_id = str(
+        assistant_message_id_for_operation(
+            parsed_operation_id
+        )
+    )
+
+    user_matches = tuple(
+        message
+        for message in thread.messages
+        if message.message_id == expected_user_id
+    )
+
+    assistant_matches = tuple(
+        message
+        for message in thread.messages
+        if message.message_id == expected_assistant_id
+    )
+
+    if (
+        not user_matches
+        and not assistant_matches
+    ):
+        return "absent"
+
+    if len(user_matches) != 1:
+        return "conflict"
+
+    user_message = user_matches[0]
+
+    if (
+        user_message.chat_id != chat_id
+        or user_message.message_type != "user"
+        or user_message.content != content
+    ):
+        return "conflict"
+
+    if not assistant_matches:
+        return "incomplete"
+
+    if len(assistant_matches) != 1:
+        return "conflict"
+
+    assistant_message = assistant_matches[0]
+
+    if (
+        assistant_message.chat_id != chat_id
+        or assistant_message.message_type != "assistant"
+        or assistant_message.sequence_no
+        != user_message.sequence_no + 1
+    ):
+        return "conflict"
+
+    return "complete"
+
+
 class _ChatTask(QRunnable):
     """Run one chat read/mutation away from the UI thread."""
 
@@ -199,6 +292,7 @@ class _ChatTask(QRunnable):
         chat_id: str | None,
         content: str | None,
         model_id: str | None,
+        operation_id: str | None,
         effective_context_limit: int | None,
         max_output_tokens: int | None,
         temperature: float | None,
@@ -218,6 +312,7 @@ class _ChatTask(QRunnable):
         self.chat_id = chat_id
         self.content = content
         self.model_id = model_id
+        self.operation_id = operation_id
         self.effective_context_limit = effective_context_limit
         self.max_output_tokens = max_output_tokens
         self.temperature = temperature
@@ -250,10 +345,51 @@ class _ChatTask(QRunnable):
                     thread=thread,
                 )
             elif self.operation == "send":
-                if self.content is None or not self.content.strip():
-                    raise ValueError("Chat send requires message content.")
+                content = self.content
+                operation_id = self.operation_id
+
+                if content is None or not content.strip():
+                    raise ValueError(
+                        "Chat send requires message content."
+                    )
+
+                if operation_id is None:
+                    raise ValueError(
+                        "Direct chat send requires "
+                        "a stable operation ID."
+                    )
+
+                parsed_operation_id = uuid.UUID(
+                    operation_id
+                )
+
                 if resolved_chat_id is None:
-                    resolved_chat_id = self.gateway.create_chat().chat_id
+                    resolved_chat_id = str(
+                        chat_id_for_operation(
+                            parsed_operation_id
+                        )
+                    )
+
+                    try:
+                        created = self.gateway.create_chat(
+                            resolved_chat_id
+                        )
+                    except CoreApiClientError as create_exc:
+                        if create_exc.status is not None:
+                            raise
+
+                        try:
+                            created = self.gateway.load_chat(
+                                resolved_chat_id
+                            )
+                        except Exception as reconcile_exc:
+                            raise create_exc from reconcile_exc
+
+                    if created.chat_id != resolved_chat_id:
+                        raise RuntimeError(
+                            "Created chat belongs to another chat."
+                        )
+
                 if (
                     self.effective_context_limit is None
                     and self.max_output_tokens is None
@@ -262,8 +398,9 @@ class _ChatTask(QRunnable):
                 ):
                     thread = self.gateway.send_chat_message(
                         resolved_chat_id,
-                        content=self.content,
+                        content=content,
                         model_id=self.model_id,
+                        operation_id=operation_id,
                     )
                 elif (
                     self.max_output_tokens is None
@@ -272,20 +409,45 @@ class _ChatTask(QRunnable):
                 ):
                     thread = self.gateway.send_chat_message(
                         resolved_chat_id,
-                        content=self.content,
+                        content=content,
                         model_id=self.model_id,
-                        effective_context_limit=self.effective_context_limit,
+                        operation_id=operation_id,
+                        effective_context_limit=(
+                            self.effective_context_limit
+                        ),
                     )
                 else:
                     thread = self.gateway.send_chat_message(
                         resolved_chat_id,
-                        content=self.content,
+                        content=content,
                         model_id=self.model_id,
-                        effective_context_limit=self.effective_context_limit,
-                        max_output_tokens=self.max_output_tokens,
+                        operation_id=operation_id,
+                        effective_context_limit=(
+                            self.effective_context_limit
+                        ),
+                        max_output_tokens=(
+                            self.max_output_tokens
+                        ),
                         temperature=self.temperature,
-                        thinking_enabled=self.thinking_enabled,
+                        thinking_enabled=(
+                            self.thinking_enabled
+                        ),
                     )
+
+                if (
+                    _classify_direct_send(
+                        thread,
+                        chat_id=resolved_chat_id,
+                        operation_id=operation_id,
+                        content=content,
+                    )
+                    != "complete"
+                ):
+                    raise RuntimeError(
+                        "Direct chat response does not contain "
+                        "the expected durable send operation."
+                    )
+
                 outcome = _ChatOperationOutcome(
                     operation=self.operation,
                     thread=thread,
@@ -453,23 +615,91 @@ class _ChatTask(QRunnable):
             else:
                 raise ValueError("Unknown desktop chat operation.")
         except CoreApiClientError as exc:
-            reconciled: ChatThreadResponse | None = None
-            deletion_reconciled = False
             if (
-                self.operation in {"send", "send_grounded"}
+                self.operation == "send"
+                and resolved_chat_id is not None
+                and self.operation_id is not None
+                and self.content is not None
+            ):
+                try:
+                    reconciled = self.gateway.load_chat(
+                        resolved_chat_id
+                    )
+                except Exception:
+                    reconciled = None
+
+                if reconciled is None:
+                    outcome = _ChatOperationOutcome(
+                        operation=self.operation,
+                        error=str(exc),
+                    )
+                else:
+                    state = _classify_direct_send(
+                        reconciled,
+                        chat_id=resolved_chat_id,
+                        operation_id=self.operation_id,
+                        content=self.content,
+                    )
+
+                    if state == "complete":
+                        outcome = _ChatOperationOutcome(
+                            operation=self.operation,
+                            thread=reconciled,
+                        )
+                    elif state == "incomplete":
+                        outcome = _ChatOperationOutcome(
+                            operation=self.operation,
+                            thread=reconciled,
+                            error=(
+                                "Direct send persisted the user turn "
+                                "but no completed assistant turn. "
+                                "Automatic re-execution is blocked."
+                            ),
+                        )
+                    elif state == "conflict":
+                        outcome = _ChatOperationOutcome(
+                            operation=self.operation,
+                            thread=reconciled,
+                            error=(
+                                "Direct send reconciliation detected "
+                                "conflicting durable message identity."
+                            ),
+                        )
+                    else:
+                        outcome = _ChatOperationOutcome(
+                            operation=self.operation,
+                            thread=reconciled,
+                            error=str(exc),
+                        )
+
+            elif (
+                self.operation == "send_grounded"
                 and resolved_chat_id is not None
             ):
                 try:
-                    reconciled = self.gateway.load_chat(resolved_chat_id)
+                    reconciled = self.gateway.load_chat(
+                        resolved_chat_id
+                    )
                 except Exception:
                     reconciled = None
+
+                outcome = _ChatOperationOutcome(
+                    operation=self.operation,
+                    thread=reconciled,
+                    error=str(exc),
+                )
+
             elif (
                 self.operation == "delete"
                 and resolved_chat_id is not None
                 and exc.status is None
             ):
+                deletion_reconciled = False
+
                 try:
-                    self.gateway.load_chat(resolved_chat_id)
+                    self.gateway.load_chat(
+                        resolved_chat_id
+                    )
                 except CoreApiClientError as reconcile_exc:
                     deletion_reconciled = (
                         reconcile_exc.status == 404
@@ -477,15 +707,21 @@ class _ChatTask(QRunnable):
                     )
                 except Exception:
                     deletion_reconciled = False
-            if deletion_reconciled:
-                outcome = _ChatOperationOutcome(
-                    operation=self.operation,
-                    deleted_chat_id=resolved_chat_id,
-                )
+
+                if deletion_reconciled:
+                    outcome = _ChatOperationOutcome(
+                        operation=self.operation,
+                        deleted_chat_id=resolved_chat_id,
+                    )
+                else:
+                    outcome = _ChatOperationOutcome(
+                        operation=self.operation,
+                        error=str(exc),
+                    )
+
             else:
                 outcome = _ChatOperationOutcome(
                     operation=self.operation,
-                    thread=reconciled,
                     error=str(exc),
                 )
         except Exception:
@@ -716,6 +952,7 @@ class DesktopApiController(QObject):
             chat_id=chat_id,
             content=content,
             model_id=model_id,
+            operation_id=str(uuid.uuid4()),
             effective_context_limit=effective_context_limit,
             max_output_tokens=max_output_tokens,
             temperature=temperature,
@@ -843,6 +1080,7 @@ class DesktopApiController(QObject):
         chat_id: str | None,
         content: str | None = None,
         model_id: str | None = None,
+        operation_id: str | None = None,
         effective_context_limit: int | None = None,
         max_output_tokens: int | None = None,
         temperature: float | None = None,
@@ -860,6 +1098,7 @@ class DesktopApiController(QObject):
             chat_id=chat_id,
             content=content,
             model_id=model_id,
+            operation_id=operation_id,
             effective_context_limit=effective_context_limit,
             max_output_tokens=max_output_tokens,
             temperature=temperature,
