@@ -4,6 +4,7 @@ from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
 from athena.api.contracts import (
     CanonicalMergeReviewResponse,
+    ChatThreadResponse,
     DedupDecisionResponse,
     KnowledgeMergeReviewResponse,
     KnowledgeReviewResponse,
@@ -298,6 +299,170 @@ def test_review_ready_does_not_expose_canonical_accept_write() -> None:
         assert window.knowledge_review_state.text() == "REVIEW COMPLETE / READY"
         buttons = window.knowledge_review_panel.findChildren(QPushButton)
         assert all(button.text() != "ACCEPT" for button in buttons)
+    finally:
+        window.close()
+        app.processEvents()
+
+
+
+def _knowledge_rerender_thread(chat_id: str) -> ChatThreadResponse:
+    return ChatThreadResponse(
+        chat_id=chat_id,
+        started_at_us=1,
+        ended_at_us=None,
+        archive_mode="standard",
+        lifecycle_state="active",
+        messages=(),
+    )
+
+
+def test_same_chat_rerender_preserves_extracting_knowledge_review() -> None:
+    app = _app()
+    window = AthenaMainWindow(api_controller=None)
+    controller = _Controller()
+
+    try:
+        window.api_controller = controller  # type: ignore[assignment]
+        window.current_chat_id = CHAT_ID
+        window._core_ready = True
+
+        widget = window._message_widget(
+            role="user",
+            content="Berlin is Germany's capital.",
+            created_at_us=1,
+            sequence_no=1,
+            message_id=MESSAGE_ID,
+            revision_id=REVISION_ID,
+        )
+        window.chat_messages_layout.insertWidget(0, widget)
+        window._sync_composer_enabled()
+
+        window.show()
+        app.processEvents()
+
+        knowledge = widget.findChild(
+            QPushButton,
+            "addKnowledgeButton",
+        )
+        assert knowledge is not None
+        assert knowledge.isEnabled() is True
+
+        knowledge.click()
+        app.processEvents()
+
+        assert controller.extract_calls == [
+            {
+                "chat_id": CHAT_ID,
+                "message_id": MESSAGE_ID,
+                "revision_id": REVISION_ID,
+                "model_id": None,
+                "effective_context_limit": None,
+                "max_output_tokens": None,
+            }
+        ]
+        assert window._knowledge_review_chat_id == CHAT_ID
+        assert window.knowledge_review_panel.isHidden() is False
+        assert window.knowledge_review_panel.isVisible() is True
+        assert (
+            window.knowledge_review_state.text()
+            == "EXTRACTING / SELECTED MESSAGE"
+        )
+
+        window.apply_chat_loaded(
+            _knowledge_rerender_thread(CHAT_ID)
+        )
+        app.processEvents()
+
+        assert window.current_chat_id == CHAT_ID
+        assert window._knowledge_review_chat_id == CHAT_ID
+        assert window.knowledge_review_panel.isHidden() is False
+        assert window.knowledge_review_panel.isVisible() is True
+        assert (
+            window.knowledge_review_state.text()
+            == "EXTRACTING / SELECTED MESSAGE"
+        )
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_same_chat_rerender_preserves_ready_knowledge_review() -> None:
+    app = _app()
+    window = AthenaMainWindow(api_controller=None)
+    controller = _Controller()
+
+    try:
+        window.api_controller = controller  # type: ignore[assignment]
+        window.current_chat_id = CHAT_ID
+
+        window.apply_knowledge_extraction_ready(
+            _extraction()
+        )
+        app.processEvents()
+
+        assert window._knowledge_review_chat_id == CHAT_ID
+        assert window.knowledge_review_panel.isHidden() is False
+
+        window.apply_knowledge_review_ready(
+            _review(merge_candidate=False)
+        )
+        app.processEvents()
+
+        assert (
+            window.knowledge_review_state.text()
+            == "REVIEW COMPLETE / READY"
+        )
+        assert window.knowledge_review_panel.isHidden() is False
+
+        window.apply_chat_loaded(
+            _knowledge_rerender_thread(CHAT_ID)
+        )
+        app.processEvents()
+
+        assert window.current_chat_id == CHAT_ID
+        assert window._knowledge_review_chat_id == CHAT_ID
+        assert window._knowledge_extraction is not None
+        assert window._knowledge_review is not None
+        assert window.knowledge_review_panel.isHidden() is False
+        assert (
+            window.knowledge_review_state.text()
+            == "REVIEW COMPLETE / READY"
+        )
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_different_chat_rerender_clears_knowledge_review() -> None:
+    app = _app()
+    window = AthenaMainWindow(api_controller=None)
+    controller = _Controller()
+
+    other_chat_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+    try:
+        window.api_controller = controller  # type: ignore[assignment]
+        window.current_chat_id = CHAT_ID
+
+        window.apply_knowledge_extraction_ready(
+            _extraction()
+        )
+        app.processEvents()
+
+        assert window._knowledge_review_chat_id == CHAT_ID
+        assert window.knowledge_review_panel.isHidden() is False
+
+        window.apply_chat_loaded(
+            _knowledge_rerender_thread(other_chat_id)
+        )
+        app.processEvents()
+
+        assert window.current_chat_id == other_chat_id
+        assert window._knowledge_review_chat_id is None
+        assert window._knowledge_extraction is None
+        assert window._knowledge_review is None
+        assert window.knowledge_review_panel.isHidden() is True
+        assert window.knowledge_review_state.text() == "IDLE"
     finally:
         window.close()
         app.processEvents()

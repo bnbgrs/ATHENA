@@ -311,6 +311,7 @@ class AthenaMainWindow(QMainWindow):
         self._remembered_message_revisions: set[tuple[str, str]] = set()
         self._knowledge_extraction: MessageKnowledgeExtractionResponse | None = None
         self._knowledge_review: KnowledgeReviewResponse | None = None
+        self._knowledge_review_chat_id: str | None = None
         self._transient_failures: dict[str, list[tuple[int, str, str]]] = {}
         self._last_rendered_sequence = 0
         self._core_transport_ready = False
@@ -1567,6 +1568,7 @@ class AthenaMainWindow(QMainWindow):
             )
             return
 
+        self._knowledge_review_chat_id = response.chat_id
         self._knowledge_extraction = response
         self._knowledge_review = None
         self._render_knowledge_review_panel()
@@ -1947,7 +1949,8 @@ class AthenaMainWindow(QMainWindow):
         assistant_display_override: str | None = None,
     ) -> None:
         self._clear_chat_messages()
-        self._clear_knowledge_review()
+        if self._knowledge_review_chat_id != thread.chat_id:
+            self._clear_knowledge_review()
         self._last_rendered_sequence = 0
         transient_key = thread.chat_id
 
@@ -2151,6 +2154,7 @@ class AthenaMainWindow(QMainWindow):
         chat_id = self.current_chat_id
         if controller is None or chat_id is None or self._chat_busy or not self._core_ready:
             return
+        self._knowledge_review_chat_id = chat_id
         self._knowledge_extraction = None
         self._knowledge_review = None
         self.knowledge_review_panel.setVisible(True)
@@ -2178,6 +2182,7 @@ class AthenaMainWindow(QMainWindow):
             )
 
     def _clear_knowledge_review(self) -> None:
+        self._knowledge_review_chat_id = None
         self._knowledge_extraction = None
         self._knowledge_review = None
         self.knowledge_review_panel.setVisible(False)
