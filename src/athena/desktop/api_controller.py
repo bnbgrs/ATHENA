@@ -675,6 +675,7 @@ class DesktopApiController(QObject):
         self.thread_pool = thread_pool or QThreadPool.globalInstance()
         self.chat_limit = chat_limit
         self._refreshing = False
+        self._refresh_requested = False
         self._outcomes: SimpleQueue[_RefreshOutcome] = SimpleQueue()
         self._active_task: _RefreshTask | None = None
         self._last_good_chats: tuple[ChatSummaryResponse, ...] | None = None
@@ -879,7 +880,11 @@ class DesktopApiController(QObject):
     @Slot()
     def refresh(self) -> None:
         if self._refreshing:
+            self._refresh_requested = True
             return
+        self._start_refresh_task()
+
+    def _start_refresh_task(self) -> None:
         task = _RefreshTask(
             gateway=self.gateway,
             chat_limit=self.chat_limit,
@@ -887,8 +892,9 @@ class DesktopApiController(QObject):
             receiver=self,
         )
         self._active_task = task
-        self._refreshing = True
-        self.refresh_state_changed.emit(True)
+        if not self._refreshing:
+            self._refreshing = True
+            self.refresh_state_changed.emit(True)
         self.thread_pool.start(task)
 
     def _stabilize_snapshot(
@@ -967,6 +973,10 @@ class DesktopApiController(QObject):
 
     def _finish_refresh(self) -> None:
         self._active_task = None
+        if self._refresh_requested:
+            self._refresh_requested = False
+            self._start_refresh_task()
+            return
         self._refreshing = False
         self.refresh_state_changed.emit(False)
 
