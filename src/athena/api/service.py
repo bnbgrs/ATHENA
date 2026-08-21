@@ -36,6 +36,10 @@ from athena.api.contracts import (
 )
 from athena.chat.models import ChatMessage, ChatSummary, ChatThread
 from athena.chat.provenance import strip_durable_provenance_manifest
+from athena.chat.send_identity import (
+    SendOperationState,
+    SendOperationStateError,
+)
 from athena.chat.service import ChatService
 from athena.chat.unified import UnifiedLocalChatResult
 from athena.knowledge.acceptance_service import ProposalAcceptanceError
@@ -77,6 +81,7 @@ class DirectChatSender(Protocol):
         chat_id: uuid.UUID,
         content: str,
         requested_model_id: str | None = None,
+        operation_id: uuid.UUID | None = None,
         effective_context_limit: int | None = None,
         output_reserve: int = 2048,
         temperature: float | None = None,
@@ -320,49 +325,142 @@ class CoreApiFacade:
         *,
         content: str,
         requested_model_id: str | None = None,
+        operation_id: str | None = None,
         effective_context_limit: int | None = None,
         max_output_tokens: int | None = None,
         temperature: float | None = None,
         thinking_enabled: bool | None = None,
     ) -> ChatThreadResponse:
         if self._direct_chat is None:
-            raise RuntimeError("Direct chat is unavailable in this Core process.")
+            raise RuntimeError(
+                "Direct chat is unavailable in this Core process."
+            )
+
         parsed_chat_id = uuid.UUID(chat_id)
-        if (
-            effective_context_limit is None
-            and max_output_tokens is None
-            and temperature is None
-            and thinking_enabled is None
-        ):
-            self._direct_chat.send_message(
-                chat_id=parsed_chat_id,
-                content=content,
-                requested_model_id=requested_model_id,
+
+        parsed_operation_id = (
+            None
+            if operation_id is None
+            else uuid.UUID(operation_id)
+        )
+
+        try:
+            if parsed_operation_id is None:
+                if (
+                    effective_context_limit is None
+                    and max_output_tokens is None
+                    and temperature is None
+                    and thinking_enabled is None
+                ):
+                    self._direct_chat.send_message(
+                        chat_id=parsed_chat_id,
+                        content=content,
+                        requested_model_id=requested_model_id,
+                    )
+                elif (
+                    max_output_tokens is None
+                    and temperature is None
+                    and thinking_enabled is None
+                ):
+                    self._direct_chat.send_message(
+                        chat_id=parsed_chat_id,
+                        content=content,
+                        requested_model_id=requested_model_id,
+                        effective_context_limit=effective_context_limit,
+                    )
+                else:
+                    self._direct_chat.send_message(
+                        chat_id=parsed_chat_id,
+                        content=content,
+                        requested_model_id=requested_model_id,
+                        effective_context_limit=effective_context_limit,
+                        output_reserve=(
+                            2048
+                            if max_output_tokens is None
+                            else max_output_tokens
+                        ),
+                        temperature=temperature,
+                        reasoning_mode=(
+                            None
+                            if thinking_enabled is True
+                            else "off"
+                        ),
+                    )
+            elif (
+                effective_context_limit is None
+                and max_output_tokens is None
+                and temperature is None
+                and thinking_enabled is None
+            ):
+                self._direct_chat.send_message(
+                    chat_id=parsed_chat_id,
+                    content=content,
+                    requested_model_id=requested_model_id,
+                    operation_id=parsed_operation_id,
+                )
+            elif (
+                max_output_tokens is None
+                and temperature is None
+                and thinking_enabled is None
+            ):
+                self._direct_chat.send_message(
+                    chat_id=parsed_chat_id,
+                    content=content,
+                    requested_model_id=requested_model_id,
+                    operation_id=parsed_operation_id,
+                    effective_context_limit=effective_context_limit,
+                )
+            else:
+                self._direct_chat.send_message(
+                    chat_id=parsed_chat_id,
+                    content=content,
+                    requested_model_id=requested_model_id,
+                    operation_id=parsed_operation_id,
+                    effective_context_limit=effective_context_limit,
+                    output_reserve=(
+                        2048
+                        if max_output_tokens is None
+                        else max_output_tokens
+                    ),
+                    temperature=temperature,
+                    reasoning_mode=(
+                        None
+                        if thinking_enabled is True
+                        else "off"
+                    ),
+                )
+
+        except SendOperationStateError as exc:
+            status = exc.status
+
+            if (
+                parsed_operation_id is None
+                or status.chat_id != parsed_chat_id
+                or status.operation_id != parsed_operation_id
+            ):
+                raise RuntimeError(
+                    "Direct chat returned send-operation "
+                    "state for another request."
+                ) from exc
+
+            if (
+                status.state
+                is SendOperationState.COMPLETE
+            ):
+                return _chat_thread(
+                    self._chat.load_chat(
+                        parsed_chat_id
+                    )
+                )
+
+            raise
+
+        return _chat_thread(
+            self._chat.load_chat(
+                parsed_chat_id
             )
-        elif (
-            max_output_tokens is None
-            and temperature is None
-            and thinking_enabled is None
-        ):
-            self._direct_chat.send_message(
-                chat_id=parsed_chat_id,
-                content=content,
-                requested_model_id=requested_model_id,
-                effective_context_limit=effective_context_limit,
-            )
-        else:
-            self._direct_chat.send_message(
-                chat_id=parsed_chat_id,
-                content=content,
-                requested_model_id=requested_model_id,
-                effective_context_limit=effective_context_limit,
-                output_reserve=(
-                    2048 if max_output_tokens is None else max_output_tokens
-                ),
-                temperature=temperature,
-                reasoning_mode=(None if thinking_enabled is True else "off"),
-            )
-        return _chat_thread(self._chat.load_chat(parsed_chat_id))
+        )
+
     def send_unified_local_chat_message(
         self,
         chat_id: str,

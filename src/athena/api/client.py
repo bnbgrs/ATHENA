@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -170,61 +171,131 @@ class CoreApiClient:
         *,
         content: str,
         model_id: str | None = None,
+        operation_id: str | None = None,
         effective_context_limit: int | None = None,
         max_output_tokens: int | None = None,
         temperature: float | None = None,
         thinking_enabled: bool | None = None,
     ) -> ChatThreadResponse:
         if not chat_id or "/" in chat_id:
-            raise ValueError("Chat ID must be a single non-empty path segment.")
+            raise ValueError(
+                "Chat ID must be a single non-empty path segment."
+            )
+
         if not content.strip():
             raise ValueError(
-                "Chat message content must contain non-whitespace text."
+                "Chat message content must contain "
+                "non-whitespace text."
             )
-        if model_id is not None and not model_id.strip():
-            raise ValueError("Chat model_id must be non-empty when provided.")
+
+        if (
+            model_id is not None
+            and not model_id.strip()
+        ):
+            raise ValueError(
+                "Chat model_id must be non-empty when provided."
+            )
+
+        canonical_operation_id: str | None = None
+
+        if operation_id is not None:
+            if not operation_id.strip():
+                raise ValueError(
+                    "Chat operation_id must be non-empty "
+                    "when provided."
+                )
+
+            try:
+                canonical_operation_id = str(
+                    uuid.UUID(operation_id)
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "Chat operation_id must be a valid UUID."
+                ) from exc
+
         if effective_context_limit is not None and (
             isinstance(effective_context_limit, bool)
             or not isinstance(effective_context_limit, int)
             or effective_context_limit < 1
         ):
             raise ValueError(
-                "Chat effective_context_limit must be positive when provided."
+                "Chat effective_context_limit must be "
+                "positive when provided."
             )
+
         if max_output_tokens is not None and (
             isinstance(max_output_tokens, bool)
             or not isinstance(max_output_tokens, int)
             or max_output_tokens < 1
         ):
-            raise ValueError("Chat max_output_tokens must be positive when provided.")
+            raise ValueError(
+                "Chat max_output_tokens must be positive "
+                "when provided."
+            )
+
         if temperature is not None and (
             isinstance(temperature, bool)
             or not isinstance(temperature, (int, float))
             or not 0.0 <= float(temperature) <= 2.0
         ):
-            raise ValueError("Chat temperature must be between 0.0 and 2.0.")
-        if thinking_enabled is not None and not isinstance(thinking_enabled, bool):
-            raise ValueError("Chat thinking_enabled must be boolean when provided.")
-        payload: dict[str, JsonValue] = {"content": content}
+            raise ValueError(
+                "Chat temperature must be between 0.0 and 2.0."
+            )
+
+        if (
+            thinking_enabled is not None
+            and not isinstance(thinking_enabled, bool)
+        ):
+            raise ValueError(
+                "Chat thinking_enabled must be boolean "
+                "when provided."
+            )
+
+        payload: dict[str, JsonValue] = {
+            "content": content
+        }
+
         if model_id is not None:
             payload["model_id"] = model_id
+
+        if canonical_operation_id is not None:
+            payload[
+                "operation_id"
+            ] = canonical_operation_id
+
         if effective_context_limit is not None:
-            payload["effective_context_limit"] = effective_context_limit
+            payload[
+                "effective_context_limit"
+            ] = effective_context_limit
+
         if max_output_tokens is not None:
-            payload["max_output_tokens"] = max_output_tokens
+            payload[
+                "max_output_tokens"
+            ] = max_output_tokens
+
         if temperature is not None:
-            payload["temperature"] = float(temperature)
+            payload[
+                "temperature"
+            ] = float(temperature)
+
         if thinking_enabled is not None:
-            payload["thinking_enabled"] = thinking_enabled
+            payload[
+                "thinking_enabled"
+            ] = thinking_enabled
+
         return _chat_thread(
             self._request(
                 "POST",
                 f"/api/v1/chats/{chat_id}/messages",
                 expected_status=200,
                 json_body=payload,
-                timeout_seconds=self.generation_timeout_seconds,
+                timeout_seconds=(
+                    self.generation_timeout_seconds
+                ),
             )
         )
+
     def send_unified_local_chat_message(
         self,
         chat_id: str,

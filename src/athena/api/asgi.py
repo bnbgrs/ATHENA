@@ -18,6 +18,10 @@ from athena.api.service import (
     KnowledgeReviewNotFoundError,
 )
 from athena.chat.repository import ChatNotFoundError
+from athena.chat.send_identity import (
+    SendOperationState,
+    SendOperationStateError,
+)
 from athena.lifecycle.service import (
     LifecycleDeletionAlreadyDeletedError,
     LifecycleDeletionNotFoundError,
@@ -357,6 +361,7 @@ class CoreApiAsgiApp:
                 unknown = set(payload) - {
                     "content",
                     "model_id",
+                    "operation_id",
                     "effective_context_limit",
                     "max_output_tokens",
                     "temperature",
@@ -378,6 +383,24 @@ class CoreApiAsgiApp:
                     raise ValueError(
                         "Chat model_id must be a non-empty string or null."
                     )
+                operation_id = payload.get("operation_id")
+                if operation_id is not None:
+                    if (
+                        not isinstance(operation_id, str)
+                        or not operation_id.strip()
+                    ):
+                        raise ValueError(
+                            "Chat operation_id must be a "
+                            "non-empty UUID string or null."
+                        )
+                    try:
+                        uuid.UUID(operation_id)
+                    except ValueError as exc:
+                        raise ValueError(
+                            "Chat operation_id must be a "
+                            "valid UUID string or null."
+                        ) from exc
+
                 effective_context_limit = payload.get(
                     "effective_context_limit"
                 )
@@ -423,6 +446,7 @@ class CoreApiAsgiApp:
                         chat_id,
                         content=content,
                         requested_model_id=model_id,
+                        operation_id=operation_id,
                         effective_context_limit=effective_context_limit,
                         max_output_tokens=max_output_tokens,
                         temperature=temperature,
@@ -629,6 +653,37 @@ class CoreApiAsgiApp:
                 retryable=False,
             )
             return
+        except SendOperationStateError as exc:
+            if exc.status.state is SendOperationState.INCOMPLETE:
+                code = "send_operation_incomplete"
+                message = (
+                    "The send operation already has a persisted "
+                    "user turn but no completed assistant turn. "
+                    "Automatic re-execution is blocked."
+                )
+            elif exc.status.state is SendOperationState.CONFLICT:
+                code = "send_operation_conflict"
+                message = (
+                    "The send operation identity conflicts with "
+                    "the requested chat or content."
+                )
+            else:
+                code = "send_operation_state_conflict"
+                message = (
+                    "The send operation cannot be executed from "
+                    "its current durable state."
+                )
+
+            await _send_problem(
+                send,
+                status=409,
+                code=code,
+                message=message,
+                request_id=request_id,
+                retryable=False,
+            )
+            return
+
         except (ValueError, TypeError) as exc:
             await _send_problem(
                 send,

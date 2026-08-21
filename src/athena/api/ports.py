@@ -95,11 +95,13 @@ class CoreApiSurface(Protocol):
         *,
         content: str,
         requested_model_id: str | None = None,
+        operation_id: str | None = None,
         effective_context_limit: int | None = None,
         max_output_tokens: int | None = None,
         temperature: float | None = None,
         thinking_enabled: bool | None = None,
     ) -> ChatThreadResponse: ...
+
     def send_unified_local_chat_message(
         self,
         chat_id: str,
