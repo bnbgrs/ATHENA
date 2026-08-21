@@ -20,7 +20,7 @@ from athena.source.protected_blob import (
 from athena.source.representation_store import UnsupportedTextSourceError
 from athena.source.service import ProtectedSourcePersistentPathUnavailableError
 from athena.storage.schema import (
-    PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
+    GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID,
     SCHEMA_VERSION,
 )
 
@@ -88,7 +88,7 @@ def test_fresh_schema_is_v33_and_allows_protected_blob_records(
         assert metadata is not None
         assert tuple(metadata) == (
             SCHEMA_VERSION,
-            PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
+            GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID,
             SCHEMA_VERSION,
         )
         tables = {

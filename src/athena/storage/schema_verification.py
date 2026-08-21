@@ -48,6 +48,12 @@ from athena.storage.schema_contract import (
     EXHAUSTIVE_RESEARCH_SCHEMA_VERSION as EXHAUSTIVE_RESEARCH_SCHEMA_VERSION,
 )
 from athena.storage.schema_contract import (
+    GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID as GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID,
+)
+from athena.storage.schema_contract import (
+    GROUNDED_RESPONSE_RECEIPT_SCHEMA_VERSION as GROUNDED_RESPONSE_RECEIPT_SCHEMA_VERSION,
+)
+from athena.storage.schema_contract import (
     HIERARCHICAL_SOURCE_EXTRACTION_MIGRATION_ID as HIERARCHICAL_SOURCE_EXTRACTION_MIGRATION_ID,
 )
 from athena.storage.schema_contract import (
@@ -265,15 +271,18 @@ def _verify_schema_v37(
 
 def _verify_schema_v39(
     connection: sqlite3.Connection,
+    *,
+    schema_version: int = (
+        PROTECTED_SOURCE_SEMANTIC_SCHEMA_VERSION
+    ),
+    migration_id: str = (
+        PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID
+    ),
 ) -> None:
     _verify_schema_v38(
         connection,
-        schema_version=(
-            PROTECTED_SOURCE_SEMANTIC_SCHEMA_VERSION
-        ),
-        migration_id=(
-            PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID
-        ),
+        schema_version=schema_version,
+        migration_id=migration_id,
     )
 
     required_tables = {
@@ -2912,3 +2921,134 @@ _verify_schema_v36.__module__ = "athena.storage.schema"
 _verify_schema_v37.__module__ = "athena.storage.schema"
 _verify_schema_v38.__module__ = "athena.storage.schema"
 _verify_schema_v39.__module__ = "athena.storage.schema"
+
+
+def _verify_schema_v40(
+    connection: sqlite3.Connection,
+) -> None:
+    """Verify durable Grounded-response receipt persistence."""
+    _verify_schema_v39(
+        connection,
+        schema_version=(
+            GROUNDED_RESPONSE_RECEIPT_SCHEMA_VERSION
+        ),
+        migration_id=(
+            GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID
+        ),
+    )
+
+    tables = set(
+        _user_tables(
+            connection
+        )
+    )
+
+    if "grounded_response_receipts" not in tables:
+        raise DatabaseCompatibilityError(
+            "ATHENA Grounded response receipt schema is missing."
+        )
+
+    columns = {
+        str(row[1])
+        for row in connection.execute(
+            """
+            PRAGMA table_info(
+                grounded_response_receipts
+            )
+            """
+        )
+    }
+
+    expected_columns = {
+        "operation_id",
+        "chat_id",
+        "processing_run_id",
+        "payload_json",
+        "payload_sha256",
+        "format_version",
+        "created_at_us",
+    }
+
+    if not expected_columns.issubset(
+        columns
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA Grounded response receipt columns are incomplete."
+        )
+
+    indexes = {
+        str(row[0])
+        for row in connection.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'index'
+              AND name = 'idx_grounded_response_receipts_chat'
+            """
+        )
+    }
+
+    if indexes != {
+        "idx_grounded_response_receipts_chat"
+    }:
+        raise DatabaseCompatibilityError(
+            "ATHENA Grounded response receipt index is missing."
+        )
+
+    foreign_keys = {
+        (
+            str(row[3]),
+            str(row[2]),
+            str(row[4]),
+            str(row[6]).upper(),
+        )
+        for row in connection.execute(
+            """
+            PRAGMA foreign_key_list(
+                grounded_response_receipts
+            )
+            """
+        )
+    }
+
+    if (
+        "chat_id",
+        "chats",
+        "chat_id",
+        "CASCADE",
+    ) not in foreign_keys:
+        raise DatabaseCompatibilityError(
+            "ATHENA Grounded response receipt chat foreign key is missing."
+        )
+
+    invalid = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM grounded_response_receipts
+        WHERE length(operation_id) != 16
+           OR length(chat_id) != 16
+           OR length(processing_run_id) != 16
+           OR length(payload_json) <= 1
+           OR length(payload_sha256) != 64
+           OR format_version != 1
+           OR created_at_us < 0
+        """
+    ).fetchone()
+
+    if (
+        invalid is None
+        or int(invalid[0]) != 0
+    ):
+        raise DatabaseCompatibilityError(
+            "ATHENA Grounded response receipt rows are invalid."
+        )
+
+    if connection.execute(
+        "PRAGMA foreign_key_check"
+    ).fetchall():
+        raise DatabaseCompatibilityError(
+            "ATHENA foreign-key verification failed."
+        )
+
+
+_verify_schema_v40.__module__ = "athena.storage.schema"

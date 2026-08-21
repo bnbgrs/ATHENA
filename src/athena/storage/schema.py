@@ -59,6 +59,12 @@ from athena.storage.schema_contract import (
     EXTRACTION_SNAPSHOT_SCHEMA_VERSION as EXTRACTION_SNAPSHOT_SCHEMA_VERSION,
 )
 from athena.storage.schema_contract import (
+    GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID as GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID,
+)
+from athena.storage.schema_contract import (
+    GROUNDED_RESPONSE_RECEIPT_SCHEMA_VERSION as GROUNDED_RESPONSE_RECEIPT_SCHEMA_VERSION,
+)
+from athena.storage.schema_contract import (
     HIERARCHICAL_SOURCE_EXTRACTION_MIGRATION_ID as HIERARCHICAL_SOURCE_EXTRACTION_MIGRATION_ID,
 )
 from athena.storage.schema_contract import (
@@ -379,6 +385,9 @@ from athena.storage.schema_evolution import (
 from athena.storage.schema_evolution import (
     _migrate_schema_v38_to_v39 as _migrate_schema_v38_to_v39,
 )
+from athena.storage.schema_evolution import (
+    _migrate_schema_v39_to_v40 as _migrate_schema_v39_to_v40,
+)
 from athena.storage.schema_verification import (
     _verify_schema_v15 as _verify_schema_v15,
 )
@@ -459,6 +468,9 @@ from athena.storage.schema_verification import (
 )
 from athena.storage.schema_verification import (
     _verify_schema_v39 as _verify_schema_v39,
+)
+from athena.storage.schema_verification import (
+    _verify_schema_v40 as _verify_schema_v40,
 )
 
 
@@ -546,6 +558,7 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
         DELETION_LEDGER_SCHEMA_VERSION,
         OPERATIONAL_ERROR_SANITIZATION_SCHEMA_VERSION,
         OPERATIONAL_ERROR_PHYSICAL_CLEANUP_SCHEMA_VERSION,
+        PROTECTED_SOURCE_SEMANTIC_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
     if existing_user_version not in supported_versions:
@@ -791,8 +804,18 @@ def initialize_schema(connection: sqlite3.Connection, *, created_at_us: int) -> 
             PROTECTED_SOURCE_SEMANTIC_SCHEMA_VERSION
         )
 
+    if (
+        existing_user_version
+        == PROTECTED_SOURCE_SEMANTIC_SCHEMA_VERSION
+    ):
+        _verify_schema_v39(connection)
+        _migrate_schema_v39_to_v40(connection)
+        existing_user_version = (
+            GROUNDED_RESPONSE_RECEIPT_SCHEMA_VERSION
+        )
+
     _configure_connection(connection)
-    _verify_schema_v39(connection)
+    _verify_schema_v40(connection)
 
 
 

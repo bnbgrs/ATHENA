@@ -18,7 +18,7 @@ from athena.storage.database import SQLiteDatabase
 from athena.storage.schema import (
     ARCHIVE_REPLICATION_MIGRATION_ID,
     ARCHIVE_REPLICATION_SCHEMA_VERSION,
-    PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
+    GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID,
     SCHEMA_VERSION,
 )
 
@@ -158,7 +158,7 @@ def test_fresh_schema_has_v32_security_tables_without_persistent_unlock_state(
             metadata
         ) == (
             SCHEMA_VERSION,
-            PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
+            GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID,
             SCHEMA_VERSION,
         )
 
@@ -716,6 +716,10 @@ def test_v31_database_is_upgraded_additively_to_protected_content_v32(
     # behavior intentionally remains fail-closed.
     legacy.execute(
         "DROP TABLE IF EXISTS "
+        "grounded_response_receipts"
+    )
+    legacy.execute(
+        "DROP TABLE IF EXISTS "
         "source_protection_representation_blobs"
     )
     legacy.execute(
@@ -851,7 +855,7 @@ def test_v31_database_is_upgraded_additively_to_protected_content_v32(
             metadata
         ) == (
             SCHEMA_VERSION,
-            PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
+            GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID,
             SCHEMA_VERSION,
         )
 

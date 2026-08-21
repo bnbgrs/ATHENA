@@ -23,7 +23,7 @@ from athena.config.settings import AthenaSettings
 from athena.core.application import AthenaApplication
 from athena.storage.database import SQLiteDatabase
 from athena.storage.schema import (
-    PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
+    GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID,
     SCHEMA_VERSION,
     SOURCE_PROTECTION_TRANSITION_MIGRATION_ID,
     SOURCE_PROTECTION_TRANSITION_SCHEMA_VERSION,
@@ -70,6 +70,10 @@ def test_v34_to_v35_adds_backup_retention_schema(
     # v39 child state before removing older parents or
     # rewriting schema metadata. Production migration
     # behavior intentionally remains fail-closed.
+    legacy.execute(
+        "DROP TABLE IF EXISTS "
+        "grounded_response_receipts"
+    )
     legacy.execute(
         "DROP TABLE IF EXISTS "
         "source_protection_representation_blobs"
@@ -170,7 +174,7 @@ def test_v34_to_v35_adds_backup_retention_schema(
             SCHEMA_VERSION
         )
         assert str(metadata[1]) == (
-            PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID
+            GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID
         )
         assert int(metadata[2]) == (
             SCHEMA_VERSION

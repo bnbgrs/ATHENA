@@ -1267,6 +1267,10 @@ def test_v29_migration_backfills_legacy_event_assessment_without_model(
     # behavior remains intentionally fail-closed.
     legacy.execute(
         "DROP TABLE IF EXISTS "
+        "grounded_response_receipts"
+    )
+    legacy.execute(
+        "DROP TABLE IF EXISTS "
         "source_protection_representation_blobs"
     )
     legacy.execute(

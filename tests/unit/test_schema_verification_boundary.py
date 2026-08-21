@@ -6,7 +6,7 @@ import pickle
 
 from athena.storage import schema, schema_verification
 
-_EXPECTED_VERIFIERS = ('_verify_schema_v15', '_verify_schema_v16', '_verify_schema_v17', '_verify_schema_v18', '_verify_schema_v19', '_verify_schema_v20', '_verify_schema_v21', '_verify_schema_v22', '_verify_schema_v23', '_verify_schema_v24', '_verify_schema_v24_compatible', '_verify_schema_v25', '_verify_schema_v26', '_verify_schema_v27', '_verify_schema_v28', '_verify_schema_v29', '_verify_schema_v30', '_verify_schema_v31', '_verify_schema_v31_compatible', '_verify_schema_v32', '_verify_schema_v33', '_verify_schema_v34', '_verify_schema_v35', '_verify_schema_v36', '_verify_schema_v37', '_verify_schema_v38', '_verify_schema_v39')
+_EXPECTED_VERIFIERS = ('_verify_schema_v15', '_verify_schema_v16', '_verify_schema_v17', '_verify_schema_v18', '_verify_schema_v19', '_verify_schema_v20', '_verify_schema_v21', '_verify_schema_v22', '_verify_schema_v23', '_verify_schema_v24', '_verify_schema_v24_compatible', '_verify_schema_v25', '_verify_schema_v26', '_verify_schema_v27', '_verify_schema_v28', '_verify_schema_v29', '_verify_schema_v30', '_verify_schema_v31', '_verify_schema_v31_compatible', '_verify_schema_v32', '_verify_schema_v33', '_verify_schema_v34', '_verify_schema_v35', '_verify_schema_v36', '_verify_schema_v37', '_verify_schema_v38', '_verify_schema_v39', '_verify_schema_v40')
 
 
 def test_schema_reexports_all_verifiers() -> None:

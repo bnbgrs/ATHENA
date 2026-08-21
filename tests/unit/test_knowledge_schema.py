@@ -10,6 +10,7 @@ from athena.storage.schema import (
     DURABLE_JOBS_SCHEMA_VERSION,
     EXHAUSTIVE_RESEARCH_SCHEMA_VERSION,
     EXTRACTION_SNAPSHOT_SCHEMA_VERSION,
+    GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID,
     HIERARCHICAL_SOURCE_EXTRACTION_SCHEMA_VERSION,
     KNOWLEDGE_SCHEMA_VERSION,
     LEGACY_SCHEMA_VERSION,
@@ -28,7 +29,6 @@ from athena.storage.schema import (
     PERSONAL_MEMORY_SCHEMA_VERSION,
     PRECISE_RESEARCH_PROVENANCE_MIGRATION_ID,
     PRECISE_RESEARCH_PROVENANCE_SCHEMA_VERSION,
-    PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
     PROVENANCE_SCHEMA_VERSION,
     RESEARCH_ORCHESTRATION_MIGRATION_ID,
     RESEARCH_ORCHESTRATION_SCHEMA_VERSION,
@@ -67,6 +67,7 @@ EXPECTED_SEMANTIC_TABLES = {
     "blob_records",
     "archive_replication_outbox",
     "archive_replication_watermark",
+    "grounded_response_receipts",
     "key_slots",
     "protection_scopes",
     "protection_scope_keys",
@@ -207,7 +208,7 @@ def test_fresh_database_contains_semantic_schema(tmp_path) -> None:
     ).fetchone()
     assert tuple(metadata) == (
         SCHEMA_VERSION,
-        PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
+        GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID,
         SCHEMA_VERSION,
     )
 
@@ -796,7 +797,7 @@ def test_v14_database_is_upgraded_additively_to_durable_jobs(tmp_path) -> None:
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID
+    assert metadata["last_migration_id"] == GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID
     database.stop()
 
 
@@ -973,7 +974,7 @@ def test_v17_database_is_upgraded_additively_to_hierarchical_source_analysis(tmp
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID
+    assert metadata["last_migration_id"] == GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID
     database.stop()
 
 
@@ -1036,7 +1037,7 @@ def test_v18_database_is_upgraded_additively_to_source_knowledge_promotion(tmp_p
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID
+    assert metadata["last_migration_id"] == GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID
     database.stop()
 
 
@@ -1106,7 +1107,7 @@ def test_v19_database_is_upgraded_additively_to_hierarchical_source_extraction(t
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID
+    assert metadata["last_migration_id"] == GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID
     database.stop()
 
 
@@ -1179,7 +1180,7 @@ def test_v20_database_is_upgraded_additively_to_personal_memory(tmp_path) -> Non
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID
+    assert metadata["last_migration_id"] == GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID
     database.stop()
 
 
@@ -1261,7 +1262,7 @@ def test_v21_database_is_upgraded_additively_to_exhaustive_research(tmp_path) ->
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID
+    assert metadata["last_migration_id"] == GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID
     database.stop()
 
 
@@ -1359,7 +1360,7 @@ def test_v22_database_is_upgraded_additively_to_research_orchestration(
         "SELECT last_migration_id FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID
+    assert metadata["last_migration_id"] == GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID
     database.stop()
 
 
@@ -1448,7 +1449,7 @@ def test_v23_database_is_upgraded_additively_to_research_synthesis(tmp_path) -> 
         "FROM schema_metadata WHERE singleton_id = 1"
     ).fetchone()
     assert metadata is not None
-    assert metadata["last_migration_id"] == PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID
+    assert metadata["last_migration_id"] == GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID
     assert metadata["minimum_reader_version"] == SCHEMA_VERSION
     assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     database.stop()
@@ -1518,6 +1519,10 @@ def test_v28_database_is_upgraded_additively_to_precise_research_provenance(
     # v39 child state before removing older parents or
     # rewriting schema metadata. Production migration
     # behavior intentionally remains fail-closed.
+    legacy.execute(
+        "DROP TABLE IF EXISTS "
+        "grounded_response_receipts"
+    )
     legacy.execute(
         "DROP TABLE IF EXISTS "
         "source_protection_representation_blobs"
@@ -1703,7 +1708,7 @@ def test_v28_database_is_upgraded_additively_to_precise_research_provenance(
 
     assert tuple(metadata) == (
         SCHEMA_VERSION,
-        PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
+        GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID,
         SCHEMA_VERSION,
     )
 
@@ -1747,6 +1752,10 @@ def test_v29_database_is_upgraded_additively_to_news_event_eligibility(
     # v39 child state before removing older parents or
     # rewriting schema metadata. Production migration
     # behavior intentionally remains fail-closed.
+    legacy.execute(
+        "DROP TABLE IF EXISTS "
+        "grounded_response_receipts"
+    )
     legacy.execute(
         "DROP TABLE IF EXISTS "
         "source_protection_representation_blobs"
@@ -1902,7 +1911,7 @@ def test_v29_database_is_upgraded_additively_to_news_event_eligibility(
 
     assert tuple(metadata) == (
         SCHEMA_VERSION,
-        PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
+        GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID,
         SCHEMA_VERSION,
     )
 
@@ -2141,6 +2150,10 @@ def test_v36_operational_error_text_is_sanitized_without_changing_resume_state(
     # The production migration remains fail-closed.
     legacy.execute(
         "DROP TABLE IF EXISTS "
+        "grounded_response_receipts"
+    )
+    legacy.execute(
+        "DROP TABLE IF EXISTS "
         "source_protection_representation_blobs"
     )
     legacy.execute(
@@ -2201,7 +2214,7 @@ def test_v36_operational_error_text_is_sanitized_without_changing_resume_state(
         metadata
     ) == (
         SCHEMA_VERSION,
-        PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
+        GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID,
         SCHEMA_VERSION,
     )
 

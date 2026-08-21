@@ -16,9 +16,9 @@ from athena.source.protection_transition import (
 from athena.source.repository import SourceProtectionTransitionPendingError
 from athena.storage.database import SQLiteDatabase
 from athena.storage.schema import (
+    GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID,
     PROTECTED_SOURCE_BLOB_MIGRATION_ID,
     PROTECTED_SOURCE_BLOB_SCHEMA_VERSION,
-    PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
     SCHEMA_VERSION,
 )
 
@@ -458,9 +458,13 @@ def test_v33_database_upgrades_additively_to_transition_v34(
 
     # This fixture starts from the current schema and
     # reconstructs an older boundary. Remove additive
-    # v39 child state before removing older parents or
-    # rewriting schema metadata. Production migration
+    # v40 and v39 child state before removing older parents
+    # or rewriting schema metadata. Production migration
     # behavior intentionally remains fail-closed.
+    legacy.execute(
+        "DROP TABLE IF EXISTS "
+        "grounded_response_receipts"
+    )
     legacy.execute(
         "DROP TABLE IF EXISTS "
         "source_protection_representation_blobs"
@@ -537,7 +541,7 @@ def test_v33_database_upgrades_additively_to_transition_v34(
         assert metadata is not None
         assert tuple(metadata) == (
             SCHEMA_VERSION,
-            PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
+            GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID,
             SCHEMA_VERSION,
         )
         assert connection.execute(

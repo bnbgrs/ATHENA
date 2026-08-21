@@ -4,9 +4,10 @@ import sqlite3
 from pathlib import Path
 
 from athena.storage.schema import (
+    GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID,
+    GROUNDED_RESPONSE_RECEIPT_SCHEMA_VERSION,
     OPERATIONAL_ERROR_PHYSICAL_CLEANUP_MIGRATION_ID,
     OPERATIONAL_ERROR_PHYSICAL_CLEANUP_SCHEMA_VERSION,
-    PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
     PROTECTED_SOURCE_SEMANTIC_SCHEMA_VERSION,
     SCHEMA_VERSION,
     initialize_schema,
@@ -65,16 +66,21 @@ def test_fresh_database_reaches_protected_source_semantic_schema(
         )
 
         assert (
-            SCHEMA_VERSION
-            == PROTECTED_SOURCE_SEMANTIC_SCHEMA_VERSION
+            PROTECTED_SOURCE_SEMANTIC_SCHEMA_VERSION
             == 39
+        )
+
+        assert (
+            SCHEMA_VERSION
+            == GROUNDED_RESPONSE_RECEIPT_SCHEMA_VERSION
+            == 40
         )
 
         assert int(
             connection.execute(
                 "PRAGMA user_version"
             ).fetchone()[0]
-        ) == 39
+        ) == SCHEMA_VERSION
 
         metadata = _schema_metadata(
             connection
@@ -84,7 +90,7 @@ def test_fresh_database_reaches_protected_source_semantic_schema(
             metadata[
                 "schema_version"
             ]
-        ) == 39
+        ) == SCHEMA_VERSION
 
         assert (
             str(
@@ -92,14 +98,14 @@ def test_fresh_database_reaches_protected_source_semantic_schema(
                     "last_migration_id"
                 ]
             )
-            == PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID
+            == GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID
         )
 
         assert int(
             metadata[
                 "minimum_reader_version"
             ]
-        ) == 39
+        ) == SCHEMA_VERSION
 
         tables = {
             str(row[0])
@@ -160,6 +166,13 @@ def test_realistic_v38_database_migrates_additively_to_v39(
         connection.execute(
             """
             DROP TABLE
+            grounded_response_receipts
+            """
+        )
+
+        connection.execute(
+            """
+            DROP TABLE
             source_protection_representation_blobs
             """
         )
@@ -208,7 +221,7 @@ def test_realistic_v38_database_migrates_additively_to_v39(
             connection.execute(
                 "PRAGMA user_version"
             ).fetchone()[0]
-        ) == 39
+        ) == SCHEMA_VERSION
 
         metadata = _schema_metadata(
             connection
@@ -218,7 +231,7 @@ def test_realistic_v38_database_migrates_additively_to_v39(
             metadata[
                 "schema_version"
             ]
-        ) == 39
+        ) == SCHEMA_VERSION
 
         assert (
             str(
@@ -226,7 +239,7 @@ def test_realistic_v38_database_migrates_additively_to_v39(
                     "last_migration_id"
                 ]
             )
-            == PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID
+            == GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID
         )
 
         assert (

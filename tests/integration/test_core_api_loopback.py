@@ -25,8 +25,14 @@ class _Chat:
         self.actor_id = uuid.UUID("44444444-4444-4444-4444-444444444444")
         self.create_calls = 0
 
-    def list_chats(self, *, limit: int = 50) -> tuple[ChatSummary, ...]:
+    def list_chats(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[ChatSummary, ...]:
         assert 1 <= limit <= 200
+        assert offset == 0
         return (
             ChatSummary(
                 chat_id=self.chat_id,

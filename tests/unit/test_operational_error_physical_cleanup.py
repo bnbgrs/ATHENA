@@ -77,6 +77,15 @@ def _set_version(
     try:
         if (
             version
+            < schema_module.GROUNDED_RESPONSE_RECEIPT_SCHEMA_VERSION
+        ):
+            connection.execute(
+                "DROP TABLE IF EXISTS "
+                "grounded_response_receipts"
+            )
+
+        if (
+            version
             < schema_module.PROTECTED_SOURCE_SEMANTIC_SCHEMA_VERSION
         ):
             connection.execute(
@@ -385,7 +394,7 @@ def test_physical_cleanup_migration_removes_deleted_canary(
 
     assert metadata == (
         schema_module.SCHEMA_VERSION,
-        schema_module.PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
+        schema_module.GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID,
         schema_module.SCHEMA_VERSION,
     )
 
@@ -405,6 +414,8 @@ def test_physical_cleanup_migration_removes_deleted_canary(
         "idx_source_protected_semantic_entity",
         "idx_source_protection_representation_state",
         "idx_source_protection_representation_old_blob",
+        "grounded_response_receipts",
+        "idx_grounded_response_receipts_chat",
     }
 
     preserved_objects_after = tuple(
@@ -449,6 +460,14 @@ def test_physical_cleanup_migration_removes_deleted_canary(
             "index",
             "idx_source_protection_representation_old_blob",
         ),
+        (
+            "table",
+            "grounded_response_receipts",
+        ),
+        (
+            "index",
+            "idx_grounded_response_receipts_chat",
+        ),
     }
 
     counts_after = _table_counts(
@@ -458,6 +477,7 @@ def test_physical_cleanup_migration_removes_deleted_canary(
     v39_tables = {
         "source_protected_semantic_payloads",
         "source_protection_representation_blobs",
+        "grounded_response_receipts",
     }
 
     preserved_counts_after = {
@@ -474,6 +494,7 @@ def test_physical_cleanup_migration_removes_deleted_canary(
     } == {
         "source_protected_semantic_payloads": 0,
         "source_protection_representation_blobs": 0,
+        "grounded_response_receipts": 0,
     }
 
     _assert_integrity(
@@ -588,7 +609,7 @@ def test_v38_second_start_does_not_repeat_cleanup(
 
     assert metadata == (
         schema_module.SCHEMA_VERSION,
-        schema_module.PROTECTED_SOURCE_SEMANTIC_MIGRATION_ID,
+        schema_module.GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID,
         schema_module.SCHEMA_VERSION,
     )
 

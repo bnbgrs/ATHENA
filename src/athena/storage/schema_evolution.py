@@ -47,6 +47,12 @@ from athena.storage.schema_contract import (
     EXTRACTION_SNAPSHOT_SCHEMA_VERSION as EXTRACTION_SNAPSHOT_SCHEMA_VERSION,
 )
 from athena.storage.schema_contract import (
+    GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID as GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID,
+)
+from athena.storage.schema_contract import (
+    GROUNDED_RESPONSE_RECEIPT_SCHEMA_VERSION as GROUNDED_RESPONSE_RECEIPT_SCHEMA_VERSION,
+)
+from athena.storage.schema_contract import (
     HIERARCHICAL_SOURCE_EXTRACTION_MIGRATION_ID as HIERARCHICAL_SOURCE_EXTRACTION_MIGRATION_ID,
 )
 from athena.storage.schema_contract import (
@@ -3989,6 +3995,89 @@ def _migrate_schema_v38_to_v39(
         raise
 
 
+def _migrate_schema_v39_to_v40(
+    connection: sqlite3.Connection,
+) -> None:
+    """Persist exact structured Grounded-chat replay receipts."""
+    connection.execute(
+        "BEGIN IMMEDIATE"
+    )
+
+    try:
+        connection.execute(
+            """
+            CREATE TABLE grounded_response_receipts (
+                operation_id BLOB(16) NOT NULL
+                    CHECK(length(operation_id) = 16),
+
+                chat_id BLOB(16) NOT NULL
+                    CHECK(length(chat_id) = 16),
+
+                processing_run_id BLOB(16) NOT NULL
+                    CHECK(length(processing_run_id) = 16),
+
+                payload_json TEXT NOT NULL
+                    CHECK(length(payload_json) > 1),
+
+                payload_sha256 TEXT NOT NULL
+                    CHECK(length(payload_sha256) = 64),
+
+                format_version INTEGER NOT NULL
+                    CHECK(format_version = 1),
+
+                created_at_us INTEGER NOT NULL
+                    CHECK(created_at_us >= 0),
+
+                PRIMARY KEY(operation_id),
+
+                FOREIGN KEY(chat_id)
+                    REFERENCES chats(chat_id)
+                    ON DELETE CASCADE
+            ) WITHOUT ROWID
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE INDEX
+            idx_grounded_response_receipts_chat
+            ON grounded_response_receipts(
+                chat_id,
+                created_at_us,
+                operation_id
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            UPDATE schema_metadata
+            SET schema_version = ?,
+                last_migration_id = ?,
+                minimum_reader_version = ?
+            WHERE singleton_id = 1
+            """,
+            (
+                GROUNDED_RESPONSE_RECEIPT_SCHEMA_VERSION,
+                GROUNDED_RESPONSE_RECEIPT_MIGRATION_ID,
+                GROUNDED_RESPONSE_RECEIPT_SCHEMA_VERSION,
+            ),
+        )
+
+        connection.execute(
+            f"PRAGMA user_version = "
+            f"{GROUNDED_RESPONSE_RECEIPT_SCHEMA_VERSION}"
+        )
+
+        connection.execute(
+            "COMMIT"
+        )
+
+    except BaseException:
+        connection.rollback()
+        raise
+
+
 # Preserve historical private evolution import/pickle identities.
 _create_schema_v1.__module__ = "athena.storage.schema"
 _migrate_schema_v1_to_v2.__module__ = "athena.storage.schema"
@@ -4024,3 +4113,4 @@ _migrate_schema_v34_to_v35.__module__ = "athena.storage.schema"
 _migrate_schema_v35_to_v36.__module__ = "athena.storage.schema"
 _migrate_schema_v36_to_v37.__module__ = "athena.storage.schema"
 _migrate_schema_v38_to_v39.__module__ = "athena.storage.schema"
+_migrate_schema_v39_to_v40.__module__ = "athena.storage.schema"
