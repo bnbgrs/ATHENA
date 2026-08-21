@@ -1513,6 +1513,9 @@ class AthenaMainWindow(QMainWindow):
             return
 
         self._apply_control_snapshot(snapshot)
+        chat_freshness = snapshot.resolved_chat_freshness
+        model_freshness = snapshot.resolved_model_freshness
+
         loaded_model = self._selected_model()
         model_name = (
             loaded_model.display_name
@@ -1527,27 +1530,58 @@ class AthenaMainWindow(QMainWindow):
             if snapshot.provider is not None
             else "unavailable"
         )
-        self.provider_metric.set_value(provider_status)
-        self.local_model_metric.set_value(model_name)
-        self.model_metric.set_value(model_name)
-        self.context_metric.set_value(_format_context(context))
-        self.chat_metric.set_value(
-            "unavailable"
-            if snapshot.chat_error is not None
-            else str(len(snapshot.chats))
+
+        model_metric_value = (
+            model_name
+            if model_freshness == "fresh"
+            else f"{model_name} · STALE"
+            if model_freshness == "stale"
+            else "UNAVAILABLE"
         )
+        chat_metric_value = (
+            str(len(snapshot.chats))
+            if chat_freshness == "fresh"
+            else f"{len(snapshot.chats)} · STALE"
+            if chat_freshness == "stale"
+            else "UNAVAILABLE"
+        )
+
+        self.provider_metric.set_value(provider_status)
+        self.local_model_metric.set_value(model_metric_value)
+        self.model_metric.set_value(model_metric_value)
+        self.context_metric.set_value(_format_context(context))
+        self.chat_metric.set_value(chat_metric_value)
 
         self._core_transport_ready = snapshot.health.core_status in {
             "ok",
             "ready",
             "running",
         }
-        self._provider_ready = provider_status == "ready"
+        self._provider_ready = (
+            provider_status == "ready"
+            and model_freshness == "fresh"
+        )
         self._last_model_error = snapshot.model_error
         self._update_ready_state()
 
         if snapshot.chat_error is not None:
-            self.connection_detail.setText(snapshot.chat_error)
+            chat_state = (
+                "STALE"
+                if chat_freshness == "stale"
+                else "UNAVAILABLE"
+            )
+            self.connection_detail.setText(
+                f"Chat list {chat_state} · {snapshot.chat_error}"
+            )
+        elif snapshot.model_error is not None:
+            model_state = (
+                "STALE"
+                if model_freshness == "stale"
+                else "UNAVAILABLE"
+            )
+            self.connection_detail.setText(
+                f"Model status {model_state} · {snapshot.model_error}"
+            )
         elif not self._provider_ready:
             self.connection_detail.setText(
                 "ATHENA Core is connected, but LM Studio is unavailable."

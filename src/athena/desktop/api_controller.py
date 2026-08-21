@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from queue import Empty, SimpleQueue
-from typing import Protocol
+from typing import Literal, Protocol
 
 from PySide6.QtCore import QMetaObject, QObject, QRunnable, Qt, QThreadPool, Signal, Slot
 
@@ -113,6 +113,9 @@ class CoreApiGateway(Protocol):
         preview_digest: str,
     ) -> DeletionResultResponse: ...
 
+SnapshotFreshness = Literal["fresh", "stale", "unavailable"]
+
+
 @dataclass(frozen=True, slots=True)
 class DesktopApiSnapshot:
     """One coherent read snapshot rendered by the desktop shell."""
@@ -123,10 +126,24 @@ class DesktopApiSnapshot:
     chats: tuple[ChatSummaryResponse, ...]
     chat_error: str | None = None
     model_error: str | None = None
+    chat_freshness: SnapshotFreshness | None = None
+    model_freshness: SnapshotFreshness | None = None
 
     @property
     def loaded_model(self) -> ModelResponse | None:
         return next((model for model in self.models if model.loaded), None)
+
+    @property
+    def resolved_chat_freshness(self) -> SnapshotFreshness:
+        if self.chat_freshness is not None:
+            return self.chat_freshness
+        return "fresh" if self.chat_error is None else "unavailable"
+
+    @property
+    def resolved_model_freshness(self) -> SnapshotFreshness:
+        if self.model_freshness is not None:
+            return self.model_freshness
+        return "fresh" if self.model_error is None else "unavailable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -660,6 +677,9 @@ class DesktopApiController(QObject):
         self._refreshing = False
         self._outcomes: SimpleQueue[_RefreshOutcome] = SimpleQueue()
         self._active_task: _RefreshTask | None = None
+        self._last_good_chats: tuple[ChatSummaryResponse, ...] | None = None
+        self._last_good_provider: ProviderHealthResponse | None = None
+        self._last_good_models: tuple[ModelResponse, ...] | None = None
         self._chat_busy = False
         self._chat_outcomes: SimpleQueue[_ChatOperationOutcome] = SimpleQueue()
         self._active_chat_task: _ChatTask | None = None
@@ -871,6 +891,60 @@ class DesktopApiController(QObject):
         self.refresh_state_changed.emit(True)
         self.thread_pool.start(task)
 
+    def _stabilize_snapshot(
+        self,
+        snapshot: DesktopApiSnapshot,
+    ) -> DesktopApiSnapshot:
+        if snapshot.chat_error is None:
+            chats = snapshot.chats
+            self._last_good_chats = chats
+            chat_freshness: SnapshotFreshness = "fresh"
+        elif self._last_good_chats is not None:
+            chats = self._last_good_chats
+            chat_freshness = "stale"
+        else:
+            chats = ()
+            chat_freshness = "unavailable"
+
+        provider = snapshot.provider
+        models = snapshot.models
+
+        if snapshot.model_error is None:
+            self._last_good_provider = provider
+            self._last_good_models = models
+            model_freshness: SnapshotFreshness = "fresh"
+        else:
+            if provider is not None:
+                self._last_good_provider = provider
+
+            if self._last_good_models is not None:
+                provider = (
+                    provider
+                    if provider is not None
+                    else self._last_good_provider
+                )
+                models = self._last_good_models
+                model_freshness = "stale"
+            else:
+                provider = (
+                    provider
+                    if provider is not None
+                    else self._last_good_provider
+                )
+                models = ()
+                model_freshness = "unavailable"
+
+        return DesktopApiSnapshot(
+            health=snapshot.health,
+            provider=provider,
+            models=models,
+            chats=chats,
+            chat_error=snapshot.chat_error,
+            model_error=snapshot.model_error,
+            chat_freshness=chat_freshness,
+            model_freshness=model_freshness,
+        )
+
     @Slot()
     def _drain_worker_outcome(self) -> None:
         try:
@@ -882,7 +956,9 @@ class DesktopApiController(QObject):
                 )
                 return
             if outcome.snapshot is not None:
-                self.snapshot_ready.emit(outcome.snapshot)
+                self.snapshot_ready.emit(
+                    self._stabilize_snapshot(outcome.snapshot)
+                )
                 return
             assert outcome.error is not None
             self.connection_failed.emit(outcome.error)
