@@ -312,6 +312,7 @@ class AthenaMainWindow(QMainWindow):
         self._knowledge_extraction: MessageKnowledgeExtractionResponse | None = None
         self._knowledge_review: KnowledgeReviewResponse | None = None
         self._knowledge_review_chat_id: str | None = None
+        self._knowledge_review_request: tuple[str, str, str] | None = None
         self._transient_failures: dict[str, list[tuple[int, str, str]]] = {}
         self._last_rendered_sequence = 0
         self._core_transport_ready = False
@@ -1561,11 +1562,19 @@ class AthenaMainWindow(QMainWindow):
     def apply_knowledge_extraction_ready(self, response: object) -> None:
         if not isinstance(response, MessageKnowledgeExtractionResponse):
             return
+
+        request = self._knowledge_review_request
+        response_identity = (
+            response.chat_id,
+            response.message_id,
+            response.message_revision_id,
+        )
+
+        if request is None or response_identity != request:
+            return
+
         if response.chat_id != self.current_chat_id:
-            self.apply_chat_operation_failure(
-                "extract_knowledge",
-                "Knowledge extraction belongs to another chat",
-            )
+            self._clear_knowledge_review()
             return
 
         self._knowledge_review_chat_id = response.chat_id
@@ -1588,24 +1597,21 @@ class AthenaMainWindow(QMainWindow):
             "Knowledge extraction complete · canonical deduplication preflight pending."
         )
 
-        controller = self.api_controller
-        if controller is not None:
-            run_id = response.processing_run_id
-            QTimer.singleShot(
-                0,
-                lambda: controller.prepare_knowledge_review(run_id),
-            )
+        run_id = response.processing_run_id
+        QTimer.singleShot(
+            0,
+            lambda: self._prepare_knowledge_review_if_active(run_id),
+        )
 
     @Slot(object)
     def apply_knowledge_review_ready(self, response: object) -> None:
         if not isinstance(response, KnowledgeReviewResponse):
             return
         extraction = self._knowledge_extraction
-        if extraction is None or response.processing_run_id != extraction.processing_run_id:
-            self.apply_chat_operation_failure(
-                "prepare_knowledge_review",
-                "Knowledge review belongs to another extraction run",
-            )
+        if (
+            extraction is None
+            or response.processing_run_id != extraction.processing_run_id
+        ):
             return
         self._knowledge_review = response
         self._render_knowledge_review_panel()
@@ -1635,13 +1641,11 @@ class AthenaMainWindow(QMainWindow):
             + (response.decision or response.status).replace("_", " ").upper()
             + "."
         )
-        controller = self.api_controller
-        if controller is not None:
-            run_id = extraction.processing_run_id
-            QTimer.singleShot(
-                0,
-                lambda: controller.prepare_knowledge_review(run_id),
-            )
+        run_id = extraction.processing_run_id
+        QTimer.singleShot(
+            0,
+            lambda: self._prepare_knowledge_review_if_active(run_id),
+        )
 
     @Slot(str, str)
     def apply_chat_operation_failure(
@@ -1649,6 +1653,20 @@ class AthenaMainWindow(QMainWindow):
         operation: str,
         message: str,
     ) -> None:
+        knowledge_operations = {
+            "extract_knowledge",
+            "prepare_knowledge_review",
+            "load_merge_review",
+            "resolve_merge_review",
+        }
+
+        if (
+            operation in knowledge_operations
+            and self._knowledge_review_request is None
+            and self._knowledge_extraction is None
+        ):
+            return
+
         operation_label = (
             "Grounded chat"
             if operation == "send_grounded"
@@ -2154,6 +2172,11 @@ class AthenaMainWindow(QMainWindow):
         chat_id = self.current_chat_id
         if controller is None or chat_id is None or self._chat_busy or not self._core_ready:
             return
+        self._knowledge_review_request = (
+            chat_id,
+            message_id,
+            revision_id,
+        )
         self._knowledge_review_chat_id = chat_id
         self._knowledge_extraction = None
         self._knowledge_review = None
@@ -2166,6 +2189,25 @@ class AthenaMainWindow(QMainWindow):
             model_id=self._selected_model_id(),
             effective_context_limit=self._effective_context_limit(),
             max_output_tokens=self._max_output_tokens(),
+        )
+
+    def _prepare_knowledge_review_if_active(
+        self,
+        processing_run_id: str,
+    ) -> None:
+        controller = self.api_controller
+        extraction = self._knowledge_extraction
+
+        if (
+            controller is None
+            or self._knowledge_review_request is None
+            or extraction is None
+            or extraction.processing_run_id != processing_run_id
+        ):
+            return
+
+        controller.prepare_knowledge_review(
+            processing_run_id
         )
 
     def _close_knowledge_review(self) -> None:
@@ -2182,6 +2224,7 @@ class AthenaMainWindow(QMainWindow):
             )
 
     def _clear_knowledge_review(self) -> None:
+        self._knowledge_review_request = None
         self._knowledge_review_chat_id = None
         self._knowledge_extraction = None
         self._knowledge_review = None
